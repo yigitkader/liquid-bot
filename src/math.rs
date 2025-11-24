@@ -7,13 +7,26 @@ pub async fn calculate_liquidation_opportunity(
     position: &AccountPosition,
     _config: &Config,
 ) -> Result<Option<LiquidationOpportunity>> {
-    // TODO: Gerçek hesaplama mantığı burada olacak
-    // - Max liquidatable amount hesaplama
-    // - Seizable collateral hesaplama
-    // - Liquidation bonus hesaplama
-    // - Estimated profit hesaplama
+    // PRODUCTION TODO: Gerçek protokol parametrelerine göre hesaplama yap
+    // Şu an basit placeholder hesaplamalar var
+    //
+    // Gerçek implementasyon için yapılması gerekenler:
+    // 1. Protokol parametrelerini al (close_factor, liquidation_bonus)
+    // 2. Gerçek max liquidatable amount hesapla:
+    //    - close_factor * total_debt (protokol limiti)
+    //    - Account'un mevcut durumuna göre
+    // 3. Gerçek seizable collateral hesapla:
+    //    - liquidation_bonus'u kullan
+    //    - Price oracle'dan güncel fiyatları al
+    // 4. Gerçek profit hesapla:
+    //    - Seizable collateral - liquidated debt - transaction fees
+    //    - Slippage'i hesaba kat
+    // 5. Fiyat oracle entegrasyonu (Pyth, Switchboard)
+    //
+    // Not: Bu olmadan bot yanlış profit hesaplayabilir!
+    // Detaylar için: TODOS.md dosyasına bakın
     
-    // Placeholder: Basit bir örnek
+    // Placeholder: Basit bir örnek (production için gerçek hesaplamalar gerekli)
     if position.health_factor < 1.0 && position.total_debt_usd > 0.0 {
         // Örnek hesaplama (gerçek implementasyon protokol parametrelerine göre olacak)
         let max_liquidatable = (position.total_debt_usd * 0.5) as u64; // %50'ye kadar likide edilebilir

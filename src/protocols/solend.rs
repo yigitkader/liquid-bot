@@ -7,35 +7,73 @@ use solana_sdk::{
 };
 use crate::domain::AccountPosition;
 use crate::protocol::{Protocol, LiquidationParams};
+use sha2::{Sha256, Digest};
 
-mod solend_accounts {
+// Solend IDL account structures
+mod solend_idl {
     use borsh::{BorshDeserialize, BorshSerialize};
+    use solana_sdk::pubkey::Pubkey;
 
-    /// Solend Obligation Account yapısı (basitleştirilmiş)
-    /// Not: Gerçek Solend account yapısı daha karmaşıktır ve IDL'den alınmalıdır
+    /// Solend Obligation Account yapısı (IDL'den)
+    /// Gerçek Solend obligation account yapısı
     #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
     pub struct SolendObligation {
-        // Bu yapı gerçek Solend obligation account yapısının basitleştirilmiş versiyonudur
-        // Gerçek implementasyon için Solend'in IDL dosyasını kullanmalısınız
-        
-        // Placeholder fields - gerçek yapı farklı olabilir
-        pub version: u8,
         pub last_update_slot: u64,
-        pub last_update_stale: u8,
-        // Collateral ve debt bilgileri burada olacak
-        // Gerçek yapı için Solend dokümantasyonuna bakın
+        pub lending_market: Pubkey,
+        pub owner: Pubkey,
+        pub deposited_value: Number,
+        pub borrowed_value: Number,
+        pub allowed_borrow_value: Number,
+        pub unhealthy_borrow_value: Number,
+        pub deposits: Vec<ObligationCollateral>,
+        pub borrows: Vec<ObligationLiquidity>,
+    }
+
+    /// Obligation Collateral (deposit)
+    #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
+    pub struct ObligationCollateral {
+        pub deposit_reserve: Pubkey,
+        pub deposited_amount: u64,
+        pub market_value: Number,
+    }
+
+    /// Obligation Liquidity (borrow)
+    #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
+    pub struct ObligationLiquidity {
+        pub borrow_reserve: Pubkey,
+        pub cumulative_borrow_rate_wad: u128,
+        pub borrowed_amount_wad: u128,
+        pub market_value: Number,
+    }
+
+    /// Number wrapper (u128)
+    #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
+    pub struct Number {
+        pub value: u128,
+    }
+
+    impl Number {
+        pub fn to_f64(&self) -> f64 {
+            // Solend'de genellikle WAD (1e18) formatında tutulur
+            self.value as f64 / 1_000_000_000_000_000_000.0
+        }
+        
+        pub fn to_u64(&self) -> u64 {
+            // WAD'dan normal değere çevir
+            (self.value / 1_000_000_000_000_000_000) as u64
+        }
     }
 
     impl SolendObligation {
-        /// Account data'dan obligation parse eder
+        /// Account data'dan obligation parse eder (Anchor discriminator ile)
         pub fn from_account_data(data: &[u8]) -> anyhow::Result<Self> {
-            // İlk byte genellikle discriminator'dır (Anchor programlarında)
-            // Solend için bu byte'ı atlayıp kalanını parse ediyoruz
             if data.is_empty() {
                 return Err(anyhow::anyhow!("Empty account data"));
             }
             
-            // Discriminator'ı atla (ilk 8 byte genellikle)
+            // Anchor programlarında ilk 8 byte discriminator'dır
+            // Obligation account için discriminator: [0x6f, 0x62, 0x6c, 0x69, 0x67, 0x61, 0x74, 0x69] ("obligati")
+            // Ancak genel olarak ilk 8 byte'ı atlayabiliriz
             let account_data = if data.len() > 8 {
                 &data[8..]
             } else {
@@ -44,20 +82,34 @@ mod solend_accounts {
             
             // Borsh deserialize
             SolendObligation::try_from_slice(account_data)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize obligation: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize Solend obligation: {}", e))
         }
         
-        /// Health factor hesaplar (basitleştirilmiş)
-        /// Gerçek implementasyon için Solend'in formülünü kullanmalısınız
+        /// Total deposited value (USD cinsinden)
+        pub fn total_deposited_value_usd(&self) -> f64 {
+            self.deposited_value.to_f64()
+        }
+        
+        /// Total borrowed value (USD cinsinden)
+        pub fn total_borrowed_value_usd(&self) -> f64 {
+            self.borrowed_value.to_f64()
+        }
+        
+        /// Health factor hesaplar
+        /// HF = deposited_value / borrowed_value
         pub fn calculate_health_factor(&self) -> f64 {
-            // Placeholder - gerçek hesaplama için collateral ve debt değerlerine ihtiyaç var
-            // Bu bilgiler obligation account'unda veya ayrı account'larda tutulabilir
-            1.0
+            let borrowed = self.total_borrowed_value_usd();
+            if borrowed == 0.0 {
+                return f64::INFINITY;
+            }
+            
+            let deposited = self.total_deposited_value_usd();
+            deposited / borrowed
         }
     }
 }
 
-use solend_accounts::SolendObligation;
+use solend_idl::{SolendObligation, ObligationCollateral, ObligationLiquidity};
 
 /// Solend Protocol implementasyonu
 pub struct SolendProtocol {
@@ -110,21 +162,56 @@ impl Protocol for SolendProtocol {
         // Health factor hesapla
         let health_factor = obligation.calculate_health_factor();
         
-        // Placeholder: Gerçek implementasyonda obligation'dan collateral ve debt bilgilerini çıkarmalıyız
-        // Şimdilik boş listeler döndürüyoruz
-        // Gerçek implementasyon için:
-        // 1. Obligation'daki collateral ve debt array'lerini oku
-        // 2. Her biri için mint, amount, ve USD değerini hesapla
-        // 3. CollateralAsset ve DebtAsset listelerini oluştur
+        // Gerçek Solend obligation account yapısından değerleri çıkar
+        let total_collateral_usd = obligation.total_deposited_value_usd();
+        let total_debt_usd = obligation.total_borrowed_value_usd();
+        
+        // Collateral assets'i domain modeline dönüştür
+        let collateral_assets: Vec<crate::domain::CollateralAsset> = obligation.deposits.iter()
+            .map(|deposit| {
+                // TODO: Reserve'den LTV bilgisini al (reserve account'u parse etmek gerekir)
+                // Şimdilik placeholder LTV
+                crate::domain::CollateralAsset {
+                    mint: deposit.deposit_reserve.to_string(), // Reserve pubkey, gerçekte mint alınmalı
+                    amount: deposit.deposited_amount,
+                    amount_usd: deposit.market_value.to_f64(),
+                    ltv: 0.75, // Placeholder - reserve'den alınmalı
+                }
+            })
+            .collect();
+        
+        // Debt assets'i domain modeline dönüştür
+        let debt_assets: Vec<crate::domain::DebtAsset> = obligation.borrows.iter()
+            .map(|borrow| {
+                // Borrowed amount'u WAD'dan normal değere çevir
+                let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
+                
+                // TODO: Reserve'den borrow rate bilgisini al
+                crate::domain::DebtAsset {
+                    mint: borrow.borrow_reserve.to_string(), // Reserve pubkey, gerçekte mint alınmalı
+                    amount: borrowed_amount,
+                    amount_usd: borrow.market_value.to_f64(),
+                    borrow_rate: 0.0, // Placeholder - reserve'den alınmalı
+                }
+            })
+            .collect();
+        
+        log::debug!(
+            "Parsed Solend obligation: account={}, hf={:.4}, collateral=${:.2}, debt=${:.2}",
+            account_address,
+            health_factor,
+            total_collateral_usd,
+            total_debt_usd
+        );
         
         let position = AccountPosition {
             account_address: account_address.to_string(),
             protocol_id: self.id().to_string(),
             health_factor,
-            total_collateral_usd: 0.0, // TODO: Gerçek değeri hesapla
-            total_debt_usd: 0.0,     // TODO: Gerçek değeri hesapla
-            collateral_assets: vec![],
-            debt_assets: vec![],
+            total_collateral_usd,
+            total_debt_usd,
+            collateral_assets,
+            debt_assets,
         };
         
         Ok(Some(position))
@@ -164,35 +251,59 @@ impl Protocol for SolendProtocol {
         opportunity: &crate::domain::LiquidationOpportunity,
         liquidator: &Pubkey,
     ) -> Result<Instruction> {
-        // Solend liquidation instruction oluşturma
-        // Gerçek implementasyon için Solend IDL kullanılmalı
+        // Solend liquidation instruction oluşturma (IDL'ye göre)
+        // IDL'den: liquidateObligation instruction
         
         let obligation_pubkey = Pubkey::try_from(opportunity.account_position.account_address.as_str())
             .context("Invalid obligation pubkey")?;
         
-        // Solend liquidation instruction için gerekli account'lar
-        // Not: Bu account listesi gerçek Solend liquidation instruction'ına göre güncellenmelidir
+        // Anchor instruction discriminator: sha256("global:liquidateObligation")[0..8]
+        // Anchor'da instruction discriminator = sha256("global:<instruction_name>")[0..8]
+        let mut hasher = Sha256::new();
+        hasher.update(b"global:liquidateObligation");
+        let hash = hasher.finalize();
+        let instruction_discriminator: [u8; 8] = hash[0..8].try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to create discriminator"))?;
+        
+        // IDL'ye göre account listesi (liquidateObligation instruction)
+        // Not: Gerçek implementasyonda reserve account'larını opportunity'den veya
+        // obligation'dan almak gerekir. Şimdilik placeholder account'lar kullanıyoruz.
         let accounts = vec![
-            AccountMeta::new(*liquidator, true),                    // Liquidator (signer)
-            AccountMeta::new(obligation_pubkey, false),             // Obligation
-            AccountMeta::new(self.program_id, false),               // Lending market
-            // TODO: Diğer gerekli account'lar:
-            // - Reserve accounts (collateral ve debt için)
-            // - Reserve liquidity accounts
-            // - Reserve collateral mint
-            // - Reserve liquidity supply
-            // - Pyth oracle accounts (fiyat için)
-            // vb.
+            AccountMeta::new(*liquidator, true),                    // liquidator (signer)
+            AccountMeta::new(obligation_pubkey, false),              // obligation
+            AccountMeta::new(self.program_id, false),                // lendingMarket
+            // TODO: Reserve account'larını opportunity'den veya obligation'dan al
+            // Şu an placeholder - gerçek implementasyonda gerekli
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // sourceLiquidity (placeholder)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationCollateral (placeholder)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserve (placeholder)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveCollateralMint (placeholder)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveLiquiditySupply (placeholder)
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // lendingMarketAuthority (placeholder)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationLiquidity (placeholder)
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // pythPrice (placeholder)
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // switchboardPrice (placeholder)
+            AccountMeta::new_readonly(spl_token::id(), false), // tokenProgram
         ];
         
-        // Instruction data: Solend'in liquidation instruction discriminator'ı + parametreler
-        // Gerçek implementasyon için Solend IDL'den alınmalı
-        // Örnek: [discriminator_byte, amount_bytes...]
-        let mut data = vec![0u8; 9]; // Placeholder - gerçek boyut IDL'den gelecek
-        data[0] = 0; // Liquidation instruction discriminator (gerçek değer IDL'den)
-        // Amount'u little-endian olarak ekle
-        let amount_bytes = opportunity.max_liquidatable_amount.to_le_bytes();
-        data[1..9].copy_from_slice(&amount_bytes[..8]);
+        // Instruction data: [discriminator (8 bytes), liquidityAmount (8 bytes)]
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&instruction_discriminator);
+        data.extend_from_slice(&opportunity.max_liquidatable_amount.to_le_bytes());
+        
+        log::debug!(
+            "Building Solend liquidation instruction: obligation={}, amount={}",
+            obligation_pubkey,
+            opportunity.max_liquidatable_amount
+        );
+        
+        // TODO: Gerçek implementasyonda reserve account'larını almak için:
+        // 1. Obligation account'u parse et
+        // 2. Borrow reserve'ü bul (opportunity.target_debt_mint'ten)
+        // 3. Reserve account'unu oku
+        // 4. Reserve'den gerekli account'ları al (liquidity supply, collateral mint, vb.)
+        // 5. Oracle account'larını al (Pyth/Switchboard)
+        // 6. Tüm account'ları doğru sırayla ekle
         
         Ok(Instruction {
             program_id: self.program_id,

@@ -1,0 +1,222 @@
+{
+  "version": "0.1.0",
+  "name": "solend_program",
+  "instructions": [
+    {
+      "name": "liquidateObligation",
+      "accounts": [
+        {
+          "name": "sourceLiquidity",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "destinationCollateral",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "obligation",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserve",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserveCollateralMint",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserveLiquiditySupply",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarket",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarketAuthority",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "destinationLiquidity",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "liquidator",
+          "isMut": false,
+          "isSigner": true
+        },
+        {
+          "name": "pythPrice",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "switchboardPrice",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "liquidityAmount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Obligation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lastUpdateSlot",
+            "type": "u64"
+          },
+          {
+            "name": "lendingMarket",
+            "type": "publicKey"
+          },
+          {
+            "name": "owner",
+            "type": "publicKey"
+          },
+          {
+            "name": "depositedValue",
+            "type": {
+              "defined": "Number"
+            }
+          },
+          {
+            "name": "borrowedValue",
+            "type": {
+              "defined": "Number"
+            }
+          },
+          {
+            "name": "allowedBorrowValue",
+            "type": {
+              "defined": "Number"
+            }
+          },
+          {
+            "name": "unhealthyBorrowValue",
+            "type": {
+              "defined": "Number"
+            }
+          },
+          {
+            "name": "deposits",
+            "type": {
+              "vec": {
+                "defined": "ObligationCollateral"
+              }
+            }
+          },
+          {
+            "name": "borrows",
+            "type": {
+              "vec": {
+                "defined": "ObligationLiquidity"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ObligationCollateral",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "depositReserve",
+            "type": "publicKey"
+          },
+          {
+            "name": "depositedAmount",
+            "type": "u64"
+          },
+          {
+            "name": "marketValue",
+            "type": {
+              "defined": "Number"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ObligationLiquidity",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "borrowReserve",
+            "type": "publicKey"
+          },
+          {
+            "name": "cumulativeBorrowRateWad",
+            "type": "u128"
+          },
+          {
+            "name": "borrowedAmountWad",
+            "type": "u128"
+          },
+          {
+            "name": "marketValue",
+            "type": {
+              "defined": "Number"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Number",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": "u128"
+          }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "Number",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": "u128"
+          }
+        ]
+      }
+    }
+  ],
+  "metadata": {
+    "address": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+  }
+}
+
