@@ -1,6 +1,6 @@
 -- Version 1.0.0 Business Analysis Document (BAD) --
 
-Aşağıdaki doküman, **“Solana Üzeri Lending Likidasyon Botu”** projesi için hazırlanmış,
+Aşağıdaki doküman, **“ Rust Lang ile Solana Üzeri Lending Likidasyon Botu”** projesi için hazırlanmış,
 **kurumsal seviyede**, **kod içermeyen**, tamamen **mimari & business analiz** odaklı,
 geleceğe referans olacak **resmi bir Business Analysis Document (BAD)** formatındadır.
 
