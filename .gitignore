@@ -7,3 +7,5 @@
 *.tmp
 .DS_Store
 *.xml
+/secrt
+/secrt/*
