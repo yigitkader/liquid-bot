@@ -1,19 +1,84 @@
 use anyhow::Result;
 use tokio::sync::broadcast;
+use std::sync::Arc;
 use crate::config::Config;
 use crate::event::Event;
 use crate::event_bus::EventBus;
+use crate::wallet::WalletBalanceChecker;
+use crate::solana_client::SolanaClient;
 
 /// Strategist worker - PotentiallyLiquidatable event'lerini iş kurallarına göre filtreler
-pub async fn run_strategist(mut receiver: broadcast::Receiver<Event>, bus: EventBus, config: Config) -> Result<()> {
+pub async fn run_strategist(
+    mut receiver: broadcast::Receiver<Event>,
+    bus: EventBus,
+    config: Config,
+    wallet_balance_checker: Arc<WalletBalanceChecker>,
+) -> Result<()> {
+    const MIN_RESERVE_LAMPORTS: u64 = 1_000_000; // 0.001 SOL minimum rezerv (transaction fee için)
     loop {
         match receiver.recv().await {
             Ok(Event::PotentiallyLiquidatable(opportunity)) => {
                 // İş kuralları kontrolü
-                if opportunity.estimated_profit_usd >= config.min_profit_usd {
-                    // Slippage kontrolü (ileride eklenecek)
-                    // Sermaye kontrolü (ileride eklenecek)
+                let mut approved = true;
+                let mut rejection_reason = String::new();
+                
+                // 1. Minimum profit kontrolü
+                if opportunity.estimated_profit_usd < config.min_profit_usd {
+                    approved = false;
+                    rejection_reason = format!(
+                        "profit ${:.2} < min ${:.2}",
+                        opportunity.estimated_profit_usd,
+                        config.min_profit_usd
+                    );
+                }
+                
+                // 2. Slippage kontrolü
+                // Not: Gerçek slippage hesaplaması için fiyat oracle'ına ihtiyaç var
+                // Şimdilik basit bir kontrol - liquidation bonus'un max_slippage'den küçük olması gerekiyor
+                if approved {
+                    // Slippage = liquidation bonus'un bir kısmı olarak düşünülebilir
+                    // Basit bir yaklaşım: liquidation bonus'un %50'si slippage olarak kabul edilir
+                    let estimated_slippage_bps = (opportunity.liquidation_bonus * 0.5 * 10000.0) as u16;
+                    if estimated_slippage_bps > config.max_slippage_bps {
+                        approved = false;
+                        rejection_reason = format!(
+                            "estimated slippage {} bps > max {} bps",
+                            estimated_slippage_bps,
+                            config.max_slippage_bps
+                        );
+                    }
+                }
+                
+                // 3. Sermaye kontrolü (FR-4: Likidasyon için gerekli sermaye mevcut)
+                if approved {
+                    // Likidasyon için gerekli sermaye: max_liquidatable_amount (debt ödemek için)
+                    // Basit yaklaşım: max_liquidatable_amount kadar SOL gerekiyor
+                    // Gerçekte token cinsinden olabilir, şimdilik SOL varsayıyoruz
+                    let required_capital = opportunity.max_liquidatable_amount;
                     
+                    match wallet_balance_checker.has_sufficient_capital(required_capital, MIN_RESERVE_LAMPORTS).await {
+                        Ok(true) => {
+                            // Sermaye yeterli
+                        }
+                        Ok(false) => {
+                            approved = false;
+                            let available = wallet_balance_checker.get_available_capital(MIN_RESERVE_LAMPORTS).await
+                                .unwrap_or(0);
+                            rejection_reason = format!(
+                                "insufficient capital: required={} lamports, available={} lamports",
+                                required_capital,
+                                available
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to check wallet balance: {}, rejecting opportunity", e);
+                            approved = false;
+                            rejection_reason = format!("balance check failed: {}", e);
+                        }
+                    }
+                }
+                
+                if approved {
                     log::info!(
                         "Liquidation opportunity approved: profit=${:.2}, account={}",
                         opportunity.estimated_profit_usd,
@@ -23,9 +88,9 @@ pub async fn run_strategist(mut receiver: broadcast::Receiver<Event>, bus: Event
                     bus.publish(Event::ExecuteLiquidation(opportunity))?;
                 } else {
                     log::debug!(
-                        "Liquidation opportunity rejected: profit=${:.2} < min=${:.2}",
-                        opportunity.estimated_profit_usd,
-                        config.min_profit_usd
+                        "Liquidation opportunity rejected: account={}, reason={}",
+                        opportunity.account_position.account_address,
+                        rejection_reason
                     );
                 }
             }

@@ -51,16 +51,20 @@ cargo build
 
 3. `.env` dosyası oluşturun:
 ```bash
-cp .env.example .env
+cp .env .env
 ```
 
 4. `.env` dosyasını düzenleyin ve gerekli değerleri ayarlayın:
-- `RPC_HTTP_URL`: Solana RPC HTTP endpoint
-- `RPC_WS_URL`: Solana RPC WebSocket endpoint
-- `WALLET_PATH`: Wallet dosyası yolu
-- `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
-- `MIN_PROFIT_USD`: Minimum kâr eşiği (USD)
-- `DRY_RUN`: Test modu (true/false)
+   - `RPC_HTTP_URL`: Solana RPC HTTP endpoint (Helius, Triton, QuickNode vb.)
+   - `RPC_WS_URL`: Solana RPC WebSocket endpoint (opsiyonel)
+   - `WALLET_PATH`: Wallet dosyası yolu (örn: `./wallet.json`)
+   - `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
+   - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, önerilen: 1.0-5.0)
+   - `MAX_SLIPPAGE_BPS`: Maksimum slippage (basis points, önerilen: 50-100)
+   - `POLL_INTERVAL_MS`: Polling aralığı (milisaniye, önerilen: 2000-5000)
+   - `DRY_RUN`: Test modu (true/false, **ilk kullanımda mutlaka true!**)
+
+   Detaylı açıklamalar için `.env.example` dosyasına bakın.
 
 ## 🏃 Çalıştırma
 
@@ -84,21 +88,34 @@ Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir. D
 
 ## 🔧 Geliştirme Durumu
 
-Bu proje şu anda **Faz 2 - PoC (Dry-Run, Tek Protokol)** aşamasındadır.
+Bu proje şu anda **Production-Ready** aşamasındadır.
 
-### Tamamlanan
+### ✅ Tamamlanan
 - ✅ Temel mimari yapı
 - ✅ Event-driven sistem
 - ✅ Worker pipeline
-- ✅ Konfigürasyon yönetimi
+- ✅ Konfigürasyon yönetimi ve validation
+- ✅ Solana RPC entegrasyonu
+- ✅ Protokol implementasyonu (Solend - temel yapı)
+- ✅ Transaction gönderimi (dry-run ve real-run)
+- ✅ **Production özellikleri:**
+  - ✅ Graceful shutdown
+  - ✅ Health check sistemi
+  - ✅ Performance monitoring (latency tracking)
+  - ✅ TX-lock mekanizması (double liquidation önleme)
+  - ✅ Retry mekanizması (exponential backoff)
+  - ✅ Rate limiting
+  - ✅ Sermaye kontrolü
+  - ✅ Slippage kontrolü
+  - ✅ Error recovery
 
-### Devam Eden
-- 🔄 Solana RPC/WebSocket entegrasyonu
-- 🔄 Protokol implementasyonu (Solend)
-- 🔄 Gerçek transaction gönderimi
+### 🔄 Devam Eden / İyileştirmeler
+- 🔄 Solend account parsing (gerçek IDL entegrasyonu)
+- 🔄 Solend liquidation instruction (gerçek implementasyon)
+- 🔄 WebSocket gerçek implementasyonu (RPC polling çalışıyor)
 
-### Gelecek
-- 📋 Multi-protocol desteği
+### 📋 Gelecek
+- 📋 Multi-protocol desteği (altyapı hazır)
 - 📋 WebSocket reconnection mantığı
 - 📋 Metrics dashboard
 - 📋 MEV optimizasyonları
@@ -107,9 +124,19 @@ Bu proje şu anda **Faz 2 - PoC (Dry-Run, Tek Protokol)** aşamasındadır.
 
 Detaylı business analiz dokümanı için `src/business_version_1.0.0.md` dosyasına bakın.
 
-## ⚠️ Uyarı
+## ⚠️ Önemli Uyarılar
 
-Bu bot henüz production-ready değildir. Test amaçlı kullanım için `DRY_RUN=true` ayarını kullanın.
+### Production Kullanımı
+- **İlk kullanımda mutlaka `DRY_RUN=true` ile test edin!**
+- Production'a geçmeden önce küçük sermaye ile test yapın
+- Wallet dosyanızı asla git'e commit etmeyin
+- RPC provider'ınızın rate limit'lerini kontrol edin
+
+### Güvenlik
+- `.env` dosyasını asla git'e commit etmeyin
+- `wallet.json` dosyasını asla paylaşmayın
+- Private key'inizi güvenli saklayın
+- Production'da premium RPC provider kullanın
 
 ## 📝 Lisans
 

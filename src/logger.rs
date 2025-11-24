@@ -1,9 +1,11 @@
 use anyhow::Result;
 use tokio::sync::broadcast;
+use std::sync::Arc;
 use crate::event::Event;
+use crate::health::HealthManager;
 
 /// Logger worker - Tüm event'leri loglar ve metrics toplar
-pub async fn run_logger(mut receiver: broadcast::Receiver<Event>) -> Result<()> {
+pub async fn run_logger(mut receiver: broadcast::Receiver<Event>, health_manager: Arc<HealthManager>) -> Result<()> {
     let mut metrics = Metrics::new();
     
     loop {
@@ -19,6 +21,7 @@ pub async fn run_logger(mut receiver: broadcast::Receiver<Event>) -> Result<()> 
                     }
                     Event::PotentiallyLiquidatable(opp) => {
                         metrics.opportunities_found += 1;
+                        health_manager.record_opportunity().await;
                         log::info!(
                             "Opportunity found: account={}, profit=${:.2}",
                             opp.account_position.account_address,
@@ -34,6 +37,7 @@ pub async fn run_logger(mut receiver: broadcast::Receiver<Event>) -> Result<()> 
                         );
                     }
                     Event::TxResult { opportunity, success, signature, error } => {
+                        health_manager.record_transaction(*success).await;
                         if *success {
                             metrics.tx_success += 1;
                             metrics.total_profit_usd += opportunity.estimated_profit_usd;

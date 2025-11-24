@@ -14,6 +14,11 @@ geleceğe referans olacak **resmi bir Business Analysis Document (BAD)** format�
 
 ---
 
+Başlangıçta KESİNLİKLE TEK BİR PROTOKOL ile başlamalısın.
+
+Ancak, mimariyi "gelecekte çoklu protokole geçecekmiş gibi" (Interface/Trait tabanlı) kurmalısın.
+
+
 # 1. **Executive Summary**
 
 Bu doküman, Solana üzerinde çalışan otomatik bir **Lending Likidasyon Botu** projesinin iş gereksinimlerini, mimari yaklaşımını, kapsamını ve büyüme stratejisini tanımlamak amacıyla hazırlanmıştır.

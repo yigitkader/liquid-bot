@@ -9,3 +9,15 @@
 *.xml
 /secrt
 /secrt/*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Wallet files (CRITICAL - never commit!)
+wallet.json
+*-wallet.json
+bot-wallet.json
+*.key
+*.keypair
