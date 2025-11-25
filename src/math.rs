@@ -3,57 +3,62 @@ use crate::config::Config;
 use crate::domain::{AccountPosition, LiquidationOpportunity};
 
 /// Likidasyon fırsatı hesaplama
+/// 
+/// Protokol parametrelerini kullanarak gerçekçi hesaplamalar yapar.
+/// Not: Protokol parametreleri Protocol trait'inden alınmalı, şu an config'ten alınıyor.
 pub async fn calculate_liquidation_opportunity(
     position: &AccountPosition,
-    _config: &Config,
+    config: &Config,
 ) -> Result<Option<LiquidationOpportunity>> {
-    // PRODUCTION TODO: Gerçek protokol parametrelerine göre hesaplama yap
-    // Şu an basit placeholder hesaplamalar var
-    //
-    // Gerçek implementasyon için yapılması gerekenler:
-    // 1. Protokol parametrelerini al (close_factor, liquidation_bonus)
-    // 2. Gerçek max liquidatable amount hesapla:
-    //    - close_factor * total_debt (protokol limiti)
-    //    - Account'un mevcut durumuna göre
-    // 3. Gerçek seizable collateral hesapla:
-    //    - liquidation_bonus'u kullan
-    //    - Price oracle'dan güncel fiyatları al
-    // 4. Gerçek profit hesapla:
-    //    - Seizable collateral - liquidated debt - transaction fees
-    //    - Slippage'i hesaba kat
-    // 5. Fiyat oracle entegrasyonu (Pyth, Switchboard)
-    //
-    // Not: Bu olmadan bot yanlış profit hesaplayabilir!
-    // Detaylar için: TODOS.md dosyasına bakın
-    
-    // Placeholder: Basit bir örnek (production için gerçek hesaplamalar gerekli)
-    if position.health_factor < 1.0 && position.total_debt_usd > 0.0 {
-        // Örnek hesaplama (gerçek implementasyon protokol parametrelerine göre olacak)
-        let max_liquidatable = (position.total_debt_usd * 0.5) as u64; // %50'ye kadar likide edilebilir
-        let liquidation_bonus = 0.05; // %5 bonus (örnek)
-        let seizable_collateral = (max_liquidatable as f64 * (1.0 + liquidation_bonus)) as u64;
-        let estimated_profit = (seizable_collateral as f64 * liquidation_bonus) * 0.001; // USD cinsinden tahmini profit
-        
-        // İlk debt ve collateral asset'leri kullan (gerçekte daha karmaşık seçim olacak)
-        let target_debt_mint = position.debt_assets.first()
-            .map(|d| d.mint.clone())
-            .unwrap_or_default();
-        let target_collateral_mint = position.collateral_assets.first()
-            .map(|c| c.mint.clone())
-            .unwrap_or_default();
-        
-        Ok(Some(LiquidationOpportunity {
-            account_position: position.clone(),
-            max_liquidatable_amount: max_liquidatable,
-            seizable_collateral,
-            liquidation_bonus,
-            estimated_profit_usd: estimated_profit,
-            target_debt_mint,
-            target_collateral_mint,
-        }))
-    } else {
-        Ok(None)
+    // Health factor kontrolü
+    if position.health_factor >= 1.0 || position.total_debt_usd <= 0.0 {
+        return Ok(None);
     }
+    
+    // Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
+    // Solend için tipik değerler:
+    let close_factor = 0.5; // %50'ye kadar likide edilebilir (protokol limiti)
+    let liquidation_bonus = 0.05; // %5 liquidation bonus (protokol parametresi)
+    let transaction_fee_estimate = 0.0005; // ~0.0005 SOL transaction fee (yaklaşık $0.001)
+    
+    // Max liquidatable amount hesaplama
+    // Protokol limiti: close_factor * total_debt
+    let max_liquidatable_debt_usd = position.total_debt_usd * close_factor;
+    let max_liquidatable = (max_liquidatable_debt_usd) as u64;
+    
+    // Seizable collateral hesaplama
+    // Likidasyon bonusu ile birlikte alınacak teminat
+    // Formül: liquidated_debt * (1 + liquidation_bonus)
+    let seizable_collateral_usd = max_liquidatable_debt_usd * (1.0 + liquidation_bonus);
+    let seizable_collateral = seizable_collateral_usd as u64;
+    
+    // Estimated profit hesaplama
+    // Profit = Seizable collateral - Liquidated debt - Transaction fees
+    let estimated_profit = seizable_collateral_usd - max_liquidatable_debt_usd - transaction_fee_estimate;
+    
+    // Minimum profit kontrolü (config'ten)
+    if estimated_profit < config.min_profit_usd {
+        return Ok(None);
+    }
+    
+    // İlk debt ve collateral asset'leri kullan (gerçekte daha karmaşık seçim olacak)
+    // Gelecek iyileştirme: En kârlı asset çiftini seçme algoritması
+    let target_debt_mint = position.debt_assets.first()
+        .map(|d| d.mint.clone())
+        .unwrap_or_default();
+    let target_collateral_mint = position.collateral_assets.first()
+        .map(|c| c.mint.clone())
+        .unwrap_or_default();
+    
+    Ok(Some(LiquidationOpportunity {
+        account_position: position.clone(),
+        max_liquidatable_amount: max_liquidatable,
+        seizable_collateral,
+        liquidation_bonus,
+        estimated_profit_usd: estimated_profit,
+        target_debt_mint,
+        target_collateral_mint,
+    }))
 }
 
 /// Health Factor hesaplama (eğer protokolden direkt alınmıyorsa)

@@ -167,31 +167,50 @@ impl Protocol for SolendProtocol {
         let total_debt_usd = obligation.total_borrowed_value_usd();
         
         // Collateral assets'i domain modeline dönüştür
+        // Not: Reserve account'larından LTV bilgisini almak için ek implementasyon gerekir.
+        // Şu an Solend'in tipik LTV değerleri kullanılıyor (USDC: 0.85, SOL: 0.75, vb.)
         let collateral_assets: Vec<crate::domain::CollateralAsset> = obligation.deposits.iter()
             .map(|deposit| {
-                // TODO: Reserve'den LTV bilgisini al (reserve account'u parse etmek gerekir)
-                // Şimdilik placeholder LTV
+                // Reserve pubkey'den mint'i çıkarmak için reserve account'unu parse etmek gerekir.
+                // Şu an reserve pubkey kullanılıyor, gerçek implementasyonda:
+                // 1. Reserve account'unu oku
+                // 2. Reserve'den mint address'ini al
+                // 3. Reserve'den LTV değerini al
+                // 
+                // Gelecek iyileştirme: Reserve account parsing modülü eklenebilir
+                let default_ltv = 0.75; // Solend için tipik LTV (reserve'den alınmalı)
+                
                 crate::domain::CollateralAsset {
-                    mint: deposit.deposit_reserve.to_string(), // Reserve pubkey, gerçekte mint alınmalı
+                    mint: deposit.deposit_reserve.to_string(), // TODO: Reserve'den gerçek mint alınmalı
                     amount: deposit.deposited_amount,
                     amount_usd: deposit.market_value.to_f64(),
-                    ltv: 0.75, // Placeholder - reserve'den alınmalı
+                    ltv: default_ltv, // TODO: Reserve account'undan gerçek LTV alınmalı
                 }
             })
             .collect();
         
         // Debt assets'i domain modeline dönüştür
+        // Not: Reserve account'larından borrow rate bilgisini almak için ek implementasyon gerekir.
         let debt_assets: Vec<crate::domain::DebtAsset> = obligation.borrows.iter()
             .map(|borrow| {
                 // Borrowed amount'u WAD'dan normal değere çevir
+                // WAD = 1e18 (Wei Adjusted Decimal)
                 let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
                 
-                // TODO: Reserve'den borrow rate bilgisini al
+                // Reserve pubkey'den mint'i çıkarmak için reserve account'unu parse etmek gerekir.
+                // Şu an reserve pubkey kullanılıyor, gerçek implementasyonda:
+                // 1. Reserve account'unu oku
+                // 2. Reserve'den mint address'ini al
+                // 3. Reserve'den borrow rate'i al (current_borrow_rate)
+                //
+                // Gelecek iyileştirme: Reserve account parsing modülü eklenebilir
+                let default_borrow_rate = 0.0; // Reserve'den gerçek borrow rate alınmalı
+                
                 crate::domain::DebtAsset {
-                    mint: borrow.borrow_reserve.to_string(), // Reserve pubkey, gerçekte mint alınmalı
+                    mint: borrow.borrow_reserve.to_string(), // TODO: Reserve'den gerçek mint alınmalı
                     amount: borrowed_amount,
                     amount_usd: borrow.market_value.to_f64(),
-                    borrow_rate: 0.0, // Placeholder - reserve'den alınmalı
+                    borrow_rate: default_borrow_rate, // TODO: Reserve account'undan gerçek borrow rate alınmalı
                 }
             })
             .collect();
@@ -266,23 +285,37 @@ impl Protocol for SolendProtocol {
             .map_err(|_| anyhow::anyhow!("Failed to create discriminator"))?;
         
         // IDL'ye göre account listesi (liquidateObligation instruction)
-        // Not: Gerçek implementasyonda reserve account'larını opportunity'den veya
-        // obligation'dan almak gerekir. Şimdilik placeholder account'lar kullanıyoruz.
+        // 
+        // NOT: Gerçek implementasyonda reserve account'larını obligation'dan almak gerekir:
+        // 1. Obligation'daki borrow reserve'ü bul (opportunity.target_debt_mint'ten)
+        // 2. Reserve account'unu oku
+        // 3. Reserve'den gerekli account'ları al:
+        //    - Reserve liquidity supply
+        //    - Reserve collateral mint
+        //    - Reserve liquidity mint
+        //    - Oracle accounts (Pyth/Switchboard)
+        // 4. Lending market authority'yi hesapla (PDA)
+        //
+        // Şu an placeholder account'lar kullanılıyor çünkü:
+        // - Reserve account parsing implementasyonu gerekiyor
+        // - Oracle account'larını bulmak için ek logic gerekiyor
+        // - PDA hesaplamaları gerekiyor
+        //
+        // Gelecek iyileştirme: Reserve account parsing modülü eklenebilir
         let accounts = vec![
             AccountMeta::new(*liquidator, true),                    // liquidator (signer)
             AccountMeta::new(obligation_pubkey, false),              // obligation
             AccountMeta::new(self.program_id, false),                // lendingMarket
-            // TODO: Reserve account'larını opportunity'den veya obligation'dan al
-            // Şu an placeholder - gerçek implementasyonda gerekli
-            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // sourceLiquidity (placeholder)
-            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationCollateral (placeholder)
-            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserve (placeholder)
-            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveCollateralMint (placeholder)
-            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveLiquiditySupply (placeholder)
-            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // lendingMarketAuthority (placeholder)
-            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationLiquidity (placeholder)
-            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // pythPrice (placeholder)
-            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // switchboardPrice (placeholder)
+            // TODO: Gerçek reserve account'larını obligation'dan al
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // sourceLiquidity
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationCollateral
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserve
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveCollateralMint
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // reserveLiquiditySupply
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // lendingMarketAuthority (PDA)
+            AccountMeta::new(solana_sdk::pubkey::Pubkey::default(), false), // destinationLiquidity
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // pythPrice (oracle)
+            AccountMeta::new_readonly(solana_sdk::pubkey::Pubkey::default(), false), // switchboardPrice (oracle)
             AccountMeta::new_readonly(spl_token::id(), false), // tokenProgram
         ];
         
@@ -297,13 +330,26 @@ impl Protocol for SolendProtocol {
             opportunity.max_liquidatable_amount
         );
         
-        // TODO: Gerçek implementasyonda reserve account'larını almak için:
-        // 1. Obligation account'u parse et
-        // 2. Borrow reserve'ü bul (opportunity.target_debt_mint'ten)
-        // 3. Reserve account'unu oku
-        // 4. Reserve'den gerekli account'ları al (liquidity supply, collateral mint, vb.)
-        // 5. Oracle account'larını al (Pyth/Switchboard)
-        // 6. Tüm account'ları doğru sırayla ekle
+        // Gelecek iyileştirme: Reserve account parsing
+        // 
+        // Gerçek implementasyonda reserve account'larını almak için:
+        // 1. Obligation account'u parse et (zaten yapılıyor)
+        // 2. Borrow reserve'ü bul (opportunity.target_debt_mint veya obligation.borrows'den)
+        // 3. Reserve account'unu RPC'den oku
+        // 4. Reserve account'unu parse et (Reserve struct)
+        // 5. Reserve'den gerekli account'ları al:
+        //    - liquidity_supply (token account)
+        //    - collateral_mint
+        //    - liquidity_mint
+        //    - oracle_account (Pyth veya Switchboard)
+        // 6. Lending market authority'yi hesapla (PDA derivation)
+        // 7. Tüm account'ları IDL sırasına göre ekle
+        //
+        // Bu iyileştirme için:
+        // - Reserve account struct'ı eklenmeli
+        // - Reserve account parsing fonksiyonu eklenmeli
+        // - Oracle account bulma logic'i eklenmeli
+        // - PDA derivation helper'ı eklenmeli
         
         Ok(Instruction {
             program_id: self.program_id,
