@@ -3,17 +3,20 @@ use crate::config::Config;
 use crate::event_bus::EventBus;
 
 /// WebSocket listener - account değişikliklerini dinler
+/// 
+/// NOT: Şu an placeholder implementasyon. RPC polling aktif ve çalışıyor.
+/// WebSocket implementasyonu gelecek iyileştirme olarak planlanmıştır.
 pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
-    // PRODUCTION TODO: Solana WebSocket (PubSub) bağlantısı kur
+    // Gelecek İyileştirme: Solana WebSocket (PubSub) bağlantısı
     // 
     // Gerçek implementasyon için yapılması gerekenler:
-    // 1. Solana WebSocket client kullan (solana-client crate veya custom)
+    // 1. Solana WebSocket client kullan (solana-client crate veya custom WebSocket)
     // 2. accountSubscribe implementasyonu:
     //    - Program ID'ye subscribe ol
     //    - Account değişikliklerini dinle
     // 3. Auto-reconnect mantığı:
     //    - Bağlantı koparsa otomatik yeniden bağlan
-    //    - Exponential backoff
+    //    - Exponential backoff (rpc_poller'daki gibi)
     // 4. Error handling:
     //    - Rate limit durumunda backoff
     //    - Network hatalarında retry
@@ -22,25 +25,23 @@ pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
     //    - Protocol trait ile AccountPosition'a dönüştür
     //    - Event::AccountUpdated olarak yayınla
     //
-    // Not: RPC polling çalışıyor, bu yüzden düşük öncelik
-    // Ancak latency için önemli (NFR-1: WS latencies < 100ms)
-    // Detaylar için: TODOS.md dosyasına bakın
+    // Öncelik: Düşük (RPC polling çalışıyor ve yeterli)
+    // Avantaj: WS latencies < 100ms (NFR-1 hedefi)
+    // Dezavantaj: Ek karmaşıklık, RPC rate limit yok
     
-    log::warn!("⚠️  WebSocket listener is using placeholder implementation. RPC polling is active.");
-    log::info!("Starting WebSocket listener (placeholder - RPC polling active)");
+    log::info!("📡 WebSocket listener: Placeholder mode (RPC polling active)");
+    log::info!("   WebSocket implementasyonu gelecek iyileştirme olarak planlanmıştır");
     
-    // Placeholder - gerçek implementasyon için yukarıdaki TODO'ları tamamla
+    // Placeholder: RPC polling aktif olduğu için bu worker şu an boşta
+    // Gerçek implementasyonda WebSocket bağlantısı kurulacak
     loop {
-        // WebSocket'ten gelen account update'leri
-        // parse_account_position() ile AccountPosition'a dönüştür
-        // Event::AccountUpdated olarak yayınla
-        
-        // Örnek implementasyon:
+        // Gelecek: WebSocket'ten account update'leri al
         // let account_update = ws_receiver.recv().await?;
-        // let position = parse_account_position(account_update)?;
+        // let position = protocol.parse_account_position(&account_address, &account_data).await?;
         // bus.publish(Event::AccountUpdated(position))?;
         
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Şu an: RPC polling çalıştığı için burada bekliyoruz
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
 }
 
