@@ -107,7 +107,6 @@ pub struct ReserveInfo {
 /// Solend'in resmi dokümantasyonundan veya SDK'sından alınmalıdır.
 pub mod known_reserves {
     use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
     
     // NOT: Bu adresler örnek adreslerdir. Gerçek adresleri Solend'in resmi kaynaklarından alınmalıdır.
     // Solend'in mainnet reserve account'larını bulmak için:
@@ -116,13 +115,13 @@ pub mod known_reserves {
     // 3. Veya mainnet'teki lending market account'larından reserve'leri bul
     
     /// USDC Reserve (örnek - gerçek adres bulunmalı)
-    pub fn usdc_reserve() -> Result<Pubkey> {
+    pub fn usdc_reserve() -> anyhow::Result<Pubkey> {
         // PLACEHOLDER - gerçek adres bulunmalı
         Err(anyhow::anyhow!("USDC reserve address not configured. Please find from Solend SDK or documentation."))
     }
     
     /// SOL Reserve (örnek - gerçek adres bulunmalı)
-    pub fn sol_reserve() -> Result<Pubkey> {
+    pub fn sol_reserve() -> anyhow::Result<Pubkey> {
         // PLACEHOLDER - gerçek adres bulunmalı
         Err(anyhow::anyhow!("SOL reserve address not configured. Please find from Solend SDK or documentation."))
     }

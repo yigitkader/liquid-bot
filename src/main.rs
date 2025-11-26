@@ -24,6 +24,7 @@ mod protocols {
     pub mod reserve_helper;
     pub mod solend_reserve;
     pub mod oracle_helper;
+    pub mod reserve_validator;
 }
 
 use anyhow::Result;

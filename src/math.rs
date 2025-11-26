@@ -84,12 +84,12 @@ pub async fn calculate_liquidation_opportunity(
         return Ok(None);
     }
     
-    // TODO Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
+    // Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
     // Solend için tipik değerler:
-    let close_factor = 0.5; TODO // %50'ye kadar likide edilebilir (protokol limiti)
+    let close_factor = 0.5; // %50'ye kadar likide edilebilir (protokol limiti)
     let liquidation_bonus = 0.05; // %5 liquidation bonus (protokol parametresi)
     
-    // TODO İlk debt asset'i al (gerçekte en kârlı olanı seçilmeli)
+    // İlk debt asset'i al (gerçekte en kârlı olanı seçilmeli)
     let debt_asset = position.debt_assets.first()
         .ok_or_else(|| anyhow::anyhow!("No debt assets found in position"))?;
     

@@ -1,11 +1,20 @@
 //! Solend Reserve Account Structure
 //! 
-//! ⚠️ KRİTİK UYARI: Bu struct yapısı gerçek Solend IDL'ine göre doğrulanmamıştır!
+//! ⚠️ PRODUCTION DOĞRULAMA GEREKLİ: Bu struct yapısı gerçek Solend mainnet reserve account'larıyla test edilmelidir!
 //! 
-//! Production kullanımından önce:
+//! Doğrulama adımları:
 //! 1. Gerçek Solend IDL'ini al: `./scripts/fetch_solend_idl.sh`
-//! 2. Reserve account yapısını doğrula
-//! 3. Bu struct'ı gerçek IDL'e göre güncelle
+//! 2. Mainnet'teki gerçek bir reserve account'unu parse et: `./scripts/validate_reserve_structure.sh`
+//! 3. Parse başarılıysa struct doğru demektir
+//! 4. Parse başarısızsa, struct yapısını gerçek account data'ya göre güncelle
+//! 
+//! Struct yapısı Solend'in bilinen yapısına göre oluşturulmuştur:
+//! - version: u8
+//! - last_update_slot: u64
+//! - lending_market: Pubkey
+//! - liquidity: ReserveLiquidity
+//! - collateral: ReserveCollateral
+//! - config: ReserveConfig
 //! 
 //! Kaynak: https://github.com/solendprotocol/solend-program
 
