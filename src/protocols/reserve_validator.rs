@@ -102,28 +102,43 @@ pub struct ReserveInfo {
 }
 
 /// Bilinen Solend mainnet reserve account'ları
-/// 
-/// NOT: Bu adresler gerçek mainnet reserve account'larıdır.
-/// Solend'in resmi dokümantasyonundan veya SDK'sından alınmalıdır.
+///
+/// NOT:
+/// - Bu adresler, Solend ekosistemiyle ilgili herkese açık dokümantasyon ve
+///   topluluk kaynaklarından derlenen **varsayılan** adreslerdir.
+/// - Production'da kullanmadan önce mutlaka Solend'in resmi kaynakları
+///   (SDK, dashboard, docs) üzerinden doğrulanmalıdır.
+/// - Amaç: Geliştirme ve hızlı validation için out-of-the-box bir başlangıç
+///   sağlamak; tek otorite **Solend**'dir.
 pub mod known_reserves {
     use solana_sdk::pubkey::Pubkey;
     
-    // NOT: Bu adresler örnek adreslerdir. Gerçek adresleri Solend'in resmi kaynaklarından alınmalıdır.
-    // Solend'in mainnet reserve account'larını bulmak için:
+    // Bu fonksiyonlar **best-effort** default adresler döndürür.
+    // Eğer Solend tarafında bir güncelleme olursa, bu adreslerin de
+    // güncellenmesi gerekir. Bu yüzden:
+    //
     // 1. Solend SDK kullan: https://sdk.solend.fi
-    // 2. Veya Solend'in resmi dokümantasyonunu kontrol et
-    // 3. Veya mainnet'teki lending market account'larından reserve'leri bul
+    // 2. Solend'in resmi dokümantasyonunu kontrol et
+    // 3. Reserve adreslerini config / env ile override etmeyi tercih et
     
-    /// USDC Reserve (örnek - gerçek adres bulunmalı)
+    /// USDC Reserve (main market, mainnet)
+    ///
+    /// Kaynak: Solend-related public docs / community references.
     pub fn usdc_reserve() -> anyhow::Result<Pubkey> {
-        // PLACEHOLDER - gerçek adres bulunmalı
-        Err(anyhow::anyhow!("USDC reserve address not configured. Please find from Solend SDK or documentation."))
+        // Varsayılan USDC reserve adresi (mainnet)
+        let addr = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
+        Pubkey::from_str(addr)
+            .map_err(|e| anyhow::anyhow!("Invalid hardcoded USDC reserve address {}: {}", addr, e))
     }
     
-    /// SOL Reserve (örnek - gerçek adres bulunmalı)
+    /// SOL Reserve (main market, mainnet)
+    ///
+    /// Kaynak: Solend-related public docs / community references.
     pub fn sol_reserve() -> anyhow::Result<Pubkey> {
-        // PLACEHOLDER - gerçek adres bulunmalı
-        Err(anyhow::anyhow!("SOL reserve address not configured. Please find from Solend SDK or documentation."))
+        // Varsayılan SOL reserve adresi (mainnet)
+        let addr = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36";
+        Pubkey::from_str(addr)
+            .map_err(|e| anyhow::anyhow!("Invalid hardcoded SOL reserve address {}: {}", addr, e))
     }
 }
 

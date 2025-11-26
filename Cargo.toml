@@ -26,3 +26,7 @@ anchor-client = "0.29"
 sha2 = "0.10"
 spl-token = "4.0"
 bytemuck = "1.14"
+
+[[bin]]
+name = "validate_reserve"
+path = "src/bin/validate_reserve.rs"
