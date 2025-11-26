@@ -112,6 +112,20 @@ impl SolanaClient {
         .await
         .context("Failed to spawn blocking task")?
     }
+    
+    /// Current slot numarasını alır
+    pub async fn get_slot(&self) -> Result<u64> {
+        // Rate limiting
+        self.rate_limiter.wait_if_needed().await;
+        
+        let client = Arc::clone(&self.rpc_client);
+        tokio::task::spawn_blocking(move || {
+            client.get_slot()
+                .map_err(|e| anyhow::anyhow!("Failed to get slot: {}", e))
+        })
+        .await
+        .context("Failed to spawn blocking task")?
+    }
 }
 
 /// Likidasyon transaction'ını oluşturur ve gönderir
