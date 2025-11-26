@@ -196,5 +196,31 @@ impl WalletBalanceChecker {
         
         Ok((debt_token_balance, available_sol))
     }
+
+    /// Belirli bir mint için Associated Token Account (ATA) var mı kontrol et
+    /// 
+    /// Bu fonksiyon, liquidation işlemi için kritiktir çünkü:
+    /// - Debt token account: Borç ödemek için gerekli (balance kontrolü yapılıyor)
+    /// - Collateral token account: Seizable collateral almak için gerekli (bu fonksiyon ile kontrol ediliyor)
+    /// 
+    /// Eğer collateral token account yoksa, liquidation transaction başarısız olur
+    /// çünkü instruction destination collateral account bekler.
+    /// 
+    /// mint: Token mint address'i
+    /// Returns: true if token account exists and has data, false otherwise
+    pub async fn ensure_token_account_exists(&self, mint: &Pubkey) -> Result<bool> {
+        let ata = self.get_associated_token_address(mint)?;
+        
+        match self.rpc_client.get_account(&ata).await {
+            Ok(account) => {
+                // Account exists and has data (not empty)
+                Ok(!account.data.is_empty())
+            }
+            Err(_) => {
+                // Account doesn't exist
+                Ok(false)
+            }
+        }
+    }
 }
 

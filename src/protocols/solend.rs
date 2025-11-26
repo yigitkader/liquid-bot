@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::protocols::solend_accounts::{get_associated_token_address, derive_lending_market_authority};
 
 // Solend IDL account structures
-mod solend_idl {
+pub mod solend_idl {
     use borsh::{BorshDeserialize, BorshSerialize};
     use solana_sdk::pubkey::Pubkey;
 
@@ -449,8 +449,8 @@ impl Protocol for SolendProtocol {
         let (source_liquidity, destination_collateral, obligation, lending_market, 
              lending_market_authority, repay_reserve, repay_reserve_liquidity_supply,
              withdraw_reserve, withdraw_reserve_collateral_supply) = 
-            if let Some(rpc) = rpc_client {
-                self.resolve_liquidation_accounts(opportunity, liquidator, &*rpc).await?
+            if let Some(rpc) = rpc_client.as_ref() {
+                self.resolve_liquidation_accounts(opportunity, liquidator, rpc).await?
             } else {
                 log::warn!("⚠️  RPC client not provided, using placeholder accounts");
                 (Pubkey::default(), Pubkey::default(), Pubkey::default(), self.program_id,
@@ -461,35 +461,101 @@ impl Protocol for SolendProtocol {
         // SYSVAR_CLOCK_PUBKEY - Solana system program clock sysvar
         let sysvar_clock = solana_sdk::sysvar::clock::id();
         
-        // Build accounts vector matching Solend SDK exactly
-        // Order and flags must match the official Solend SDK:
-        // https://github.com/solendprotocol/solend-sdk/blob/master/src/instructions/liquidateObligation.ts
+        // ⚠️ CRITICAL: Account order MUST match the official Solend IDL EXACTLY!
+        // 
+        // ✅ DOĞRULANMIŞ: Account order from idl/solend.json (official Solend IDL)
+        // Reference: idl/solend.json - liquidateObligation instruction accounts
+        //
+        // IDL Account Order (EXACT MATCH REQUIRED):
+        // 1. sourceLiquidity (isMut: true, isSigner: false)
+        // 2. destinationCollateral (isMut: true, isSigner: false)
+        // 3. obligation (isMut: true, isSigner: false)
+        // 4. reserve (isMut: true, isSigner: false) - repay reserve
+        // 5. reserveCollateralMint (isMut: true, isSigner: false) - withdraw reserve collateral mint
+        // 6. reserveLiquiditySupply (isMut: true, isSigner: false) - repay reserve liquidity supply
+        // 7. lendingMarket (isMut: false, isSigner: false)
+        // 8. lendingMarketAuthority (isMut: false, isSigner: false)
+        // 9. destinationLiquidity (isMut: true, isSigner: false) - withdraw reserve collateral supply
+        // 10. liquidator (isMut: false, isSigner: true)
+        // 11. pythPrice (isMut: false, isSigner: false) - Pyth oracle account
+        // 12. switchboardPrice (isMut: false, isSigner: false) - Switchboard oracle account
+        // 13. tokenProgram (isMut: false, isSigner: false)
+        //
+        // ⚠️ WARNING: Any deviation from this order will cause transaction failure!
+        
+        // Get oracle accounts from reserve (for pythPrice and switchboardPrice)
+        // Get collateral mint from withdraw reserve
+        let (pyth_oracle, switchboard_oracle, reserve_collateral_mint) = if let Some(rpc) = rpc_client.as_ref() {
+            use crate::protocols::reserve_helper::parse_reserve_account;
+            
+            // Get oracles from repay reserve (debt reserve)
+            let (pyth, switchboard) = match rpc.get_account(&repay_reserve).await {
+                Ok(reserve_account) => {
+                    match parse_reserve_account(&repay_reserve, &reserve_account).await {
+                        Ok(reserve_info) => (
+                            reserve_info.pyth_oracle.unwrap_or(Pubkey::default()),
+                            reserve_info.switchboard_oracle.unwrap_or(Pubkey::default()),
+                        ),
+                        Err(_) => (Pubkey::default(), Pubkey::default()),
+                    }
+                }
+                Err(_) => (Pubkey::default(), Pubkey::default()),
+            };
+            
+            // Get collateral mint from withdraw reserve
+            let collateral_mint = match rpc.get_account(&withdraw_reserve).await {
+                Ok(reserve_account) => {
+                    match parse_reserve_account(&withdraw_reserve, &reserve_account).await {
+                        Ok(reserve_info) => reserve_info.collateral_mint.unwrap_or(Pubkey::default()),
+                        Err(_) => Pubkey::default(),
+                    }
+                }
+                Err(_) => Pubkey::default(),
+            };
+            
+            (pyth, switchboard, collateral_mint)
+        } else {
+            (Pubkey::default(), Pubkey::default(), Pubkey::default())
+        };
+        
+        // Build accounts vector matching Solend IDL EXACTLY
+        // ⚠️ CRITICAL: Order and flags must match idl/solend.json EXACTLY!
         let accounts = vec![
-            // 1. sourceLiquidity - liquidator's token account for debt (isWritable: true, isSigner: false)
+            // 1. sourceLiquidity - liquidator's token account for debt (isMut: true, isSigner: false)
             AccountMeta::new(source_liquidity, false),
-            // 2. destinationCollateral - liquidator's token account for collateral (isWritable: true, isSigner: false)
+            // 2. destinationCollateral - liquidator's token account for collateral (isMut: true, isSigner: false)
             AccountMeta::new(destination_collateral, false),
-            // 3. obligation - obligation account being liquidated (isWritable: true, isSigner: false)
+            // 3. obligation - obligation account being liquidated (isMut: true, isSigner: false)
             AccountMeta::new(obligation, false),
-            // 4. lendingMarket - lending market account (isWritable: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market, false),
-            // 5. lendingMarketAuthority - lending market authority PDA (isWritable: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market_authority, false),
-            // 6. repayReserve - the reserve we're repaying debt to (isWritable: true, isSigner: false)
+            // 4. reserve - the reserve we're repaying debt to (isMut: true, isSigner: false)
             AccountMeta::new(repay_reserve, false),
-            // 7. repayReserveLiquiditySupply - liquidity supply token account of repay reserve (isWritable: true, isSigner: false)
+            // 5. reserveCollateralMint - collateral mint of withdraw reserve (isMut: true, isSigner: false)
+            AccountMeta::new(reserve_collateral_mint, false),
+            // 6. reserveLiquiditySupply - liquidity supply token account of repay reserve (isMut: true, isSigner: false)
             AccountMeta::new(repay_reserve_liquidity_supply, false),
-            // 8. withdrawReserve - the reserve we're withdrawing collateral from (isWritable: true, isSigner: false)
-            AccountMeta::new(withdraw_reserve, false),
-            // 9. withdrawReserveCollateralSupply - collateral supply token account of withdraw reserve (isWritable: true, isSigner: false)
+            // 7. lendingMarket - lending market account (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(lending_market, false),
+            // 8. lendingMarketAuthority - lending market authority PDA (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(lending_market_authority, false),
+            // 9. destinationLiquidity - collateral supply token account of withdraw reserve (isMut: true, isSigner: false)
             AccountMeta::new(withdraw_reserve_collateral_supply, false),
-            // 10. liquidator - liquidator pubkey (isWritable: false, isSigner: true)
+            // 10. liquidator - liquidator pubkey (isMut: false, isSigner: true)
             AccountMeta::new_readonly(*liquidator, true),
-            // 11. sysvarClock - SYSVAR_CLOCK_PUBKEY (isWritable: false, isSigner: false)
-            AccountMeta::new_readonly(sysvar_clock, false),
-            // 12. tokenProgram - SPL Token program (isWritable: false, isSigner: false)
+            // 11. pythPrice - Pyth oracle account (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(pyth_oracle, false),
+            // 12. switchboardPrice - Switchboard oracle account (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(switchboard_oracle, false),
+            // 13. tokenProgram - SPL Token program (isMut: false, isSigner: false)
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
+        
+        // Validate account count matches IDL (13 accounts)
+        if accounts.len() != 13 {
+            return Err(anyhow::anyhow!(
+                "Account count mismatch: expected 13 accounts (per IDL), got {}",
+                accounts.len()
+            ));
+        }
         
         // Instruction data format (Solend SDK'ya göre):
         // [discriminator (8 bytes), liquidityAmount (8 bytes)] = 16 bytes total
