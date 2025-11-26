@@ -43,8 +43,15 @@ pub async fn parse_reserve_account(
     // (Bu kontrolü çağıran fonksiyon yapmalı, ama güvenlik için burada da kontrol ediyoruz)
     
     // Solend reserve account'unu parse et
+    // ⚠️ PRODUCTION WARNING: Bu struct gerçek Solend IDL'ine göre doğrulanmamıştır!
+    // Parse error alırsanız, gerçek IDL'den struct'ı güncelleyin: ./scripts/fetch_solend_idl.sh
     let reserve = SolendReserve::from_account_data(&account_data.data)
-        .context("Failed to parse Solend reserve account")?;
+        .context(format!(
+            "Failed to parse Solend reserve account {}. \
+            This might indicate the struct structure doesn't match the real Solend IDL. \
+            Please validate against official IDL: ./scripts/fetch_solend_idl.sh",
+            reserve_pubkey
+        ))?;
     
     // Reserve'den bilgileri çıkar
     let liquidity_mint = reserve.liquidity_mint();

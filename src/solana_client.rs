@@ -50,7 +50,7 @@ impl SolanaClient {
         // Rate limiting
         self.rate_limiter.wait_if_needed().await;
         
-        // RpcClient sync, ama async wrapper kullanabiliriz
+        // todo RpcClient sync, ama async wrapper kullanabiliriz
         let client = Arc::clone(&self.rpc_client);
         let pubkey = *pubkey;
         tokio::task::spawn_blocking(move || {

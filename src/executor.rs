@@ -192,8 +192,8 @@ impl Drop for UnlockGuard {
         let tx_lock = Arc::clone(&self.tx_lock);
         let account_address = self.account_address.clone();
         
-        // Spawn edilen task'a error handling ekle
-        // Task başarısız olursa (örneğin runtime panik olursa) loglanacak
+        //todo: Spawn edilen task'a error handling ekle
+        //todo: Task başarısız olursa (örneğin runtime panik olursa) loglanacak
         tokio::spawn(async move {
             // Unlock işlemi
             tx_lock.unlock(&account_address).await;
@@ -202,7 +202,8 @@ impl Drop for UnlockGuard {
             // Ancak runtime panik olursa, tokio runtime bunu loglar
             log::debug!("Successfully unlocked account: {}", account_address);
         });
-        
+
+        //TODO:
         // NOT: Spawn edilen task'ın tamamlanmasını bekleyemeyiz (Drop sync olmalı)
         // Ancak:
         // 1. Explicit unlock scope sonunda yapılıyor (daha güvenilir)

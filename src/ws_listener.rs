@@ -7,6 +7,7 @@ use crate::event_bus::EventBus;
 /// NOT: Şu an placeholder implementasyon. RPC polling aktif ve çalışıyor.
 /// WebSocket implementasyonu gelecek iyileştirme olarak planlanmıştır.
 pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
+    // todo:
     // Gelecek İyileştirme: Solana WebSocket (PubSub) bağlantısı
     // 
     // Gerçek implementasyon için yapılması gerekenler:
@@ -32,9 +33,10 @@ pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
     log::info!("📡 WebSocket listener: Placeholder mode (RPC polling active)");
     log::info!("   WebSocket implementasyonu gelecek iyileştirme olarak planlanmıştır");
     
-    // Placeholder: RPC polling aktif olduğu için bu worker şu an boşta
+    //todo: Placeholder: RPC polling aktif olduğu için bu worker şu an boşta
     // Gerçek implementasyonda WebSocket bağlantısı kurulacak
     loop {
+        //todo:
         // Gelecek: WebSocket'ten account update'leri al
         // let account_update = ws_receiver.recv().await?;
         // let position = protocol.parse_account_position(&account_address, &account_data).await?;

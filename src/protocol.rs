@@ -20,7 +20,7 @@ pub trait Protocol: Send + Sync {
     
     /// Raw Solana account verisini AccountPosition'a dönüştürür
     /// 
-    /// NOT: RPC client parametresi eklendi çünkü gerçek mint address'lerini almak için
+    /// todo NOT: RPC client parametresi eklendi çünkü gerçek mint address'lerini almak için
     /// reserve account'larını RPC'den okumak gerekiyor.
     /// 
     /// rpc_client: None ise reserve pubkey'leri mint olarak kullanılır (fallback)

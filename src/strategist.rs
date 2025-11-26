@@ -34,8 +34,8 @@ pub async fn run_strategist(
                 }
                 
                 // 2. Slippage kontrolü
-                // Not: Gerçek slippage hesaplaması için fiyat oracle'ına ihtiyaç var
-                // Şimdilik basit bir kontrol - liquidation bonus'un max_slippage'den küçük olması gerekiyor
+                // todo: Not: Gerçek slippage hesaplaması için fiyat oracle'ına ihtiyaç var
+                // todo: Şimdilik basit bir kontrol - liquidation bonus'un max_slippage'den küçük olması gerekiyor
                 if approved {
                     // Slippage = liquidation bonus'un bir kısmı olarak düşünülebilir
                     // Basit bir yaklaşım: liquidation bonus'un %50'si slippage olarak kabul edilir

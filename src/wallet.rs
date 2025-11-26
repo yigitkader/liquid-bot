@@ -29,7 +29,7 @@ impl WalletManager {
                 .context("Failed to create keypair from bytes")?
         } else {
             // Object format veya başka format - Keypair::read_from_file kullan
-            // Ancak bu fonksiyon deprecated, manuel parse edelim
+            // todo: Ancak bu fonksiyon deprecated, manuel parse edelim
             return Err(anyhow::anyhow!(
                 "Unsupported wallet format. Expected JSON array format [1,2,3,...]"
             ));
@@ -130,7 +130,7 @@ impl WalletBalanceChecker {
                 use solana_sdk::program_pack::Pack;
                 
                 // Account struct'ını parse et
-                // spl-token 4.0'da Account Pack trait'ini implement ediyor, unpack kullanabiliriz
+                // todo: spl-token 4.0'da Account Pack trait'ini implement ediyor, unpack kullanabiliriz
                 let token_account_state = Account::unpack(&account.data)
                     .map_err(|e| anyhow::anyhow!("Failed to parse token account data: {:?}", e))?;
                 

@@ -74,7 +74,7 @@ fn calculate_swap_cost_usd(
 /// - Token swap maliyeti (eğer gerekirse)
 /// - Konservatif profit tahmini
 /// 
-/// NOT: Protokol parametreleri Protocol trait'inden alınmalı, şu an config'ten alınıyor.
+/// NOT: TODO Protokol parametreleri Protocol trait'inden alınmalı, şu an config'ten alınıyor.
 pub async fn calculate_liquidation_opportunity(
     position: &AccountPosition,
     config: &Config,
@@ -84,21 +84,48 @@ pub async fn calculate_liquidation_opportunity(
         return Ok(None);
     }
     
-    // Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
+    // TODO Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
     // Solend için tipik değerler:
-    let close_factor = 0.5; // %50'ye kadar likide edilebilir (protokol limiti)
+    let close_factor = 0.5; TODO // %50'ye kadar likide edilebilir (protokol limiti)
     let liquidation_bonus = 0.05; // %5 liquidation bonus (protokol parametresi)
     
-    // Max liquidatable amount hesaplama
+    // TODO İlk debt asset'i al (gerçekte en kârlı olanı seçilmeli)
+    let debt_asset = position.debt_assets.first()
+        .ok_or_else(|| anyhow::anyhow!("No debt assets found in position"))?;
+    
+    // TODO İlk collateral asset'i al (gerçekte en kârlı olanı seçilmeli)
+    let collateral_asset = position.collateral_assets.first()
+        .ok_or_else(|| anyhow::anyhow!("No collateral assets found in position"))?;
+    
+    // Max liquidatable amount hesaplama (USD cinsinden)
     // Protokol limiti: close_factor * total_debt
     let max_liquidatable_debt_usd = position.total_debt_usd * close_factor;
-    let max_liquidatable = (max_liquidatable_debt_usd) as u64;
     
-    // Seizable collateral hesaplama
+    // USD'yi token amount'una çevir
+    // Token price = amount_usd / amount (native units)
+    let debt_token_price_usd = if debt_asset.amount > 0 {
+        debt_asset.amount_usd / debt_asset.amount as f64
+    } else {
+        return Ok(None); // Division by zero protection
+    };
+    
+    // Max liquidatable amount (token native units)
+    let max_liquidatable = (max_liquidatable_debt_usd / debt_token_price_usd) as u64;
+    
+    // Seizable collateral hesaplama (USD cinsinden)
     // Likidasyon bonusu ile birlikte alınacak teminat
     // Formül: liquidated_debt * (1 + liquidation_bonus)
     let seizable_collateral_usd = max_liquidatable_debt_usd * (1.0 + liquidation_bonus);
-    let seizable_collateral = seizable_collateral_usd as u64;
+    
+    // USD'yi collateral token amount'una çevir
+    let collateral_token_price_usd = if collateral_asset.amount > 0 {
+        collateral_asset.amount_usd / collateral_asset.amount as f64
+    } else {
+        return Ok(None); // Division by zero protection
+    };
+    
+    // Seizable collateral (token native units)
+    let seizable_collateral = (seizable_collateral_usd / collateral_token_price_usd) as u64;
     
     // ============================================
     // GERÇEKÇİ PROFIT HESAPLAMA
@@ -117,8 +144,8 @@ pub async fn calculate_liquidation_opportunity(
     );
     
     // 2. Slippage maliyeti
-    // Config'ten max_slippage_bps kullan, ancak gerçek slippage genellikle daha düşüktür
-    // Konservatif tahmin: max_slippage'in %50'si (gerçek slippage genellikle daha düşük)
+    // Todo Config'ten max_slippage_bps kullan, ancak gerçek slippage genellikle daha düşüktür
+    // todo Konservatif tahmin: max_slippage'in %50'si (gerçek slippage genellikle daha düşük)
     let estimated_slippage_bps = (config.max_slippage_bps as f64 * 0.5) as u16;
     let slippage_cost_usd = calculate_slippage_cost_usd(
         seizable_collateral_usd,
@@ -147,8 +174,23 @@ pub async fn calculate_liquidation_opportunity(
     // Net profit = Gross profit - Tüm maliyetler
     let estimated_profit_usd = gross_profit_usd - total_cost_usd;
     
-    // 6. Güvenlik marjı (konservatif profit tahmini)
-    // Gerçek profit genellikle tahminden düşük olabilir, bu yüzden %10 güvenlik marjı ekle
+    // 6. Minimum profit margin kontrolü (%1 minimum margin)
+    // Production safety: Minimum %1 profit margin gereklidir
+    const MIN_PROFIT_MARGIN_BPS: u16 = 100; // %1 = 100 basis points
+    let min_profit_margin_usd = max_liquidatable_debt_usd * (MIN_PROFIT_MARGIN_BPS as f64 / 10_000.0);
+    
+    if estimated_profit_usd < min_profit_margin_usd {
+        log::debug!(
+            "Opportunity rejected: estimated profit ${:.2} < min margin ${:.2} ({}% of debt)",
+            estimated_profit_usd,
+            min_profit_margin_usd,
+            MIN_PROFIT_MARGIN_BPS as f64 / 100.0
+        );
+        return Ok(None);
+    }
+    
+    // 7. Güvenlik marjı (konservatif profit tahmini)
+    // todo: Gerçek profit genellikle tahminden düşük olabilir, bu yüzden %10 güvenlik marjı ekle
     let conservative_profit_usd = estimated_profit_usd * 0.9;
     
     log::debug!(
@@ -172,14 +214,9 @@ pub async fn calculate_liquidation_opportunity(
         return Ok(None);
     }
     
-    // İlk debt ve collateral asset'leri kullan (gerçekte daha karmaşık seçim olacak)
-    // Gelecek iyileştirme: En kârlı asset çiftini seçme algoritması
-    let target_debt_mint = position.debt_assets.first()
-        .map(|d| d.mint.clone())
-        .unwrap_or_default();
-    let target_collateral_mint = position.collateral_assets.first()
-        .map(|c| c.mint.clone())
-        .unwrap_or_default();
+    // Debt ve collateral asset'leri zaten yukarıda alındı
+    let target_debt_mint = debt_asset.mint.clone();
+    let target_collateral_mint = collateral_asset.mint.clone();
     
     Ok(Some(LiquidationOpportunity {
         account_position: position.clone(),

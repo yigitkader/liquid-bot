@@ -16,7 +16,7 @@ pub async fn run_data_source(
     health_manager: Arc<HealthManager>,
 ) -> Result<()> {
     // İlk versiyonda RPC polling ile başlayalım
-    // İleride config'ten seçim yapılabilir
+    //todo: İleride config'ten seçim yapılabilir
     rpc_poller::run_rpc_poller(bus, config, rpc_client, protocol, health_manager).await
 }
 
