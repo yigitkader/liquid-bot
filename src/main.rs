@@ -21,6 +21,9 @@ mod performance;
 
 mod protocols {
     pub mod solend;
+    pub mod reserve_helper;
+    pub mod solend_reserve;
+    pub mod oracle_helper;
 }
 
 use anyhow::Result;

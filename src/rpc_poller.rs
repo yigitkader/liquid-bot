@@ -74,9 +74,14 @@ async fn fetch_and_publish_positions(
     let mut position_count = 0;
     
     // Her account'u parse et
+    // RPC client'ı Arc olarak geç (gerçek mint address'leri için)
+    let rpc_client_arc = Arc::new(SolanaClient::new(rpc_client.get_url().to_string())
+        .context("Failed to create RPC client for parsing")?);
+    
     for (account_pubkey, account) in accounts {
         // Protocol trait'i ile account'u parse et
-        match protocol.parse_account_position(&account_pubkey, &account).await {
+        // RPC client'ı geçerek gerçek mint address'lerini al
+        match protocol.parse_account_position(&account_pubkey, &account, Some(Arc::clone(&rpc_client_arc))).await {
             Ok(Some(position)) => {
                 // AccountPosition başarıyla parse edildi, event yayınla
                 bus.publish(Event::AccountUpdated(position))

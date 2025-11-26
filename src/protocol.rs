@@ -19,10 +19,17 @@ pub trait Protocol: Send + Sync {
     fn program_id(&self) -> Pubkey;
     
     /// Raw Solana account verisini AccountPosition'a dönüştürür
+    /// 
+    /// NOT: RPC client parametresi eklendi çünkü gerçek mint address'lerini almak için
+    /// reserve account'larını RPC'den okumak gerekiyor.
+    /// 
+    /// rpc_client: None ise reserve pubkey'leri mint olarak kullanılır (fallback)
+    /// rpc_client: Some(client) ise gerçek mint address'leri reserve'den alınır
     async fn parse_account_position(
         &self,
         account_address: &Pubkey,
         account_data: &Account,
+        rpc_client: Option<Arc<SolanaClient>>,
     ) -> Result<Option<AccountPosition>>;
     
     /// Health Factor hesaplar (veya protokolden alır)

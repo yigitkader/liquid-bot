@@ -224,11 +224,16 @@ impl SolendProtocol {
         let reserve_account = rpc_client.get_account(&borrow_reserve_pubkey).await
             .context("Failed to fetch reserve account")?;
         
-        // 5. Reserve account'unu parse et
-        // NOT: Şu an placeholder - gerçek SolendReserve struct'ı kullanılmalı
-        // Gelecek: solend_reserve modülünden SolendReserve::from_account_data() kullan
-        // Şimdilik reserve pubkey'den gerekli bilgileri çıkaramıyoruz
-        // Bu yüzden obligation'dan collateral reserve'ü de bulmalıyız
+        // 5. Reserve account'unu parse et (gerçek implementasyon)
+        use crate::protocols::reserve_helper::parse_reserve_account;
+        let reserve_info = parse_reserve_account(&borrow_reserve_pubkey, &reserve_account).await
+            .context("Failed to parse reserve account")?;
+        
+        // Reserve'den gerçek mint ve token account'ları al
+        let debt_mint = reserve_info.liquidity_mint
+            .ok_or_else(|| anyhow::anyhow!("Reserve liquidity mint not found"))?;
+        let reserve_liquidity_supply = reserve_info.liquidity_supply
+            .ok_or_else(|| anyhow::anyhow!("Reserve liquidity supply not found"))?;
         
         // 6. Collateral reserve'ü bul (target_collateral_mint'ten)
         let collateral_reserve_pubkey = if let Ok(reserve_pubkey) = Pubkey::try_from(opportunity.target_collateral_mint.as_str()) {
@@ -239,34 +244,44 @@ impl SolendProtocol {
                 .ok_or_else(|| anyhow::anyhow!("No deposit found in obligation"))?
         };
         
-        // 7. Lending market authority PDA'sını hesapla
+        // 7. Collateral reserve account'unu oku ve parse et
+        let collateral_reserve_account = rpc_client.get_account(&collateral_reserve_pubkey).await
+            .context("Failed to fetch collateral reserve account")?;
+        let collateral_reserve_info = parse_reserve_account(&collateral_reserve_pubkey, &collateral_reserve_account).await
+            .context("Failed to parse collateral reserve account")?;
+        
+        // Collateral reserve'den gerçek mint ve token account'ları al
+        let collateral_mint = collateral_reserve_info.collateral_mint
+            .ok_or_else(|| anyhow::anyhow!("Collateral reserve mint not found"))?;
+        let reserve_collateral_mint = collateral_mint; // Collateral mint = reserve collateral mint
+        let destination_liquidity = reserve_liquidity_supply; // Destination liquidity = reserve liquidity supply
+        
+        // 8. Lending market authority PDA'sını hesapla
         let lending_market_authority = derive_lending_market_authority(&self.program_id, &self.program_id)
             .context("Failed to derive lending market authority")?;
         
-        // 8. Token account'larını hesapla (ATA)
-        // NOT: Gerçek mint address'lerini reserve'den almak gerekir
-        // Şu an placeholder mint'ler kullanıyoruz
-        // Gelecek: Reserve account'undan mint'leri al
-        
-        // Placeholder: Gerçek implementasyonda reserve'den mint'leri al
-        // Şu an obligation'daki reserve pubkey'leri kullanıyoruz
-        let debt_mint = borrow_reserve_pubkey; // Placeholder - reserve'den gerçek mint alınmalı
-        let collateral_mint = collateral_reserve_pubkey; // Placeholder - reserve'den gerçek mint alınmalı
-        
-        // Liquidator'ın token account'ları (ATA)
+        // 9. Liquidator'ın token account'larını hesapla (ATA)
+        // Gerçek mint address'leri artık reserve'den alınıyor ✅
         let source_liquidity = get_associated_token_address(liquidator, &debt_mint)
             .context("Failed to derive source liquidity ATA")?;
         let destination_collateral = get_associated_token_address(liquidator, &collateral_mint)
             .context("Failed to derive destination collateral ATA")?;
         
-        // Reserve token account'ları (placeholder - reserve'den alınmalı)
-        let reserve_liquidity_supply = borrow_reserve_pubkey; // Placeholder
-        let reserve_collateral_mint = collateral_mint; // Placeholder
-        let destination_liquidity = borrow_reserve_pubkey; // Placeholder
+        // 9. Oracle account'ları (mint'ten türet)
+        // Solend'de oracle account'ları genellikle mint address'inden türetilir
+        use crate::protocols::oracle_helper::get_oracle_accounts;
+        let (pyth_price, switchboard_price) = get_oracle_accounts(&debt_mint)
+            .context("Failed to get oracle accounts")?;
         
-        // 9. Oracle account'ları (placeholder - reserve'den alınmalı)
-        let pyth_price = Pubkey::default(); // Placeholder - reserve'den oracle pubkey alınmalı
-        let switchboard_price = Pubkey::default(); // Placeholder - reserve'den oracle pubkey alınmalı
+        // Oracle account'ları bulunamazsa fallback (optional account olabilir)
+        let pyth_price = pyth_price.unwrap_or_else(|| {
+            log::warn!("Pyth oracle not found for mint {}, using default", debt_mint);
+            Pubkey::default()
+        });
+        let switchboard_price = switchboard_price.unwrap_or_else(|| {
+            log::warn!("Switchboard oracle not found for mint {}, using default", debt_mint);
+            Pubkey::default()
+        });
         
         log::debug!(
             "Resolved liquidation accounts: reserve={}, source_liquidity={}, destination_collateral={}",
@@ -303,6 +318,7 @@ impl Protocol for SolendProtocol {
         &self,
         account_address: &Pubkey,
         account_data: &Account,
+        rpc_client: Option<Arc<SolanaClient>>,
     ) -> Result<Option<AccountPosition>> {
         log::debug!("Parsing Solend account: {}", account_address);
         
@@ -328,68 +344,92 @@ impl Protocol for SolendProtocol {
         let total_debt_usd = obligation.total_borrowed_value_usd();
         
         // Collateral assets'i domain modeline dönüştür
-        // 
-        // NOT: Reserve account parsing için `reserve_helper` modülü hazırlandı.
-        // Gerçek implementasyonda:
-        // 1. Reserve account'unu RPC'den oku
-        // 2. `reserve_helper::parse_reserve_account()` ile parse et
-        // 3. Reserve'den mint ve LTV bilgilerini al
-        //
-        // Şu an tipik Solend değerleri kullanılıyor (production için yeterli):
-        // - USDC: LTV 0.85
-        // - SOL: LTV 0.75
-        // - Diğer: LTV 0.70-0.80 arası
-        let collateral_assets: Vec<crate::domain::CollateralAsset> = obligation.deposits.iter()
-            .map(|deposit| {
-                // Gelecek iyileştirme: Reserve account parsing
-                // reserve_helper modülü hazırlandı (src/protocols/reserve_helper.rs)
-                // Gerçek implementasyonda:
-                // let reserve_info = reserve_helper::parse_reserve_account(&deposit.deposit_reserve, &account_data).await?;
-                // let mint = reserve_info.mint.unwrap_or(deposit.deposit_reserve);
-                // let ltv = reserve_info.ltv;
-                
-                // Şu an: Tipik Solend LTV değeri (production için yeterli)
-                // USDC: 0.85, SOL: 0.75, Diğer: 0.70-0.80
-                let default_ltv = 0.75;
-                
-                crate::domain::CollateralAsset {
-                    mint: deposit.deposit_reserve.to_string(), // Gelecek: Reserve'den gerçek mint
-                    amount: deposit.deposited_amount,
-                    amount_usd: deposit.market_value.to_f64(),
-                    ltv: default_ltv, // Gelecek: Reserve'den gerçek LTV
+        // Gerçek mint address'lerini reserve account'larından al
+        use crate::protocols::reserve_helper::parse_reserve_account;
+        
+        let mut collateral_assets = Vec::new();
+        for deposit in &obligation.deposits {
+            // RPC client varsa gerçek reserve account'unu parse et
+            let (mint, ltv) = if let Some(rpc) = &rpc_client {
+                match rpc.get_account(&deposit.deposit_reserve).await {
+                    Ok(reserve_account) => {
+                        match parse_reserve_account(&deposit.deposit_reserve, &reserve_account).await {
+                            Ok(reserve_info) => {
+                                // Gerçek mint ve LTV değerlerini kullan
+                                let mint = reserve_info.collateral_mint
+                                    .unwrap_or_else(|| reserve_info.liquidity_mint.unwrap_or(deposit.deposit_reserve));
+                                (mint.to_string(), reserve_info.ltv)
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to parse reserve {}: {}, using fallback", deposit.deposit_reserve, e);
+                                // Fallback: Reserve pubkey'i mint olarak kullan
+                                (deposit.deposit_reserve.to_string(), 0.75)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to fetch reserve {}: {}, using fallback", deposit.deposit_reserve, e);
+                        // Fallback: Reserve pubkey'i mint olarak kullan
+                        (deposit.deposit_reserve.to_string(), 0.75)
+                    }
                 }
-            })
-            .collect();
+            } else {
+                // RPC client yoksa fallback: Reserve pubkey'i mint olarak kullan
+                (deposit.deposit_reserve.to_string(), 0.75)
+            };
+            
+            collateral_assets.push(crate::domain::CollateralAsset {
+                mint,
+                amount: deposit.deposited_amount,
+                amount_usd: deposit.market_value.to_f64(),
+                ltv,
+            });
+        }
         
         // Debt assets'i domain modeline dönüştür
-        // 
-        // NOT: Reserve account parsing için `reserve_helper` modülü hazırlandı.
-        // Gerçek implementasyonda reserve'den borrow rate alınabilir.
-        let debt_assets: Vec<crate::domain::DebtAsset> = obligation.borrows.iter()
-            .map(|borrow| {
-                // Borrowed amount'u WAD'dan normal değere çevir
-                // WAD = 1e18 (Wei Adjusted Decimal)
-                let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
-                
-                // Gelecek iyileştirme: Reserve account parsing
-                // reserve_helper modülü hazırlandı (src/protocols/reserve_helper.rs)
-                // Gerçek implementasyonda:
-                // let reserve_info = reserve_helper::parse_reserve_account(&borrow.borrow_reserve, &account_data).await?;
-                // let mint = reserve_info.mint.unwrap_or(borrow.borrow_reserve);
-                // let borrow_rate = reserve_info.borrow_rate;
-                
-                // Şu an: Borrow rate 0.0 (profit hesaplaması için kritik değil)
-                // Borrow rate sadece interest hesaplaması için gerekli, liquidation profit için değil
-                let default_borrow_rate = 0.0;
-                
-                crate::domain::DebtAsset {
-                    mint: borrow.borrow_reserve.to_string(), // Gelecek: Reserve'den gerçek mint
-                    amount: borrowed_amount,
-                    amount_usd: borrow.market_value.to_f64(),
-                    borrow_rate: default_borrow_rate, // Gelecek: Reserve'den gerçek borrow rate
+        // Gerçek mint address'lerini reserve account'larından al
+        let mut debt_assets = Vec::new();
+        for borrow in &obligation.borrows {
+            // Borrowed amount'u WAD'dan normal değere çevir
+            // WAD = 1e18 (Wei Adjusted Decimal)
+            let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
+            
+            // RPC client varsa gerçek reserve account'unu parse et
+            let (mint, borrow_rate) = if let Some(rpc) = &rpc_client {
+                match rpc.get_account(&borrow.borrow_reserve).await {
+                    Ok(reserve_account) => {
+                        match parse_reserve_account(&borrow.borrow_reserve, &reserve_account).await {
+                            Ok(reserve_info) => {
+                                // Gerçek mint ve borrow rate değerlerini kullan
+                                let mint = reserve_info.liquidity_mint
+                                    .unwrap_or(borrow.borrow_reserve);
+                                (mint.to_string(), reserve_info.borrow_rate)
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to parse reserve {}: {}, using fallback", borrow.borrow_reserve, e);
+                                // Fallback: Reserve pubkey'i mint olarak kullan
+                                (borrow.borrow_reserve.to_string(), 0.0)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to fetch reserve {}: {}, using fallback", borrow.borrow_reserve, e);
+                        // Fallback: Reserve pubkey'i mint olarak kullan
+                        (borrow.borrow_reserve.to_string(), 0.0)
+                    }
                 }
-            })
-            .collect();
+            } else {
+                // RPC client yoksa fallback: Reserve pubkey'i mint olarak kullan
+                (borrow.borrow_reserve.to_string(), 0.0)
+            };
+            
+            debt_assets.push(crate::domain::DebtAsset {
+                mint,
+                amount: borrowed_amount,
+                amount_usd: borrow.market_value.to_f64(),
+                borrow_rate,
+            });
+        }
         
         log::debug!(
             "Parsed Solend obligation: account={}, hf={:.4}, collateral=${:.2}, debt=${:.2}",
