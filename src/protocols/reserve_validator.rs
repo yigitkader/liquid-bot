@@ -65,13 +65,17 @@ pub async fn validate_reserve_structure(
             log::error!("   This indicates the struct structure doesn't match the real Solend IDL");
             log::error!("   Please update src/protocols/solend_reserve.rs with the correct structure");
             
-            // Hex dump ilk 100 byte'ı göster (debug için)
+            // Hex dump ilk 200 byte'ı göster (debug için)
             let hex_dump: String = account.data.iter()
-                .take(100)
+                .take(200)
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
-            log::debug!("First 100 bytes (hex): {}", hex_dump);
+            log::info!("Account data size: {} bytes", account.data.len());
+            log::info!("First 200 bytes (hex): {}", hex_dump);
+            
+            // Account owner'ı kontrol et
+            log::info!("Account owner: {}", account.owner);
             
             Ok(ValidationResult {
                 success: false,

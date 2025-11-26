@@ -1,32 +1,5 @@
-mod config;
-mod domain;
-mod event;
-mod event_bus;
-mod data_source;
-mod rpc_poller;
-mod ws_listener;
-mod analyzer;
-mod strategist;
-mod executor;
-mod logger;
-mod solana_client;
-mod math;
-mod wallet;
-mod protocol;
-mod tx_lock;
-mod rate_limiter;
-mod shutdown;
-mod health;
-mod performance;
-
-mod protocols {
-    pub mod solend;
-    pub mod solend_accounts;
-    pub mod reserve_helper;
-    pub mod solend_reserve;
-    pub mod oracle_helper;
-    pub mod reserve_validator;
-}
+// Modüller artık lib.rs'de tanımlı
+use liquid_bot::*;
 
 use anyhow::Result;
 use dotenv::dotenv;
@@ -34,8 +7,8 @@ use env_logger;
 use tokio;
 use tokio::signal;
 use std::sync::Arc;
-use crate::protocol::Protocol;
-use crate::shutdown::ShutdownManager;
+use liquid_bot::protocol::Protocol;
+use liquid_bot::shutdown::ShutdownManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {

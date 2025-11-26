@@ -59,11 +59,11 @@ pub async fn parse_reserve_account(
     let ltv = reserve.ltv();
     let liquidation_bonus = reserve.liquidation_bonus();
     
-    // Borrow rate'i hesapla (WAD formatından APY'ye çevir)
-    // borrow_rate_wad zaten WAD formatında (1e18), ancak bu anlık rate değil
-    // Gerçek borrow rate'i hesaplamak için daha karmaşık bir formül gerekir
-    // Şu an basit bir yaklaşım kullanıyoruz
-    let borrow_rate = reserve.liquidity.borrow_rate_wad as f64 / 1_000_000_000_000_000_000.0;
+    // Borrow rate'i hesapla
+    // Gerçek borrow rate'i hesaplamak için utilization rate'e göre config'deki rate'leri kullanmalıyız
+    // Şu an optimal borrow rate'i kullanıyoruz (basit yaklaşım)
+    // Gerçek implementasyonda utilization rate'e göre min/optimal/max arasında interpolasyon yapılmalı
+    let borrow_rate = reserve.config.optimal_borrow_rate as f64 / 100.0; // APY olarak (0.0 - 1.0)
     
     // Mint olarak liquidity_mint kullanıyoruz (borrow için)
     // Collateral mint ayrı bir field olarak saklanıyor
