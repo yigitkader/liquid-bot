@@ -31,3 +31,11 @@ clap = { version = "4.4", features = ["derive"] }
 [[bin]]
 name = "validate_reserve"
 path = "src/bin/validate_reserve.rs"
+
+[[bin]]
+name = "validate_obligation"
+path = "src/bin/validate_obligation.rs"
+
+[[bin]]
+name = "test_instruction_format"
+path = "src/bin/test_instruction_format.rs"

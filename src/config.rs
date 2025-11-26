@@ -28,7 +28,7 @@ impl Config {
                 .parse()
                 .context("Invalid HF_LIQUIDATION_THRESHOLD value")?,
             min_profit_usd: env::var("MIN_PROFIT_USD")
-                .unwrap_or_else(|_| "1.0".to_string())
+                .unwrap_or_else(|_| "5.0".to_string()) // Default: $5 (production-safe)
                 .parse()
                 .context("Invalid MIN_PROFIT_USD value")?,
             max_slippage_bps: env::var("MAX_SLIPPAGE_BPS")
@@ -83,6 +83,26 @@ impl Config {
                 "MIN_PROFIT_USD must be >= 0.0, got: {}",
                 self.min_profit_usd
             ));
+        }
+
+        // Production safety: Warn if MIN_PROFIT_USD is too low
+        // Transaction fees + gas typically cost $0.1-0.5, so $1 profit leaves very little margin
+        if !self.dry_run && self.min_profit_usd < 5.0 {
+            log::warn!(
+                "⚠️  MIN_PROFIT_USD={} is very low for production! \
+                 Transaction fees + gas typically cost $0.1-0.5, \
+                 so you may end up with negative profit. \
+                 Recommended: MIN_PROFIT_USD >= 5.0 for production, \
+                 MIN_PROFIT_USD=1.0 only for testing.",
+                self.min_profit_usd
+            );
+        } else if self.min_profit_usd < 1.0 {
+            log::warn!(
+                "⚠️  MIN_PROFIT_USD={} is very low! \
+                 Recommended: MIN_PROFIT_USD >= 5.0 for production, \
+                 MIN_PROFIT_USD=1.0 only for testing.",
+                self.min_profit_usd
+            );
         }
 
         if self.max_slippage_bps > 10000 {

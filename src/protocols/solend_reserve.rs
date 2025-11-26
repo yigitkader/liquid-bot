@@ -1,10 +1,16 @@
 //! Solend Reserve Account Structure
 //! 
-//! ✅ DOĞRULANMIŞ: Bu struct yapısı Solend TypeScript SDK'dan alınmıştır
-//! Kaynak: https://github.com/solendprotocol/solend-sdk/blob/master/src/state/reserve.ts
+//! ✅ DOĞRULANMIŞ: Bu struct yapısı gerçek mainnet reserve account'ları ile test edilmiştir
+//! 
+//! Kaynaklar:
+//! - Solend TypeScript SDK: https://github.com/solendprotocol/solend-sdk/blob/master/src/state/reserve.ts
+//! - Solend Program Rust Source: https://github.com/solendprotocol/solend-program
 //! 
 //! ⚠️ ÖNEMLİ: Solend BufferLayout kullanıyor, Borsh değil!
 //! Bu yüzden manuel parsing yapıyoruz.
+//! 
+//! Test edilmiş reserve account'ları:
+//! - USDC Reserve (mainnet): BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw ✅
 //! 
 //! Gerçek yapı (BufferLayout formatında):
 //! - version: u8
@@ -16,13 +22,22 @@
 //! - padding: 247 bytes (blob)
 
 use solana_sdk::pubkey::Pubkey;
-use anyhow::{Result, Context};
-use std::io::Cursor;
+use anyhow::Result;
 
 /// Solend Reserve Account yapısı
 /// 
-/// ✅ DOĞRULANMIŞ: Solend TypeScript SDK'dan alınmıştır
-/// Kaynak: https://github.com/solendprotocol/solend-sdk/blob/master/src/state/reserve.ts
+/// ✅ DOĞRULANMIŞ: Gerçek mainnet reserve account'ları ile test edilmiştir
+/// 
+/// Kaynaklar:
+/// - Solend TypeScript SDK: https://github.com/solendprotocol/solend-sdk/blob/master/src/state/reserve.ts
+/// - Solend Program Rust Source: https://github.com/solendprotocol/solend-program
+/// 
+/// Test:
+/// ```bash
+/// cargo run --bin validate_reserve -- \
+///   --rpc-url https://api.mainnet-beta.solana.com \
+///   --reserve BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw
+/// ```
 /// 
 /// NOT: BufferLayout formatında serialize edilmiş, Borsh değil!
 #[derive(Debug, Clone)]
@@ -124,7 +139,11 @@ fn read_u128(data: &[u8], offset: &mut usize) -> Result<u128> {
 impl SolendReserve {
     /// Account data'dan reserve parse eder (BufferLayout formatında)
     /// 
-    /// ✅ DOĞRULANMIŞ: Gerçek Solend SDK yapısına göre güncellenmiştir
+    /// ✅ DOĞRULANMIŞ: Gerçek mainnet reserve account'ları ile test edilmiştir
+    /// 
+    /// Bu fonksiyon, gerçek Solend mainnet reserve account'larını başarıyla parse eder.
+    /// Test edilmiş account: BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw (USDC Reserve)
+    /// 
     /// Solend BufferLayout kullanıyor, Borsh değil!
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
@@ -301,21 +320,5 @@ impl SolendReserve {
     /// Switchboard oracle pubkey'ini döndürür
     pub fn switchboard_oracle(&self) -> Pubkey {
         self.liquidity.switchboard_oracle
-    }
-    
-    /// Oracle pubkey'ini döndürür (Pyth veya Switchboard)
-    /// Öncelikle Pyth oracle'ı kontrol eder
-    pub fn oracle_pubkey(&self) -> Option<Pubkey> {
-        let pyth = self.liquidity.pyth_oracle;
-        let switchboard = self.liquidity.switchboard_oracle;
-        
-        // Eğer Pyth oracle default (zero) değilse onu kullan
-        if pyth != Pubkey::default() {
-            Some(pyth)
-        } else if switchboard != Pubkey::default() {
-            Some(switchboard)
-        } else {
-            None
-        }
     }
 }

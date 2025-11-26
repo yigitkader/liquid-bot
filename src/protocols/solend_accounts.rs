@@ -7,6 +7,17 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+// NOT: Lending Market Authority PDA için seed kullanılmıyor!
+// Solend SDK'ya göre sadece lending_market pubkey'i seed olarak kullanılıyor.
+// Reference: https://github.com/solendprotocol/solend-sdk/blob/master/src/core/LendingMarket.ts
+// 
+// export const deriveLendingMarketAuthority = (lendingMarket: PublicKey, programId: PublicKey) => {
+//   return PublicKey.findProgramAddressSync(
+//     [lendingMarket.toBuffer()],  // Sadece lending_market, başka seed yok!
+//     programId
+//   );
+// };
+
 /// Associated Token Account (ATA) adresini hesaplar
 pub fn get_associated_token_address(
     wallet: &Pubkey,
@@ -30,13 +41,31 @@ pub fn get_associated_token_address(
 /// Lending Market Authority PDA'sını hesaplar
 /// 
 /// Solend'de lending market authority bir PDA'dır.
-/// Formül: PDA(lending_market, [b"lending-market-authority"], program_id)
+/// 
+/// ✅ DOĞRULANMIŞ: Solend SDK'ya göre güncellendi
+/// 
+/// PDA derivation formülü (Solend SDK'dan):
+/// - Seeds: [lending_market] (SADECE lending_market, başka seed YOK!)
+/// - Program ID: Solend program ID
+/// 
+/// Referans: Solend SDK - LendingMarket.ts
+/// https://github.com/solendprotocol/solend-sdk/blob/master/src/core/LendingMarket.ts
+/// 
+/// ```typescript
+/// export const deriveLendingMarketAuthority = (lendingMarket: PublicKey, programId: PublicKey) => {
+///   return PublicKey.findProgramAddressSync(
+///     [lendingMarket.toBuffer()],  // Sadece lending_market!
+///     programId
+///   );
+/// };
+/// ```
 pub fn derive_lending_market_authority(
     lending_market: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
+    // ✅ DOĞRU: Solend SDK'ya göre sadece lending_market seed olarak kullanılıyor
+    // "lending-market-authority" string'i kullanılmıyor!
     let seeds = &[
-        b"lending-market-authority".as_ref(),
         lending_market.as_ref(),
     ];
     

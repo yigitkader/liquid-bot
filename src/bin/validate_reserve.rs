@@ -82,6 +82,17 @@ async fn main() -> Result<()> {
             println!("  Collateral Mint: {}", info.collateral_mint);
             println!("  LTV: {:.2}%", info.ltv * 100.0);
             println!("  Liquidation Bonus: {:.2}%", info.liquidation_bonus * 100.0);
+            println!("\n🔮 Oracle Accounts (from reserve):");
+            if let Some(pyth) = info.pyth_oracle {
+                println!("  ✅ Pyth Oracle: {}", pyth);
+            } else {
+                println!("  ❌ Pyth Oracle: Not found");
+            }
+            if let Some(switchboard) = info.switchboard_oracle {
+                println!("  ✅ Switchboard Oracle: {}", switchboard);
+            } else {
+                println!("  ❌ Switchboard Oracle: Not found");
+            }
         }
         
         println!("\n✅ Struct structure matches the real Solend IDL!");

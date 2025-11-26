@@ -65,7 +65,7 @@ cp .env.example .env
    - `RPC_WS_URL`: Solana RPC WebSocket endpoint (opsiyonel)
    - `WALLET_PATH`: Wallet dosyası yolu (örn: `./wallet.json`)
    - `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
-   - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, önerilen: 1.0-5.0)
+   - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, **production için önerilen: 5.0-10.0**, test için: 1.0)
    - `MAX_SLIPPAGE_BPS`: Maksimum slippage (basis points, önerilen: 50-100)
    - `POLL_INTERVAL_MS`: Polling aralığı (milisaniye, önerilen: 2000-5000)
    - `DRY_RUN`: Test modu (true/false, **ilk kullanımda mutlaka true!**)
@@ -90,6 +90,8 @@ Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir. D
 
 - **HF_LIQUIDATION_THRESHOLD**: Health Factor bu değerin altındaysa pozisyon riskli kabul edilir
 - **MIN_PROFIT_USD**: Bu değerin altındaki fırsatlar işleme alınmaz
+  - **Production için önerilen: $5-10** (transaction fee + gas maliyetleri için yeterli margin)
+  - **Test için: $1** (sadece test amaçlı, production'da kullanmayın!)
 - **DRY_RUN**: `true` ise gerçek transaction gönderilmez, sadece simüle edilir
 
 ## 🔧 Geliştirme Durumu

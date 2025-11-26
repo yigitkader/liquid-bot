@@ -39,12 +39,18 @@ pub async fn validate_reserve_structure(
     match SolendReserve::from_account_data(&account.data) {
         Ok(reserve) => {
             log::info!("✅ Reserve account parsed successfully!");
+            
+            let pyth_oracle = reserve.pyth_oracle();
+            let switchboard_oracle = reserve.switchboard_oracle();
+            
             log::debug!(
-                "Reserve details: version={}, lending_market={}, liquidity_mint={}, collateral_mint={}",
+                "Reserve details: version={}, lending_market={}, liquidity_mint={}, collateral_mint={}, pyth_oracle={}, switchboard_oracle={}",
                 reserve.version,
                 reserve.lending_market,
                 reserve.liquidity_mint(),
-                reserve.collateral_mint()
+                reserve.collateral_mint(),
+                pyth_oracle,
+                switchboard_oracle
             );
             
             Ok(ValidationResult {
@@ -57,6 +63,8 @@ pub async fn validate_reserve_structure(
                     collateral_mint: reserve.collateral_mint(),
                     ltv: reserve.ltv(),
                     liquidation_bonus: reserve.liquidation_bonus(),
+                    pyth_oracle: if pyth_oracle != Pubkey::default() { Some(pyth_oracle) } else { None },
+                    switchboard_oracle: if switchboard_oracle != Pubkey::default() { Some(switchboard_oracle) } else { None },
                 }),
             })
         }
@@ -103,6 +111,8 @@ pub struct ReserveInfo {
     pub collateral_mint: Pubkey,
     pub ltv: f64,
     pub liquidation_bonus: f64,
+    pub pyth_oracle: Option<Pubkey>,
+    pub switchboard_oracle: Option<Pubkey>,
 }
 
 /// Bilinen Solend mainnet reserve account'ları

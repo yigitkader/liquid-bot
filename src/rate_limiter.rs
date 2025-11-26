@@ -1,26 +1,24 @@
-use std::time::{Duration, Instant};
+use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// Token Bucket Rate Limiter - RPC çağrılarını sınırlandırır
+/// Basit Rate Limiter - RPC çağrılarını sınırlandırır
 /// 
-/// Token bucket algoritması:
-/// - Belirli bir kapasiteye sahip bir "bucket" (token deposu)
-/// - Her saniye belirli sayıda token eklenir (refill rate)
-/// - Her request bir token tüketir
-/// - Token yoksa request bekler
+/// ✅ OPTİMİZE EDİLDİ: Token bucket algoritması yerine basit time-based rate limiting
 /// 
 /// Avantajları:
-/// - Lock contention'ı azaltır (sadece token alırken lock)
-/// - Burst request'lere izin verir (bucket doluysa)
-/// - Daha adil rate limiting
+/// - Çok daha basit ve hafif (token bucket'a göre)
+/// - Lock contention'ı minimize eder (sadece last_request güncellemesi)
 /// - Yüksek concurrency'de daha iyi performans
+/// - RPC rate limiting için yeterli (burst gerekmez)
+/// 
+/// Nasıl çalışır:
+/// - Her request'ten önce son request zamanını kontrol eder
+/// - Minimum interval geçmediyse, kalan süreyi bekler
+/// - Son request zamanını günceller
 pub struct RateLimiter {
-    // Token bucket state
-    tokens: AtomicU64,           // Mevcut token sayısı
-    capacity: u64,                // Bucket kapasitesi (max token sayısı)
-    refill_rate: f64,             // Saniyede eklenen token sayısı
-    last_refill: Mutex<Instant>,  // Son token ekleme zamanı
+    last_request: Arc<Mutex<Instant>>,
+    min_interval: Duration,
 }
 
 impl RateLimiter {
@@ -31,93 +29,43 @@ impl RateLimiter {
     /// 
     /// Örnek: min_interval_ms = 100 → 10 req/s
     pub fn new(min_interval_ms: u64) -> Self {
-        // Request rate'i hesapla (req/s)
-        let requests_per_second = 1000.0 / min_interval_ms as f64;
-        
-        // Token bucket parametreleri
-        // Capacity: Burst için izin verilen max request sayısı (örnek: 2x refill rate)
-        let capacity = (requests_per_second * 2.0) as u64;
-        // Refill rate: Saniyede eklenen token sayısı
-        let refill_rate = requests_per_second;
-        
         RateLimiter {
-            tokens: AtomicU64::new(capacity), // Başlangıçta bucket dolu
-            capacity,
-            refill_rate,
-            last_refill: Mutex::new(Instant::now()),
-        }
-    }
-
-    /// Token bucket'a token ekle (refill)
-    /// 
-    /// Bu fonksiyon lock kullanır ama çok kısa süreli (sadece time check)
-    async fn refill_tokens(&self) -> u64 {
-        let mut last_refill = self.last_refill.lock().await;
-        let now = Instant::now();
-        let elapsed = now.duration_since(*last_refill);
-        
-        if elapsed.as_secs_f64() > 0.0 {
-            // Geçen süreye göre token ekle
-            let tokens_to_add = (elapsed.as_secs_f64() * self.refill_rate) as u64;
-            
-            if tokens_to_add > 0 {
-                // Mevcut token sayısını al ve güncelle
-                let current = self.tokens.load(Ordering::Relaxed);
-                let new_tokens = (current + tokens_to_add).min(self.capacity);
-                self.tokens.store(new_tokens, Ordering::Relaxed);
-                
-                *last_refill = now;
-                
-                drop(last_refill);
-                return new_tokens;
-            }
-        }
-        
-        self.tokens.load(Ordering::Relaxed)
-    }
-
-    /// Bir token al (request için)
-    /// 
-    /// Token yoksa, token gelene kadar bekler
-    pub async fn acquire_token(&self) {
-        loop {
-            // Önce token'ları refill et
-            let available_tokens = self.refill_tokens().await;
-            
-            if available_tokens > 0 {
-                // Token var, bir tane al
-                let previous = self.tokens.fetch_sub(1, Ordering::Relaxed);
-                if previous > 0 {
-                    // Token başarıyla alındı
-                    return;
-                } else {
-                    // Race condition: başka bir thread token'ı aldı
-                    // Token'ı geri ekle ve tekrar dene
-                    self.tokens.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            
-            // Token yok, kısa bir süre bekle ve tekrar dene
-            // Refill rate'e göre bekleme süresini hesapla
-            let wait_time_ms = (1000.0 / self.refill_rate) as u64;
-            tokio::time::sleep(Duration::from_millis(wait_time_ms.max(1))).await;
+            last_request: Arc::new(Mutex::new(Instant::now())),
+            min_interval: Duration::from_millis(min_interval_ms),
         }
     }
 
     /// Bir sonraki request için bekleme süresini kontrol et ve gerekirse bekle
     /// 
-    /// Backward compatibility için eski API'yi koruyoruz
+    /// ✅ OPTİMİZE EDİLDİ: Basit time-based rate limiting
+    /// - Token bucket algoritması kaldırıldı (gereksiz karmaşık)
+    /// - Sadece last_request zamanını kontrol eder ve gerekirse bekler
+    /// - Lock sadece kısa süreli (sadece time check ve update)
     pub async fn wait_if_needed(&self) {
-        self.acquire_token().await;
+        let mut last = self.last_request.lock().await;
+        let now = Instant::now();
+        let elapsed = last.elapsed();
+        
+        if elapsed < self.min_interval {
+            // Minimum interval geçmedi, kalan süreyi bekle
+            let remaining = self.min_interval - elapsed;
+            drop(last); // Lock'u bırak (sleep sırasında lock tutmuyoruz)
+            sleep(remaining).await;
+            // Sleep sonrası tekrar lock al ve zamanı güncelle
+            let mut last = self.last_request.lock().await;
+            *last = Instant::now();
+        } else {
+            // Minimum interval geçti, direkt devam et
+            *last = now;
+        }
     }
 
     /// Rate limit kontrolü yapmadan sadece zamanı güncelle
     /// 
     /// Backward compatibility için eski API'yi koruyoruz
-    /// Token bucket'ta bu fonksiyon gerekli değil, ama API uyumluluğu için bırakıyoruz
     pub async fn record_request(&self) {
-        // Token bucket'ta token zaten acquire_token() ile alınıyor
-        // Bu fonksiyon artık gerekli değil, ama API uyumluluğu için boş bırakıyoruz
+        let mut last = self.last_request.lock().await;
+        *last = Instant::now();
     }
 }
 
