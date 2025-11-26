@@ -1,14 +1,27 @@
 //! Solend Reserve Account Structure
 //! 
-//! Bu modül, Solend reserve account'larını parse etmek için gerekli yapıları içerir.
-//! Gerçek Solend IDL'den türetilmelidir.
+//! ⚠️ KRİTİK UYARI: Bu struct yapısı gerçek Solend IDL'ine göre doğrulanmamıştır!
+//! 
+//! Production kullanımından önce:
+//! 1. Gerçek Solend IDL'ini al: `./scripts/fetch_solend_idl.sh`
+//! 2. Reserve account yapısını doğrula
+//! 3. Bu struct'ı gerçek IDL'e göre güncelle
+//! 
+//! Kaynak: https://github.com/solendprotocol/solend-program
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::pubkey::Pubkey;
 use anyhow::Result;
 
-/// Solend Reserve Account yapısı (IDL'den)
-/// Gerçek Solend reserve account yapısı
+/// Solend Reserve Account yapısı
+/// 
+/// ⚠️ UYARI: Bu yapı tahmine dayalıdır ve gerçek Solend IDL'ine göre doğrulanmamıştır.
+/// Production kullanımından önce gerçek IDL'den doğrulanmalıdır.
+/// 
+/// Gerçek yapıyı almak için:
+/// ```bash
+/// ./scripts/fetch_solend_idl.sh
+/// ```
 #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct SolendReserve {
     pub version: u8,
@@ -17,6 +30,9 @@ pub struct SolendReserve {
     pub liquidity: ReserveLiquidity,
     pub collateral: ReserveCollateral,
     pub config: ReserveConfig,
+    // NOT: Gerçek Solend reserve account yapısında daha fazla field olabilir
+    // Örnek: oracle account'ları, additional config, vb.
+    // Bu struct gerçek IDL'e göre güncellenmelidir
 }
 
 /// Reserve Liquidity bilgileri
@@ -30,6 +46,9 @@ pub struct ReserveLiquidity {
     pub available_amount: u64,
     pub borrowed_amount_wad: u128,
     pub market_price: Number,
+    // NOT: Gerçek Solend reserve yapısında oracle_pubkey field'ı olabilir
+    // Örnek: pub oracle_pubkey: Pubkey, // Pyth veya Switchboard oracle
+    // Ancak field sırası Borsh için kritik olduğu için gerçek IDL'e göre doğrulanmalı
 }
 
 /// Reserve Collateral bilgileri
@@ -38,6 +57,7 @@ pub struct ReserveCollateral {
     pub mint_pubkey: Pubkey,
     pub supply_pubkey: Pubkey, // Reserve collateral supply token account
     pub total_deposits: u64,
+    // NOT: Gerçek yapıda daha fazla field olabilir
 }
 
 /// Reserve Configuration
@@ -51,6 +71,7 @@ pub struct ReserveConfig {
     pub optimal_borrow_rate: u8,
     pub max_borrow_rate: u8,
     pub fees: ReserveFees,
+    // NOT: Gerçek yapıda oracle account'ları veya başka config field'ları olabilir
 }
 
 /// Reserve Fees
@@ -75,6 +96,9 @@ impl Number {
 
 impl SolendReserve {
     /// Account data'dan reserve parse eder (Anchor discriminator ile)
+    /// 
+    /// ⚠️ UYARI: Bu fonksiyon gerçek Solend reserve account yapısına göre test edilmelidir.
+    /// Parse error alırsanız, struct yapısını gerçek IDL'e göre güncelleyin.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("Empty account data"));
@@ -88,7 +112,14 @@ impl SolendReserve {
         };
         
         SolendReserve::try_from_slice(account_data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Solend reserve: {}", e))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to deserialize Solend reserve: {}. \
+                    This might indicate the struct structure doesn't match the real Solend IDL. \
+                    Please validate against official IDL: ./scripts/fetch_solend_idl.sh",
+                    e
+                )
+            })
     }
     
     /// Liquidity mint address'ini döndürür
@@ -120,5 +151,17 @@ impl SolendReserve {
     pub fn liquidation_bonus(&self) -> f64 {
         self.config.liquidation_bonus as f64 / 100.0
     }
+    
+    /// Oracle pubkey'ini döndürür (eğer reserve yapısında varsa)
+    /// 
+    /// NOT: Gerçek Solend reserve yapısında oracle_pubkey field'ı olabilir.
+    /// Ancak şu an struct yapısında bu field yok (gerçek IDL'e göre doğrulanmalı).
+    /// 
+    /// Gelecek: Gerçek IDL'e göre struct güncellendiğinde bu fonksiyon çalışacak.
+    pub fn oracle_pubkey(&self) -> Option<Pubkey> {
+        // NOT: Gerçek yapıda oracle_pubkey field'ı varsa:
+        // Some(self.liquidity.oracle_pubkey)
+        // Şu an: None (struct'da field yok)
+        None
+    }
 }
-

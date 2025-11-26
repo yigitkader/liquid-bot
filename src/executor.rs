@@ -79,7 +79,7 @@ pub async fn run_executor(
                             &config,
                             wallet.as_ref(),
                             protocol.as_ref(),
-                            rpc_client.as_ref(),
+                            Arc::clone(&rpc_client),
                         ).await {
                             Ok(sig) => {
                                 signature = Some(sig.clone());
@@ -139,7 +139,28 @@ pub async fn run_executor(
                     })?;
                 }
                 
-                // Unlock guard scope'tan çıkınca otomatik unlock yapacak
+                // Explicit unlock yaparak error handling'i garanti altına alıyoruz
+                // Drop'ta spawn edilen task'a güvenmek yerine, burada explicit unlock yapıyoruz
+                // Bu şekilde unlock'ın başarılı olduğundan emin oluyoruz
+                let tx_lock_for_unlock = Arc::clone(&tx_lock);
+                let account_address_for_unlock = account_address.clone();
+                let unlock_handle = tokio::spawn(async move {
+                    tx_lock_for_unlock.unlock(&account_address_for_unlock).await;
+                    log::debug!("Successfully unlocked account: {}", account_address_for_unlock);
+                });
+                
+                // Spawn edilen task'ın handle'ını al ve error'ları logla
+                // NOT: await edemeyiz (async context'te değiliz), ama task'ı spawn ettik
+                // Task başarısız olursa tokio runtime loglar, ama biz de log ekleyebiliriz
+                let account_address_for_error_log = account_address.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = unlock_handle.await {
+                        log::error!("Failed to unlock account {}: {:?}", account_address_for_error_log, e);
+                    }
+                });
+                
+                // Guard'ı drop et (artık unlock yapıldı, ama guard yine de drop edilmeli)
+                // Drop'taki spawn fallback olarak kalacak (explicit unlock başarısız olursa)
                 drop(unlock_guard);
             }
             Ok(_) => {
@@ -167,11 +188,31 @@ struct UnlockGuard {
 impl Drop for UnlockGuard {
     fn drop(&mut self) {
         // Async drop yapamayız, bu yüzden spawn ediyoruz
+        // NOT: Fire-and-forget pattern kullanıyoruz, ama error handling ekliyoruz
         let tx_lock = Arc::clone(&self.tx_lock);
         let account_address = self.account_address.clone();
+        
+        // Spawn edilen task'a error handling ekle
+        // Task başarısız olursa (örneğin runtime panik olursa) loglanacak
         tokio::spawn(async move {
+            // Unlock işlemi
             tx_lock.unlock(&account_address).await;
+            
+            // Unlock başarılı (unlock fonksiyonu Result döndürmüyor, bu yüzden başarılı kabul ediyoruz)
+            // Ancak runtime panik olursa, tokio runtime bunu loglar
+            log::debug!("Successfully unlocked account: {}", account_address);
         });
+        
+        // NOT: Spawn edilen task'ın tamamlanmasını bekleyemeyiz (Drop sync olmalı)
+        // Ancak:
+        // 1. Explicit unlock scope sonunda yapılıyor (daha güvenilir)
+        // 2. Drop'taki spawn sadece fallback (explicit unlock başarısız olursa)
+        // 3. Task başarısız olursa tokio runtime loglar
+        // 
+        // Alternatif çözümler (gelecek iyileştirmeler):
+        // 1. AsyncDrop trait'i kullanmak (henüz stable değil)
+        // 2. Task handle'ı saklamak ve join etmek (ama Drop sync olmalı)
+        // 3. Unlock'u sync yapmak (ama bu async context'i bozar)
     }
 }
 

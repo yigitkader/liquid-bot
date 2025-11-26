@@ -192,6 +192,7 @@ impl SolendProtocol {
         Pubkey, // reserve
         Pubkey, // reserve_collateral_mint
         Pubkey, // reserve_liquidity_supply
+        Pubkey, // lending_market (obligation'dan alınır)
         Pubkey, // lending_market_authority
         Pubkey, // destination_liquidity
         Pubkey, // pyth_price
@@ -207,6 +208,9 @@ impl SolendProtocol {
         // 2. Obligation'ı parse et
         let obligation = solend_idl::SolendObligation::from_account_data(&obligation_account.data)
             .context("Failed to parse obligation account")?;
+        
+        // Obligation'dan lending market'i al (gerçek liquidation instruction için gerekli)
+        let obligation_lending_market = obligation.lending_market;
         
         // 3. Borrow reserve'ü bul (target_debt_mint'ten veya obligation.borrows'den)
         // target_debt_mint reserve pubkey olabilir veya mint address olabilir
@@ -257,7 +261,9 @@ impl SolendProtocol {
         let destination_liquidity = reserve_liquidity_supply; // Destination liquidity = reserve liquidity supply
         
         // 8. Lending market authority PDA'sını hesapla
-        let lending_market_authority = derive_lending_market_authority(&self.program_id, &self.program_id)
+        // NOT: Lending market obligation'dan alınmalı, şu an program_id kullanılıyor
+        // Gelecek: obligation_lending_market kullan
+        let lending_market_authority = derive_lending_market_authority(&obligation_lending_market, &self.program_id)
             .context("Failed to derive lending market authority")?;
         
         // 9. Liquidator'ın token account'larını hesapla (ATA)
@@ -267,11 +273,23 @@ impl SolendProtocol {
         let destination_collateral = get_associated_token_address(liquidator, &collateral_mint)
             .context("Failed to derive destination collateral ATA")?;
         
-        // 9. Oracle account'ları (mint'ten türet)
-        // Solend'de oracle account'ları genellikle mint address'inden türetilir
-        use crate::protocols::oracle_helper::get_oracle_accounts;
-        let (pyth_price, switchboard_price) = get_oracle_accounts(&debt_mint)
-            .context("Failed to get oracle accounts")?;
+        // 9. Oracle account'ları (reserve account'tan oku - ÖNERİLEN)
+        // Öncelik: Reserve account'tan oracle pubkey'i oku (dinamik, her token için çalışır)
+        // Fallback: Mint'ten hardcoded mapping kullan
+        use crate::protocols::oracle_helper::get_oracle_accounts_from_reserve;
+        let (pyth_price, switchboard_price) = match get_oracle_accounts_from_reserve(&reserve_info) {
+            Ok((pyth, switchboard)) => {
+                // Reserve account'tan oracle bulundu
+                (pyth, switchboard)
+            }
+            Err(e) => {
+                log::warn!("Failed to get oracle from reserve: {}, using mint-based fallback", e);
+                // Fallback: Mint'ten hardcoded mapping kullan
+                use crate::protocols::oracle_helper::get_oracle_accounts_from_mint;
+                get_oracle_accounts_from_mint(&debt_mint)
+                    .context("Failed to get oracle accounts from mint")?
+            }
+        };
         
         // Oracle account'ları bulunamazsa fallback (optional account olabilir)
         let pyth_price = pyth_price.unwrap_or_else(|| {
@@ -296,6 +314,7 @@ impl SolendProtocol {
             borrow_reserve_pubkey, // reserve
             reserve_collateral_mint,
             reserve_liquidity_supply,
+            obligation_lending_market, // lending_market (obligation'dan alınır)
             lending_market_authority,
             destination_liquidity,
             pyth_price,
@@ -513,7 +532,7 @@ impl Protocol for SolendProtocol {
         // 7. Oracle account'larını bul
         
         let (source_liquidity, destination_collateral, reserve, reserve_collateral_mint, 
-             reserve_liquidity_supply, lending_market_authority, destination_liquidity,
+             reserve_liquidity_supply, lending_market, lending_market_authority, destination_liquidity,
              pyth_price, switchboard_price) = if let Some(rpc) = rpc_client {
             // Gerçek account'ları al
             self.resolve_liquidation_accounts(opportunity, liquidator, &*rpc).await?
@@ -526,6 +545,7 @@ impl Protocol for SolendProtocol {
                 Pubkey::default(), // reserve
                 Pubkey::default(), // reserveCollateralMint
                 Pubkey::default(), // reserveLiquiditySupply
+                self.program_id,   // lendingMarket (fallback: program_id)
                 Pubkey::default(), // lendingMarketAuthority
                 Pubkey::default(), // destinationLiquidity
                 Pubkey::default(), // pythPrice
@@ -533,22 +553,37 @@ impl Protocol for SolendProtocol {
             )
         };
         
-        // IDL sırasına göre account listesi
+        // IDL sırasına göre account listesi (liquidateObligation instruction)
+        // IDL'deki sıra: sourceLiquidity, destinationCollateral, obligation, reserve, 
+        // reserveCollateralMint, reserveLiquiditySupply, lendingMarket, lendingMarketAuthority,
+        // destinationLiquidity, liquidator, pythPrice, switchboardPrice, tokenProgram
+        
+        // Lending market artık obligation'dan alınıyor (resolve_liquidation_accounts'tan)
+        
+        // IDL'e göre account listesi (sıra ve isMut/isSigner önemli!)
         let accounts = vec![
-            AccountMeta::new_readonly(source_liquidity, false),        // sourceLiquidity (liquidator'ın debt token account'u)
-            AccountMeta::new(destination_collateral, false),          // destinationCollateral (liquidator'ın collateral token account'u)
-            AccountMeta::new(obligation_pubkey, false),               // obligation
-            AccountMeta::new(reserve, false),                          // reserve
-            AccountMeta::new(reserve_collateral_mint, false),         // reserveCollateralMint
-            AccountMeta::new(reserve_liquidity_supply, false),        // reserveLiquiditySupply
-            AccountMeta::new_readonly(self.program_id, false),        // lendingMarket
-            AccountMeta::new_readonly(lending_market_authority, false), // lendingMarketAuthority (PDA)
-            AccountMeta::new(destination_liquidity, false),          // destinationLiquidity (reserve'e geri gönderilecek)
-            AccountMeta::new(*liquidator, true),                      // liquidator (signer)
-            AccountMeta::new_readonly(pyth_price, false),             // pythPrice (oracle)
-            AccountMeta::new_readonly(switchboard_price, false),      // switchboardPrice (oracle)
-            AccountMeta::new_readonly(spl_token::id(), false),         // tokenProgram
+            AccountMeta::new(source_liquidity, false),                 // sourceLiquidity (isMut: true) - liquidator'ın debt token account'u
+            AccountMeta::new(destination_collateral, false),          // destinationCollateral (isMut: true) - liquidator'ın collateral token account'u
+            AccountMeta::new(obligation_pubkey, false),               // obligation (isMut: true)
+            AccountMeta::new(reserve, false),                          // reserve (isMut: true)
+            AccountMeta::new(reserve_collateral_mint, false),         // reserveCollateralMint (isMut: true)
+            AccountMeta::new(reserve_liquidity_supply, false),        // reserveLiquiditySupply (isMut: true)
+            AccountMeta::new_readonly(lending_market, false),         // lendingMarket (isMut: false)
+            AccountMeta::new_readonly(lending_market_authority, false), // lendingMarketAuthority (isMut: false, PDA)
+            AccountMeta::new(destination_liquidity, false),          // destinationLiquidity (isMut: true) - reserve'e geri gönderilecek
+            AccountMeta::new(*liquidator, true),                      // liquidator (isMut: false, isSigner: true)
+            AccountMeta::new_readonly(pyth_price, false),             // pythPrice (isMut: false, oracle)
+            AccountMeta::new_readonly(switchboard_price, false),      // switchboardPrice (isMut: false, oracle)
+            AccountMeta::new_readonly(spl_token::id(), false),         // tokenProgram (isMut: false)
         ];
+        
+        // Account sayısını doğrula (IDL'de 13 account var)
+        if accounts.len() != 13 {
+            return Err(anyhow::anyhow!(
+                "Invalid account count: expected 13, got {}. IDL mismatch!",
+                accounts.len()
+            ));
+        }
         
         // Instruction data: [discriminator (8 bytes), liquidityAmount (8 bytes)]
         let mut data = Vec::with_capacity(16);

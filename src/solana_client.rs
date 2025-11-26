@@ -120,7 +120,7 @@ pub async fn execute_liquidation(
     _config: &Config,
     wallet: &WalletManager,
     protocol: &dyn Protocol,
-    rpc_client: &SolanaClient,
+    rpc_client: Arc<SolanaClient>,
 ) -> Result<String> {
     log::info!(
         "Executing liquidation for account: {}",
@@ -133,13 +133,11 @@ pub async fn execute_liquidation(
     // 2. Protokol trait'inden liquidation instruction al
     let liquidator_pubkey = wallet.pubkey();
     // RPC client'ı Arc olarak geç (gerçek account'ları almak için)
-    let rpc_url = rpc_client.get_url().to_string();
-    let rpc_client_arc = Arc::new(SolanaClient::new(rpc_url)
-        .context("Failed to create RPC client for liquidation")?);
+    // Mevcut Arc'ı clone et (yeni Arc oluşturma - gereksiz!)
     let liquidation_ix = protocol.build_liquidation_instruction(
         opportunity, 
         liquidator_pubkey,
-        Some(rpc_client_arc),
+        Some(Arc::clone(&rpc_client)),
     )
         .await
         .context("Failed to build liquidation instruction")?;

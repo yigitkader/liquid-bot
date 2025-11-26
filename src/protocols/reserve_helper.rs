@@ -24,6 +24,7 @@ pub struct ReserveInfo {
     pub liquidity_supply: Option<Pubkey>, // Reserve liquidity supply token account
     pub collateral_supply: Option<Pubkey>, // Reserve collateral supply token account
     pub liquidation_bonus: f64, // Liquidation bonus (0.0 - 1.0)
+    pub oracle_pubkey: Option<Pubkey>, // Oracle pubkey (Pyth veya Switchboard) - reserve'den alınır
 }
 
 /// Reserve account'unu parse et ve bilgilerini döndür
@@ -61,13 +62,20 @@ pub async fn parse_reserve_account(
     // Collateral mint ayrı bir field olarak saklanıyor
     let mint = Some(liquidity_mint);
     
+    // Oracle pubkey'ini reserve'den al (eğer varsa)
+    // NOT: Gerçek Solend reserve yapısında oracle_pubkey field'ı olabilir
+    // Şu an struct'da yok, bu yüzden None döndürüyoruz
+    // Gerçek IDL'e göre struct güncellendiğinde bu çalışacak
+    let oracle_pubkey = reserve.oracle_pubkey();
+    
     log::debug!(
-        "Parsed reserve {}: mint={}, ltv={:.2}, borrow_rate={:.4}, liquidation_bonus={:.2}",
+        "Parsed reserve {}: mint={}, ltv={:.2}, borrow_rate={:.4}, liquidation_bonus={:.2}, oracle={:?}",
         reserve_pubkey,
         liquidity_mint,
         ltv,
         borrow_rate,
-        liquidation_bonus
+        liquidation_bonus,
+        oracle_pubkey
     );
     
     Ok(ReserveInfo {
@@ -80,6 +88,7 @@ pub async fn parse_reserve_account(
         liquidity_supply: Some(reserve.liquidity_supply()),
         collateral_supply: Some(reserve.collateral_supply()),
         liquidation_bonus,
+        oracle_pubkey,
     })
 }
 

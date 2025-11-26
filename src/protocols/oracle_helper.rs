@@ -2,8 +2,10 @@
 //! 
 //! Bu modül, Solend liquidation için gerekli oracle account'larını (Pyth/Switchboard) bulur.
 //! 
-//! NOT: Solend'de oracle account'ları genellikle mint address'inden türetilir veya
-//! bilinen oracle mapping'lerinden alınır.
+//! Öncelik sırası:
+//! 1. Reserve account'tan oracle pubkey'i oku (EN İYİ - dinamik)
+//! 2. Hardcoded mapping kullan (fallback - sadece bilinen token'lar için)
+//! 3. Pubkey::default() kullan (son çare - optional account olabilir)
 
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
@@ -85,16 +87,61 @@ pub fn get_switchboard_oracle_account(mint: &Pubkey) -> Result<Option<Pubkey>> {
     Ok(None)
 }
 
-/// Her iki oracle account'unu da bulur (Pyth ve Switchboard)
+/// Reserve account'tan oracle account'larını bulur (ÖNERİLEN YÖNTEM)
 /// 
-/// Solend liquidation instruction'ı her iki oracle'ı da bekliyor olabilir.
-/// Eğer bir oracle bulunamazsa, Pubkey::default() kullanılabilir (optional account).
-pub fn get_oracle_accounts(
+/// Solend reserve account'larında oracle pubkey saklanır.
+/// Bu yöntem hardcoded mapping'den çok daha iyidir çünkü:
+/// - Dinamik (her token için çalışır)
+/// - Güncel (reserve account'tan alınır)
+/// - Ölçeklenebilir (yeni token'lar için otomatik)
+/// 
+/// NOT: Gerçek Solend reserve yapısında oracle_pubkey field'ı olmalı.
+/// Şu an struct'da yok, bu yüzden fallback kullanılıyor.
+pub fn get_oracle_accounts_from_reserve(
+    reserve_info: &crate::protocols::reserve_helper::ReserveInfo,
+) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
+    // Öncelik 1: Reserve account'tan oracle pubkey'i al
+    if let Some(oracle_pubkey) = reserve_info.oracle_pubkey {
+        // Solend'de genellikle tek bir oracle kullanılır (Pyth veya Switchboard)
+        // Hangi oracle olduğunu anlamak için oracle account'unu kontrol etmek gerekir
+        // Şimdilik her ikisini de aynı oracle olarak kullanıyoruz
+        // Gelecek: Oracle account'unu parse ederek Pyth/Switchboard ayrımı yap
+        
+        log::debug!("Using oracle from reserve account: {}", oracle_pubkey);
+        return Ok((Some(oracle_pubkey), Some(oracle_pubkey)));
+    }
+    
+    // Fallback: Mint'ten hardcoded mapping kullan
+    let mint = reserve_info.liquidity_mint
+        .or(reserve_info.collateral_mint)
+        .ok_or_else(|| anyhow::anyhow!("No mint found in reserve info"))?;
+    
+    get_oracle_accounts_from_mint(&mint)
+}
+
+/// Mint address'inden oracle account'larını bulur (FALLBACK)
+/// 
+/// Hardcoded mapping kullanır - sadece bilinen token'lar için çalışır.
+/// Yeni token'lar için reserve account'tan okuma kullanılmalı.
+pub fn get_oracle_accounts_from_mint(
     mint: &Pubkey,
 ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
     let pyth = get_pyth_oracle_account(mint)?;
     let switchboard = get_switchboard_oracle_account(mint)?;
     
     Ok((pyth, switchboard))
+}
+
+/// Her iki oracle account'unu da bulur (Pyth ve Switchboard)
+/// 
+/// Solend liquidation instruction'ı her iki oracle'ı da bekliyor olabilir.
+/// Eğer bir oracle bulunamazsa, Pubkey::default() kullanılabilir (optional account).
+/// 
+/// Öncelik: Reserve account'tan okuma > Hardcoded mapping > Default
+pub fn get_oracle_accounts(
+    mint: &Pubkey,
+) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
+    // Fallback: Hardcoded mapping (reserve account bilgisi yoksa)
+    get_oracle_accounts_from_mint(mint)
 }
 

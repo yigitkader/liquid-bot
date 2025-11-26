@@ -25,7 +25,7 @@ pub async fn run_rpc_poller(
     const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     
     loop {
-        match fetch_and_publish_positions(&bus, &rpc_client, protocol.as_ref()).await {
+        match fetch_and_publish_positions(&bus, Arc::clone(&rpc_client), protocol.as_ref()).await {
             Ok(count) => {
                 consecutive_errors = 0; // Reset error counter on success
                 health_manager.record_successful_poll().await;
@@ -60,7 +60,7 @@ pub async fn run_rpc_poller(
 /// Program account'larını çeker, parse eder ve event bus'a yayınlar
 async fn fetch_and_publish_positions(
     bus: &EventBus,
-    rpc_client: &SolanaClient,
+    rpc_client: Arc<SolanaClient>,
     protocol: &dyn Protocol,
 ) -> Result<usize> {
     let program_id = protocol.program_id();
@@ -75,13 +75,13 @@ async fn fetch_and_publish_positions(
     
     // Her account'u parse et
     // RPC client'ı Arc olarak geç (gerçek mint address'leri için)
-    let rpc_client_arc = Arc::new(SolanaClient::new(rpc_client.get_url().to_string())
-        .context("Failed to create RPC client for parsing")?);
+    // Mevcut Arc'ı clone et (yeni Arc oluşturma - gereksiz!)
     
     for (account_pubkey, account) in accounts {
         // Protocol trait'i ile account'u parse et
         // RPC client'ı geçerek gerçek mint address'lerini al
-        match protocol.parse_account_position(&account_pubkey, &account, Some(Arc::clone(&rpc_client_arc))).await {
+        // Mevcut Arc'ı clone et
+        match protocol.parse_account_position(&account_pubkey, &account, Some(Arc::clone(&rpc_client))).await {
             Ok(Some(position)) => {
                 // AccountPosition başarıyla parse edildi, event yayınla
                 bus.publish(Event::AccountUpdated(position))
