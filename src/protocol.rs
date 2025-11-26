@@ -6,6 +6,8 @@ use solana_sdk::{
     account::Account,
 };
 use crate::domain::AccountPosition;
+use crate::solana_client::SolanaClient;
+use std::sync::Arc;
 
 /// Protokol soyutlaması - Her lending protokolü bu trait'i implement eder
 #[async_trait]
@@ -30,10 +32,17 @@ pub trait Protocol: Send + Sync {
     fn get_liquidation_params(&self) -> LiquidationParams;
     
     /// Likidasyon instruction'ını oluşturur
+    /// 
+    /// NOT: RPC client parametresi eklendi çünkü gerçek account'ları almak için
+    /// reserve account'larını RPC'den okumak gerekiyor.
+    /// 
+    /// rpc_client: None ise placeholder account'lar kullanılır (dry-run için)
+    /// rpc_client: Some(client) ise gerçek account'lar RPC'den alınır
     async fn build_liquidation_instruction(
         &self,
         opportunity: &crate::domain::LiquidationOpportunity,
         liquidator: &Pubkey,
+        rpc_client: Option<Arc<SolanaClient>>,
     ) -> Result<Instruction>;
 }
 

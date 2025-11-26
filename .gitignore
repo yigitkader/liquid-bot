@@ -7,8 +7,10 @@
 *.tmp
 .DS_Store
 *.xml
-/secrt
-/secrt/*
+
+# Wallet directories (CRITICAL - never commit!)
+/secret
+/secret/*
 
 # Environment files
 .env

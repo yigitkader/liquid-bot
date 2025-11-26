@@ -22,7 +22,7 @@ impl Config {
             rpc_ws_url: env::var("RPC_WS_URL")
                 .unwrap_or_else(|_| "wss://api.mainnet-beta.solana.com".to_string()),
             wallet_path: env::var("WALLET_PATH")
-                .unwrap_or_else(|_| "./wallet.json".to_string()),
+                .unwrap_or_else(|_| "./secret/bot-wallet.json".to_string()),
             hf_liquidation_threshold: env::var("HF_LIQUIDATION_THRESHOLD")
                 .unwrap_or_else(|_| "1.0".to_string())
                 .parse()

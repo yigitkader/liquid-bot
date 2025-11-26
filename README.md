@@ -49,9 +49,15 @@ src/
 cargo build
 ```
 
-3. `.env` dosyası oluşturun:
+3. Wallet oluşturun (eğer yoksa):
 ```bash
-cp .env .env
+mkdir -p solanakey
+solana-keygen new -o ./solanakey/bot-wallet.json
+```
+
+4. `.env` dosyası oluşturun:
+```bash
+cp .env.example .env
 ```
 
 4. `.env` dosyasını düzenleyin ve gerekli değerleri ayarlayın:

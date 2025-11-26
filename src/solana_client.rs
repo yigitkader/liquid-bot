@@ -16,6 +16,7 @@ use crate::rate_limiter::RateLimiter;
 /// Solana RPC client wrapper
 pub struct SolanaClient {
     rpc_client: Arc<RpcClient>,
+    rpc_url: String, // RPC URL'yi sakla (Arc için gerekli)
     commitment: CommitmentConfig,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -24,7 +25,7 @@ impl SolanaClient {
     /// Yeni RPC client oluşturur
     pub fn new(rpc_url: String) -> Result<Self> {
         let rpc_client = Arc::new(RpcClient::new_with_commitment(
-            rpc_url,
+            rpc_url.clone(),
             CommitmentConfig::confirmed(), // Confirmed commitment level
         ));
         
@@ -33,9 +34,15 @@ impl SolanaClient {
         
         Ok(SolanaClient {
             rpc_client,
+            rpc_url,
             commitment: CommitmentConfig::confirmed(),
             rate_limiter,
         })
+    }
+    
+    /// RPC URL'yi döndürür
+    pub fn get_url(&self) -> &str {
+        &self.rpc_url
     }
     
     /// Account bilgisini çeker
@@ -125,7 +132,15 @@ pub async fn execute_liquidation(
     
     // 2. Protokol trait'inden liquidation instruction al
     let liquidator_pubkey = wallet.pubkey();
-    let liquidation_ix = protocol.build_liquidation_instruction(opportunity, liquidator_pubkey)
+    // RPC client'ı Arc olarak geç (gerçek account'ları almak için)
+    let rpc_url = rpc_client.get_url().to_string();
+    let rpc_client_arc = Arc::new(SolanaClient::new(rpc_url)
+        .context("Failed to create RPC client for liquidation")?);
+    let liquidation_ix = protocol.build_liquidation_instruction(
+        opportunity, 
+        liquidator_pubkey,
+        Some(rpc_client_arc),
+    )
         .await
         .context("Failed to build liquidation instruction")?;
     
