@@ -16,7 +16,7 @@ pub async fn run_strategist(
     config: Config,
     wallet_balance_checker: Arc<WalletBalanceChecker>,
     rpc_client: Arc<SolanaClient>,
-    protocol: Arc<dyn Protocol>,
+    _protocol: Arc<dyn Protocol>,
 ) -> Result<()> {
     const MIN_RESERVE_LAMPORTS: u64 = 1_000_000; // 0.001 SOL minimum rezerv (transaction fee için)
     loop {
