@@ -118,17 +118,57 @@ async fn main() -> Result<()> {
         }
     };
     
-    // Protocol registry oluştur ve Solend ekle
+    // Protocol Registry oluştur - Trait tabanlı mimari (gelecekte çoklu protokol desteği için)
+    // 
+    // ŞU AN: Sadece Solend protokolü kullanılıyor (tek protokol - business requirement)
+    // GELECEK: Yeni protokol eklemek için sadece registry'ye eklemek yeterli
+    // 
+    // Mimari tasarım:
+    // - Protocol trait: Tüm protokoller için ortak arayüz
+    // - ProtocolRegistry: Protokolleri yönetir (şu an 1, gelecekte N)
+    // - Worker'lar: Trait üzerinden çalışır (protokole bağımlı değil)
+    let mut protocol_registry = protocol::ProtocolRegistry::new();
+    
+    // Solend protokolünü ekle (şu an tek protokol)
     let solend_protocol = match protocols::solend::SolendProtocol::new() {
         Ok(proto) => {
-            log::info!("✅ Protocol registered: {}", proto.id());
-            Arc::new(proto)
+            let protocol_id = proto.id().to_string();
+            let program_id = proto.program_id();
+            
+            // Registry'ye ekle (gelecekte çoklu protokol için)
+            protocol_registry.register(Box::new(proto));
+            
+            log::info!("✅ Protocol registered: {}", protocol_id);
+            log::info!("   Program ID: {}", program_id);
+            log::info!("   📌 Current mode: Single protocol (Solend)");
+            log::info!("   🔮 Architecture: Multi-protocol ready (trait-based)");
+            
+            // Şu an tek protokol olduğu için direkt kullanıyoruz
+            // Ancak tüm worker'lar trait üzerinden çalışıyor (Arc<dyn Protocol>)
+            // Bu sayede gelecekte yeni protokol eklenince worker'lar değişmeden çalışır
+            match protocols::solend::SolendProtocol::new() {
+                Ok(proto) => Arc::new(proto) as Arc<dyn protocol::Protocol>,
+                Err(e) => {
+                    log::error!("Failed to create protocol Arc: {}", e);
+                    return Err(e);
+                }
+            }
         }
         Err(e) => {
             log::error!("❌ Failed to initialize protocol: {}", e);
             return Err(e);
         }
     };
+    
+    // Protocol registry durumunu logla
+    let protocol_count = protocol_registry.count();
+    log::info!("📋 Protocol registry: {} protocol(s) registered", protocol_count);
+    
+    // Gelecekte çoklu protokol desteği için hazır olduğunu göster
+    if protocol_count == 1 {
+        log::info!("   💡 To add more protocols: Create new protocol struct + implement Protocol trait + register()");
+        log::info!("   📚 See: docs/MULTI_PROTOCOL_ARCHITECTURE.md");
+    }
     
     // Event Bus oluştur
     let bus = event_bus::EventBus::new(1000); // Buffer size: 1000 events

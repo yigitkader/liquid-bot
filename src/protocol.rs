@@ -46,11 +46,16 @@ pub struct LiquidationParams {
 }
 
 /// Protokol registry - Desteklenen protokolleri tutar
+/// 
+/// Bu yapı, trait tabanlı mimari sayesinde gelecekte çoklu protokol desteği için hazırdır.
+/// Şu an tek protokol (Solend) kullanılıyor, ancak yeni protokol eklemek için
+/// sadece `register()` çağrısı yeterlidir.
 pub struct ProtocolRegistry {
     protocols: Vec<Box<dyn Protocol>>,
 }
 
 impl ProtocolRegistry {
+    /// Yeni bir protocol registry oluşturur
     pub fn new() -> Self {
         ProtocolRegistry {
             protocols: Vec::new(),
@@ -58,11 +63,24 @@ impl ProtocolRegistry {
     }
     
     /// Protokol ekler
+    /// 
+    /// Gelecekte yeni protokol eklemek için:
+    /// ```rust
+    /// let marginfi = MarginFiProtocol::new()?;
+    /// registry.register(Box::new(marginfi));
+    /// ```
     pub fn register(&mut self, protocol: Box<dyn Protocol>) {
+        let protocol_id = protocol.id().to_string();
         self.protocols.push(protocol);
+        log::debug!("Protocol '{}' registered in registry", protocol_id);
     }
     
     /// Protokol ID'sine göre bulur
+    /// 
+    /// Gelecekte çoklu protokol desteğinde kullanılacak:
+    /// ```rust
+    /// let protocol = registry.find("Solend")?;
+    /// ```
     pub fn find(&self, protocol_id: &str) -> Option<&dyn Protocol> {
         self.protocols.iter()
             .find(|p| p.id() == protocol_id)
@@ -70,8 +88,15 @@ impl ProtocolRegistry {
     }
     
     /// Tüm protokolleri döndürür
+    /// 
+    /// Gelecekte çoklu protokol desteğinde tüm protokolleri iterate etmek için kullanılacak
     pub fn all(&self) -> &[Box<dyn Protocol>] {
         &self.protocols
+    }
+    
+    /// Şu an aktif protokol sayısını döndürür
+    pub fn count(&self) -> usize {
+        self.protocols.len()
     }
 }
 
