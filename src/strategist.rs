@@ -7,6 +7,7 @@ use crate::event::Event;
 use crate::event_bus::EventBus;
 use crate::wallet::WalletBalanceChecker;
 use crate::solana_client::SolanaClient;
+use crate::protocol::Protocol;
 
 /// Strategist worker - PotentiallyLiquidatable event'lerini iş kurallarına göre filtreler
 pub async fn run_strategist(
@@ -14,6 +15,8 @@ pub async fn run_strategist(
     bus: EventBus,
     config: Config,
     wallet_balance_checker: Arc<WalletBalanceChecker>,
+    rpc_client: Arc<SolanaClient>,
+    protocol: Arc<dyn Protocol>,
 ) -> Result<()> {
     const MIN_RESERVE_LAMPORTS: u64 = 1_000_000; // 0.001 SOL minimum rezerv (transaction fee için)
     loop {
@@ -33,20 +36,29 @@ pub async fn run_strategist(
                     );
                 }
                 
-                // 2. Slippage kontrolü
-                // todo: Not: Gerçek slippage hesaplaması için fiyat oracle'ına ihtiyaç var
-                // todo: Şimdilik basit bir kontrol - liquidation bonus'un max_slippage'den küçük olması gerekiyor
                 if approved {
-                    // Slippage = liquidation bonus'un bir kısmı olarak düşünülebilir
-                    // Basit bir yaklaşım: liquidation bonus'un %50'si slippage olarak kabul edilir
                     let estimated_slippage_bps = (opportunity.liquidation_bonus * 0.5 * 10000.0) as u16;
-                    if estimated_slippage_bps > config.max_slippage_bps {
+                    if let Ok(debt_mint) = Pubkey::try_from(opportunity.target_debt_mint.as_str()) {
+                        use crate::protocols::oracle_helper::{get_oracle_accounts_from_mint, read_oracle_price};
+                        if let Ok((pyth, switchboard)) = get_oracle_accounts_from_mint(&debt_mint) {
+                            if let Ok(Some(price)) = read_oracle_price(pyth.as_ref(), switchboard.as_ref(), Arc::clone(&rpc_client)).await {
+                                let confidence_slippage_bps = ((price.confidence / price.price) * 10000.0) as u16;
+                                let age_seconds = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64 - price.timestamp;
+                                
+                                if age_seconds > 300 {
+                                    approved = false;
+                                    rejection_reason = format!("oracle price too old: {}s", age_seconds);
+                                } else if confidence_slippage_bps > config.max_slippage_bps {
+                                    approved = false;
+                                    rejection_reason = format!("oracle slippage {} bps > max {} bps", confidence_slippage_bps, config.max_slippage_bps);
+                                }
+                            }
+                        }
+                    }
+                    if approved && estimated_slippage_bps > config.max_slippage_bps {
                         approved = false;
-                        rejection_reason = format!(
-                            "estimated slippage {} bps > max {} bps",
-                            estimated_slippage_bps,
-                            config.max_slippage_bps
-                        );
+                        rejection_reason = format!("estimated slippage {} bps > max {} bps", estimated_slippage_bps, config.max_slippage_bps);
                     }
                 }
                 

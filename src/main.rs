@@ -123,55 +123,18 @@ async fn main() -> Result<()> {
         }
     };
     
-    // Protocol Registry oluştur - Trait tabanlı mimari (gelecekte çoklu protokol desteği için)
-    // 
-    // ŞU AN: Sadece Solend protokolü kullanılıyor (tek protokol - business requirement)
-    // GELECEK: Yeni protokol eklemek için sadece registry'ye eklemek yeterli
-    // 
-    // Mimari tasarım:
-    // - Protocol trait: Tüm protokoller için ortak arayüz
-    // - ProtocolRegistry: Protokolleri yönetir (şu an 1, gelecekte N)
-    // - Worker'lar: Trait üzerinden çalışır (protokole bağımlı değil)
-    let mut protocol_registry = protocol::ProtocolRegistry::new();
-    
-    // Solend protokolünü ekle (şu an tek protokol)
     let solend_protocol = match protocols::solend::SolendProtocol::new() {
         Ok(proto) => {
             let protocol_id = proto.id().to_string();
             let program_id = proto.program_id();
-            
-            // Registry'ye ekle (gelecekte çoklu protokol için)
-            protocol_registry.register(Box::new(proto));
-            
-            log::info!("✅ Protocol registered: {}", protocol_id);
-            log::info!("   Program ID: {}", program_id);
-            log::info!("   📌 Current mode: Single protocol (Solend)");
-            log::info!("   🔮 Architecture: Multi-protocol ready (trait-based)");
-            
-            // Aynı protokolü tekrar oluştur (registry'deki Box'tan kullanılamaz çünkü Arc'a dönüştürülemez)
-            match protocols::solend::SolendProtocol::new() {
-                Ok(proto) => Arc::new(proto) as Arc<dyn protocol::Protocol>,
-                Err(e) => {
-                    log::error!("Failed to create protocol Arc: {}", e);
-                    return Err(e);
-                }
-            }
+            log::info!("✅ Protocol initialized: {} (program: {})", protocol_id, program_id);
+            Arc::new(proto) as Arc<dyn protocol::Protocol>
         }
         Err(e) => {
             log::error!("❌ Failed to initialize protocol: {}", e);
             return Err(e);
         }
     };
-    
-    // Protocol registry durumunu logla
-    let protocol_count = protocol_registry.count();
-    log::info!("📋 Protocol registry: {} protocol(s) registered", protocol_count);
-    
-    // Gelecekte çoklu protokol desteği için hazır olduğunu göster
-    if protocol_count == 1 {
-        log::info!("   💡 To add more protocols: Create new protocol struct + implement Protocol trait + register()");
-        log::info!("   📚 See: docs/MULTI_PROTOCOL_ARCHITECTURE.md");
-    }
     
     // Event Bus oluştur
     let bus = event_bus::EventBus::new(1000); // Buffer size: 1000 events
@@ -186,103 +149,87 @@ async fn main() -> Result<()> {
     // Performance tracker
     let performance_tracker = Arc::new(performance::PerformanceTracker::new());
     
-    // Worker'ları spawn et - production için task tracking
     log::info!("🔧 Starting worker tasks...");
     
-    let bus_clone_1 = bus.clone();
-    let config_clone_1 = config.clone();
-    let performance_tracker_clone_1 = Arc::clone(&performance_tracker);
-    let analyzer_handle = tokio::spawn(async move {
-        log::info!("   ✅ Analyzer worker started");
-        if let Err(e) = analyzer::run_analyzer(analyzer_receiver, bus_clone_1, config_clone_1, performance_tracker_clone_1).await {
-            log::error!("❌ Analyzer worker error: {}", e);
-        }
-        log::info!("   ⏹️  Analyzer worker stopped");
-    });
-    
-    // Wallet balance checker oluştur
     let wallet_balance_checker = Arc::new(wallet::WalletBalanceChecker::new(
         *wallet.pubkey(),
         Arc::clone(&rpc_client),
     ));
     
-    let bus_clone_2 = bus.clone();
-    let config_clone_2 = config.clone();
-    let wallet_balance_checker_clone = Arc::clone(&wallet_balance_checker);
-    let strategist_handle = tokio::spawn(async move {
-        log::info!("   ✅ Strategist worker started");
-        if let Err(e) = strategist::run_strategist(
-            strategist_receiver,
-            bus_clone_2,
-            config_clone_2,
-            wallet_balance_checker_clone,
-        ).await {
-            log::error!("❌ Strategist worker error: {}", e);
+    let analyzer_handle = tokio::spawn({
+        let bus = bus.clone();
+        let config = config.clone();
+        let performance_tracker = Arc::clone(&performance_tracker);
+        let protocol = Arc::clone(&solend_protocol);
+        async move {
+            log::info!("   ✅ Analyzer worker started");
+            if let Err(e) = analyzer::run_analyzer(analyzer_receiver, bus, config, performance_tracker, protocol).await {
+                log::error!("❌ Analyzer worker error: {}", e);
+            }
+            log::info!("   ⏹️  Analyzer worker stopped");
         }
-        log::info!("   ⏹️  Strategist worker stopped");
     });
     
-    // Executor için wallet, protocol, rpc_client ve performance_tracker clone et
-    let bus_clone_3 = bus.clone();
-    let config_clone_3 = config.clone();
-    let wallet_clone = Arc::clone(&wallet);
-    let protocol_clone = Arc::clone(&solend_protocol) as Arc<dyn protocol::Protocol>;
-    let rpc_client_clone = Arc::clone(&rpc_client);
-    let performance_tracker_clone_2 = Arc::clone(&performance_tracker);
-    let executor_handle = tokio::spawn(async move {
-        log::info!("   ✅ Executor worker started");
-        if let Err(e) = executor::run_executor(
-            executor_receiver,
-            bus_clone_3,
-            config_clone_3,
-            wallet_clone,
-            protocol_clone,
-            rpc_client_clone,
-            performance_tracker_clone_2,
-        ).await {
-            log::error!("❌ Executor worker error: {}", e);
+    let strategist_handle = tokio::spawn({
+        let bus = bus.clone();
+        let config = config.clone();
+        let wallet_balance_checker = Arc::clone(&wallet_balance_checker);
+        let rpc_client = Arc::clone(&rpc_client);
+        let protocol = Arc::clone(&solend_protocol);
+        async move {
+            log::info!("   ✅ Strategist worker started");
+            if let Err(e) = strategist::run_strategist(strategist_receiver, bus, config, wallet_balance_checker, rpc_client, protocol).await {
+                log::error!("❌ Strategist worker error: {}", e);
+            }
+            log::info!("   ⏹️  Strategist worker stopped");
         }
-        log::info!("   ⏹️  Executor worker stopped");
     });
     
-    let health_manager_for_logger = Arc::clone(&health_manager);
-    let logger_handle = tokio::spawn(async move {
-        log::info!("   ✅ Logger worker started");
-        if let Err(e) = logger::run_logger(logger_receiver, health_manager_for_logger).await {
-            log::error!("❌ Logger worker error: {}", e);
+    let executor_handle = tokio::spawn({
+        let bus = bus.clone();
+        let config = config.clone();
+        let wallet = Arc::clone(&wallet);
+        let protocol = Arc::clone(&solend_protocol);
+        let rpc_client = Arc::clone(&rpc_client);
+        let performance_tracker = Arc::clone(&performance_tracker);
+        async move {
+            log::info!("   ✅ Executor worker started");
+            if let Err(e) = executor::run_executor(executor_receiver, bus, config, wallet, protocol, rpc_client, performance_tracker).await {
+                log::error!("❌ Executor worker error: {}", e);
+            }
+            log::info!("   ⏹️  Executor worker stopped");
         }
-        log::info!("   ⏹️  Logger worker stopped");
     });
     
-    // Data source için rpc_client, protocol ve health_manager clone'ları
-    let rpc_client_for_source = Arc::clone(&rpc_client);
-    let protocol_for_source = Arc::clone(&solend_protocol) as Arc<dyn protocol::Protocol>;
-    let health_manager_for_source = Arc::clone(&health_manager);
+    let logger_handle = tokio::spawn({
+        let health_manager = Arc::clone(&health_manager);
+        async move {
+            log::info!("   ✅ Logger worker started");
+            if let Err(e) = logger::run_logger(logger_receiver, health_manager).await {
+                log::error!("❌ Logger worker error: {}", e);
+            }
+            log::info!("   ⏹️  Logger worker stopped");
+        }
+    });
     
-    // Health check task - periyodik olarak sistem sağlığını kontrol et
-    let health_manager_for_check = Arc::clone(&health_manager);
-    let performance_tracker_for_check = Arc::clone(&performance_tracker);
-    let health_check_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let is_healthy = health_manager_for_check.check_health().await;
-            let status = health_manager_for_check.get_status().await;
-            
-            // Performance metrics logla
-            performance_tracker_for_check.log_metrics().await;
-            
-            if !is_healthy {
-                log::warn!("⚠️  Health check failed: consecutive_errors={}, last_error={:?}", 
-                    status.consecutive_errors,
-                    status.last_error
-                );
-            } else {
-                log::debug!("✅ Health check passed: opportunities={}, tx={}/{}", 
-                    status.total_opportunities,
-                    status.successful_transactions,
-                    status.total_transactions
-                );
+    let health_check_handle = tokio::spawn({
+        let health_manager = Arc::clone(&health_manager);
+        let performance_tracker = Arc::clone(&performance_tracker);
+        async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let is_healthy = health_manager.check_health().await;
+                let status = health_manager.get_status().await;
+                performance_tracker.log_metrics().await;
+                
+                if !is_healthy {
+                    log::warn!("⚠️  Health check failed: consecutive_errors={}, last_error={:?}", 
+                        status.consecutive_errors, status.last_error);
+                } else {
+                    log::debug!("✅ Health check passed: opportunities={}, tx={}/{}", 
+                        status.total_opportunities, status.successful_transactions, status.total_transactions);
+                }
             }
         }
     });
@@ -290,13 +237,19 @@ async fn main() -> Result<()> {
     log::info!("✅ All workers started");
     log::info!("🎯 Bot is running. Press Ctrl+C to stop gracefully.");
     
-    // Data source'u başlat (ana task) - shutdown sinyali ile durdurulabilir
-    let data_source_handle = tokio::spawn(async move {
-        log::info!("   ✅ Data source worker started");
-        if let Err(e) = data_source::run_data_source(bus, config, rpc_client_for_source, protocol_for_source, health_manager_for_source).await {
-            log::error!("❌ Data source error: {}", e);
+    let data_source_handle = tokio::spawn({
+        let bus = bus.clone();
+        let config = config.clone();
+        let rpc_client = Arc::clone(&rpc_client);
+        let protocol = Arc::clone(&solend_protocol);
+        let health_manager = Arc::clone(&health_manager);
+        async move {
+            log::info!("   ✅ Data source worker started");
+            if let Err(e) = data_source::run_data_source(bus, config, rpc_client, protocol, health_manager).await {
+                log::error!("❌ Data source error: {}", e);
+            }
+            log::info!("   ⏹️  Data source worker stopped");
         }
-        log::info!("   ⏹️  Data source worker stopped");
     });
     
     // Graceful shutdown bekle

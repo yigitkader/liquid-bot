@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::{env, str::FromStr, sync::Arc};
 use solana_sdk::pubkey::Pubkey;
-use liquid_bot::solana_client::SolanaClient;
-use liquid_bot::protocols::reserve_validator::{self, validate_reserve_structure};
+use crate::solana_client::SolanaClient;
+use crate::protocols::reserve_validator;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     let rpc = Arc::new(SolanaClient::new(rpc_url)?);
 
-    let result = validate_reserve_structure(rpc, &reserve_pubkey).await?;
+    let result = reserve_validator::validate_reserve_structure(rpc, &reserve_pubkey).await?;
 
     println!("reserve: {}", reserve_pubkey);
     println!("success: {}", result.success);

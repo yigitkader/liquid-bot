@@ -1,6 +1,8 @@
 use anyhow::Result;
+use std::sync::Arc;
 use crate::config::Config;
 use crate::domain::{AccountPosition, LiquidationOpportunity};
+use crate::protocol::Protocol;
 
 /// Transaction fee hesaplama (compute unit'e göre)
 /// 
@@ -66,6 +68,54 @@ fn calculate_swap_cost_usd(
     amount_usd * (DEX_FEE_BPS as f64 / 10_000.0)
 }
 
+/// En kârlı collateral asset'i seçer
+/// 
+/// Seçim kriterleri:
+/// 1. Yeterli miktarda olmalı (seizable_collateral_usd'yi karşılayabilmeli)
+/// 2. En yüksek değerli olmalı (amount_usd en yüksek)
+/// 3. Eşitse, en yüksek LTV'ye sahip olanı seç (daha fazla değer = daha fazla profit potansiyeli)
+fn select_most_profitable_collateral(
+    collateral_assets: &[crate::domain::CollateralAsset],
+    required_collateral_usd: f64,
+) -> Option<&crate::domain::CollateralAsset> {
+    collateral_assets
+        .iter()
+        // Yeterli miktarda olanları filtrele
+        .filter(|asset| asset.amount_usd >= required_collateral_usd)
+        // En yüksek değerli olanı seç (amount_usd en yüksek)
+        // Eşitse, en yüksek LTV'ye sahip olanı seç
+        .max_by(|a, b| {
+            // Önce amount_usd'ye göre karşılaştır
+            a.amount_usd
+                .partial_cmp(&b.amount_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Eşitse LTV'ye göre karşılaştır
+                .then_with(|| a.ltv.partial_cmp(&b.ltv).unwrap_or(std::cmp::Ordering::Equal))
+        })
+}
+
+/// En kârlı debt asset'i seçer
+/// 
+/// Seçim kriterleri:
+/// 1. En yüksek değerli olmalı (amount_usd en yüksek)
+/// 2. Eşitse, en düşük borrow rate'e sahip olanı seç (daha az maliyet)
+fn select_most_profitable_debt(
+    debt_assets: &[crate::domain::DebtAsset],
+) -> Option<&crate::domain::DebtAsset> {
+    debt_assets
+        .iter()
+        // En yüksek değerli olanı seç (amount_usd en yüksek)
+        // Eşitse, en düşük borrow rate'e sahip olanı seç
+        .max_by(|a, b| {
+            // Önce amount_usd'ye göre karşılaştır
+            a.amount_usd
+                .partial_cmp(&b.amount_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Eşitse borrow rate'e göre ters sırala (düşük rate = daha iyi)
+                .then_with(|| b.borrow_rate.partial_cmp(&a.borrow_rate).unwrap_or(std::cmp::Ordering::Equal))
+        })
+}
+
 /// Likidasyon fırsatı hesaplama (GERÇEKÇİ)
 /// 
 /// Gerçekçi profit hesaplaması yapar:
@@ -74,32 +124,44 @@ fn calculate_swap_cost_usd(
 /// - Token swap maliyeti (eğer gerekirse)
 /// - Konservatif profit tahmini
 /// 
-/// NOT: TODO Protokol parametreleri Protocol trait'inden alınmalı, şu an config'ten alınıyor.
+/// Protokol parametreleri Protocol trait'inden alınır.
 pub async fn calculate_liquidation_opportunity(
     position: &AccountPosition,
     config: &Config,
+    protocol: Arc<dyn Protocol>,
 ) -> Result<Option<LiquidationOpportunity>> {
     // Health factor kontrolü
     if position.health_factor >= 1.0 || position.total_debt_usd <= 0.0 {
         return Ok(None);
     }
     
-    // Protokol parametreleri (şu an config'ten, gelecekte Protocol trait'inden alınacak)
-    // Solend için tipik değerler:
-    let close_factor = 0.5; // %50'ye kadar likide edilebilir (protokol limiti)
-    let liquidation_bonus = 0.05; // %5 liquidation bonus (protokol parametresi)
-    
-    // İlk debt asset'i al (gerçekte en kârlı olanı seçilmeli)
-    let debt_asset = position.debt_assets.first()
-        .ok_or_else(|| anyhow::anyhow!("No debt assets found in position"))?;
-    
-    // TODO İlk collateral asset'i al (gerçekte en kârlı olanı seçilmeli)
-    let collateral_asset = position.collateral_assets.first()
-        .ok_or_else(|| anyhow::anyhow!("No collateral assets found in position"))?;
+    // Protokol parametrelerini Protocol trait'inden al
+    let liquidation_params = protocol.get_liquidation_params();
+    let close_factor = liquidation_params.close_factor;
+    let liquidation_bonus = liquidation_params.liquidation_bonus;
     
     // Max liquidatable amount hesaplama (USD cinsinden)
     // Protokol limiti: close_factor * total_debt
     let max_liquidatable_debt_usd = position.total_debt_usd * close_factor;
+    
+    // Seizable collateral hesaplama (USD cinsinden) - önce hesapla ki yeterli miktarda olanı seçebilelim
+    // Likidasyon bonusu ile birlikte alınacak teminat
+    // Formül: liquidated_debt * (1 + liquidation_bonus)
+    let seizable_collateral_usd = max_liquidatable_debt_usd * (1.0 + liquidation_bonus);
+    
+    // En kârlı debt asset'i seç
+    let debt_asset = select_most_profitable_debt(&position.debt_assets)
+        .ok_or_else(|| anyhow::anyhow!("No debt assets found in position"))?;
+    
+    // En kârlı collateral asset'i seç (yeterli miktarda olan en yüksek değerli)
+    let collateral_asset = select_most_profitable_collateral(&position.collateral_assets, seizable_collateral_usd)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No sufficient collateral assets found. Required: ${:.2}, Available: {:?}",
+                seizable_collateral_usd,
+                position.collateral_assets.iter().map(|a| a.amount_usd).collect::<Vec<_>>()
+            )
+        })?;
     
     // USD'yi token amount'una çevir
     // Token price = amount_usd / amount (native units)
@@ -111,11 +173,6 @@ pub async fn calculate_liquidation_opportunity(
     
     // Max liquidatable amount (token native units)
     let max_liquidatable = (max_liquidatable_debt_usd / debt_token_price_usd) as u64;
-    
-    // Seizable collateral hesaplama (USD cinsinden)
-    // Likidasyon bonusu ile birlikte alınacak teminat
-    // Formül: liquidated_debt * (1 + liquidation_bonus)
-    let seizable_collateral_usd = max_liquidatable_debt_usd * (1.0 + liquidation_bonus);
     
     // USD'yi collateral token amount'una çevir
     let collateral_token_price_usd = if collateral_asset.amount > 0 {
@@ -144,19 +201,32 @@ pub async fn calculate_liquidation_opportunity(
     );
     
     // 2. Slippage maliyeti
-    // Todo Config'ten max_slippage_bps kullan, ancak gerçek slippage genellikle daha düşüktür
-    // todo Konservatif tahmin: max_slippage'in %50'si (gerçek slippage genellikle daha düşük)
-    let estimated_slippage_bps = (config.max_slippage_bps as f64 * 0.5) as u16;
+    // Konservatif tahmin: Config'teki max_slippage'in %50'si kullanılır
+    // Gerçek slippage genellikle daha düşüktür, bu yüzden konservatif bir tahmin yapıyoruz
+    // İşlem büyüklüğüne göre dinamik slippage (büyük işlemler = daha yüksek slippage)
+    let base_slippage_bps = config.max_slippage_bps as f64 * 0.5; // Konservatif tahmin: %50
+    
+    // İşlem büyüklüğüne göre slippage ayarı:
+    // - Küçük işlemler (< $10k): %40'ı kullan (daha düşük slippage)
+    // - Orta işlemler ($10k-$100k): %50'yi kullan (varsayılan)
+    // - Büyük işlemler (> $100k): %60'ı kullan (daha yüksek slippage)
+    let size_multiplier = if seizable_collateral_usd < 10_000.0 {
+        0.4 // Küçük işlemler için daha düşük slippage
+    } else if seizable_collateral_usd > 100_000.0 {
+        0.6 // Büyük işlemler için daha yüksek slippage
+    } else {
+        0.5 // Orta işlemler için varsayılan
+    };
+    
+    let estimated_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
     let slippage_cost_usd = calculate_slippage_cost_usd(
         seizable_collateral_usd,
         estimated_slippage_bps,
     );
     
     // 3. Token swap maliyeti (eğer collateral ve debt farklı token'larsa)
-    let needs_swap = position.debt_assets.first()
-        .and_then(|d| position.collateral_assets.first()
-            .map(|c| c.mint != d.mint))
-        .unwrap_or(false);
+    // Seçilen en kârlı asset'leri kullan
+    let needs_swap = collateral_asset.mint != debt_asset.mint;
     
     let swap_cost_usd = if needs_swap {
         calculate_swap_cost_usd(seizable_collateral_usd, true)

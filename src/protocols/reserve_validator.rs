@@ -127,7 +127,7 @@ pub mod known_reserves {
     pub fn usdc_reserve() -> anyhow::Result<Pubkey> {
         // Varsayılan USDC reserve adresi (mainnet)
         let addr = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
-        Pubkey::from_str(addr)
+        addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid hardcoded USDC reserve address {}: {}", addr, e))
     }
     
@@ -137,7 +137,7 @@ pub mod known_reserves {
     pub fn sol_reserve() -> anyhow::Result<Pubkey> {
         // Varsayılan SOL reserve adresi (mainnet)
         let addr = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36";
-        Pubkey::from_str(addr)
+        addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid hardcoded SOL reserve address {}: {}", addr, e))
     }
 }

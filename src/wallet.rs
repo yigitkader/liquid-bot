@@ -5,7 +5,6 @@ use solana_sdk::{
 };
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 
 /// Wallet yönetimi - Keypair okuma ve transaction imzalama
 pub struct WalletManager {
@@ -91,21 +90,8 @@ impl WalletBalanceChecker {
         Ok(balance.saturating_sub(min_reserve))
     }
 
-    /// Associated Token Account (ATA) adresini hesaplar
     fn get_associated_token_address(&self, mint: &Pubkey) -> Result<Pubkey> {
-        let associated_token_program_id = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-            .map_err(|_| anyhow::anyhow!("Invalid associated token program ID"))?;
-        
-        let token_program_id = spl_token::id();
-        let seeds = &[
-            self.wallet_pubkey.as_ref(),
-            token_program_id.as_ref(),
-            mint.as_ref(),
-        ];
-        
-        Pubkey::try_find_program_address(seeds, &associated_token_program_id)
-            .map(|(pubkey, _)| pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Failed to derive associated token address"))
+        crate::protocols::solend_accounts::get_associated_token_address(&self.wallet_pubkey, mint)
     }
 
     /// Wallet'daki belirli bir token'ın balance'ını kontrol et

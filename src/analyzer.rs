@@ -6,6 +6,7 @@ use crate::event::Event;
 use crate::event_bus::EventBus;
 use crate::math;
 use crate::performance::PerformanceTracker;
+use crate::protocol::Protocol;
 
 /// Analyzer worker - AccountUpdated event'lerini alır, HF kontrolü yapar
 pub async fn run_analyzer(
@@ -13,6 +14,7 @@ pub async fn run_analyzer(
     bus: EventBus,
     config: Config,
     performance_tracker: Arc<PerformanceTracker>,
+    protocol: Arc<dyn Protocol>,
 ) -> Result<()> {
     loop {
         match receiver.recv().await {
@@ -20,7 +22,7 @@ pub async fn run_analyzer(
                 // Health Factor kontrolü
                 if position.health_factor < config.hf_liquidation_threshold {
                     // Potansiyel likidasyon fırsatı hesapla
-                    if let Some(opportunity) = math::calculate_liquidation_opportunity(&position, &config).await? {
+                    if let Some(opportunity) = math::calculate_liquidation_opportunity(&position, &config, Arc::clone(&protocol)).await? {
                         // Opportunity ID oluştur (account + timestamp için unique)
                         let opportunity_id = format!("{}_{}", position.account_address, 
                             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)

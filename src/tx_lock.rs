@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// TX-lock mekanizması - Aynı pozisyonun tekrar işlenmesini önler
 pub struct TxLock {
