@@ -10,50 +10,7 @@ use crate::protocol::{Protocol, LiquidationParams};
 use crate::solana_client::SolanaClient;
 use sha2::{Sha256, Digest};
 use std::sync::Arc;
-
-// Solend account helper functions
-mod solend_accounts {
-    use anyhow::Result;
-    use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
-    
-    /// Associated Token Account (ATA) adresini hesaplar
-    pub fn get_associated_token_address(
-        wallet: &Pubkey,
-        mint: &Pubkey,
-    ) -> Result<Pubkey> {
-        let associated_token_program_id = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-            .map_err(|_| anyhow::anyhow!("Invalid associated token program ID"))?;
-        
-        let token_program_id = spl_token::id();
-        let seeds = &[
-            wallet.as_ref(),
-            token_program_id.as_ref(),
-            mint.as_ref(),
-        ];
-        
-        Pubkey::try_find_program_address(seeds, &associated_token_program_id)
-            .map(|(pubkey, _)| pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Failed to derive associated token address"))
-    }
-    
-    /// Lending Market Authority PDA'sını hesaplar
-    pub fn derive_lending_market_authority(
-        lending_market: &Pubkey,
-        program_id: &Pubkey,
-    ) -> Result<Pubkey> {
-        let seeds = &[
-            b"lending-market-authority".as_ref(),
-            lending_market.as_ref(),
-        ];
-        
-        Pubkey::try_find_program_address(seeds, program_id)
-            .map(|(pubkey, _)| pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Failed to derive lending market authority"))
-    }
-}
-
-use solend_accounts::{get_associated_token_address, derive_lending_market_authority};
+use crate::protocols::solend_accounts::{get_associated_token_address, derive_lending_market_authority};
 
 // Solend IDL account structures
 mod solend_idl {
@@ -362,39 +319,29 @@ impl Protocol for SolendProtocol {
         let total_collateral_usd = obligation.total_deposited_value_usd();
         let total_debt_usd = obligation.total_borrowed_value_usd();
         
-        // Collateral assets'i domain modeline dönüştür
-        // Gerçek mint address'lerini reserve account'larından al
         use crate::protocols::reserve_helper::parse_reserve_account;
+        
+        async fn get_reserve_info(
+            reserve_pubkey: &Pubkey,
+            rpc_client: Option<&Arc<SolanaClient>>,
+        ) -> Option<crate::protocols::reserve_helper::ReserveInfo> {
+            let rpc = rpc_client?;
+            let account = rpc.get_account(reserve_pubkey).await.ok()?;
+            parse_reserve_account(reserve_pubkey, &account).await.ok()
+        }
         
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {
-            // RPC client varsa gerçek reserve account'unu parse et
-            let (mint, ltv) = if let Some(rpc) = &rpc_client {
-                match rpc.get_account(&deposit.deposit_reserve).await {
-                    Ok(reserve_account) => {
-                        match parse_reserve_account(&deposit.deposit_reserve, &reserve_account).await {
-                            Ok(reserve_info) => {
-                                // Gerçek mint ve LTV değerlerini kullan
-                                let mint = reserve_info.collateral_mint
-                                    .unwrap_or_else(|| reserve_info.liquidity_mint.unwrap_or(deposit.deposit_reserve));
-                                (mint.to_string(), reserve_info.ltv)
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to parse reserve {}: {}, using fallback", deposit.deposit_reserve, e);
-                                // Fallback: Reserve pubkey'i mint olarak kullan
-                                (deposit.deposit_reserve.to_string(), 0.75)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to fetch reserve {}: {}, using fallback", deposit.deposit_reserve, e);
-                        // Fallback: Reserve pubkey'i mint olarak kullan
-                        (deposit.deposit_reserve.to_string(), 0.75)
-                    }
+            let (mint, ltv) = match get_reserve_info(&deposit.deposit_reserve, rpc_client.as_deref()).await {
+                Some(reserve_info) => {
+                    let mint = reserve_info.collateral_mint
+                        .unwrap_or_else(|| reserve_info.liquidity_mint.unwrap_or(deposit.deposit_reserve));
+                    (mint.to_string(), reserve_info.ltv)
                 }
-            } else {
-                // RPC client yoksa fallback: Reserve pubkey'i mint olarak kullan
-                (deposit.deposit_reserve.to_string(), 0.75)
+                None => {
+                    log::warn!("Failed to get reserve info for {}, using fallback", deposit.deposit_reserve);
+                    (deposit.deposit_reserve.to_string(), 0.75)
+                }
             };
             
             collateral_assets.push(crate::domain::CollateralAsset {
@@ -405,41 +352,19 @@ impl Protocol for SolendProtocol {
             });
         }
         
-        // Debt assets'i domain modeline dönüştür
-        // Gerçek mint address'lerini reserve account'larından al
         let mut debt_assets = Vec::new();
         for borrow in &obligation.borrows {
-            // Borrowed amount'u WAD'dan normal değere çevir
-            // WAD = 1e18 (Wei Adjusted Decimal)
             let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
             
-            // RPC client varsa gerçek reserve account'unu parse et
-            let (mint, borrow_rate) = if let Some(rpc) = &rpc_client {
-                match rpc.get_account(&borrow.borrow_reserve).await {
-                    Ok(reserve_account) => {
-                        match parse_reserve_account(&borrow.borrow_reserve, &reserve_account).await {
-                            Ok(reserve_info) => {
-                                // Gerçek mint ve borrow rate değerlerini kullan
-                                let mint = reserve_info.liquidity_mint
-                                    .unwrap_or(borrow.borrow_reserve);
-                                (mint.to_string(), reserve_info.borrow_rate)
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to parse reserve {}: {}, using fallback", borrow.borrow_reserve, e);
-                                // Fallback: Reserve pubkey'i mint olarak kullan
-                                (borrow.borrow_reserve.to_string(), 0.0)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to fetch reserve {}: {}, using fallback", borrow.borrow_reserve, e);
-                        // Fallback: Reserve pubkey'i mint olarak kullan
-                        (borrow.borrow_reserve.to_string(), 0.0)
-                    }
+            let (mint, borrow_rate) = match get_reserve_info(&borrow.borrow_reserve, rpc_client.as_deref()).await {
+                Some(reserve_info) => {
+                    let mint = reserve_info.liquidity_mint.unwrap_or(borrow.borrow_reserve);
+                    (mint.to_string(), reserve_info.borrow_rate)
                 }
-            } else {
-                // RPC client yoksa fallback: Reserve pubkey'i mint olarak kullan
-                (borrow.borrow_reserve.to_string(), 0.0)
+                None => {
+                    log::warn!("Failed to get reserve info for {}, using fallback", borrow.borrow_reserve);
+                    (borrow.borrow_reserve.to_string(), 0.0)
+                }
             };
             
             debt_assets.push(crate::domain::DebtAsset {

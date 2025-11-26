@@ -21,6 +21,7 @@ mod performance;
 
 mod protocols {
     pub mod solend;
+    pub mod solend_accounts;
     pub mod reserve_helper;
     pub mod solend_reserve;
     pub mod oracle_helper;
@@ -147,9 +148,7 @@ async fn main() -> Result<()> {
             log::info!("   📌 Current mode: Single protocol (Solend)");
             log::info!("   🔮 Architecture: Multi-protocol ready (trait-based)");
             
-            // Şu an tek protokol olduğu için direkt kullanıyoruz
-            // Ancak tüm worker'lar trait üzerinden çalışıyor (Arc<dyn Protocol>)
-            // Bu sayede gelecekte yeni protokol eklenince worker'lar değişmeden çalışır
+            // Aynı protokolü tekrar oluştur (registry'deki Box'tan kullanılamaz çünkü Arc'a dönüştürülemez)
             match protocols::solend::SolendProtocol::new() {
                 Ok(proto) => Arc::new(proto) as Arc<dyn protocol::Protocol>,
                 Err(e) => {

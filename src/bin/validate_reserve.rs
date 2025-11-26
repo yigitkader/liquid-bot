@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::{env, sync::Arc};
+use std::{env, str::FromStr, sync::Arc};
 use solana_sdk::pubkey::Pubkey;
 use liquid_bot::solana_client::SolanaClient;
 use liquid_bot::protocols::reserve_validator::{self, validate_reserve_structure};
@@ -46,15 +46,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-{
-  "cells": [],
-  "metadata": {
-    "language_info": {
-      "name": "python"
-    }
-  },
-  "nbformat": 4,
-  "nbformat_minor": 2
 }
