@@ -18,6 +18,7 @@ pub async fn run_rpc_poller(
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let program_id = protocol.program_id();
 
+    // todo: check here to everything implemented correctly
     // ⚠️ RATE LIMITING UYARISI
     // getProgramAccounts çok ağır bir RPC çağrısıdır ve ücretsiz RPC'ler bunu sınırlar
     // Önerilen çözümler:
@@ -42,7 +43,7 @@ pub async fn run_rpc_poller(
     );
 
     let mut consecutive_errors = 0;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+    let max_consecutive_errors = config.max_consecutive_errors;
 
     loop {
         match fetch_and_publish_positions(&bus, Arc::clone(&rpc_client), protocol.as_ref()).await {
@@ -60,11 +61,11 @@ pub async fn run_rpc_poller(
                     "{} (attempt {}/{})",
                     error_msg,
                     consecutive_errors,
-                    MAX_CONSECUTIVE_ERRORS
+                    max_consecutive_errors
                 );
                 health_manager.record_error(error_msg).await;
 
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                if consecutive_errors >= max_consecutive_errors {
                     log::error!(
                         "Too many consecutive errors ({}), stopping poller",
                         consecutive_errors

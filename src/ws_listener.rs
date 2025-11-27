@@ -6,7 +6,7 @@ use crate::event_bus::EventBus;
 /// 
 /// NOT: Şu an placeholder implementasyon. RPC polling aktif ve çalışıyor.
 /// WebSocket implementasyonu gelecek iyileştirme olarak planlanmıştır.
-pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
+pub async fn run_ws_listener(_bus: EventBus, config: Config) -> Result<()> {
     // todo:
     // Gelecek İyileştirme: Solana WebSocket (PubSub) bağlantısı
     // 
@@ -43,7 +43,7 @@ pub async fn run_ws_listener(_bus: EventBus, _config: Config) -> Result<()> {
         // bus.publish(Event::AccountUpdated(position))?;
         
         // Şu an: RPC polling çalıştığı için burada bekliyoruz
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(config.ws_listener_sleep_seconds)).await;
     }
 }
 

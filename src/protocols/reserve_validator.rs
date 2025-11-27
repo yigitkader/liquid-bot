@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub async fn validate_reserve_structure(
     rpc_client: Arc<SolanaClient>,
     reserve_pubkey: &Pubkey,
+    config: Option<&crate::config::Config>,
 ) -> Result<ValidationResult> {
     log::info!("Validating reserve account structure: {}", reserve_pubkey);
 
@@ -21,12 +22,17 @@ pub async fn validate_reserve_structure(
 
     log::debug!("Reserve account data size: {} bytes", account.data.len());
 
-    const EXPECTED_RESERVE_SIZE: usize = 619;
-    if account.data.len() != EXPECTED_RESERVE_SIZE {
+    // Expected reserve size is now configurable via config.expected_reserve_size (default: 619)
+    // This allows for different reserve versions or structures
+    let expected_size = config
+        .map(|c| c.expected_reserve_size)
+        .unwrap_or(619); // Default: 619 bytes (mainnet Solend reserve)
+    
+    if account.data.len() != expected_size {
         log::warn!(
             "⚠️  Account size mismatch: {} bytes (expected {} bytes). This might indicate a different Reserve version or structure.",
             account.data.len(),
-            EXPECTED_RESERVE_SIZE
+            expected_size
         );
     }
 
@@ -115,7 +121,7 @@ pub async fn validate_reserve_structure(
             log::info!(
                 "Account data size: {} bytes (expected: {} bytes)",
                 account.data.len(),
-                EXPECTED_RESERVE_SIZE
+                expected_size
             );
             log::info!("First 200 bytes (hex): {}", hex_dump);
             
@@ -173,7 +179,7 @@ pub mod known_reserves {
         let addr = config
             .and_then(|c| c.usdc_reserve_address.as_ref())
             .map(|s| s.as_str())
-            .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"); // Default mainnet USDC reserve
+            .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"); // Default mainnet USDC reserve // todo: check here why hardcoded
         
         addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid USDC reserve address {}: {}", addr, e))
@@ -184,7 +190,7 @@ pub mod known_reserves {
         let addr = config
             .and_then(|c| c.sol_reserve_address.as_ref())
             .map(|s| s.as_str())
-            .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"); // Default mainnet SOL reserve
+            .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"); // Default mainnet SOL reserve // todo: check here why hardcoded
         
         addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid SOL reserve address {}: {}", addr, e))

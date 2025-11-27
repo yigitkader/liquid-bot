@@ -69,13 +69,19 @@ impl WalletManager {
 pub struct WalletBalanceChecker {
     wallet_pubkey: Pubkey,
     rpc_client: std::sync::Arc<crate::solana_client::SolanaClient>,
+    config: Option<crate::config::Config>,
 }
 
 impl WalletBalanceChecker {
-    pub fn new(wallet_pubkey: Pubkey, rpc_client: std::sync::Arc<crate::solana_client::SolanaClient>) -> Self {
+    pub fn new(
+        wallet_pubkey: Pubkey,
+        rpc_client: std::sync::Arc<crate::solana_client::SolanaClient>,
+        config: Option<crate::config::Config>,
+    ) -> Self {
         WalletBalanceChecker {
             wallet_pubkey,
             rpc_client,
+            config,
         }
     }
     
@@ -96,7 +102,7 @@ impl WalletBalanceChecker {
     }
 
     fn get_associated_token_address(&self, mint: &Pubkey) -> Result<Pubkey> {
-        crate::protocols::solend_accounts::get_associated_token_address(&self.wallet_pubkey, mint)
+        crate::protocols::solend_accounts::get_associated_token_address(&self.wallet_pubkey, mint, self.config.as_ref())
     }
     
     pub async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64> {

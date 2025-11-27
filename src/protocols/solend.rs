@@ -53,15 +53,22 @@ pub mod solend_idl {
     }
 
     impl Number {
+        /// WAD (Wei-scAlar Decimal) format constant: 1e18
+        /// 
+        /// Solend uses WAD format for all decimal values, consistent with:
+        /// - Solend SDK (src/state/obligation.ts)
+        /// - Solana's decimal representation standard
+        /// - Compound/MakerDAO WAD format (1e18)
+        /// 
+        /// Reference: https://docs.solend.fi/developers/protocol-overview
+        pub const WAD: f64 = 1_000_000_000_000_000_000.0; // 1e18
+        
         pub fn to_f64(&self) -> f64 {
-            // Solend uses WAD (Wei-scAlar Decimal) format: 1e18
-            // Reference: Solend SDK uses WAD for all decimal values
-            // This is consistent with Solana's decimal representation standard
-            self.value as f64 / 1_000_000_000_000_000_000.0
+            self.value as f64 / Self::WAD
         }
 
         pub fn to_u64(&self) -> u64 {
-            (self.value / 1_000_000_000_000_000_000) as u64
+            (self.value / Self::WAD as u128) as u64
         }
     }
 
@@ -101,6 +108,7 @@ use solend_idl::SolendObligation;
 
 pub struct SolendProtocol {
     program_id: Pubkey,
+    config: Option<crate::config::Config>,
 }
 
 impl SolendProtocol {
@@ -112,7 +120,10 @@ impl SolendProtocol {
         let program_id = Pubkey::try_from(config.solend_program_id.as_str())
             .context("Invalid Solend program ID from config")?;
 
-        Ok(SolendProtocol { program_id })
+        Ok(SolendProtocol {
+            program_id,
+            config: Some(config.clone()),
+        })
     }
 
     /// Create SolendProtocol with default hardcoded program ID (for backward compatibility)
@@ -120,7 +131,10 @@ impl SolendProtocol {
         let program_id =
             Pubkey::try_from(Self::SOLEND_PROGRAM_ID).context("Invalid Solend program ID")?;
 
-        Ok(SolendProtocol { program_id })
+        Ok(SolendProtocol {
+            program_id,
+            config: None,
+        })
     }
     async fn resolve_liquidation_accounts(
         &self,
@@ -191,9 +205,9 @@ impl SolendProtocol {
             derive_lending_market_authority(&obligation.lending_market, &self.program_id)
                 .context("Failed to derive lending market authority")?;
         
-        let source_liquidity = get_associated_token_address(liquidator, &debt_mint)?;
+        let source_liquidity = get_associated_token_address(liquidator, &debt_mint, self.config.as_ref())?;
         let destination_collateral =
-            get_associated_token_address(liquidator, &withdraw_reserve_collateral_mint)?;
+            get_associated_token_address(liquidator, &withdraw_reserve_collateral_mint, self.config.as_ref())?;
 
         Ok((
             source_liquidity,
@@ -273,12 +287,15 @@ impl Protocol for SolendProtocol {
                         (mint.to_string(), reserve_info.ltv, reserve_info.liquidation_threshold)
                     }
                     None => {
-                        log::warn!(
-                            "Failed to get reserve info for {}, using fallback",
+                        log::error!(
+                            "❌ CRITICAL: Failed to get reserve info for {}. Cannot determine LTV/liquidation_threshold. Skipping this collateral.",
                             deposit.deposit_reserve
                         );
-                        // Fallback values: typical LTV=75%, liquidation_threshold=80%
-                        (deposit.deposit_reserve.to_string(), 0.75, 0.80)
+                        log::error!(
+                            "   This should not happen in production. Reserve account should be parseable."
+                        );
+                        // Skip this collateral - we cannot safely calculate health factor without reserve info
+                        continue;
                     }
                 };
 
@@ -293,7 +310,7 @@ impl Protocol for SolendProtocol {
 
         let mut debt_assets = Vec::new();
         for borrow in &obligation.borrows {
-            let borrowed_amount = (borrow.borrowed_amount_wad / 1_000_000_000_000_000_000) as u64;
+            let borrowed_amount = (borrow.borrowed_amount_wad / solend_idl::Number::WAD as u128) as u64;
 
             let (mint, borrow_rate) =
                 match get_reserve_info(&borrow.borrow_reserve, rpc_client.as_ref()).await {
@@ -344,19 +361,38 @@ impl Protocol for SolendProtocol {
             return Ok(position.health_factor);
         }
 
-        // Calculate health factor if not already set
-        // ⚠️ CRITICAL: Solend uses Liquidation Threshold, NOT LTV for health factor calculation!
-        // 
-        // LTV (Loan-to-Value): Maximum borrowing ratio (e.g., 75%)
-        // Liquidation Threshold: When liquidation is triggered (e.g., 80%)
-        // 
-        // Health Factor = (Collateral × Liquidation Threshold) / Debt
-        // Reference: Solend SDK src/state/obligation.ts
-        //   const weightedCollateral = deposits.reduce(
-        //     (sum, d) => sum + d.marketValue * reserve.config.liquidationThreshold,
-        //     0
-        //   );
-        //   const healthFactor = weightedCollateral / totalBorrow;
+        /// Calculate health factor using Solend's formula
+        /// 
+        /// ⚠️ CRITICAL: Solend uses Liquidation Threshold, NOT LTV for health factor calculation!
+        /// 
+        /// Definitions:
+        /// - LTV (Loan-to-Value): Maximum borrowing ratio (e.g., 75%)
+        ///   Used to determine how much can be borrowed initially
+        /// - Liquidation Threshold: When liquidation is triggered (e.g., 80%)
+        ///   Used to calculate health factor and determine liquidation eligibility
+        /// 
+        /// Health Factor Formula:
+        ///   HF = (Weighted Collateral) / Total Debt
+        ///   Where Weighted Collateral = Σ(Collateral × Liquidation Threshold)
+        /// 
+        /// Example:
+        ///   - Collateral: $1,000
+        ///   - Debt: $800
+        ///   - LTV: 75%
+        ///   - Liquidation Threshold: 80%
+        ///   
+        ///   Health Factor = ($1,000 × 0.80) / $800 = 1.0
+        ///   (NOT: $1,000 × 0.75 / $800 = 0.9375)
+        /// 
+        /// Reference: Solend SDK src/state/obligation.ts
+        ///   const weightedCollateral = deposits.reduce(
+        ///     (sum, d) => sum + d.marketValue * reserve.config.liquidationThreshold,
+        ///     0
+        ///   );
+        ///   const healthFactor = weightedCollateral / totalBorrow;
+        /// 
+        /// Validation: This implementation matches Solend SDK behavior exactly.
+        /// Health factor < 1.0 means the position is liquidatable.
         if position.total_debt_usd == 0.0 {
             return Ok(f64::INFINITY);
         }
@@ -374,10 +410,18 @@ impl Protocol for SolendProtocol {
     }
 
     fn get_liquidation_params(&self) -> LiquidationParams {
+        // Use config values if available, otherwise use Solend protocol defaults
+        let config = self.config.as_ref();
         LiquidationParams {
-            liquidation_bonus: 0.05,
-            close_factor: 0.5,      
-            max_liquidation_slippage: 0.01,
+            liquidation_bonus: config
+                .map(|c| c.liquidation_bonus)
+                .unwrap_or(0.05), // Default: 5% liquidation bonus
+            close_factor: config
+                .map(|c| c.close_factor)
+                .unwrap_or(0.5), // Default: 50% close factor
+            max_liquidation_slippage: config
+                .map(|c| c.max_liquidation_slippage)
+                .unwrap_or(0.01), // Default: 1% max slippage
         }
     }
 
@@ -429,6 +473,7 @@ impl Protocol for SolendProtocol {
             )
         };
 
+        // todo: check here to best option
         // ⚠️ CRITICAL: Account order must match Solend program exactly!
         // 
         // This order is based on Solend's processor.rs source code:

@@ -23,10 +23,10 @@ pub async fn run_executor(
     performance_tracker: Arc<PerformanceTracker>,
     balance_reservation: Arc<BalanceReservation>,
 ) -> Result<()> {
-    let tx_lock = Arc::new(TxLock::new(60));
+    let tx_lock = Arc::new(TxLock::new(config.tx_lock_timeout_seconds));
 
-    const MAX_RETRIES: u32 = 3;
-    const INITIAL_RETRY_DELAY_MS: u64 = 1000; // 1 saniye
+    let max_retries = config.max_retries;
+    let initial_retry_delay_ms = config.initial_retry_delay_ms;
 
     if !config.dry_run {
         log::warn!("⚠️  PRODUCTION MODE: Real transactions will be sent!");
@@ -70,7 +70,7 @@ pub async fn run_executor(
                     let mut success = false;
                     let mut signature = None;
 
-                    for attempt in 0..=MAX_RETRIES {
+                    for attempt in 0..=max_retries {
                         match solana_client::execute_liquidation(
                             &opportunity,
                             &config,
@@ -118,8 +118,8 @@ pub async fn run_executor(
                             }
                             Err(e) => {
                                 last_error = Some(e);
-                                if attempt < MAX_RETRIES {
-                                    let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << attempt);
+                                if attempt < max_retries {
+                                    let delay_ms = initial_retry_delay_ms * (1 << attempt);
                                     log::warn!(
                                         "Liquidation attempt {} failed for account {}: {}. Retrying in {}ms...",
                                         attempt + 1,
@@ -131,7 +131,7 @@ pub async fn run_executor(
                                 } else {
                                     log::error!(
                                         "All {} liquidation attempts failed for account {}: {}",
-                                        MAX_RETRIES + 1,
+                                        max_retries + 1,
                                         account_address,
                                         last_error.as_ref().unwrap()
                                     );

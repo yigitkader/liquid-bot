@@ -10,9 +10,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-// Solend'in oracle staleness limiti: 60 saniye
-// get_price fonksiyonunda kullanılan limit ile aynı
-const MAX_ORACLE_AGE_SECONDS: i64 = 60;
+// Oracle staleness limit is now configurable via config.max_oracle_age_seconds (default: 60)
 
 pub async fn run_strategist(
     mut receiver: broadcast::Receiver<Event>,
@@ -41,7 +39,7 @@ pub async fn run_strategist(
 
                 if approved {
                     let estimated_slippage_bps =
-                        (opportunity.liquidation_bonus * 0.5 * 10000.0) as u16;
+                        (opportunity.liquidation_bonus * config.slippage_estimation_multiplier * 10000.0) as u16;
                     let debt_mint_str = &opportunity.target_debt_mint;
                     let mut debt_reserve_pubkey: Option<Pubkey> = None;
 
@@ -86,13 +84,13 @@ pub async fn run_strategist(
                                                     pyth.as_ref(),
                                                     switchboard.as_ref(),
                                                     Arc::clone(&rpc_client),
+                                                    Some(&config),
                                                 )
                                                 .await
                                                 {
                                                     // Pyth confidence = %68 confidence interval (1 sigma)
-                                                    // %95 confidence interval için Z-score 1.96 kullanılmalı
-                                                    const Z_SCORE_95: f64 = 1.96;
-                                                    let confidence_95 = price.confidence * Z_SCORE_95;
+                                                    // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
+                                                    let confidence_95 = price.confidence * config.z_score_95;
                                                     let confidence_slippage_bps = ((confidence_95
                                                         / price.price)
                                                         * 10000.0)
@@ -104,13 +102,13 @@ pub async fn run_strategist(
                                                         as i64
                                                         - price.timestamp;
 
-                                                    if age_seconds > MAX_ORACLE_AGE_SECONDS {
-                                                        approved = false;
-                                                        rejection_reason = format!(
-                                                            "oracle price too old: {}s (max: {}s)",
-                                                            age_seconds,
-                                                            MAX_ORACLE_AGE_SECONDS
-                                                        );
+                                                            if age_seconds > config.max_oracle_age_seconds as i64 {
+                                                                approved = false;
+                                                                rejection_reason = format!(
+                                                                    "oracle price too old: {}s (max: {}s)",
+                                                                    age_seconds,
+                                                                    config.max_oracle_age_seconds
+                                                                );
                                                     } else if confidence_slippage_bps
                                                         > config.max_slippage_bps
                                                     {
@@ -133,19 +131,19 @@ pub async fn run_strategist(
                                                 {
                                                     use crate::protocols::oracle_helper::get_oracle_accounts_from_mint;
                                                     if let Ok((pyth, switchboard)) =
-                                                        get_oracle_accounts_from_mint(&debt_mint)
+                                                        get_oracle_accounts_from_mint(&debt_mint, Some(&config))
                                                     {
                                                         if let Ok(Some(price)) = read_oracle_price(
                                                             pyth.as_ref(),
                                                             switchboard.as_ref(),
                                                             Arc::clone(&rpc_client),
+                                                            Some(&config),
                                                         )
                                                         .await
                                                         {
                                                             // Pyth confidence = %68 confidence interval (1 sigma)
-                                                            // %95 confidence interval için Z-score 1.96 kullanılmalı
-                                                            const Z_SCORE_95: f64 = 1.96;
-                                                            let confidence_95 = price.confidence * Z_SCORE_95;
+                                                            // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
+                                                            let confidence_95 = price.confidence * config.z_score_95;
                                                             let confidence_slippage_bps =
                                                                 ((confidence_95 / price.price)
                                                                     * 10000.0)
@@ -160,12 +158,12 @@ pub async fn run_strategist(
                                                                     as i64
                                                                     - price.timestamp;
 
-                                                            if age_seconds > MAX_ORACLE_AGE_SECONDS {
+                                                            if age_seconds > config.max_oracle_age_seconds as i64 {
                                                                 approved = false;
                                                                 rejection_reason = format!(
                                                                     "oracle price too old: {}s (max: {}s)",
                                                                     age_seconds,
-                                                                    MAX_ORACLE_AGE_SECONDS
+                                                                    config.max_oracle_age_seconds
                                                                 );
                                                             } else if confidence_slippage_bps
                                                                 > config.max_slippage_bps

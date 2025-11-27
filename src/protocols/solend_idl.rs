@@ -35,15 +35,22 @@ pub struct Number {
 }
 
 impl Number {
+    /// WAD (Wei-scAlar Decimal) format constant: 1e18
+    /// 
+    /// Solend uses WAD format for all decimal values, consistent with:
+    /// - Solend SDK (src/state/obligation.ts)
+    /// - Solana's decimal representation standard
+    /// - Compound/MakerDAO WAD format (1e18)
+    /// 
+    /// Reference: https://docs.solend.fi/developers/protocol-overview
+    pub const WAD: f64 = 1_000_000_000_000_000_000.0; // 1e18
+    
     pub fn to_f64(&self) -> f64 {
-        // Solend uses WAD (Wei-scAlar Decimal) format: 1e18
-        // Reference: Solend SDK uses WAD for all decimal values
-        // This is consistent with Solana's decimal representation standard
-        self.value as f64 / 1_000_000_000_000_000_000.0
+        self.value as f64 / Self::WAD
     }
 
     pub fn to_u64(&self) -> u64 {
-        (self.value / 1_000_000_000_000_000_000) as u64
+        (self.value / Self::WAD as u128) as u64
     }
 }
 

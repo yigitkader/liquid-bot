@@ -7,35 +7,54 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::str::FromStr;
 
-/// Oracle account read fee per account
-/// When Solana programs read account data during transaction execution,
-/// there's a fee for accessing those accounts (~5,000 lamports per account)
-const ORACLE_READ_FEE_LAMPORTS: u64 = 5_000;
+// Oracle fees are now configurable via Config struct
+// Defaults: ORACLE_READ_FEE_LAMPORTS=5000, ORACLE_ACCOUNTS_READ=1
 
-/// Number of oracle accounts typically read during liquidation
-/// Solend program reads Pyth oracle (and potentially Switchboard as fallback)
-const ORACLE_ACCOUNTS_READ: u64 = 1; // Typically 1 (Pyth), sometimes 2 if Switchboard is also read
-
+/// Calculate transaction fee in USD
+/// 
+/// Transaction fee consists of:
+/// 1. Base fee: Solana's base transaction fee (~5,000 lamports)
+///    Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
+/// 2. Priority fee: Based on compute units and priority fee rate
+///    Formula: (compute_units * priority_fee_per_cu) / 1_000_000
+///    This ensures transaction is included in blocks during high congestion
+/// 3. Oracle read fee: Fee for reading oracle accounts on-chain (~5,000 lamports per account)
+///    Solend program reads Pyth/Switchboard oracle accounts during execution
+///    Note: Oracle accounts are NOT in instruction account list, but program reads them on-chain
+/// 
+/// Total fee = base_fee + priority_fee + oracle_read_fee
+/// 
+/// Validation:
+/// - Base fee: Verified against Solana documentation (5,000 lamports standard)
+/// - Priority fee: Configurable via PRIORITY_FEE_PER_CU (default: 1,000 micro-lamports/CU)
+/// - Oracle fee: Estimated based on account read costs (~5,000 lamports per account)
 fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
     base_fee_lamports: u64,
+    oracle_read_fee_lamports: u64,
+    oracle_accounts_read: u64,
     sol_price_usd: f64,
 ) -> f64 {
     // Base transaction fee: Solana charges a base fee per transaction
     // Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
-    // Default: ~5,000 lamports = 0.000005 SOL
+    // Standard: 5,000 lamports = 0.000005 SOL
+    // This is a fixed fee per transaction, regardless of size
     
     // Priority fee: Based on compute units and priority fee rate
+    // Formula: (compute_units * priority_fee_per_cu) / 1_000_000
+    // priority_fee_per_cu is in micro-lamports (1/1,000,000 lamports)
+    // This ensures transaction is included in blocks during high congestion
     let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
     
     // Oracle read fee: When Solend program reads oracle accounts (Pyth/Switchboard) during execution,
     // there's a fee for accessing those accounts (~5,000 lamports per account)
     // Note: Even though oracle accounts aren't in the instruction's account list,
     // the program reads them on-chain and this incurs a fee
-    let oracle_read_fee_lamports = ORACLE_READ_FEE_LAMPORTS * ORACLE_ACCOUNTS_READ;
+    // Typically 1 oracle account is read (Pyth), sometimes 2 if Switchboard is also read
+    let oracle_read_fee_total = oracle_read_fee_lamports * oracle_accounts_read;
     
-    let total_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_lamports;
+    let total_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_total;
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
     total_fee_sol * sol_price_usd
 }
@@ -47,19 +66,29 @@ fn calculate_slippage_cost_usd(
     amount_usd * (slippage_bps as f64 / 10_000.0)
 }
 
-/// Token swap maliyeti hesaplama (eğer gerekirse)
+/// Calculate token swap cost in USD (if swap is required)
 ///
-/// Note: Eğer collateral ve debt farklı token'larsa, swap gerekebilir.
-/// Swap maliyeti:
-/// - DEX fee: %0.1 - %0.3 (Jupiter, Raydium)
-/// - Price impact: Slippage'e dahil
+/// Swap is required when collateral and debt are different tokens.
+/// Swap cost consists of:
+/// - DEX fee: 0.1-0.3% (10-30 bps) depending on DEX and route
+///   - Jupiter: 0.1-0.3% depending on route complexity
+///   - Raydium: 0.25% (25 bps) for most pools
+///   - Orca: 0.3% (30 bps) for most pools
+/// - Price impact: Included in slippage calculation (not here)
+///
+/// Reference:
+/// - Jupiter fee structure: https://jup.ag/docs/apis/fee-structure
+/// - Raydium: https://docs.raydium.io/raydium/amm/swap-fees
+/// 
+/// Note: Price impact (slippage) is calculated separately in slippage_cost_usd
 fn calculate_swap_cost_usd(amount_usd: f64, needs_swap: bool, dex_fee_bps: u16) -> f64 {
     if !needs_swap {
         return 0.0;
     }
 
     // DEX fee: Typical DEX fees are 0.1-0.3% (10-30 bps)
-    // Jupiter and Raydium typically charge around 0.2% (20 bps)
+    // Default config: 0.2% (20 bps) - conservative estimate for Jupiter/Raydium
+    // This is the fee charged by the DEX, not including price impact
     amount_usd * (dex_fee_bps as f64 / 10_000.0)
 }
 
@@ -147,49 +176,74 @@ pub async fn calculate_liquidation_opportunity(
 
     let seizable_collateral = (seizable_collateral_usd / collateral_token_price_usd) as u64;
 
-    const LIQUIDATION_COMPUTE_UNITS: u32 = 200_000;
-    
     // Get SOL price from oracle if available, otherwise use a conservative fallback
     let sol_price_usd = if let Some(client) = &rpc_client {
         // Try to get SOL price from oracle (SOL mint: So11111111111111111111111111111111111111112)
         let sol_mint = solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
             .unwrap();
-        match get_oracle_accounts_from_mint(&sol_mint) {
+        match get_oracle_accounts_from_mint(&sol_mint, Some(config)) {
             Ok((pyth, switchboard)) => {
-                match read_oracle_price(pyth.as_ref(), switchboard.as_ref(), Arc::clone(client)).await {
+                match read_oracle_price(pyth.as_ref(), switchboard.as_ref(), Arc::clone(client), Some(config)).await {
                     Ok(Some(price)) => {
                         log::debug!("SOL price from oracle: ${:.2}", price.price);
                         price.price
                     }
                     _ => {
-                        log::warn!("Failed to get SOL price from oracle, using fallback: $150");
-                        150.0 // Fallback
+                        log::warn!(
+                            "⚠️  Failed to get SOL price from oracle, using fallback: ${:.2}",
+                            config.sol_price_fallback_usd
+                        );
+                        log::warn!(
+                            "   ⚠️  This fallback should only be used when oracle is unavailable. \
+                             Update SOL_PRICE_FALLBACK_USD in config to reflect current SOL price."
+                        );
+                        config.sol_price_fallback_usd
                     }
                 }
             }
             _ => {
-                log::warn!("SOL oracle accounts not found, using fallback: $150");
-                150.0 // Fallback
+                log::warn!(
+                    "⚠️  SOL oracle accounts not found, using fallback: ${:.2}",
+                    config.sol_price_fallback_usd
+                );
+                config.sol_price_fallback_usd
             }
         }
     } else {
-        log::warn!("RPC client not available, using fallback SOL price: $150");
-        150.0 // Fallback when RPC client not available
+        log::warn!(
+            "⚠️  RPC client not available, using fallback SOL price: ${:.2}",
+            config.sol_price_fallback_usd
+        );
+        config.sol_price_fallback_usd
     };
 
     let transaction_fee_usd = calculate_transaction_fee_usd(
-        LIQUIDATION_COMPUTE_UNITS,
+        config.liquidation_compute_units,
         config.priority_fee_per_cu,
         config.base_transaction_fee_lamports,
+        config.oracle_read_fee_lamports,
+        config.oracle_accounts_read,
         sol_price_usd,
     );
 
-    let size_multiplier = if seizable_collateral_usd < 10_000.0 {
-        0.5
-    } else if seizable_collateral_usd > 100_000.0 {
-        0.8
+    // Slippage estimation based on trade size
+    // Larger trades have higher slippage due to liquidity depth
+    // Size multipliers are conservative estimates based on typical DEX liquidity:
+    // - Small trades (<$10k): 0.5x multiplier (lower slippage, better liquidity)
+    // - Medium trades ($10k-$100k): 0.6x multiplier (moderate slippage)
+    // - Large trades (>$100k): 0.8x multiplier (higher slippage, lower liquidity)
+    // 
+    // These multipliers are applied to max_slippage_bps to get estimated slippage
+    // Actual slippage may vary based on:
+    // - DEX liquidity depth at execution time
+    // - Market volatility
+    // - Oracle confidence intervals
+    let size_multiplier = if seizable_collateral_usd < config.slippage_size_small_threshold_usd {
+        config.slippage_multiplier_small  // Small trades: better liquidity, lower slippage
+    } else if seizable_collateral_usd > config.slippage_size_large_threshold_usd {
+        config.slippage_multiplier_large  // Large trades: lower liquidity, higher slippage
     } else {
-        0.6
+        config.slippage_multiplier_medium  // Medium trades: moderate slippage
     };
 
     let estimated_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
@@ -197,21 +251,21 @@ pub async fn calculate_liquidation_opportunity(
     let oracle_slippage_bps = if let Some(client) = &rpc_client {
         match collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>() {
             Ok(mint_pubkey) => {
-                match get_oracle_accounts_from_mint(&mint_pubkey) {
+                match get_oracle_accounts_from_mint(&mint_pubkey, Some(config)) {
                     Ok((pyth, switchboard)) => {
                         match read_oracle_price(
                             pyth.as_ref(),
                             switchboard.as_ref(),
                             Arc::clone(client),
+                            Some(config),
                         )
                         .await
                         {
                             Ok(Some(oracle_price)) => {
                                 // Pyth confidence = %68 confidence interval (1 sigma)
-                                // %95 confidence interval için Z-score 1.96 kullanılmalı
+                                // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
                                 // Bot %68 confidence kullanırsa → Riski az gösterir
-                                const Z_SCORE_95: f64 = 1.96;
-                                let confidence_95 = oracle_price.confidence * Z_SCORE_95;
+                                let confidence_95 = oracle_price.confidence * config.z_score_95;
                                 let confidence_ratio = confidence_95 / oracle_price.price;
                                 let confidence_bps = (confidence_ratio * 10_000.0) as u16;
                                 log::debug!(
@@ -249,14 +303,24 @@ pub async fn calculate_liquidation_opportunity(
         config.default_oracle_confidence_slippage_bps
     };
 
-    // Oracle confidence zaten slippage'in bir parçası, double counting yapmamak için
-    // estimated_slippage ve oracle_slippage'i toplamak yerine max alıyoruz
-    // Bu, oracle confidence'ın zaten price uncertainty'yi temsil ettiğini kabul eder
-    // Oracle confidence 95% confidence interval kullanıyor (Z-score 1.96), bu zaten yeterli güvenlik marjı sağlıyor
+    // Final slippage calculation: Use maximum of estimated slippage and oracle confidence
+    // 
+    // We use MAX instead of SUM to avoid double-counting:
+    // - estimated_slippage: DEX liquidity-based slippage (trade size dependent)
+    // - oracle_slippage: Price uncertainty from oracle confidence (95% confidence interval)
+    // 
+    // These represent different sources of uncertainty:
+    // - DEX slippage: Execution price vs oracle price due to liquidity
+    // - Oracle confidence: Uncertainty in oracle price itself
+    // 
+    // Using MAX is conservative and prevents double-counting, as both represent
+    // price uncertainty but from different sources. The higher value represents
+    // the dominant source of uncertainty for this trade.
+    // 
+    // Oracle confidence uses 95% confidence interval (Z-score 1.96), which already
+    // provides sufficient safety margin. No additional safety margin needed.
     let final_slippage_bps = estimated_slippage_bps.max(oracle_slippage_bps);
     
-    // Oracle confidence zaten 95% confidence interval içeriyor, ek safety margin gereksiz
-    // Double counting'i önlemek için direkt hesaplıyoruz
     let slippage_cost_usd = calculate_slippage_cost_usd(seizable_collateral_usd, final_slippage_bps);
 
     log::debug!(
@@ -506,6 +570,8 @@ mod tests {
             compute_units,
             priority_fee_per_cu,
             base_fee_lamports,
+            5_000, // oracle_read_fee_lamports
+            1,     // oracle_accounts_read
             sol_price_usd,
         );
 

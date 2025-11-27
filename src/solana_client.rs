@@ -70,6 +70,9 @@ impl SolanaClient {
         let program_id = *program_id;
 
         // Retry with exponential backoff for rate limit errors
+        // Note: Jitter is hardcoded here because SolanaClient doesn't have config access
+        // For production, consider adding config to SolanaClient or passing jitter as parameter
+        // Default jitter: 1000ms (configurable via RETRY_JITTER_MAX_MS in main)
         Self::fetch_with_retry(
             {
                 let client = Arc::clone(&client);
@@ -89,13 +92,14 @@ impl SolanaClient {
                 }
             },
             5, // max_retries
+            1000, // jitter_max_ms (default, should be configurable)
         )
         .await
     }
 
     /// Helper function for retrying operations with exponential backoff and jitter
     /// Specifically handles 429 (rate limit) errors
-    async fn fetch_with_retry<T, F, Fut>(operation: F, max_retries: u32) -> Result<T>
+    async fn fetch_with_retry<T, F, Fut>(operation: F, max_retries: u32, jitter_max_ms: u64) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -114,9 +118,10 @@ impl SolanaClient {
                         || error_str.contains("429 too many requests");
 
                     if is_rate_limit && attempt < max_retries {
-                        // Exponential backoff: 2^attempt seconds, with jitter (0-1000ms)
+                        // Exponential backoff: 2^attempt seconds, with jitter
+                        // Jitter prevents thundering herd problem when multiple clients retry simultaneously
                         let base_delay_secs = 2_u64.pow(attempt);
-                        let jitter_ms = rand::thread_rng().gen_range(0..1000);
+                        let jitter_ms = rand::thread_rng().gen_range(0..jitter_max_ms);
                         let backoff = Duration::from_secs(base_delay_secs)
                             + Duration::from_millis(jitter_ms);
 
@@ -188,7 +193,7 @@ impl SolanaClient {
 
 pub async fn execute_liquidation(
     opportunity: &LiquidationOpportunity,
-    _config: &Config,
+    config: &Config,
     wallet: &WalletManager,
     protocol: &dyn Protocol,
     rpc_client: Arc<SolanaClient>,
@@ -209,8 +214,8 @@ pub async fn execute_liquidation(
         .await
         .context("Failed to build liquidation instruction")?;
 
-    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(200_000);
-    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(1_000);
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(config.default_compute_units);
+    let priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(config.default_priority_fee_per_cu);
 
     let instructions = vec![compute_budget_ix, priority_fee_ix, liquidation_ix];
 

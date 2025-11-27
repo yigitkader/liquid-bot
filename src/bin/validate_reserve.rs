@@ -61,9 +61,11 @@ async fn main() -> Result<()> {
     );
 
     // Reserve account'unu validate et
+    // Note: Config not available in binary, using default expected size (619 bytes)
     let result = reserve_validator::validate_reserve_structure(
         rpc_client,
         &reserve_pubkey,
+        None, // Config not available in binary
     )
     .await
     .context("Failed to validate reserve structure")?;

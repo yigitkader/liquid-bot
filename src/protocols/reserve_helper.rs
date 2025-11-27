@@ -45,13 +45,32 @@ pub async fn parse_reserve_account(
     let liquidation_threshold = reserve.config.liquidation_threshold as f64 / 100.0;
     let liquidation_bonus = reserve.liquidation_bonus();
 
-    // Calculate borrow rate based on utilization rate
-    // Solend uses a piecewise linear function:
-    // - If utilization < optimal: linear interpolation between min and optimal
-    // - If utilization >= optimal: linear interpolation between optimal and max
-    let utilization_rate = if reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as u64 > 0 {
-        let total_liquidity = reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as u64;
-        (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as f64 / total_liquidity as f64
+    /// Calculate borrow rate based on utilization rate
+    /// 
+    /// Solend uses a piecewise linear interest rate model:
+    /// 
+    /// 1. If utilization < optimal_utilization:
+    ///    - Linear interpolation between min_borrow_rate and optimal_borrow_rate
+    ///    - Formula: min_rate + (optimal_rate - min_rate) * (utilization / optimal_utilization)
+    /// 
+    /// 2. If utilization >= optimal_utilization:
+    ///    - Linear interpolation between optimal_borrow_rate and max_borrow_rate
+    ///    - Formula: optimal_rate + (max_rate - optimal_rate) * (excess_utilization / remaining_utilization)
+    /// 
+    /// This model incentivizes optimal utilization:
+    /// - Low utilization: Lower rates encourage borrowing
+    /// - Optimal utilization: Balanced rates
+    /// - High utilization: Higher rates discourage borrowing and encourage repayment
+    /// 
+    /// Reference: Solend's interest rate model implementation
+    /// Validation: Matches Solend SDK behavior for borrow rate calculation
+    /// 
+    /// WAD format constant: 1e18 (from Solend's WAD format)
+    const WAD: u128 = 1_000_000_000_000_000_000;
+    
+    let utilization_rate = if reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / WAD) as u64 > 0 {
+        let total_liquidity = reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / WAD) as u64;
+        (reserve.liquidity.borrowed_amount_wads / WAD) as f64 / total_liquidity as f64
     } else {
         0.0
     };

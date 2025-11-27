@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     let shutdown_manager = Arc::new(ShutdownManager::new());
 
-    let health_manager = Arc::new(health::HealthManager::new(300)); // 5 dakika max error age
+    let health_manager = Arc::new(health::HealthManager::new(config.health_manager_max_error_age_seconds));
     let balance_reservation = Arc::new(balance_reservation::BalanceReservation::new());
 
     let shutdown = shutdown_manager.clone();
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let bus = event_bus::EventBus::new(1000); // Buffer size: 1000 events
+    let bus = event_bus::EventBus::new(config.event_bus_buffer_size);
     log::info!("✅ Event bus initialized");
 
     let analyzer_receiver = bus.subscribe();
@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
     let wallet_balance_checker = Arc::new(wallet::WalletBalanceChecker::new(
         *wallet.pubkey(),
         Arc::clone(&rpc_client),
+        Some(config.clone()),
     ));
 
     let analyzer_handle = tokio::spawn({

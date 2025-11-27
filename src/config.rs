@@ -28,6 +28,55 @@ pub struct Config {
     // Known reserve addresses (for testing/validation)
     pub usdc_reserve_address: Option<String>,
     pub sol_reserve_address: Option<String>,
+    // Associated Token Program ID (standard Solana program)
+    pub associated_token_program_id: String,
+    // SOL price fallback (only used when oracle fails - should be updated regularly)
+    pub sol_price_fallback_usd: f64,
+    // Oracle mappings (mint -> oracle account) - optional, falls back to hardcoded defaults
+    // Format: JSON string with {"mint": {"pyth": "oracle_account", "switchboard": "oracle_account"}}
+    // Example: {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {"pyth": "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98", "switchboard": "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD"}}
+    // If not provided, uses hardcoded defaults for USDC, USDT, SOL, ETH, BTC
+    pub oracle_mappings_json: Option<String>,
+    // Oracle configuration
+    pub max_oracle_age_seconds: u64,
+    pub oracle_read_fee_lamports: u64,
+    pub oracle_accounts_read: u64,
+    // Transaction configuration
+    pub liquidation_compute_units: u32,
+    // Statistical configuration
+    pub z_score_95: f64, // Z-score for 95% confidence interval (1.96)
+    // Slippage size-based multipliers
+    pub slippage_size_small_threshold_usd: f64,
+    pub slippage_size_large_threshold_usd: f64,
+    pub slippage_multiplier_small: f64,
+    pub slippage_multiplier_medium: f64,
+    pub slippage_multiplier_large: f64,
+    // Slippage estimation multiplier (for strategist)
+    pub slippage_estimation_multiplier: f64,
+    // Transaction lock configuration
+    pub tx_lock_timeout_seconds: u64,
+    // Retry configuration
+    pub max_retries: u32,
+    pub initial_retry_delay_ms: u64,
+    // Compute budget configuration
+    pub default_compute_units: u32,
+    pub default_priority_fee_per_cu: u64,
+    // WebSocket/Worker sleep configuration
+    pub ws_listener_sleep_seconds: u64,
+    // RPC polling configuration
+    pub max_consecutive_errors: u32,
+    // Reserve validation configuration
+    pub expected_reserve_size: usize,
+    // Liquidation parameters (Solend protocol defaults)
+    pub liquidation_bonus: f64,
+    pub close_factor: f64,
+    pub max_liquidation_slippage: f64,
+    // Event bus configuration
+    pub event_bus_buffer_size: usize,
+    // Health manager configuration
+    pub health_manager_max_error_age_seconds: u64,
+    // Retry jitter configuration
+    pub retry_jitter_max_ms: u64,
 }
 
 impl Config {
@@ -75,14 +124,30 @@ impl Config {
                 .unwrap_or_else(|_| "5000".to_string()) // ~0.000005 SOL (Solana base fee)
                 .parse()
                 .context("Invalid BASE_TRANSACTION_FEE_LAMPORTS value")?,
+            // DEX fee: Typical DEX fees on Solana
+            // - Jupiter: 0.1-0.3% (10-30 bps) depending on route
+            // - Raydium: 0.25% (25 bps) for most pools
+            // - Orca: 0.3% (30 bps) for most pools
+            // Default: 0.2% (20 bps) - conservative estimate for Jupiter/Raydium
+            // Reference: https://jup.ag/docs/apis/fee-structure
             dex_fee_bps: env::var("DEX_FEE_BPS")
                 .unwrap_or_else(|_| "20".to_string()) // 0.2% (typical for Jupiter/Raydium)
                 .parse()
                 .context("Invalid DEX_FEE_BPS value")?,
+            // Minimum profit margin: Ensures we have a buffer above transaction costs
+            // Default: 1% (100 bps) of debt amount
+            // This prevents marginal opportunities that may become unprofitable due to:
+            // - Price movements between detection and execution
+            // - Slippage variations
+            // - Oracle confidence intervals
             min_profit_margin_bps: env::var("MIN_PROFIT_MARGIN_BPS")
                 .unwrap_or_else(|_| "100".to_string()) // 1% minimum profit margin
                 .parse()
                 .context("Invalid MIN_PROFIT_MARGIN_BPS value")?,
+            // Default oracle confidence slippage: Used when oracle price is unavailable
+            // This represents the uncertainty in price when we can't read oracle confidence
+            // Default: 1% (100 bps) - conservative estimate
+            // Note: When oracle is available, we use actual confidence interval (95% with Z-score 1.96)
             default_oracle_confidence_slippage_bps: env::var("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS")
                 .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
                 .parse()
@@ -104,6 +169,135 @@ impl Config {
             sol_reserve_address: env::var("SOL_RESERVE_ADDRESS")
                 .ok()
                 .or_else(|| Some("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36".to_string())),
+            // Associated Token Program ID - standard Solana program (rarely changes)
+            associated_token_program_id: env::var("ASSOCIATED_TOKEN_PROGRAM_ID")
+                .unwrap_or_else(|_| "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string()),
+            // SOL price fallback - only used when oracle fails (should be updated regularly)
+            // ⚠️ WARNING: This is a fallback value. Oracle should be used in production.
+            // Update this value regularly to reflect current SOL price.
+            sol_price_fallback_usd: env::var("SOL_PRICE_FALLBACK_USD")
+                .unwrap_or_else(|_| "150.0".to_string())
+                .parse()
+                .context("Invalid SOL_PRICE_FALLBACK_USD value")?,
+            // Oracle mappings: Optional JSON string with mint -> oracle account mappings
+            // If not provided, uses hardcoded defaults (USDC, USDT, SOL, ETH, BTC)
+            // This allows users to add custom oracle mappings or update existing ones
+            oracle_mappings_json: env::var("ORACLE_MAPPINGS_JSON").ok(),
+            // Oracle configuration
+            max_oracle_age_seconds: env::var("MAX_ORACLE_AGE_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("Invalid MAX_ORACLE_AGE_SECONDS value (must be u64)")?,
+            oracle_read_fee_lamports: env::var("ORACLE_READ_FEE_LAMPORTS")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse()
+                .context("Invalid ORACLE_READ_FEE_LAMPORTS value")?,
+            oracle_accounts_read: env::var("ORACLE_ACCOUNTS_READ")
+                .unwrap_or_else(|_| "1".to_string())
+                .parse()
+                .context("Invalid ORACLE_ACCOUNTS_READ value")?,
+            // Transaction configuration
+            liquidation_compute_units: env::var("LIQUIDATION_COMPUTE_UNITS")
+                .unwrap_or_else(|_| "200000".to_string())
+                .parse()
+                .context("Invalid LIQUIDATION_COMPUTE_UNITS value")?,
+            // Statistical configuration
+            z_score_95: env::var("Z_SCORE_95")
+                .unwrap_or_else(|_| "1.96".to_string())
+                .parse()
+                .context("Invalid Z_SCORE_95 value")?,
+            // Slippage size-based multipliers
+            slippage_size_small_threshold_usd: env::var("SLIPPAGE_SIZE_SMALL_THRESHOLD_USD")
+                .unwrap_or_else(|_| "10000.0".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_SIZE_SMALL_THRESHOLD_USD value")?,
+            slippage_size_large_threshold_usd: env::var("SLIPPAGE_SIZE_LARGE_THRESHOLD_USD")
+                .unwrap_or_else(|_| "100000.0".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_SIZE_LARGE_THRESHOLD_USD value")?,
+            slippage_multiplier_small: env::var("SLIPPAGE_MULTIPLIER_SMALL")
+                .unwrap_or_else(|_| "0.5".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_MULTIPLIER_SMALL value")?,
+            slippage_multiplier_medium: env::var("SLIPPAGE_MULTIPLIER_MEDIUM")
+                .unwrap_or_else(|_| "0.6".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_MULTIPLIER_MEDIUM value")?,
+            slippage_multiplier_large: env::var("SLIPPAGE_MULTIPLIER_LARGE")
+                .unwrap_or_else(|_| "0.8".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_MULTIPLIER_LARGE value")?,
+            // Slippage estimation multiplier (for strategist)
+            slippage_estimation_multiplier: env::var("SLIPPAGE_ESTIMATION_MULTIPLIER")
+                .unwrap_or_else(|_| "0.5".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_ESTIMATION_MULTIPLIER value")?,
+            // Transaction lock configuration
+            tx_lock_timeout_seconds: env::var("TX_LOCK_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("Invalid TX_LOCK_TIMEOUT_SECONDS value")?,
+            // Retry configuration
+            max_retries: env::var("MAX_RETRIES")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()
+                .context("Invalid MAX_RETRIES value")?,
+            initial_retry_delay_ms: env::var("INITIAL_RETRY_DELAY_MS")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("Invalid INITIAL_RETRY_DELAY_MS value")?,
+            // Compute budget configuration
+            default_compute_units: env::var("DEFAULT_COMPUTE_UNITS")
+                .unwrap_or_else(|_| "200000".to_string())
+                .parse()
+                .context("Invalid DEFAULT_COMPUTE_UNITS value")?,
+            default_priority_fee_per_cu: env::var("DEFAULT_PRIORITY_FEE_PER_CU")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("Invalid DEFAULT_PRIORITY_FEE_PER_CU value")?,
+            // WebSocket/Worker sleep configuration
+            ws_listener_sleep_seconds: env::var("WS_LISTENER_SLEEP_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .context("Invalid WS_LISTENER_SLEEP_SECONDS value")?,
+            // RPC polling configuration
+            max_consecutive_errors: env::var("MAX_CONSECUTIVE_ERRORS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .context("Invalid MAX_CONSECUTIVE_ERRORS value")?,
+            // Reserve validation configuration
+            expected_reserve_size: env::var("EXPECTED_RESERVE_SIZE")
+                .unwrap_or_else(|_| "619".to_string())
+                .parse()
+                .context("Invalid EXPECTED_RESERVE_SIZE value")?,
+            // Liquidation parameters (Solend protocol defaults)
+            liquidation_bonus: env::var("LIQUIDATION_BONUS")
+                .unwrap_or_else(|_| "0.05".to_string())
+                .parse()
+                .context("Invalid LIQUIDATION_BONUS value")?,
+            close_factor: env::var("CLOSE_FACTOR")
+                .unwrap_or_else(|_| "0.5".to_string())
+                .parse()
+                .context("Invalid CLOSE_FACTOR value")?,
+            max_liquidation_slippage: env::var("MAX_LIQUIDATION_SLIPPAGE")
+                .unwrap_or_else(|_| "0.01".to_string())
+                .parse()
+                .context("Invalid MAX_LIQUIDATION_SLIPPAGE value")?,
+            // Event bus configuration
+            event_bus_buffer_size: env::var("EVENT_BUS_BUFFER_SIZE")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("Invalid EVENT_BUS_BUFFER_SIZE value")?,
+            // Health manager configuration
+            health_manager_max_error_age_seconds: env::var("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .context("Invalid HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS value")?,
+            // Retry jitter configuration
+            retry_jitter_max_ms: env::var("RETRY_JITTER_MAX_MS")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("Invalid RETRY_JITTER_MAX_MS value")?,
         };
 
         config.validate()?;
@@ -214,6 +408,7 @@ impl Config {
         if self.dex_fee_bps > 1000 {
             log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
         }
+        // todo: check here to best implementation and dont use hardcoded values
         // Note: slippage_safety_margin_multiplier is now hardcoded to 1.1 (10%) in math.rs
         // to avoid over-conservative profit calculations. This config field is kept for
         // backward compatibility but not used in calculations.
