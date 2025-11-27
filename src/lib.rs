@@ -15,6 +15,7 @@ pub mod wallet;
 pub mod protocol;
 pub mod tx_lock;
 pub mod rate_limiter;
+pub mod balance_reservation;
 pub mod shutdown;
 pub mod health;
 pub mod performance;

@@ -94,10 +94,11 @@ async fn fetch_and_publish_positions(
     // ⚠️ getProgramAccounts çok ağır bir RPC çağrısıdır
     // Ücretsiz RPC'ler genelde 1 req/10s limit koyar
     // Premium RPC (Helius, Triton) veya WebSocket kullanılması önerilir
+    // Note: get_program_accounts now includes automatic retry with exponential backoff for 429 errors
     let accounts = rpc_client
         .get_program_accounts(&program_id)
         .await
-        .context("Failed to fetch program accounts. Note: getProgramAccounts is rate-limited on free RPC endpoints. Consider using premium RPC or WebSocket.")?;
+        .context("Failed to fetch program accounts after retries. Note: getProgramAccounts is rate-limited on free RPC endpoints. Consider using premium RPC or WebSocket.")?;
 
     log::debug!(
         "Fetched {} accounts for program {}",

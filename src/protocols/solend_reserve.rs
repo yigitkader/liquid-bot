@@ -1,7 +1,8 @@
 use solana_sdk::pubkey::Pubkey;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct SolendReserve {
     pub version: u8,
     pub last_update: LastUpdate,
@@ -11,13 +12,13 @@ pub struct SolendReserve {
     pub config: ReserveConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct LastUpdate {
     pub slot: u64,
     pub stale: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct ReserveLiquidity {
     pub mint_pubkey: Pubkey,
     pub mint_decimals: u8,
@@ -32,14 +33,14 @@ pub struct ReserveLiquidity {
     pub market_price: u128,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct ReserveCollateral {
     pub mint_pubkey: Pubkey,
     pub mint_total_supply: u64,
     pub supply_pubkey: Pubkey,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct ReserveConfig {
     pub optimal_utilization_rate: u8,
     pub loan_to_value_ratio: u8,
@@ -56,185 +57,75 @@ pub struct ReserveConfig {
     pub protocol_take_rate: u8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
 pub struct ReserveFees {
     pub borrow_fee_wad: u64,
     pub flash_loan_fee_wad: u64,
     pub host_fee_percentage: u8,
 }
 
-fn read_pubkey(data: &[u8], offset: &mut usize) -> Result<Pubkey> {
-    if *offset + 32 > data.len() {
-        return Err(anyhow::anyhow!("Insufficient data for Pubkey"));
-    }
-    let pubkey_bytes = &data[*offset..*offset + 32];
-    *offset += 32;
-    Pubkey::try_from(pubkey_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid Pubkey: {}", e))
-}
-
-fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
-    if *offset + 8 > data.len() {
-        return Err(anyhow::anyhow!("Insufficient data for u64"));
-    }
-    let bytes = &data[*offset..*offset + 8];
-    *offset += 8;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_u128(data: &[u8], offset: &mut usize) -> Result<u128> {
-    if *offset + 16 > data.len() {
-        return Err(anyhow::anyhow!("Insufficient data for u128"));
-    }
-    let bytes = &data[*offset..*offset + 16];
-    *offset += 16;
-    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
-}
+// Expected size of the reserve struct without padding
+// This is calculated from the struct layout:
+// version: 1 byte
+// LastUpdate: 9 bytes (slot: 8, stale: 1)
+// lending_market: 32 bytes
+// ReserveLiquidity: 32 + 1 + 32 + 32 + 32 + 8 + 16 + 16 + 16 = 185 bytes
+// ReserveCollateral: 32 + 8 + 32 = 72 bytes
+// ReserveConfig: 7 + (8 + 8 + 1) + 8 + 8 + 32 + 1 + 1 = 74 bytes
+// Total: ~372 bytes
+const EXPECTED_RESERVE_SIZE_WITHOUT_PADDING: usize = 372;
+const EXPECTED_PADDING_SIZE: usize = 247;
+const EXPECTED_TOTAL_SIZE: usize = EXPECTED_RESERVE_SIZE_WITHOUT_PADDING + EXPECTED_PADDING_SIZE;
 
 impl SolendReserve {
+    /// Deserializes a Solend reserve account from raw account data.
+    /// 
+    /// The account data structure:
+    /// - The reserve struct data (starts at offset 0)
+    /// - 247 bytes of padding at the end (automatically skipped by Borsh)
+    /// 
+    /// This uses Borsh deserialization for type safety and automatic validation.
+    /// Borsh will automatically handle padding by only deserializing the known struct fields.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("Empty account data"));
         }
-        
-        if data.len() < 42 {
+
+        if data.len() < EXPECTED_RESERVE_SIZE_WITHOUT_PADDING {
             return Err(anyhow::anyhow!(
-                "Account data too small: {} bytes (expected at least 42 bytes for basic fields)",
-                data.len()
+                "Account data too small: {} bytes (expected at least {} bytes for reserve struct)",
+                data.len(),
+                EXPECTED_RESERVE_SIZE_WITHOUT_PADDING
             ));
         }
-        
-        let mut offset = 0;
-        
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for version"));
-        }
-        let version = data[offset];
-        offset += 1;
-        
-        let slot = read_u64(data, &mut offset)?;
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for stale"));
-        }
-        let stale = data[offset];
-        offset += 1;
-        let last_update = LastUpdate { slot, stale };
-        
-        let lending_market = read_pubkey(data, &mut offset)?;
-        
-        let mint_pubkey = read_pubkey(data, &mut offset)?;
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for mint_decimals"));
-        }
-        let mint_decimals = data[offset];
-        offset += 1;
-        let supply_pubkey = read_pubkey(data, &mut offset)?;
-        // Solend'in gerçek kodunda oracle_option YOK!
-        // Layout: direkt pyth_oracle, sonra switchboard_oracle
-        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
-        let pyth_oracle = read_pubkey(data, &mut offset)?;
-        let switchboard_oracle = read_pubkey(data, &mut offset)?;
-        
-        let available_amount = read_u64(data, &mut offset)?;
-        let borrowed_amount_wads = read_u128(data, &mut offset)?;
-        let cumulative_borrow_rate_wads = read_u128(data, &mut offset)?;
-        let market_price = read_u128(data, &mut offset)?;
-        let liquidity = ReserveLiquidity {
-            mint_pubkey,
-            mint_decimals,
-            supply_pubkey,
-            pyth_oracle,
-            switchboard_oracle,
-            available_amount,
-            borrowed_amount_wads,
-            cumulative_borrow_rate_wads,
-            market_price,
+
+        // Extract only the struct data (without padding) for Borsh deserialization
+        // Borsh expects to consume exactly the bytes needed for the struct
+        let struct_data = if data.len() >= EXPECTED_RESERVE_SIZE_WITHOUT_PADDING {
+            &data[..EXPECTED_RESERVE_SIZE_WITHOUT_PADDING]
+        } else {
+            data
         };
-        
-        let mint_pubkey = read_pubkey(data, &mut offset)?;
-        let mint_total_supply = read_u64(data, &mut offset)?;
-        let supply_pubkey = read_pubkey(data, &mut offset)?;
-        let collateral = ReserveCollateral {
-            mint_pubkey,
-            mint_total_supply,
-            supply_pubkey,
-        };
-        
-        if offset + 7 > data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for config u8 fields"));
+
+        // Deserialize the reserve struct using Borsh
+        // Borsh will automatically handle the deserialization of all nested structs
+        let reserve = SolendReserve::try_from_slice(struct_data)
+            .context("Failed to deserialize Solend reserve account. This might indicate the struct structure doesn't match the real Solend IDL. Please validate against official IDL: ./scripts/fetch_solend_idl.sh")?;
+
+        // Validate that we have enough data (including padding)
+        // The total account size should be at least the expected size
+        if data.len() < EXPECTED_TOTAL_SIZE {
+            // Warn but don't fail - padding might be smaller in some cases
+            log::warn!(
+                "Reserve account data size {} bytes is less than expected {} bytes (struct: {} + padding: {}). Padding might be smaller than expected.",
+                data.len(),
+                EXPECTED_TOTAL_SIZE,
+                EXPECTED_RESERVE_SIZE_WITHOUT_PADDING,
+                EXPECTED_PADDING_SIZE
+            );
         }
-        let optimal_utilization_rate = data[offset];
-        offset += 1;
-        let loan_to_value_ratio = data[offset];
-        offset += 1;
-        let liquidation_bonus = data[offset];
-        offset += 1;
-        let liquidation_threshold = data[offset];
-        offset += 1;
-        let min_borrow_rate = data[offset];
-        offset += 1;
-        let optimal_borrow_rate = data[offset];
-        offset += 1;
-        let max_borrow_rate = data[offset];
-        offset += 1;
-        
-        let borrow_fee_wad = read_u64(data, &mut offset)?;
-        let flash_loan_fee_wad = read_u64(data, &mut offset)?;
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for host_fee_percentage"));
-        }
-        let host_fee_percentage = data[offset];
-        offset += 1;
-        let fees = ReserveFees {
-            borrow_fee_wad,
-            flash_loan_fee_wad,
-            host_fee_percentage,
-        };
-        
-        let deposit_limit = read_u64(data, &mut offset)?;
-        let borrow_limit = read_u64(data, &mut offset)?;
-        let fee_receiver = read_pubkey(data, &mut offset)?;
-        if offset + 2 > data.len() {
-            return Err(anyhow::anyhow!("Insufficient data for protocol fees"));
-        }
-        let protocol_liquidation_fee = data[offset];
-        offset += 1;
-        let protocol_take_rate = data[offset];
-        offset += 1;
-        let config = ReserveConfig {
-            optimal_utilization_rate,
-            loan_to_value_ratio,
-            liquidation_bonus,
-            liquidation_threshold,
-            min_borrow_rate,
-            optimal_borrow_rate,
-            max_borrow_rate,
-            fees,
-            deposit_limit,
-            borrow_limit,
-            fee_receiver,
-            protocol_liquidation_fee,
-            protocol_take_rate,
-        };
-        
-        // Padding: 247 bytes (skip ediyoruz)
-        // Official SDK: BufferLayout.blob(247, "padding")
-        // Note: Padding is used to align the account size to 619 bytes total
-        // We don't need to validate padding as it's just empty space
-        
-        // Validate that we've read the expected amount of data (excluding padding)
-        // Expected size without padding: ~372 bytes
-        // With padding: ~619 bytes (official SDK RESERVE_SIZE)
-        // We don't validate exact size here because padding might vary, but we ensure we have enough data
-        
-        Ok(SolendReserve {
-            version,
-            last_update,
-            lending_market,
-            liquidity,
-            collateral,
-            config,
-        })
+
+        Ok(reserve)
     }
     
     pub fn liquidity_mint(&self) -> Pubkey {

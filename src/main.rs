@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
     let shutdown_manager = Arc::new(ShutdownManager::new());
 
     let health_manager = Arc::new(health::HealthManager::new(300)); // 5 dakika max error age
+    let balance_reservation = Arc::new(balance_reservation::BalanceReservation::new());
 
     let shutdown = shutdown_manager.clone();
     tokio::spawn(async move {
@@ -151,6 +152,7 @@ async fn main() -> Result<()> {
         let wallet_balance_checker = Arc::clone(&wallet_balance_checker);
         let rpc_client = Arc::clone(&rpc_client);
         let protocol = Arc::clone(&solend_protocol);
+        let balance_reservation = Arc::clone(&balance_reservation);
         async move {
             log::info!("   ✅ Strategist worker started");
             if let Err(e) = strategist::run_strategist(
@@ -160,6 +162,7 @@ async fn main() -> Result<()> {
                 wallet_balance_checker,
                 rpc_client,
                 protocol,
+                balance_reservation,
             )
             .await
             {
@@ -176,6 +179,7 @@ async fn main() -> Result<()> {
         let protocol = Arc::clone(&solend_protocol);
         let rpc_client = Arc::clone(&rpc_client);
         let performance_tracker = Arc::clone(&performance_tracker);
+        let balance_reservation = Arc::clone(&balance_reservation);
         async move {
             log::info!("   ✅ Executor worker started");
             if let Err(e) = executor::run_executor(
@@ -186,6 +190,7 @@ async fn main() -> Result<()> {
                 protocol,
                 rpc_client,
                 performance_tracker,
+                balance_reservation,
             )
             .await
             {

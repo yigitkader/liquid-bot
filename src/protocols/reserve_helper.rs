@@ -12,6 +12,7 @@ pub struct ReserveInfo {
     pub reserve_pubkey: Pubkey,
     pub mint: Option<Pubkey>,
     pub ltv: f64,
+    pub liquidation_threshold: f64,
     pub borrow_rate: f64,
     pub liquidity_mint: Option<Pubkey>,
     pub collateral_mint: Option<Pubkey>,
@@ -41,6 +42,7 @@ pub async fn parse_reserve_account(
     let liquidity_mint = reserve.liquidity_mint();
     let collateral_mint = reserve.collateral_mint();
     let ltv = reserve.ltv();
+    let liquidation_threshold = reserve.config.liquidation_threshold as f64 / 100.0;
     let liquidation_bonus = reserve.liquidation_bonus();
 
     // Calculate borrow rate based on utilization rate
@@ -123,12 +125,13 @@ pub async fn parse_reserve_account(
     );
     
     log::debug!(
-        "Parsed reserve {}: mint={}, ltv={:.2}, borrow_rate={:.4}, liquidation_bonus={:.2}, pyth_oracle={:?}, switchboard_oracle={:?}",
+        "Parsed reserve {}: mint={}, ltv={:.2}%, liquidation_threshold={:.2}%, borrow_rate={:.4}%, liquidation_bonus={:.2}%, pyth_oracle={:?}, switchboard_oracle={:?}",
         reserve_pubkey,
         liquidity_mint,
-        ltv,
-        borrow_rate,
-        liquidation_bonus,
+        ltv * 100.0,
+        liquidation_threshold * 100.0,
+        borrow_rate * 100.0,
+        liquidation_bonus * 100.0,
         pyth_oracle,
         switchboard_oracle
     );
@@ -137,6 +140,7 @@ pub async fn parse_reserve_account(
         reserve_pubkey: *reserve_pubkey,
         mint,
         ltv,
+        liquidation_threshold,
         borrow_rate,
         liquidity_mint: Some(liquidity_mint),
         collateral_mint: Some(collateral_mint),

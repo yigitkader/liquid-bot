@@ -262,7 +262,7 @@ impl Protocol for SolendProtocol {
 
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {
-            let (mint, ltv) =
+            let (mint, ltv, liquidation_threshold) =
                 match get_reserve_info(&deposit.deposit_reserve, rpc_client.as_ref()).await {
                     Some(reserve_info) => {
                         let mint = reserve_info.collateral_mint.unwrap_or_else(|| {
@@ -270,14 +270,15 @@ impl Protocol for SolendProtocol {
                                 .liquidity_mint
                                 .unwrap_or(deposit.deposit_reserve)
                         });
-                        (mint.to_string(), reserve_info.ltv)
+                        (mint.to_string(), reserve_info.ltv, reserve_info.liquidation_threshold)
                     }
                     None => {
                         log::warn!(
                             "Failed to get reserve info for {}, using fallback",
                             deposit.deposit_reserve
                         );
-                        (deposit.deposit_reserve.to_string(), 0.75)
+                        // Fallback values: typical LTV=75%, liquidation_threshold=80%
+                        (deposit.deposit_reserve.to_string(), 0.75, 0.80)
                     }
                 };
 
@@ -286,6 +287,7 @@ impl Protocol for SolendProtocol {
                 amount: deposit.deposited_amount,
                 amount_usd: deposit.market_value.to_f64(),
                 ltv,
+                liquidation_threshold,
             });
         }
 
@@ -343,16 +345,26 @@ impl Protocol for SolendProtocol {
         }
 
         // Calculate health factor if not already set
-        // Solend her asset için farklı LTV kullanır (SOL = 75%, BTC = 80%, shitcoin = 50%)
-        // Her asset'in kendi LTV'sini kullanarak weighted collateral hesaplıyoruz
+        // ⚠️ CRITICAL: Solend uses Liquidation Threshold, NOT LTV for health factor calculation!
+        // 
+        // LTV (Loan-to-Value): Maximum borrowing ratio (e.g., 75%)
+        // Liquidation Threshold: When liquidation is triggered (e.g., 80%)
+        // 
+        // Health Factor = (Collateral × Liquidation Threshold) / Debt
+        // Reference: Solend SDK src/state/obligation.ts
+        //   const weightedCollateral = deposits.reduce(
+        //     (sum, d) => sum + d.marketValue * reserve.config.liquidationThreshold,
+        //     0
+        //   );
+        //   const healthFactor = weightedCollateral / totalBorrow;
         if position.total_debt_usd == 0.0 {
             return Ok(f64::INFINITY);
         }
 
-        // Her asset'in kendi LTV'sini kullanarak weighted collateral hesapla
+        // Use liquidation threshold (not LTV) for weighted collateral calculation
         let mut weighted_collateral = 0.0;
         for asset in &position.collateral_assets {
-            weighted_collateral += asset.amount_usd * asset.ltv;
+            weighted_collateral += asset.amount_usd * asset.liquidation_threshold;
         }
 
         // Health Factor = Weighted Collateral / Total Debt
@@ -417,9 +429,17 @@ impl Protocol for SolendProtocol {
             )
         };
 
-        // Gerçek Solend program koduna göre doğru account sırası:
-        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/processor.rs
-        // fn process_liquidate_obligation içinde:
+        // ⚠️ CRITICAL: Account order must match Solend program exactly!
+        // 
+        // This order is based on Solend's processor.rs source code:
+        // https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/processor.rs
+        // fn process_liquidate_obligation
+        //
+        // ⚠️ VERIFICATION REQUIRED: This should be verified against actual mainnet transactions:
+        //   solana transaction <LIQUIDATION_TX_SIGNATURE> --output json
+        //   Compare the accounts array order with this implementation
+        //
+        // Account order (per Solend source code):
         // 1. source_liquidity_info
         // 2. destination_collateral_info
         // 3. repay_reserve_info
@@ -432,7 +452,9 @@ impl Protocol for SolendProtocol {
         // 10. user_transfer_authority_info (liquidator)
         // 11. clock (Sysvar)
         // 12. token_program_id
-        // NOT: Oracle accounts are NOT used in the processor!
+        //
+        // NOTE: Oracle accounts (Pyth/Switchboard) are NOT included in the instruction.
+        // The program reads oracle prices from on-chain accounts, not instruction arguments.
         let accounts = vec![
             // 1. sourceLiquidity - liquidator's token account for debt (isMut: true, isSigner: false)
             AccountMeta::new(source_liquidity, false),

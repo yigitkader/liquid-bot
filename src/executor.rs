@@ -1,3 +1,4 @@
+use crate::balance_reservation::BalanceReservation;
 use crate::config::Config;
 use crate::event::Event;
 use crate::event_bus::EventBus;
@@ -7,6 +8,7 @@ use crate::solana_client::{self, SolanaClient};
 use crate::tx_lock::TxLock;
 use crate::wallet::WalletManager;
 use anyhow::Result;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
@@ -19,6 +21,7 @@ pub async fn run_executor(
     protocol: Arc<dyn Protocol>,
     rpc_client: Arc<SolanaClient>,
     performance_tracker: Arc<PerformanceTracker>,
+    balance_reservation: Arc<BalanceReservation>,
 ) -> Result<()> {
     let tx_lock = Arc::new(TxLock::new(60));
 
@@ -81,6 +84,16 @@ pub async fn run_executor(
                                 signature = Some(sig.clone());
                                 success = true;
 
+                                // Release balance reservation after successful transaction
+                                if let Ok(debt_mint) = Pubkey::try_from(opportunity.target_debt_mint.as_str()) {
+                                    balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                                    log::debug!(
+                                        "Released balance reservation: mint={}, amount={}",
+                                        debt_mint,
+                                        opportunity.max_liquidatable_amount
+                                    );
+                                }
+
                                 let opportunity_id =
                                     opportunity.account_position.account_address.clone();
                                 if let Some(latency) =
@@ -124,6 +137,18 @@ pub async fn run_executor(
                                     );
                                 }
                             }
+                        }
+                    }
+
+                    // Release balance reservation if transaction failed
+                    if !success {
+                        if let Ok(debt_mint) = Pubkey::try_from(opportunity.target_debt_mint.as_str()) {
+                            balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                            log::debug!(
+                                "Released balance reservation after failure: mint={}, amount={}",
+                                debt_mint,
+                                opportunity.max_liquidatable_amount
+                            );
                         }
                     }
 

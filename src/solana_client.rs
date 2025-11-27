@@ -4,12 +4,14 @@ use crate::protocol::Protocol;
 use crate::rate_limiter::RateLimiter;
 use crate::wallet::WalletManager;
 use anyhow::{Context, Result};
+use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig, compute_budget::ComputeBudgetInstruction, pubkey::Pubkey,
     transaction::Transaction,
 };
 use std::sync::Arc;
+use tokio::time::{sleep, Duration};
 
 /// Solana RPC client wrapper
 pub struct SolanaClient {
@@ -57,6 +59,7 @@ impl SolanaClient {
         .context("Failed to spawn blocking task")?
     }
 
+    /// Fetches program accounts with exponential backoff retry for rate limit errors (429)
     pub async fn get_program_accounts(
         &self,
         program_id: &Pubkey,
@@ -65,13 +68,77 @@ impl SolanaClient {
 
         let client = Arc::clone(&self.rpc_client);
         let program_id = *program_id;
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_program_accounts(&program_id)
-                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
+
+        // Retry with exponential backoff for rate limit errors
+        Self::fetch_with_retry(
+            {
+                let client = Arc::clone(&client);
+                let program_id = program_id;
+                move || {
+                    let client = Arc::clone(&client);
+                    let program_id = program_id;
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            client
+                                .get_program_accounts(&program_id)
+                                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+                        })
+                        .await
+                        .context("Failed to spawn blocking task")?
+                    }
+                }
+            },
+            5, // max_retries
+        )
         .await
-        .context("Failed to spawn blocking task")?
+    }
+
+    /// Helper function for retrying operations with exponential backoff and jitter
+    /// Specifically handles 429 (rate limit) errors
+    async fn fetch_with_retry<T, F, Fut>(operation: F, max_retries: u32) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        for attempt in 0..=max_retries {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    
+                    // Check if this is a rate limit error (429 or rate limit keywords)
+                    let is_rate_limit = error_str.contains("429")
+                        || error_str.contains("rate limit")
+                        || error_str.contains("too many requests")
+                        || error_str.contains("rate_limit")
+                        || error_str.contains("429 too many requests");
+
+                    if is_rate_limit && attempt < max_retries {
+                        // Exponential backoff: 2^attempt seconds, with jitter (0-1000ms)
+                        let base_delay_secs = 2_u64.pow(attempt);
+                        let jitter_ms = rand::thread_rng().gen_range(0..1000);
+                        let backoff = Duration::from_secs(base_delay_secs)
+                            + Duration::from_millis(jitter_ms);
+
+                        log::warn!(
+                            "Rate limit error (attempt {}/{}), backing off for {:.2}s before retry",
+                            attempt + 1,
+                            max_retries + 1,
+                            backoff.as_secs_f64()
+                        );
+
+                        sleep(backoff).await;
+                        continue;
+                    } else {
+                        // Not a rate limit error, or max retries reached
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // This should never be reached, but Rust requires it
+        unreachable!("fetch_with_retry loop should always return")
     }
 
     pub async fn send_transaction(&self, transaction: &Transaction) -> Result<String> {

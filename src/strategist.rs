@@ -1,3 +1,4 @@
+use crate::balance_reservation::BalanceReservation;
 use crate::config::Config;
 use crate::event::Event;
 use crate::event_bus::EventBus;
@@ -20,6 +21,7 @@ pub async fn run_strategist(
     wallet_balance_checker: Arc<WalletBalanceChecker>,
     rpc_client: Arc<SolanaClient>,
     _protocol: Arc<dyn Protocol>,
+    balance_reservation: Arc<BalanceReservation>,
 ) -> Result<()> {
     // Minimum SOL reserve for transaction fees (from config)
     let min_reserve_lamports = config.min_reserve_lamports;
@@ -88,8 +90,9 @@ pub async fn run_strategist(
                                                 .await
                                                 {
                                                     // Pyth confidence = %68 confidence interval (1 sigma)
-                                                    // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
-                                                    let confidence_95 = price.confidence * 2.0;
+                                                    // %95 confidence interval için Z-score 1.96 kullanılmalı
+                                                    const Z_SCORE_95: f64 = 1.96;
+                                                    let confidence_95 = price.confidence * Z_SCORE_95;
                                                     let confidence_slippage_bps = ((confidence_95
                                                         / price.price)
                                                         * 10000.0)
@@ -140,8 +143,9 @@ pub async fn run_strategist(
                                                         .await
                                                         {
                                                             // Pyth confidence = %68 confidence interval (1 sigma)
-                                                            // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
-                                                            let confidence_95 = price.confidence * 2.0;
+                                                            // %95 confidence interval için Z-score 1.96 kullanılmalı
+                                                            const Z_SCORE_95: f64 = 1.96;
+                                                            let confidence_95 = price.confidence * Z_SCORE_95;
                                                             let confidence_slippage_bps =
                                                                 ((confidence_95 / price.price)
                                                                     * 10000.0)
@@ -323,48 +327,61 @@ pub async fn run_strategist(
                     }
 
                     if approved {
-                        match wallet_balance_checker
-                            .has_sufficient_capital_for_liquidation(
-                                &debt_mint,
-                                required_debt_amount,
-                                min_reserve_lamports,
-                            )
-                            .await
-                        {
-                            Ok(true) => {
-                                log::debug!(
-                                "Sufficient capital: debt_mint={}, required_debt={}, min_sol_reserve={}",
-                                debt_mint,
-                                required_debt_amount,
-                                min_reserve_lamports
-                            );
-                            }
-                            Ok(false) => {
-                                approved = false;
-                                let (available_debt, available_sol) = wallet_balance_checker
-                                    .get_available_capital_for_liquidation(
-                                        &debt_mint,
-                                        min_reserve_lamports,
-                                    )
-                                    .await
-                                    .unwrap_or((0, 0));
-                                rejection_reason = format!(
-                                "insufficient capital: required_debt={} (mint={}), available_debt={}, required_sol={}, available_sol={}",
-                                required_debt_amount,
-                                debt_mint,
-                                available_debt,
-                                min_reserve_lamports,
-                                available_sol
-                            );
-                            }
+                        // Use balance reservation to prevent race conditions
+                        // This ensures that if multiple opportunities require the same token,
+                        // only one can be approved at a time
+                        let debt_balance = match wallet_balance_checker.get_token_balance(&debt_mint).await {
+                            Ok(balance) => balance,
                             Err(e) => {
-                                log::warn!(
-                                    "Failed to check wallet balance: {}, rejecting opportunity",
-                                    e
-                                );
+                                log::warn!("Failed to get debt token balance: {}, rejecting opportunity", e);
                                 approved = false;
                                 rejection_reason = format!("balance check failed: {}", e);
+                                continue;
                             }
+                        };
+
+                        let sol_balance = match wallet_balance_checker.get_sol_balance().await {
+                            Ok(balance) => balance,
+                            Err(e) => {
+                                log::warn!("Failed to get SOL balance: {}, rejecting opportunity", e);
+                                approved = false;
+                                rejection_reason = format!("SOL balance check failed: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Check SOL reserve
+                        if sol_balance < min_reserve_lamports {
+                            approved = false;
+                            rejection_reason = format!(
+                                "insufficient SOL: required={}, available={}",
+                                min_reserve_lamports,
+                                sol_balance
+                            );
+                            continue;
+                        }
+
+                        // Try to reserve the required debt amount
+                        // This prevents race conditions when multiple opportunities are processed in parallel
+                        if balance_reservation.reserve(&debt_mint, required_debt_amount, debt_balance).await {
+                            log::debug!(
+                                "Balance reserved: debt_mint={}, amount={}, available={}",
+                                debt_mint,
+                                required_debt_amount,
+                                debt_balance
+                            );
+                        } else {
+                            approved = false;
+                            let reserved = balance_reservation.get_reserved(&debt_mint).await;
+                            let available = balance_reservation.get_available(&debt_mint, debt_balance).await;
+                            rejection_reason = format!(
+                                "insufficient capital (race condition prevented): required_debt={} (mint={}), available={}, reserved={}, actual={}",
+                                required_debt_amount,
+                                debt_mint,
+                                available,
+                                reserved,
+                                debt_balance
+                            );
                         }
                     }
                 }

@@ -16,7 +16,8 @@ pub struct CollateralAsset {
     pub mint: String,
     pub amount: u64,
     pub amount_usd: f64,
-    pub ltv: f64,
+    pub ltv: f64, // Loan-to-Value: Maximum borrowing ratio
+    pub liquidation_threshold: f64, // Liquidation Threshold: When liquidation is triggered
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
