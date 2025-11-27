@@ -34,8 +34,20 @@ pub async fn validate_reserve_structure(
         Ok(reserve) => {
             log::info!("✅ Reserve account parsed successfully!");
 
-            let pyth_oracle = reserve.pyth_oracle();
-            let switchboard_oracle = reserve.switchboard_oracle();
+            let pyth_oracle_raw = reserve.pyth_oracle();
+            let switchboard_oracle_raw = reserve.switchboard_oracle();
+            
+            // Default pubkey olmayan oracle'ı aktif kabul et
+            let pyth_oracle = if pyth_oracle_raw != Pubkey::default() {
+                Some(pyth_oracle_raw)
+            } else {
+                None
+            };
+            let switchboard_oracle = if switchboard_oracle_raw != Pubkey::default() {
+                Some(switchboard_oracle_raw)
+            } else {
+                None
+            };
 
             if reserve.lending_market == Pubkey::default() {
                 log::warn!("⚠️  Warning: lending_market is default/empty - this might indicate parsing error");
@@ -48,7 +60,7 @@ pub async fn validate_reserve_structure(
             }
 
             log::debug!(
-                "Reserve details: version={}, lending_market={}, liquidity_mint={}, collateral_mint={}, pyth_oracle={}, switchboard_oracle={}",
+                "Reserve details: version={}, lending_market={}, liquidity_mint={}, collateral_mint={}, pyth_oracle={:?}, switchboard_oracle={:?}",
                 reserve.version,
                 reserve.lending_market,
                 reserve.liquidity_mint(),
@@ -79,16 +91,9 @@ pub async fn validate_reserve_structure(
                     collateral_mint: reserve.collateral_mint(),
                     ltv,
                     liquidation_bonus,
-                    pyth_oracle: if pyth_oracle != Pubkey::default() {
-                        Some(pyth_oracle)
-                    } else {
-                        None
-                    },
-                    switchboard_oracle: if switchboard_oracle != Pubkey::default() {
-                        Some(switchboard_oracle)
-                    } else {
-                        None
-                    },
+                    oracle_option: 0, // Solend'in gerçek kodunda oracle_option YOK - placeholder
+                    pyth_oracle,
+                    switchboard_oracle,
                 }),
             })
         }
@@ -124,9 +129,9 @@ pub async fn validate_reserve_structure(
             log::info!("  Offset 42-73: liquidity.mintPubkey (Pubkey, 32 bytes)");
             log::info!("  Offset 74: liquidity.mintDecimals (u8)");
             log::info!("  Offset 75-106: liquidity.supplyPubkey (Pubkey, 32 bytes)");
-            log::info!("  Offset 107-110: liquidity.oracleOption (u32, 4 bytes)");
-            log::info!("  Offset 111-142: liquidity.pythOracle (Pubkey, 32 bytes)");
-            log::info!("  Offset 143-174: liquidity.switchboardOracle (Pubkey, 32 bytes)");
+            log::info!("  Offset 107-138: liquidity.pythOracle (Pubkey, 32 bytes)");
+            log::info!("  Offset 139-170: liquidity.switchboardOracle (Pubkey, 32 bytes)");
+            log::info!("  Note: oracleOption field does NOT exist in Solend's real code!");
             log::info!("  ... (see official SDK for complete layout)");
             log::info!("");
             log::info!("Reference: https://github.com/solendprotocol/solend-sdk/blob/master/src/state/reserve.ts");
@@ -155,6 +160,7 @@ pub struct ReserveInfo {
     pub collateral_mint: Pubkey,
     pub ltv: f64,
     pub liquidation_bonus: f64,
+    pub oracle_option: u32,
     pub pyth_oracle: Option<Pubkey>,
     pub switchboard_oracle: Option<Pubkey>,
 }

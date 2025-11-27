@@ -87,22 +87,33 @@ pub async fn parse_reserve_account(
         max_rate * 100.0
     );
     let mint = Some(liquidity_mint);
-    let pyth_oracle = reserve.pyth_oracle();
-    let switchboard_oracle = reserve.switchboard_oracle();
-
-    let pyth_oracle = if pyth_oracle != Pubkey::default() {
-        Some(pyth_oracle)
+    let pyth_oracle_raw = reserve.pyth_oracle();
+    let switchboard_oracle_raw = reserve.switchboard_oracle();
+    
+    // Solend'in gerçek kodunda oracle_option YOK!
+    // Her iki oracle da account'ta var, hangisinin aktif olduğu program tarafından belirlenir
+    // Default pubkey (111...111) olmayan oracle'ı aktif kabul ediyoruz
+    let pyth_oracle = if pyth_oracle_raw != Pubkey::default() {
+        Some(pyth_oracle_raw)
     } else {
-        log::debug!("Pyth oracle is default (zero) for reserve {}", reserve_pubkey);
+        None
+    };
+    let switchboard_oracle = if switchboard_oracle_raw != Pubkey::default() {
+        Some(switchboard_oracle_raw)
+    } else {
         None
     };
     
-    let switchboard_oracle = if switchboard_oracle != Pubkey::default() {
-        Some(switchboard_oracle)
+    if pyth_oracle.is_none() && switchboard_oracle.is_none() {
+        log::debug!("No oracle found for reserve {} (both are default)", reserve_pubkey);
+    } else if pyth_oracle.is_some() && switchboard_oracle.is_some() {
+        log::debug!("Both oracles present for reserve {}: pyth={}, switchboard={}", 
+            reserve_pubkey, pyth_oracle.unwrap(), switchboard_oracle.unwrap());
+    } else if pyth_oracle.is_some() {
+        log::debug!("Only Pyth oracle present for reserve {}: {}", reserve_pubkey, pyth_oracle.unwrap());
     } else {
-        log::debug!("Switchboard oracle is default (zero) for reserve {}", reserve_pubkey);
-        None
-    };
+        log::debug!("Only Switchboard oracle present for reserve {}: {}", reserve_pubkey, switchboard_oracle.unwrap());
+    }
 
     log::debug!(
         "Reserve {} oracles: pyth={:?}, switchboard={:?}",

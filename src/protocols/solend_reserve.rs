@@ -22,6 +22,8 @@ pub struct ReserveLiquidity {
     pub mint_pubkey: Pubkey,
     pub mint_decimals: u8,
     pub supply_pubkey: Pubkey,
+    // Solend'in gerçek kodunda oracle_option YOK!
+    // Sadece iki oracle pubkey var - hangisinin aktif olduğu program tarafından belirlenir
     pub pyth_oracle: Pubkey,
     pub switchboard_oracle: Pubkey,
     pub available_amount: u64,
@@ -69,15 +71,6 @@ fn read_pubkey(data: &[u8], offset: &mut usize) -> Result<Pubkey> {
     *offset += 32;
     Pubkey::try_from(pubkey_bytes)
         .map_err(|e| anyhow::anyhow!("Invalid Pubkey: {}", e))
-}
-
-fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
-    if *offset + 4 > data.len() {
-        return Err(anyhow::anyhow!("Insufficient data for u32"));
-    }
-    let bytes = &data[*offset..*offset + 4];
-    *offset += 4;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
@@ -136,9 +129,12 @@ impl SolendReserve {
         let mint_decimals = data[offset];
         offset += 1;
         let supply_pubkey = read_pubkey(data, &mut offset)?;
-        let _oracle_option = read_u32(data, &mut offset)?;
+        // Solend'in gerçek kodunda oracle_option YOK!
+        // Layout: direkt pyth_oracle, sonra switchboard_oracle
+        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
         let pyth_oracle = read_pubkey(data, &mut offset)?;
         let switchboard_oracle = read_pubkey(data, &mut offset)?;
+        
         let available_amount = read_u64(data, &mut offset)?;
         let borrowed_amount_wads = read_u128(data, &mut offset)?;
         let cumulative_borrow_rate_wads = read_u128(data, &mut offset)?;
@@ -265,10 +261,12 @@ impl SolendReserve {
         self.config.liquidation_bonus as f64 / 100.0
     }
     
+    /// Pyth oracle pubkey'ini döndürür
     pub fn pyth_oracle(&self) -> Pubkey {
         self.liquidity.pyth_oracle
     }
     
+    /// Switchboard oracle pubkey'ini döndürür
     pub fn switchboard_oracle(&self) -> Pubkey {
         self.liquidity.switchboard_oracle
     }

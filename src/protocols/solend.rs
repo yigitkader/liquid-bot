@@ -420,24 +420,41 @@ impl Protocol for SolendProtocol {
             )
         };
 
+        // Solend programı her iki oracle account'ını da bekliyor (IDL'de görüldüğü gibi)
+        // Gerçek kodda oracle_option YOK - sadece iki oracle pubkey var
+        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
         let (pyth_oracle, switchboard_oracle) = if let Some(rpc) = rpc_client.as_ref() {
-            use crate::protocols::reserve_helper::parse_reserve_account;
+            use crate::protocols::solend_reserve::SolendReserve;
             
-            let (pyth, switchboard) = match rpc.get_account(&repay_reserve).await {
+            match rpc.get_account(&repay_reserve).await {
                 Ok(reserve_account) => {
-                    match parse_reserve_account(&repay_reserve, &reserve_account).await {
-                        Ok(reserve_info) => (
-                            reserve_info.pyth_oracle.unwrap_or(Pubkey::default()),
-                            reserve_info.switchboard_oracle.unwrap_or(Pubkey::default()),
-                        ),
-                        Err(_) => (Pubkey::default(), Pubkey::default()),
+                    match SolendReserve::from_account_data(&reserve_account.data) {
+                        Ok(reserve) => {
+                            let pyth = reserve.pyth_oracle();
+                            let switchboard = reserve.switchboard_oracle();
+                            
+                            log::debug!(
+                                "Reserve {} oracles: pyth={}, switchboard={}",
+                                repay_reserve,
+                                pyth,
+                                switchboard
+                            );
+                            
+                            (pyth, switchboard)
+                        }
+                        Err(e) => {
+                            log::error!("Failed to parse reserve account {}: {}", repay_reserve, e);
+                            (Pubkey::default(), Pubkey::default())
+                        }
                     }
                 }
-                Err(_) => (Pubkey::default(), Pubkey::default()),
-            };
-
-            (pyth, switchboard)
+                Err(e) => {
+                    log::error!("Failed to fetch reserve account {}: {}", repay_reserve, e);
+                    (Pubkey::default(), Pubkey::default())
+                }
+            }
         } else {
+            log::warn!("⚠️  RPC client not provided, using default oracle accounts");
             (Pubkey::default(), Pubkey::default())
         };
         

@@ -82,16 +82,18 @@ async fn main() -> Result<()> {
             println!("  Collateral Mint: {}", info.collateral_mint);
             println!("  LTV: {:.2}%", info.ltv * 100.0);
             println!("  Liquidation Bonus: {:.2}%", info.liquidation_bonus * 100.0);
-            println!("\n🔮 Oracle Accounts (from reserve):");
+            println!("\n🔮 Oracle Information:");
+            println!("  Note: Solend's real code has NO oracle_option field!");
+            println!("  Both oracles are stored directly in the account.");
             if let Some(pyth) = info.pyth_oracle {
                 println!("  ✅ Pyth Oracle: {}", pyth);
             } else {
-                println!("  ❌ Pyth Oracle: Not found");
+                println!("  ❌ Pyth Oracle: Not found (default pubkey)");
             }
             if let Some(switchboard) = info.switchboard_oracle {
                 println!("  ✅ Switchboard Oracle: {}", switchboard);
             } else {
-                println!("  ❌ Switchboard Oracle: Not found");
+                println!("  ❌ Switchboard Oracle: Not found (default pubkey)");
             }
         }
         
