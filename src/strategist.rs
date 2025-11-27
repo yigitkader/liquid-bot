@@ -9,6 +9,10 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+// Solend'in oracle staleness limiti: 60 saniye
+// get_price fonksiyonunda kullanılan limit ile aynı
+const MAX_ORACLE_AGE_SECONDS: i64 = 60;
+
 pub async fn run_strategist(
     mut receiver: broadcast::Receiver<Event>,
     bus: EventBus,
@@ -39,38 +43,25 @@ pub async fn run_strategist(
                     let debt_mint_str = &opportunity.target_debt_mint;
                     let mut debt_reserve_pubkey: Option<Pubkey> = None;
 
-                    if let Ok(pubkey) = Pubkey::try_from(debt_mint_str.as_str()) {
-                        match rpc_client.get_account(&pubkey).await {
-                            Ok(account) => {
-                                // Account'un Solend program'ına ait olup olmadığını kontrol et
-                                // Note: Solend reserve accounts are typically 619 bytes
-                                // This is a heuristic check - proper validation should check program owner
-                                if account.data.len() == 619 {
-                                    debt_reserve_pubkey = Some(pubkey);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
+                    // ✅ DOĞRU: Obligation'dan doğrudan reserve'i al
+                    // debt_mint (token mint address) ≠ reserve_pubkey
+                    // Heuristic (619 bytes) güvenilmez, yanlış account'u reserve sanabilir
+                    if let Ok(obligation_pubkey) =
+                        Pubkey::try_from(opportunity.account_position.account_address.as_str())
+                    {
+                        use crate::protocols::solend::solend_idl::SolendObligation;
 
-                    if debt_reserve_pubkey.is_none() {
-                        if let Ok(obligation_pubkey) =
-                            Pubkey::try_from(opportunity.account_position.account_address.as_str())
+                        if let Ok(obligation_account) =
+                            rpc_client.get_account(&obligation_pubkey).await
                         {
-                            use crate::protocols::solend::solend_idl::SolendObligation;
-
-                            if let Ok(obligation_account) =
-                                rpc_client.get_account(&obligation_pubkey).await
+                            if let Ok(obligation) =
+                                SolendObligation::from_account_data(&obligation_account.data)
                             {
-                                if let Ok(obligation) =
-                                    SolendObligation::from_account_data(&obligation_account.data)
-                                {
-                                    // İlk borrow reserve'ini al
-                                    // Note: In most cases, the first borrow is the primary debt
-                                    // For multi-asset positions, this may need refinement
-                                    if let Some(borrow) = obligation.borrows.first() {
-                                        debt_reserve_pubkey = Some(borrow.borrow_reserve);
-                                    }
+                                // İlk borrow reserve'ini al
+                                // Note: In most cases, the first borrow is the primary debt
+                                // For multi-asset positions, this may need refinement
+                                if let Some(borrow) = obligation.borrows.first() {
+                                    debt_reserve_pubkey = Some(borrow.borrow_reserve);
                                 }
                             }
                         }
@@ -96,8 +87,10 @@ pub async fn run_strategist(
                                                 )
                                                 .await
                                                 {
-                                                    let confidence_slippage_bps = ((price
-                                                        .confidence
+                                                    // Pyth confidence = %68 confidence interval (1 sigma)
+                                                    // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
+                                                    let confidence_95 = price.confidence * 2.0;
+                                                    let confidence_slippage_bps = ((confidence_95
                                                         / price.price)
                                                         * 10000.0)
                                                         as u16;
@@ -108,11 +101,12 @@ pub async fn run_strategist(
                                                         as i64
                                                         - price.timestamp;
 
-                                                    if age_seconds > 300 {
+                                                    if age_seconds > MAX_ORACLE_AGE_SECONDS {
                                                         approved = false;
                                                         rejection_reason = format!(
-                                                            "oracle price too old: {}s",
-                                                            age_seconds
+                                                            "oracle price too old: {}s (max: {}s)",
+                                                            age_seconds,
+                                                            MAX_ORACLE_AGE_SECONDS
                                                         );
                                                     } else if confidence_slippage_bps
                                                         > config.max_slippage_bps
@@ -145,8 +139,11 @@ pub async fn run_strategist(
                                                         )
                                                         .await
                                                         {
+                                                            // Pyth confidence = %68 confidence interval (1 sigma)
+                                                            // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
+                                                            let confidence_95 = price.confidence * 2.0;
                                                             let confidence_slippage_bps =
-                                                                ((price.confidence / price.price)
+                                                                ((confidence_95 / price.price)
                                                                     * 10000.0)
                                                                     as u16;
                                                             let age_seconds =
@@ -159,11 +156,12 @@ pub async fn run_strategist(
                                                                     as i64
                                                                     - price.timestamp;
 
-                                                            if age_seconds > 300 {
+                                                            if age_seconds > MAX_ORACLE_AGE_SECONDS {
                                                                 approved = false;
                                                                 rejection_reason = format!(
-                                                                    "oracle price too old: {}s",
-                                                                    age_seconds
+                                                                    "oracle price too old: {}s (max: {}s)",
+                                                                    age_seconds,
+                                                                    MAX_ORACLE_AGE_SECONDS
                                                                 );
                                                             } else if confidence_slippage_bps
                                                                 > config.max_slippage_bps
@@ -238,6 +236,8 @@ pub async fn run_strategist(
                             }
                         };
 
+                    let required_debt_amount = opportunity.max_liquidatable_amount;
+
                     if approved {
                         match wallet_balance_checker
                             .ensure_token_account_exists(&debt_mint)
@@ -245,6 +245,28 @@ pub async fn run_strategist(
                         {
                             Ok(true) => {
                                 log::debug!("Debt token account exists: mint={}", debt_mint);
+                                
+                                // ATA var ama bakiye kontrolü yap - bakiye sıfır olabilir
+                                match wallet_balance_checker.get_token_balance(&debt_mint).await {
+                                    Ok(debt_balance) => {
+                                        if debt_balance < required_debt_amount {
+                                            approved = false;
+                                            rejection_reason = format!(
+                                                "insufficient debt token balance: required={}, available={}",
+                                                required_debt_amount,
+                                                debt_balance
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to get debt token balance: {}, rejecting opportunity",
+                                            e
+                                        );
+                                        approved = false;
+                                        rejection_reason = format!("debt token balance check failed: {}", e);
+                                    }
+                                }
                             }
                             Ok(false) => {
                                 approved = false;
@@ -299,8 +321,6 @@ pub async fn run_strategist(
                             }
                         }
                     }
-
-                    let required_debt_amount = opportunity.max_liquidatable_amount;
 
                     if approved {
                         match wallet_balance_checker

@@ -18,10 +18,27 @@ pub async fn run_rpc_poller(
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let program_id = protocol.program_id();
 
+    // ⚠️ RATE LIMITING UYARISI
+    // getProgramAccounts çok ağır bir RPC çağrısıdır ve ücretsiz RPC'ler bunu sınırlar
+    // Önerilen çözümler:
+    // 1. Polling interval'ı artır: POLL_INTERVAL_MS=10000 (10 saniye) - ücretsiz RPC için
+    // 2. Premium RPC kullan (Helius, Triton) - rate limit yok, getProgramAccounts destekli
+    // 3. WebSocket kullan (önerilir) - account subscription, real-time updates, rate limit yok
+    if poll_interval.as_secs() < 10 {
+        log::warn!(
+            "⚠️  Polling interval {}ms is too short for getProgramAccounts on free RPC endpoints!",
+            config.poll_interval_ms
+        );
+        log::warn!(
+            "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) for free RPC, or use premium RPC/WebSocket"
+        );
+    }
+
     log::info!(
-        "Starting RPC poller for protocol: {} (program: {})",
+        "Starting RPC poller for protocol: {} (program: {}), poll_interval: {}ms",
         protocol.id(),
-        program_id
+        program_id,
+        config.poll_interval_ms
     );
 
     let mut consecutive_errors = 0;
@@ -74,10 +91,13 @@ async fn fetch_and_publish_positions(
 ) -> Result<usize> {
     let program_id = protocol.program_id();
 
+    // ⚠️ getProgramAccounts çok ağır bir RPC çağrısıdır
+    // Ücretsiz RPC'ler genelde 1 req/10s limit koyar
+    // Premium RPC (Helius, Triton) veya WebSocket kullanılması önerilir
     let accounts = rpc_client
         .get_program_accounts(&program_id)
         .await
-        .context("Failed to fetch program accounts")?;
+        .context("Failed to fetch program accounts. Note: getProgramAccounts is rate-limited on free RPC endpoints. Consider using premium RPC or WebSocket.")?;
 
     log::debug!(
         "Fetched {} accounts for program {}",

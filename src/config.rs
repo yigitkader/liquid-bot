@@ -52,7 +52,7 @@ impl Config {
                 .parse()
                 .context("Invalid MAX_SLIPPAGE_BPS value")?,
             poll_interval_ms: env::var("POLL_INTERVAL_MS")
-                .unwrap_or_else(|_| "2000".to_string())
+                .unwrap_or_else(|_| "10000".to_string()) // Default: 10s (safe for free RPC endpoints)
                 .parse()
                 .context("Invalid POLL_INTERVAL_MS value")?,
             dry_run: env::var("DRY_RUN")
@@ -88,7 +88,7 @@ impl Config {
                 .parse()
                 .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
             slippage_safety_margin_multiplier: env::var("SLIPPAGE_SAFETY_MARGIN_MULTIPLIER")
-                .unwrap_or_else(|_| "1.2".to_string()) // 20% safety margin
+                .unwrap_or_else(|_| "1.1".to_string()) // 10% safety margin (reduced from 20% to avoid over-conservative profit calculation)
                 .parse()
                 .context("Invalid SLIPPAGE_SAFETY_MARGIN_MULTIPLIER value")?,
             // Wallet configuration
@@ -177,6 +177,20 @@ impl Config {
             ));
         }
 
+        // ⚠️ getProgramAccounts rate limiting uyarısı
+        if self.poll_interval_ms < 10000 {
+            log::warn!(
+                "⚠️  POLL_INTERVAL_MS={}ms is very short for getProgramAccounts on free RPC endpoints!",
+                self.poll_interval_ms
+            );
+            log::warn!(
+                "⚠️  Free RPC endpoints typically limit getProgramAccounts to 1 req/10s"
+            );
+            log::warn!(
+                "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) for free RPC, or use premium RPC/WebSocket"
+            );
+        }
+
         if !self.dry_run {
             log::warn!("⚠️  DRY_RUN=false: Bot will send REAL transactions to blockchain!");
             log::warn!("⚠️  Make sure you have tested thoroughly in dry-run mode!");
@@ -200,8 +214,11 @@ impl Config {
         if self.dex_fee_bps > 1000 {
             log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
         }
+        // Note: slippage_safety_margin_multiplier is now hardcoded to 1.1 (10%) in math.rs
+        // to avoid over-conservative profit calculations. This config field is kept for
+        // backward compatibility but not used in calculations.
         if self.slippage_safety_margin_multiplier < 1.0 || self.slippage_safety_margin_multiplier > 2.0 {
-            log::warn!("⚠️  SLIPPAGE_SAFETY_MARGIN_MULTIPLIER={} is outside recommended range (1.0-2.0)", self.slippage_safety_margin_multiplier);
+            log::warn!("⚠️  SLIPPAGE_SAFETY_MARGIN_MULTIPLIER={} is outside recommended range (1.0-2.0), but note: this value is no longer used (hardcoded to 1.1)", self.slippage_safety_margin_multiplier);
         }
 
         Ok(())

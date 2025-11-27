@@ -189,12 +189,17 @@ pub async fn calculate_liquidation_opportunity(
                         .await
                         {
                             Ok(Some(oracle_price)) => {
-                                let confidence_ratio = oracle_price.confidence / oracle_price.price;
+                                // Pyth confidence = %68 confidence interval (1 sigma)
+                                // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
+                                // Bot %68 confidence kullanırsa → Riski az gösterir
+                                let confidence_95 = oracle_price.confidence * 2.0;
+                                let confidence_ratio = confidence_95 / oracle_price.price;
                                 let confidence_bps = (confidence_ratio * 10_000.0) as u16;
                                 log::debug!(
-                                    "Oracle confidence slippage: {} bps (confidence: ${:.4}, price: ${:.4})",
+                                    "Oracle confidence slippage: {} bps (confidence_68: ${:.4}, confidence_95: ${:.4}, price: ${:.4})",
                                     confidence_bps,
                                     oracle_price.confidence,
+                                    confidence_95,
                                     oracle_price.price
                                 );
                                 confidence_bps
@@ -225,23 +230,23 @@ pub async fn calculate_liquidation_opportunity(
         config.default_oracle_confidence_slippage_bps
     };
 
-    // Total slippage = estimated slippage + oracle confidence slippage
-    // Estimated slippage is based on position size, oracle confidence adds price uncertainty
-    let total_slippage_bps = estimated_slippage_bps.saturating_add(oracle_slippage_bps);
+    // Oracle confidence zaten slippage'in bir parçası, double counting yapmamak için
+    // estimated_slippage ve oracle_slippage'i toplamak yerine max alıyoruz
+    // Bu, oracle confidence'ın zaten price uncertainty'yi temsil ettiğini kabul eder
+    let oracle_adjusted_slippage_bps = estimated_slippage_bps.max(oracle_slippage_bps);
     let base_slippage_cost_usd =
-        calculate_slippage_cost_usd(seizable_collateral_usd, total_slippage_bps);
+        calculate_slippage_cost_usd(seizable_collateral_usd, oracle_adjusted_slippage_bps);
 
-    // Güvenlik marjı ekle - gerçek slippage tahminden daha yüksek olabilir
-    // Safety margin multiplier is configurable (default: 1.2 = 20% margin)
-    let slippage_cost_usd = base_slippage_cost_usd * config.slippage_safety_margin_multiplier;
+    // Safety margin: 10% (1.1x) yeterli - %20 çok yüksek ve kârı gereksiz azaltıyor
+    // Gerçek slippage genelde tahminlerden çok farklı değil, %10 buffer yeterli
+    let slippage_cost_usd = base_slippage_cost_usd * 1.1;
 
     log::debug!(
-        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, total={} bps, cost=${:.4} (with {:.0}% safety margin)",
+        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, adjusted={} bps (max), cost=${:.4} (with 10% safety margin)",
         estimated_slippage_bps,
         oracle_slippage_bps,
-        total_slippage_bps,
-        slippage_cost_usd,
-        (config.slippage_safety_margin_multiplier - 1.0) * 100.0
+        oracle_adjusted_slippage_bps,
+        slippage_cost_usd
     );
 
     let needs_swap = collateral_asset.mint != debt_asset.mint;

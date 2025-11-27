@@ -343,25 +343,22 @@ impl Protocol for SolendProtocol {
         }
 
         // Calculate health factor if not already set
-        // Note: This is a simplified calculation. Solend's actual formula considers:
-        // - Individual LTV for each collateral asset
-        // - Individual liquidation threshold for each asset
-        // - Weighted average based on asset values
-        // For accurate health factor, use the value from parse_account_position which uses
-        // SolendObligation::calculate_health_factor() that reads from on-chain data
+        // Solend her asset için farklı LTV kullanır (SOL = 75%, BTC = 80%, shitcoin = 50%)
+        // Her asset'in kendi LTV'sini kullanarak weighted collateral hesaplıyoruz
         if position.total_debt_usd == 0.0 {
             return Ok(f64::INFINITY);
         }
 
-        // Simplified health factor calculation
-        // Real implementation should use asset-specific LTVs from reserve configs
-        let collateral_value = position.total_collateral_usd;
-        let debt_value = position.total_debt_usd;
+        // Her asset'in kendi LTV'sini kullanarak weighted collateral hesapla
+        let mut weighted_collateral = 0.0;
+        for asset in &position.collateral_assets {
+            weighted_collateral += asset.amount_usd * asset.ltv;
+        }
 
-        // Health Factor = (Collateral * LTV) / Debt
-        // Using average LTV (0.75 = 75%) as fallback
-        // In production, calculate weighted average LTV from all collateral assets
-        Ok((collateral_value * 0.75) / debt_value)
+        // Health Factor = Weighted Collateral / Total Debt
+        let health_factor = weighted_collateral / position.total_debt_usd;
+        
+        Ok(health_factor)
     }
 
     fn get_liquidation_params(&self) -> LiquidationParams {
@@ -400,7 +397,7 @@ impl Protocol for SolendProtocol {
             repay_reserve_liquidity_supply,
             withdraw_reserve,
             withdraw_reserve_collateral_supply,
-            withdraw_reserve_collateral_mint,
+            _withdraw_reserve_collateral_mint, // Not used in instruction, only for ATA derivation
         ) = if let Some(rpc) = rpc_client.as_ref() {
             self.resolve_liquidation_accounts(opportunity, liquidator, rpc)
                 .await?
@@ -420,78 +417,53 @@ impl Protocol for SolendProtocol {
             )
         };
 
-        // Solend programı her iki oracle account'ını da bekliyor (IDL'de görüldüğü gibi)
-        // Gerçek kodda oracle_option YOK - sadece iki oracle pubkey var
-        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
-        let (pyth_oracle, switchboard_oracle) = if let Some(rpc) = rpc_client.as_ref() {
-            use crate::protocols::solend_reserve::SolendReserve;
-            
-            match rpc.get_account(&repay_reserve).await {
-                Ok(reserve_account) => {
-                    match SolendReserve::from_account_data(&reserve_account.data) {
-                        Ok(reserve) => {
-                            let pyth = reserve.pyth_oracle();
-                            let switchboard = reserve.switchboard_oracle();
-                            
-                            log::debug!(
-                                "Reserve {} oracles: pyth={}, switchboard={}",
-                                repay_reserve,
-                                pyth,
-                                switchboard
-                            );
-                            
-                            (pyth, switchboard)
-                        }
-                        Err(e) => {
-                            log::error!("Failed to parse reserve account {}: {}", repay_reserve, e);
-                            (Pubkey::default(), Pubkey::default())
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to fetch reserve account {}: {}", repay_reserve, e);
-                    (Pubkey::default(), Pubkey::default())
-                }
-            }
-        } else {
-            log::warn!("⚠️  RPC client not provided, using default oracle accounts");
-            (Pubkey::default(), Pubkey::default())
-        };
-        
+        // Gerçek Solend program koduna göre doğru account sırası:
+        // Kaynak: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/processor.rs
+        // fn process_liquidate_obligation içinde:
+        // 1. source_liquidity_info
+        // 2. destination_collateral_info
+        // 3. repay_reserve_info
+        // 4. repay_reserve_liquidity_supply_info
+        // 5. withdraw_reserve_info
+        // 6. withdraw_reserve_collateral_supply_info
+        // 7. obligation_info
+        // 8. lending_market_info
+        // 9. lending_market_authority_info
+        // 10. user_transfer_authority_info (liquidator)
+        // 11. clock (Sysvar)
+        // 12. token_program_id
+        // NOT: Oracle accounts are NOT used in the processor!
         let accounts = vec![
             // 1. sourceLiquidity - liquidator's token account for debt (isMut: true, isSigner: false)
             AccountMeta::new(source_liquidity, false),
             // 2. destinationCollateral - liquidator's token account for collateral (isMut: true, isSigner: false)
             AccountMeta::new(destination_collateral, false),
-            // 3. obligation - obligation account being liquidated (isMut: true, isSigner: false)
-            AccountMeta::new(obligation, false),
-            // 4. reserve - the reserve we're repaying debt to (isMut: true, isSigner: false)
+            // 3. repayReserve - the reserve we're repaying debt to (isMut: true, isSigner: false)
             AccountMeta::new(repay_reserve, false),
-            // 5. reserveCollateralMint - collateral mint of withdraw reserve (isMut: true, isSigner: false)
-            // ✅ DOĞRU: Reserve struct'ından alınan collateral_mint kullanılıyor
-            AccountMeta::new(withdraw_reserve_collateral_mint, false),
-            // 6. reserveLiquiditySupply - liquidity supply token account of repay reserve (isMut: true, isSigner: false)
+            // 4. repayReserveLiquiditySupply - liquidity supply token account of repay reserve (isMut: true, isSigner: false)
             AccountMeta::new(repay_reserve_liquidity_supply, false),
-            // 7. lendingMarket - lending market account (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market, false),
-            // 8. lendingMarketAuthority - lending market authority PDA (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market_authority, false),
-            // 9. destinationLiquidity - collateral supply token account of withdraw reserve (isMut: true, isSigner: false)
+            // 5. withdrawReserve - the reserve we're withdrawing collateral from (isMut: true, isSigner: false)
+            AccountMeta::new(withdraw_reserve, false),
+            // 6. withdrawReserveCollateralSupply - collateral supply token account of withdraw reserve (isMut: true, isSigner: false)
             AccountMeta::new(withdraw_reserve_collateral_supply, false),
-            // 10. liquidator - liquidator pubkey (isMut: false, isSigner: true)
+            // 7. obligation - obligation account being liquidated (isMut: true, isSigner: false)
+            AccountMeta::new(obligation, false),
+            // 8. lendingMarket - lending market account (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(lending_market, false),
+            // 9. lendingMarketAuthority - lending market authority PDA (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(lending_market_authority, false),
+            // 10. userTransferAuthority - liquidator pubkey (isMut: false, isSigner: true)
             AccountMeta::new_readonly(*liquidator, true),
-            // 11. pythPrice - Pyth oracle account (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(pyth_oracle, false),
-            // 12. switchboardPrice - Switchboard oracle account (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(switchboard_oracle, false),
-            // 13. tokenProgram - SPL Token program (isMut: false, isSigner: false)
+            // 11. clock - Clock sysvar (isMut: false, isSigner: false)
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+            // 12. tokenProgram - SPL Token program (isMut: false, isSigner: false)
             AccountMeta::new_readonly(spl_token::id(), false),
         ];
 
         
-        if accounts.len() != 13 {
+        if accounts.len() != 12 {
             return Err(anyhow::anyhow!(
-                "Account count mismatch: expected 13 accounts (per IDL), got {}",
+                "Account count mismatch: expected 12 accounts (per Solend program code), got {}",
                 accounts.len()
             ));
         }

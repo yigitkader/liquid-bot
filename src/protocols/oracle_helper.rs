@@ -31,26 +31,47 @@ fn get_oracle_account_from_mapping(mint: &Pubkey, mapping: &[(&str, &str)], orac
     Ok(None)
 }
 
+/// ⚠️ DEPRECATED: Hardcoded mapping sadece 5 token destekliyor (USDC, USDT, SOL, ETH, BTC)
+/// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al (get_oracle_accounts_from_reserve kullan)
+/// Bu fonksiyon sadece fallback olarak kullanılmalı
 pub fn get_pyth_oracle_account(mint: &Pubkey) -> Result<Option<Pubkey>> {
-    let mapping = &[ //todo: why this is hardcoded here
-        ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98"),
-        ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz"),
-        ("So11111111111111111111111111111111111111112", "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
-        ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB"),
-        ("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU"),
+    // ⚠️ Hardcoded mapping - sadece 5 token (USDC, USDT, SOL, ETH, BTC)
+    // Solend'de 20+ token var (BONK, RAY, SRM, MNGO, etc.) - bunlar desteklenmiyor
+    // Reserve account parsing kullanılmalı!
+    let mapping = &[
+        ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98"), // USDC
+        ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz"), // USDT
+        ("So11111111111111111111111111111111111111112", "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"), // SOL
+        ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB"), // ETH
+        ("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU"), // BTC
     ];
     get_oracle_account_from_mapping(mint, mapping, "Pyth")
 }
 
+/// ⚠️ DEPRECATED: Hardcoded mapping sadece 3 token destekliyor (USDC, USDT, SOL)
+/// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al (get_oracle_accounts_from_reserve kullan)
+/// Bu fonksiyon sadece fallback olarak kullanılmalı
 pub fn get_switchboard_oracle_account(mint: &Pubkey) -> Result<Option<Pubkey>> {
-    let mapping = &[//todo: why this is hardcoded here
-        ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD"),
-        ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "ETAaeeuQBwsh9mM2gqtwWSbEkf2M8GJ2iVZ3gJgKqJz"),
-        ("So11111111111111111111111111111111111111112", "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
+    // ⚠️ Hardcoded mapping - sadece 3 token (USDC, USDT, SOL)
+    // Solend'de 20+ token var (BONK, RAY, SRM, MNGO, etc.) - bunlar desteklenmiyor
+    // Reserve account parsing kullanılmalı!
+    let mapping = &[
+        ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD"), // USDC
+        ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "ETAaeeuQBwsh9mM2gqtwWSbEkf2M8GJ2iVZ3gJgKqJz"), // USDT
+        ("So11111111111111111111111111111111111111112", "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"), // SOL
     ];
     get_oracle_account_from_mapping(mint, mapping, "Switchboard")
 }
 
+/// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al
+/// Bu fonksiyon tüm Solend token'larını destekler (20+ token)
+/// Hardcoded mapping sadece fallback olarak kullanılır
+/// 
+/// Solend'de her reserve account oracle adreslerini içerir:
+/// - pyth_oracle: Pyth oracle pubkey
+/// - switchboard_oracle: Switchboard oracle pubkey
+/// 
+/// Bu fonksiyon önce reserve'den oracle'ı alır, yoksa hardcoded mapping'e fallback yapar
 pub fn get_oracle_accounts_from_reserve(
     reserve_info: &crate::protocols::reserve_helper::ReserveInfo,
 ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
@@ -58,7 +79,7 @@ pub fn get_oracle_accounts_from_reserve(
     let switchboard = reserve_info.switchboard_oracle;
     
     if pyth.is_some() || switchboard.is_some() {
-        log::info!(
+        log::debug!(
             "✅ Using oracles from reserve account: pyth={:?}, switchboard={:?}",
             pyth,
             switchboard
@@ -66,33 +87,49 @@ pub fn get_oracle_accounts_from_reserve(
         return Ok((pyth, switchboard));
     }
     
+    // Fallback: Reserve'de oracle yoksa hardcoded mapping kullan
+    // ⚠️ Bu sadece 5 token destekliyor (USDC, USDT, SOL, ETH, BTC)
     let mint = reserve_info.liquidity_mint
         .or(reserve_info.collateral_mint)
         .ok_or_else(|| anyhow::anyhow!("No mint found in reserve info"))?;
     
     log::warn!(
-        "⚠️  Oracle accounts not found in reserve, using hardcoded mapping for mint: {}",
+        "⚠️  Oracle accounts not found in reserve account, falling back to hardcoded mapping for mint: {}",
         mint
     );
     log::warn!(
         "   ⚠️  Hardcoded mapping only supports 5 tokens (USDC, USDT, SOL, ETH, BTC). \
-         Other tokens (BONK, RAY, SRM, etc.) will fail! \
+         Other tokens (BONK, RAY, SRM, MNGO, etc.) will fail! \
          Ensure reserve account parsing is working correctly. \
          Note: Reserve account parsing should provide oracle addresses automatically."
     );
     get_oracle_accounts_from_mint(&mint)
 }
 
+/// ⚠️ DEPRECATED: Hardcoded mapping kullanır - sadece 5 token destekliyor
+/// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al (get_oracle_accounts_from_reserve kullan)
+/// Bu fonksiyon sadece fallback olarak kullanılmalı
+/// 
+/// Solend'de 20+ token var (BONK, RAY, SRM, MNGO, etc.) - hardcoded mapping bunları desteklemiyor
+/// Reserve account parsing tüm token'ları destekler
 pub fn get_oracle_accounts_from_mint(
     mint: &Pubkey,
 ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
+    log::warn!(
+        "⚠️  Using hardcoded oracle mapping for mint {} - this only supports 5 tokens!",
+        mint
+    );
+    log::warn!(
+        "⚠️  Use get_oracle_accounts_from_reserve() instead for full token support"
+    );
+    
     let pyth = get_pyth_oracle_account(mint)?;
     let switchboard = get_switchboard_oracle_account(mint)?;
     
     if pyth.is_none() && switchboard.is_none() {
         log::warn!(
-            "⚠️  No oracle accounts found for mint {} in hardcoded mapping. \
-             This token is not supported by hardcoded mapping. \
+            "❌ No oracle accounts found for mint {} in hardcoded mapping. \
+             This token (BONK, RAY, SRM, MNGO, etc.) is not supported! \
              Use reserve account parsing instead!",
             mint
         );
@@ -100,10 +137,14 @@ pub fn get_oracle_accounts_from_mint(
     
     Ok((pyth, switchboard))
 }
+/// ⚠️ DEPRECATED: Hardcoded mapping kullanır
+/// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al (get_oracle_accounts_from_reserve kullan)
+/// Bu fonksiyon sadece fallback olarak kullanılmalı
 pub fn get_oracle_accounts(
     mint: &Pubkey,
 ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
-    // Fallback: Hardcoded mapping (reserve account bilgisi yoksa)
+    // ⚠️ Fallback: Hardcoded mapping (reserve account bilgisi yoksa)
+    // Bu sadece 5 token destekliyor - reserve account parsing kullanılmalı!
     get_oracle_accounts_from_mint(mint)
 }
 
