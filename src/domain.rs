@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Kullanıcının borç/teminat durumu
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountPosition {
     pub account_address: String,
@@ -12,7 +11,6 @@ pub struct AccountPosition {
     pub debt_assets: Vec<DebtAsset>,
 }
 
-/// Teminat varlığı
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollateralAsset {
     pub mint: String,
@@ -21,7 +19,6 @@ pub struct CollateralAsset {
     pub ltv: f64,
 }
 
-/// Borç varlığı
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebtAsset {
     pub mint: String,
@@ -30,7 +27,6 @@ pub struct DebtAsset {
     pub borrow_rate: f64,
 }
 
-/// Likidasyon fırsatı
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiquidationOpportunity {
     pub account_position: AccountPosition,
@@ -41,4 +37,3 @@ pub struct LiquidationOpportunity {
     pub target_debt_mint: String,
     pub target_collateral_mint: String,
 }
-

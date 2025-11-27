@@ -1,8 +1,3 @@
-//! Liquid Bot Library
-//!
-//! Bu crate, Solana üzerinde çalışan otomatik lending likidasyon botu için
-//! gerekli tüm modülleri içerir.
-
 pub mod config;
 pub mod domain;
 pub mod event;

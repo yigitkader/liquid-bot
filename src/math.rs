@@ -1,47 +1,24 @@
-use anyhow::Result;
-use std::sync::Arc;
 use crate::config::Config;
 use crate::domain::{AccountPosition, LiquidationOpportunity};
 use crate::protocol::Protocol;
+use crate::protocols::oracle_helper::{get_oracle_accounts_from_mint, read_oracle_price};
+use crate::solana_client::SolanaClient;
+use anyhow::Result;
+use std::sync::Arc;
 
-/// Transaction fee hesaplama (compute unit'e göre)
-/// 
-/// Solana'da transaction fee = base fee + (compute units * compute unit price)
-/// 
-/// Liquidation transaction için tipik değerler:
-/// - Base fee: ~5000 lamports (0.000005 SOL)
-/// - Compute units: ~200,000 (liquidation için)
-/// - Priority fee: ~1000 micro-lamports per CU (config'ten)
-/// 
-/// Total fee ≈ base_fee + (200_000 * 1000 / 1_000_000) = ~0.0002 SOL
 fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
     sol_price_usd: f64,
 ) -> f64 {
-    // Base transaction fee (Solana base fee)
+    // todo: validate is it correct Base transaction fee (Solana base fee)
     const BASE_FEE_LAMPORTS: u64 = 5_000; // ~0.000005 SOL
-    
-    // Priority fee = compute_units * priority_fee_per_cu
     let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
-    
-    // Total fee in lamports
     let total_fee_lamports = BASE_FEE_LAMPORTS + priority_fee_lamports;
-    
-    // Convert to SOL (1 SOL = 1_000_000_000 lamports)
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
-    
-    // Convert to USD (SOL price)
     total_fee_sol * sol_price_usd
 }
 
-/// Slippage maliyeti hesaplama
-/// 
-/// Oracle fiyatı vs gerçek piyasa fiyatı arasındaki fark.
-/// Slippage genellikle:
-/// - Küçük işlemler için: %0.1 - %0.5
-/// - Büyük işlemler için: %0.5 - %2.0
-/// - Volatil piyasalar için: %2.0 - %5.0
 fn calculate_slippage_cost_usd(
     amount_usd: f64,
     slippage_bps: u16, // Basis points (100 bps = 1%)
@@ -50,205 +27,206 @@ fn calculate_slippage_cost_usd(
 }
 
 /// Token swap maliyeti hesaplama (eğer gerekirse)
-/// 
-/// Eğer collateral ve debt farklı token'larsa, swap gerekebilir.
+///
+/// todo: validate => Eğer collateral ve debt farklı token'larsa, swap gerekebilir.
 /// Swap maliyeti:
 /// - DEX fee: %0.1 - %0.3 (Jupiter, Raydium)
 /// - Price impact: Slippage'e dahil
-fn calculate_swap_cost_usd(
-    amount_usd: f64,
-    needs_swap: bool,
-) -> f64 {
+fn calculate_swap_cost_usd(amount_usd: f64, needs_swap: bool) -> f64 {
     if !needs_swap {
         return 0.0;
     }
-    
-    // DEX fee (örnek: %0.2)
+
+    // DEX fee (örnek: %0.2) // todo : is is correct info?
     const DEX_FEE_BPS: u16 = 20; // 0.2%
     amount_usd * (DEX_FEE_BPS as f64 / 10_000.0)
 }
 
-/// En kârlı collateral asset'i seçer
-/// 
-/// Seçim kriterleri:
-/// 1. Yeterli miktarda olmalı (seizable_collateral_usd'yi karşılayabilmeli)
-/// 2. En yüksek değerli olmalı (amount_usd en yüksek)
-/// 3. Eşitse, en yüksek LTV'ye sahip olanı seç (daha fazla değer = daha fazla profit potansiyeli)
 fn select_most_profitable_collateral(
     collateral_assets: &[crate::domain::CollateralAsset],
     required_collateral_usd: f64,
 ) -> Option<&crate::domain::CollateralAsset> {
     collateral_assets
         .iter()
-        // Yeterli miktarda olanları filtrele
         .filter(|asset| asset.amount_usd >= required_collateral_usd)
-        // En yüksek değerli olanı seç (amount_usd en yüksek)
-        // Eşitse, en yüksek LTV'ye sahip olanı seç
         .max_by(|a, b| {
-            // Önce amount_usd'ye göre karşılaştır
             a.amount_usd
                 .partial_cmp(&b.amount_usd)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                // Eşitse LTV'ye göre karşılaştır
-                .then_with(|| a.ltv.partial_cmp(&b.ltv).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    a.ltv
+                        .partial_cmp(&b.ltv)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         })
 }
 
-/// En kârlı debt asset'i seçer
-/// 
-/// Seçim kriterleri:
-/// 1. En yüksek değerli olmalı (amount_usd en yüksek)
-/// 2. Eşitse, en düşük borrow rate'e sahip olanı seç (daha az maliyet)
 fn select_most_profitable_debt(
     debt_assets: &[crate::domain::DebtAsset],
 ) -> Option<&crate::domain::DebtAsset> {
-    debt_assets
-        .iter()
-        // En yüksek değerli olanı seç (amount_usd en yüksek)
-        // Eşitse, en düşük borrow rate'e sahip olanı seç
-        .max_by(|a, b| {
-            // Önce amount_usd'ye göre karşılaştır
-            a.amount_usd
-                .partial_cmp(&b.amount_usd)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // Eşitse borrow rate'e göre ters sırala (düşük rate = daha iyi)
-                .then_with(|| b.borrow_rate.partial_cmp(&a.borrow_rate).unwrap_or(std::cmp::Ordering::Equal))
-        })
+    debt_assets.iter().max_by(|a, b| {
+        a.amount_usd
+            .partial_cmp(&b.amount_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.borrow_rate
+                    .partial_cmp(&a.borrow_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    })
 }
 
-/// Likidasyon fırsatı hesaplama (GERÇEKÇİ)
-/// 
-/// Gerçekçi profit hesaplaması yapar:
-/// - Slippage maliyeti
-/// - Compute unit'e göre transaction fee
-/// - Token swap maliyeti (eğer gerekirse)
-/// - Konservatif profit tahmini
-/// 
-/// Protokol parametreleri Protocol trait'inden alınır.
 pub async fn calculate_liquidation_opportunity(
     position: &AccountPosition,
     config: &Config,
     protocol: Arc<dyn Protocol>,
+    rpc_client: Option<Arc<SolanaClient>>,
 ) -> Result<Option<LiquidationOpportunity>> {
-    // Health factor kontrolü
     if position.health_factor >= 1.0 || position.total_debt_usd <= 0.0 {
         return Ok(None);
     }
-    
-    // Protokol parametrelerini Protocol trait'inden al
+
     let liquidation_params = protocol.get_liquidation_params();
     let close_factor = liquidation_params.close_factor;
     let liquidation_bonus = liquidation_params.liquidation_bonus;
-    
-    // Max liquidatable amount hesaplama (USD cinsinden)
-    // Protokol limiti: close_factor * total_debt
+
     let max_liquidatable_debt_usd = position.total_debt_usd * close_factor;
-    
-    // Seizable collateral hesaplama (USD cinsinden) - önce hesapla ki yeterli miktarda olanı seçebilelim
-    // Likidasyon bonusu ile birlikte alınacak teminat
-    // Formül: liquidated_debt * (1 + liquidation_bonus)
+
     let seizable_collateral_usd = max_liquidatable_debt_usd * (1.0 + liquidation_bonus);
-    
-    // En kârlı debt asset'i seç
+
     let debt_asset = select_most_profitable_debt(&position.debt_assets)
         .ok_or_else(|| anyhow::anyhow!("No debt assets found in position"))?;
-    
-    // En kârlı collateral asset'i seç (yeterli miktarda olan en yüksek değerli)
-    let collateral_asset = select_most_profitable_collateral(&position.collateral_assets, seizable_collateral_usd)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No sufficient collateral assets found. Required: ${:.2}, Available: {:?}",
-                seizable_collateral_usd,
-                position.collateral_assets.iter().map(|a| a.amount_usd).collect::<Vec<_>>()
-            )
-        })?;
-    
-    // USD'yi token amount'una çevir
-    // Token price = amount_usd / amount (native units)
+
+    let collateral_asset =
+        select_most_profitable_collateral(&position.collateral_assets, seizable_collateral_usd)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No sufficient collateral assets found. Required: ${:.2}, Available: {:?}",
+                    seizable_collateral_usd,
+                    position
+                        .collateral_assets
+                        .iter()
+                        .map(|a| a.amount_usd)
+                        .collect::<Vec<_>>()
+                )
+            })?;
+
     let debt_token_price_usd = if debt_asset.amount > 0 {
         debt_asset.amount_usd / debt_asset.amount as f64
     } else {
         return Ok(None); // Division by zero protection
     };
-    
-    // Max liquidatable amount (token native units)
+
     let max_liquidatable = (max_liquidatable_debt_usd / debt_token_price_usd) as u64;
-    
-    // USD'yi collateral token amount'una çevir
     let collateral_token_price_usd = if collateral_asset.amount > 0 {
         collateral_asset.amount_usd / collateral_asset.amount as f64
     } else {
         return Ok(None); // Division by zero protection
     };
-    
-    // Seizable collateral (token native units)
+
     let seizable_collateral = (seizable_collateral_usd / collateral_token_price_usd) as u64;
-    
-    // ============================================
-    // GERÇEKÇİ PROFIT HESAPLAMA
-    // ============================================
-    
-    // 1. Transaction fee (compute unit'e göre)
-    // Liquidation transaction için tipik compute units: ~200,000
+
     const LIQUIDATION_COMPUTE_UNITS: u32 = 200_000;
-    const PRIORITY_FEE_PER_CU: u64 = 1_000; // micro-lamports per CU (config'ten alınabilir)
-    const SOL_PRICE_USD: f64 = 150.0; // SOL fiyatı (yaklaşık, gerçekte oracle'dan alınmalı)
-    
+    const PRIORITY_FEE_PER_CU: u64 = 1_000; // todo: micro-lamports per CU (config'ten alınabilir)
+    const SOL_PRICE_USD: f64 = 150.0; // todo: SOL fiyatı (yaklaşık, gerçekte oracle'dan alınmalı)
+
     let transaction_fee_usd = calculate_transaction_fee_usd(
         LIQUIDATION_COMPUTE_UNITS,
         PRIORITY_FEE_PER_CU,
         SOL_PRICE_USD,
     );
-    
-    // 2. Slippage maliyeti
-    // Konservatif tahmin: Config'teki max_slippage'in %50'si kullanılır
-    // Gerçek slippage genellikle daha düşüktür, bu yüzden konservatif bir tahmin yapıyoruz
-    // İşlem büyüklüğüne göre dinamik slippage (büyük işlemler = daha yüksek slippage)
-    let base_slippage_bps = config.max_slippage_bps as f64 * 0.5; // Konservatif tahmin: %50
-    
-    // İşlem büyüklüğüne göre slippage ayarı:
-    // - Küçük işlemler (< $10k): %40'ı kullan (daha düşük slippage)
-    // - Orta işlemler ($10k-$100k): %50'yi kullan (varsayılan)
-    // - Büyük işlemler (> $100k): %60'ı kullan (daha yüksek slippage)
+
     let size_multiplier = if seizable_collateral_usd < 10_000.0 {
-        0.4 // Küçük işlemler için daha düşük slippage
+        0.5
     } else if seizable_collateral_usd > 100_000.0 {
-        0.6 // Büyük işlemler için daha yüksek slippage
+        0.8
     } else {
-        0.5 // Orta işlemler için varsayılan
+        0.6
     };
-    
+
     let estimated_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
-    let slippage_cost_usd = calculate_slippage_cost_usd(
-        seizable_collateral_usd,
+
+    let oracle_slippage_bps = if let Some(client) = &rpc_client {
+        match collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>() {
+            Ok(mint_pubkey) => {
+                match get_oracle_accounts_from_mint(&mint_pubkey) {
+                    Ok((pyth, switchboard)) => {
+                        match read_oracle_price(
+                            pyth.as_ref(),
+                            switchboard.as_ref(),
+                            Arc::clone(client),
+                        )
+                        .await
+                        {
+                            Ok(Some(oracle_price)) => {
+                                let confidence_ratio = oracle_price.confidence / oracle_price.price;
+                                let confidence_bps = (confidence_ratio * 10_000.0) as u16;
+                                log::debug!(
+                                    "Oracle confidence slippage: {} bps (confidence: ${:.4}, price: ${:.4})",
+                                    confidence_bps,
+                                    oracle_price.confidence,
+                                    oracle_price.price
+                                );
+                                confidence_bps
+                            }
+                            Ok(None) => {
+                                log::warn!("Oracle price not available, using default confidence slippage: 100 bps");
+                                100 // Varsayılan: %1 // todo : is it correct?
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to read oracle price: {}, using default confidence slippage: 100 bps", e);
+                                100 // Varsayılan: %1 // todo : is it correct?
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to get oracle accounts: {}, using default confidence slippage: 100 bps", e);
+                        100 // Varsayılan: %1 // todo : is it correct?
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to parse collateral mint: {}, using default confidence slippage: 100 bps", e);
+                100 // Varsayılan: %1 // todo : is it correct?
+            }
+        }
+    } else {
+        log::debug!("RPC client not provided, using default oracle confidence slippage: 100 bps");
+        100 // Varsayılan: %1 (RPC client yoksa) // todo : is it correct?
+    };
+
+    // Total slippage = (todo: neden tahmin?)tahmini slippage + oracle confidence slippage
+    let total_slippage_bps = estimated_slippage_bps.saturating_add(oracle_slippage_bps);
+    let base_slippage_cost_usd =
+        calculate_slippage_cost_usd(seizable_collateral_usd, total_slippage_bps);
+
+    // Güvenlik marjı ekle (%20) - gerçek slippage tahminden daha yüksek olabilir todo: validate
+    let slippage_cost_usd = base_slippage_cost_usd * 1.2;
+
+    log::debug!(
+        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, total={} bps, cost=${:.4} (with 20% safety margin)",
         estimated_slippage_bps,
+        oracle_slippage_bps,
+        total_slippage_bps,
+        slippage_cost_usd
     );
-    
-    // 3. Token swap maliyeti (eğer collateral ve debt farklı token'larsa)
-    // Seçilen en kârlı asset'leri kullan
+
     let needs_swap = collateral_asset.mint != debt_asset.mint;
-    
+
     let swap_cost_usd = if needs_swap {
         calculate_swap_cost_usd(seizable_collateral_usd, true)
     } else {
         0.0
     };
-    
-    // 4. Toplam maliyet
+
     let total_cost_usd = transaction_fee_usd + slippage_cost_usd + swap_cost_usd;
-    
-    // 5. Net profit hesaplama (KONSERVATİF)
-    // Gross profit = Seizable collateral - Liquidated debt
     let gross_profit_usd = seizable_collateral_usd - max_liquidatable_debt_usd;
-    
-    // Net profit = Gross profit - Tüm maliyetler
     let estimated_profit_usd = gross_profit_usd - total_cost_usd;
-    
-    // 6. Minimum profit margin kontrolü (%1 minimum margin)
-    // Production safety: Minimum %1 profit margin gereklidir
-    const MIN_PROFIT_MARGIN_BPS: u16 = 100; // %1 = 100 basis points
-    let min_profit_margin_usd = max_liquidatable_debt_usd * (MIN_PROFIT_MARGIN_BPS as f64 / 10_000.0);
-    
+
+    const MIN_PROFIT_MARGIN_BPS: u16 = 100; // %1 = 100 basis points // todo : is it correct?
+    let min_profit_margin_usd =
+        max_liquidatable_debt_usd * (MIN_PROFIT_MARGIN_BPS as f64 / 10_000.0);
+
     if estimated_profit_usd < min_profit_margin_usd {
         log::debug!(
             "Opportunity rejected: estimated profit ${:.2} < min margin ${:.2} ({}% of debt)",
@@ -258,29 +236,7 @@ pub async fn calculate_liquidation_opportunity(
         );
         return Ok(None);
     }
-    
-    // 7. Profit hesaplama (zaten konservatif)
-    // 
-    // ✅ DOĞRULANMIŞ: Ek güvenlik marjı kaldırıldı (önceki: %10, şimdi: yok)
-    // 
-    // Neden ek güvenlik marjı eklenmiyor:
-    // - Slippage: max_slippage_bps'in %50'si kullanılıyor (konservatif tahmin)
-    // - Transaction fee: compute unit'e göre hesaplanıyor (gerçekçi)
-    // - Swap cost: DEX fee dahil (gerçekçi)
-    // - Minimum profit margin: %1 zaten kontrol ediliyor
-    // 
-    // Bu maliyetler zaten konservatif tahmin edildiği için, ek %10 güvenlik marjı
-    // gereksiz kısıtlama yaratır ve kârlı fırsatları kaçırmaya neden olur.
-    // 
-    // Önceki implementasyon (YANLIŞ):
-    //   let conservative_profit_usd = estimated_profit_usd * 0.9;  // %10 güvenlik marjı
-    // 
-    // Yeni implementasyon (DOĞRU):
-    //   estimated_profit_usd direkt kullanılıyor (zaten konservatif)
-    // 
-    // Eğer gerçek profit tahminden düşük çıkarsa, bu zaten slippage ve diğer
-    // konservatif tahminlerle karşılanmış olur.
-    
+
     log::debug!(
         "Profit calculation: gross=${:.2}, tx_fee=${:.4}, slippage=${:.4}, swap=${:.4}, total_cost=${:.4}, net=${:.2}",
         gross_profit_usd,
@@ -290,8 +246,7 @@ pub async fn calculate_liquidation_opportunity(
         total_cost_usd,
         estimated_profit_usd
     );
-    
-    // Minimum profit kontrolü
+
     if estimated_profit_usd < config.min_profit_usd {
         log::debug!(
             "Opportunity rejected: estimated profit ${:.2} < min ${:.2}",
@@ -300,32 +255,25 @@ pub async fn calculate_liquidation_opportunity(
         );
         return Ok(None);
     }
-    
-    // Debt ve collateral asset'leri zaten yukarıda alındı
+
     let target_debt_mint = debt_asset.mint.clone();
     let target_collateral_mint = collateral_asset.mint.clone();
-    
+
     Ok(Some(LiquidationOpportunity {
         account_position: position.clone(),
         max_liquidatable_amount: max_liquidatable,
         seizable_collateral,
         liquidation_bonus,
-        estimated_profit_usd, // Zaten konservatif tahmin (slippage, fees, swap dahil)
+        estimated_profit_usd, // todo:(neden tahmin?) Zaten konservatif tahmin (slippage, fees, swap dahil)
         target_debt_mint,
         target_collateral_mint,
     }))
 }
 
-/// Health Factor hesaplama (eğer protokolden direkt alınmıyorsa)
-pub fn calculate_health_factor(
-    total_collateral_usd: f64,
-    total_debt_usd: f64,
-    ltv: f64,
-) -> f64 {
+pub fn calculate_health_factor(total_collateral_usd: f64, total_debt_usd: f64, ltv: f64) -> f64 {
     if total_debt_usd == 0.0 {
         return f64::INFINITY;
     }
-    
+
     (total_collateral_usd * ltv) / total_debt_usd
 }
-

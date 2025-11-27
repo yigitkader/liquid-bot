@@ -1,8 +1,3 @@
-//! Reserve Account Helper
-//! 
-//! Bu modül, Solend reserve account'larını parse etmek için helper fonksiyonlar sağlar.
-//! Gerçek Solend reserve account yapısını kullanarak parse eder.
-
 use anyhow::{Context, Result};
 use solana_sdk::{
     pubkey::Pubkey,
@@ -12,37 +7,27 @@ use solana_sdk::{
 // Solend reserve account struct'ını kullan
 use crate::protocols::solend_reserve::SolendReserve;
 
-/// Reserve account bilgileri
 #[derive(Debug, Clone)]
 pub struct ReserveInfo {
     pub reserve_pubkey: Pubkey,
-    pub mint: Option<Pubkey>, // Reserve'den parse edilen mint
-    pub ltv: f64,              // Loan-to-Value ratio (0.0 - 1.0)
-    pub borrow_rate: f64,       // Current borrow rate (APY, 0.0 - 1.0)
-    pub liquidity_mint: Option<Pubkey>, // Liquidity mint (borrow için)
-    pub collateral_mint: Option<Pubkey>, // Collateral mint (deposit için)
-    pub liquidity_supply: Option<Pubkey>, // Reserve liquidity supply token account
-    pub collateral_supply: Option<Pubkey>, // Reserve collateral supply token account
-    pub liquidation_bonus: f64, // Liquidation bonus (0.0 - 1.0)
-    pub pyth_oracle: Option<Pubkey>, // Pyth oracle pubkey - reserve'den alınır ✅ DOĞRULANMIŞ
-    pub switchboard_oracle: Option<Pubkey>, // Switchboard oracle pubkey - reserve'den alınır ✅ DOĞRULANMIŞ
+    pub mint: Option<Pubkey>,
+    pub ltv: f64,
+    pub borrow_rate: f64,
+    pub liquidity_mint: Option<Pubkey>,
+    pub collateral_mint: Option<Pubkey>,
+    pub liquidity_supply: Option<Pubkey>,
+    pub collateral_supply: Option<Pubkey>,
+    pub liquidation_bonus: f64,
+    pub pyth_oracle: Option<Pubkey>,
+    pub switchboard_oracle: Option<Pubkey>,
 }
 
-/// Reserve account'unu parse et ve bilgilerini döndür
-/// 
-/// Gerçek Solend reserve account yapısını kullanarak:
-/// 1. Account data'yı Borsh deserialize eder
-/// 2. Reserve'den mint address'lerini alır (liquidity ve collateral)
-/// 3. Reserve'den LTV değerini alır
-/// 4. Reserve'den current borrow rate'i alır
-/// 5. Reserve'den liquidation bonus'u alır
 pub async fn parse_reserve_account(
     reserve_pubkey: &Pubkey,
     account_data: &Account,
 ) -> Result<ReserveInfo> {
-    // Account'un Solend program'ına ait olduğunu kontrol et
-    // (Bu kontrolü çağıran fonksiyon yapmalı, ama güvenlik için burada da kontrol ediyoruz)
-    
+
+    // todo:
     // Solend reserve account'unu parse et
     // ⚠️ PRODUCTION WARNING: Bu struct gerçek Solend IDL'ine göre doğrulanmamıştır!
     // Parse error alırsanız, gerçek IDL'den struct'ı güncelleyin: ./scripts/fetch_solend_idl.sh
@@ -53,33 +38,22 @@ pub async fn parse_reserve_account(
             Please validate against official IDL: ./scripts/fetch_solend_idl.sh",
             reserve_pubkey
         ))?;
-    
-    // Reserve'den bilgileri çıkar
+
     let liquidity_mint = reserve.liquidity_mint();
     let collateral_mint = reserve.collateral_mint();
     let ltv = reserve.ltv();
     let liquidation_bonus = reserve.liquidation_bonus();
-    
+
+    //todo:
     // Borrow rate'i hesapla
     // Gerçek borrow rate'i hesaplamak için utilization rate'e göre config'deki rate'leri kullanmalıyız
     // Şu an optimal borrow rate'i kullanıyoruz (basit yaklaşım)
     // Gerçek implementasyonda utilization rate'e göre min/optimal/max arasında interpolasyon yapılmalı
     let borrow_rate = reserve.config.optimal_borrow_rate as f64 / 100.0; // APY olarak (0.0 - 1.0)
-    
-    // Mint olarak liquidity_mint kullanıyoruz (borrow için)
-    // Collateral mint ayrı bir field olarak saklanıyor
     let mint = Some(liquidity_mint);
-    
-    // Oracle pubkey'lerini reserve'den al
-    // ✅ DOĞRULANMIŞ: Reserve struct'ında pyth_oracle ve switchboard_oracle field'ları var
-    // ✅ TEST EDİLDİ: Gerçek mainnet USDC reserve'inde oracle'lar doğru okunuyor
-    //   - Pyth Oracle: Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX (USDC)
-    //   - Switchboard Oracle: nu11111111111111111111111111111111111111111 (default/null)
     let pyth_oracle = reserve.pyth_oracle();
     let switchboard_oracle = reserve.switchboard_oracle();
-    
-    // Eğer oracle'lar default (zero) değilse Some, değilse None
-    // NOT: Bazı reserve'lerde switchboard oracle default (null) olabilir, bu normal
+
     let pyth_oracle = if pyth_oracle != Pubkey::default() {
         Some(pyth_oracle)
     } else {
@@ -93,8 +67,7 @@ pub async fn parse_reserve_account(
         log::debug!("Switchboard oracle is default (zero) for reserve {}", reserve_pubkey);
         None
     };
-    
-    // Log oracle'ları (debug için)
+
     log::debug!(
         "Reserve {} oracles: pyth={:?}, switchboard={:?}",
         reserve_pubkey,
@@ -128,17 +101,10 @@ pub async fn parse_reserve_account(
     })
 }
 
-/// Reserve pubkey'den mint address'ini bul
-/// 
-/// NOT: Bu fonksiyon RPC client gerektirir, bu yüzden async.
-/// Eğer account data zaten varsa, `parse_reserve_account` kullanın.
 pub async fn get_reserve_mint(
     _reserve_pubkey: &Pubkey,
     _rpc_client: Option<&crate::solana_client::SolanaClient>,
 ) -> Result<Option<Pubkey>> {
-    // Bu fonksiyon RPC client gerektirir
-    // Şu an: None döndürülüyor (caller'ın parse_reserve_account kullanması önerilir)
-    // Gelecek: RPC client ile reserve account'unu oku ve parse et
     Ok(None)
 }
 

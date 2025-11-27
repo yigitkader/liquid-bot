@@ -6,22 +6,17 @@ use solana_sdk::{
 use std::fs;
 use std::path::Path;
 
-/// Wallet yönetimi - Keypair okuma ve transaction imzalama
 pub struct WalletManager {
     keypair: Keypair,
     pubkey: Pubkey,
 }
 
 impl WalletManager {
-    /// Wallet dosyasından Keypair yükler
     pub fn from_file<P: AsRef<Path>>(wallet_path: P) -> Result<Self> {
         let wallet_data = fs::read_to_string(&wallet_path)
             .with_context(|| format!("Failed to read wallet file: {:?}", wallet_path.as_ref()))?;
         
-        // Solana wallet dosyası JSON formatındadır
-        // İki format olabilir: array format [1,2,3,...] veya object format
         let keypair = if wallet_data.trim_start().starts_with('[') {
-            // Array format: [1,2,3,...]
             let bytes: Vec<u8> = serde_json::from_str(&wallet_data)
                 .context("Failed to parse wallet file as JSON array")?;
             Keypair::from_bytes(&bytes)
@@ -39,23 +34,19 @@ impl WalletManager {
         Ok(WalletManager { keypair, pubkey })
     }
     
-    /// Public key'i döndürür
     pub fn pubkey(&self) -> &Pubkey {
         &self.pubkey
     }
     
-    /// Keypair referansını döndürür (transaction imzalama için)
     pub fn keypair(&self) -> &Keypair {
         &self.keypair
     }
     
-    /// Keypair'i consume eder (bazı durumlarda gerekli)
     pub fn into_keypair(self) -> Keypair {
         self.keypair
     }
 }
 
-/// Wallet balance kontrolü için helper
 pub struct WalletBalanceChecker {
     wallet_pubkey: Pubkey,
     rpc_client: std::sync::Arc<crate::solana_client::SolanaClient>,
@@ -68,23 +59,18 @@ impl WalletBalanceChecker {
             rpc_client,
         }
     }
-
-    /// Wallet'daki SOL balance'ı kontrol et
+    
     pub async fn get_sol_balance(&self) -> Result<u64> {
         let account = self.rpc_client.get_account(&self.wallet_pubkey).await?;
         Ok(account.lamports)
     }
-
-    /// Likidasyon için yeterli sermaye var mı kontrol et
-    /// required_capital: Gerekli sermaye (lamports cinsinden)
-    /// min_reserve: Minimum rezerv (transaction fee için, lamports cinsinden)
+    
     pub async fn has_sufficient_capital(&self, required_capital: u64, min_reserve: u64) -> Result<bool> {
         let balance = self.get_sol_balance().await?;
         let available = balance.saturating_sub(min_reserve);
         Ok(available >= required_capital)
     }
-
-    /// Wallet'daki mevcut sermayeyi döndür (lamports)
+    
     pub async fn get_available_capital(&self, min_reserve: u64) -> Result<u64> {
         let balance = self.get_sol_balance().await?;
         Ok(balance.saturating_sub(min_reserve))
@@ -93,20 +79,13 @@ impl WalletBalanceChecker {
     fn get_associated_token_address(&self, mint: &Pubkey) -> Result<Pubkey> {
         crate::protocols::solend_accounts::get_associated_token_address(&self.wallet_pubkey, mint)
     }
-
-    /// Wallet'daki belirli bir token'ın balance'ını kontrol et
-    /// mint: Token mint address'i
-    /// Returns: Token balance (native units, decimals'e göre)
+    
     pub async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64> {
-        // ATA adresini hesapla
         let token_account = self.get_associated_token_address(mint)?;
         
-        // Token account'unu RPC'den oku
         match self.rpc_client.get_account(&token_account).await {
             Ok(account) => {
-                // Token account data'sını parse et
                 if account.data.is_empty() {
-                    // Token account yok, balance = 0
                     return Ok(0);
                 }
                 
@@ -129,31 +108,17 @@ impl WalletBalanceChecker {
         }
     }
 
-    /// Belirli bir token için yeterli balance var mı kontrol et
-    /// mint: Token mint address'i
-    /// required_amount: Gerekli token amount'u (native units)
     pub async fn has_sufficient_token_balance(&self, mint: &Pubkey, required_amount: u64) -> Result<bool> {
         let balance = self.get_token_balance(mint).await?;
         Ok(balance >= required_amount)
     }
 
-    /// Likidasyon için yeterli sermaye var mı kontrol et (TOKEN CİNSİNDEN)
-    /// 
-    /// Bu fonksiyon:
-    /// 1. Debt token mint'ini kullanarak wallet'taki debt token balance'ını kontrol eder
-    /// 2. max_liquidatable_amount (debt token amount'u) ile karşılaştırır
-    /// 3. Ayrıca SOL balance'ını da kontrol eder (transaction fee için)
-    /// 
-    /// debt_mint: Debt token mint address'i
-    /// required_debt_amount: Gerekli debt token amount'u (native units)
-    /// min_sol_reserve: Minimum SOL rezerv (transaction fee için, lamports)
     pub async fn has_sufficient_capital_for_liquidation(
         &self,
         debt_mint: &Pubkey,
         required_debt_amount: u64,
         min_sol_reserve: u64,
     ) -> Result<bool> {
-        // 1. Debt token balance'ını kontrol et
         let debt_token_balance = self.get_token_balance(debt_mint).await?;
         if debt_token_balance < required_debt_amount {
             log::debug!(
@@ -165,7 +130,6 @@ impl WalletBalanceChecker {
             return Ok(false);
         }
         
-        // 2. SOL balance'ını kontrol et (transaction fee için)
         let sol_balance = self.get_sol_balance().await?;
         if sol_balance < min_sol_reserve {
             log::debug!(
@@ -178,13 +142,7 @@ impl WalletBalanceChecker {
         
         Ok(true)
     }
-
-    /// Likidasyon için mevcut sermayeyi döndür (token cinsinden)
-    /// 
-    /// debt_mint: Debt token mint address'i
-    /// min_sol_reserve: Minimum SOL rezerv (transaction fee için, lamports)
-    /// 
-    /// Returns: (debt_token_balance, sol_balance)
+    
     pub async fn get_available_capital_for_liquidation(
         &self,
         debt_mint: &Pubkey,
@@ -197,27 +155,14 @@ impl WalletBalanceChecker {
         Ok((debt_token_balance, available_sol))
     }
 
-    /// Belirli bir mint için Associated Token Account (ATA) var mı kontrol et
-    /// 
-    /// Bu fonksiyon, liquidation işlemi için kritiktir çünkü:
-    /// - Debt token account: Borç ödemek için gerekli (balance kontrolü yapılıyor)
-    /// - Collateral token account: Seizable collateral almak için gerekli (bu fonksiyon ile kontrol ediliyor)
-    /// 
-    /// Eğer collateral token account yoksa, liquidation transaction başarısız olur
-    /// çünkü instruction destination collateral account bekler.
-    /// 
-    /// mint: Token mint address'i
-    /// Returns: true if token account exists and has data, false otherwise
     pub async fn ensure_token_account_exists(&self, mint: &Pubkey) -> Result<bool> {
         let ata = self.get_associated_token_address(mint)?;
         
         match self.rpc_client.get_account(&ata).await {
             Ok(account) => {
-                // Account exists and has data (not empty)
                 Ok(!account.data.is_empty())
             }
             Err(_) => {
-                // Account doesn't exist
                 Ok(false)
             }
         }

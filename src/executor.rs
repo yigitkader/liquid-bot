@@ -1,17 +1,16 @@
-use anyhow::Result;
-use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
-use std::sync::Arc;
 use crate::config::Config;
 use crate::event::Event;
 use crate::event_bus::EventBus;
-use crate::solana_client::{self, SolanaClient};
-use crate::wallet::WalletManager;
-use crate::protocol::Protocol;
-use crate::tx_lock::TxLock;
 use crate::performance::PerformanceTracker;
+use crate::protocol::Protocol;
+use crate::solana_client::{self, SolanaClient};
+use crate::tx_lock::TxLock;
+use crate::wallet::WalletManager;
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
 
-/// Executor worker - ExecuteLiquidation event'lerini alır, transaction gönderir
 pub async fn run_executor(
     mut receiver: broadcast::Receiver<Event>,
     bus: EventBus,
@@ -21,14 +20,11 @@ pub async fn run_executor(
     rpc_client: Arc<SolanaClient>,
     performance_tracker: Arc<PerformanceTracker>,
 ) -> Result<()> {
-    // TX-lock mekanizması - double liquidation önleme
-    let tx_lock = Arc::new(TxLock::new(60)); // 60 saniye lock süresi
-    
-    // Retry parametreleri
+    let tx_lock = Arc::new(TxLock::new(60));
+
     const MAX_RETRIES: u32 = 3;
     const INITIAL_RETRY_DELAY_MS: u64 = 1000; // 1 saniye
-    
-    // Production safety: Runtime dry-run double-check
+
     if !config.dry_run {
         log::warn!("⚠️  PRODUCTION MODE: Real transactions will be sent!");
         log::warn!("⚠️  Double-checking DRY_RUN=false is intentional...");
@@ -37,8 +33,7 @@ pub async fn run_executor(
         match receiver.recv().await {
             Ok(Event::ExecuteLiquidation(opportunity)) => {
                 let account_address = opportunity.account_position.account_address.clone();
-                
-                // TX-lock kontrolü - aynı account zaten işleniyorsa atla
+
                 if !tx_lock.try_lock(&account_address).await {
                     log::warn!(
                         "Account {} is already being processed, skipping duplicate liquidation",
@@ -46,21 +41,20 @@ pub async fn run_executor(
                     );
                     continue;
                 }
-                
-                // Lock'u otomatik olarak kaldırmak için scope sonunda unlock
+
                 let unlock_guard = UnlockGuard {
+                    //todo: why this is not used ?
                     tx_lock: Arc::clone(&tx_lock),
                     account_address: account_address.clone(),
                 };
-                
+
                 if config.dry_run {
                     log::info!(
                         "DRY RUN: Would execute liquidation for account {} (profit=${:.2})",
                         account_address,
                         opportunity.estimated_profit_usd
                     );
-                    
-                    // Dry-run modunda gerçek TX göndermiyoruz
+
                     bus.publish(Event::TxResult {
                         opportunity: opportunity.clone(),
                         success: true,
@@ -68,11 +62,10 @@ pub async fn run_executor(
                         error: None,
                     })?;
                 } else {
-                    // Gerçek transaction gönderimi - retry mekanizması ile
                     let mut last_error = None;
                     let mut success = false;
                     let mut signature = None;
-                    
+
                     for attempt in 0..=MAX_RETRIES {
                         match solana_client::execute_liquidation(
                             &opportunity,
@@ -80,14 +73,18 @@ pub async fn run_executor(
                             wallet.as_ref(),
                             protocol.as_ref(),
                             Arc::clone(&rpc_client),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(sig) => {
                                 signature = Some(sig.clone());
                                 success = true;
-                                
-                                // Performance tracking - TX send latency
-                                let opportunity_id = opportunity.account_position.account_address.clone();
-                                if let Some(latency) = performance_tracker.record_tx_send(opportunity_id).await {
+
+                                let opportunity_id =
+                                    opportunity.account_position.account_address.clone();
+                                if let Some(latency) =
+                                    performance_tracker.record_tx_send(opportunity_id).await
+                                {
                                     log::info!(
                                         "Liquidation transaction sent: {} (profit=${:.2}, attempt={}, latency={}ms)",
                                         sig,
@@ -108,7 +105,6 @@ pub async fn run_executor(
                             Err(e) => {
                                 last_error = Some(e);
                                 if attempt < MAX_RETRIES {
-                                    // Exponential backoff: 1s, 2s, 4s
                                     let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << attempt);
                                     log::warn!(
                                         "Liquidation attempt {} failed for account {}: {}. Retrying in {}ms...",
@@ -129,8 +125,7 @@ pub async fn run_executor(
                             }
                         }
                     }
-                    
-                    // Sonucu event bus'a yayınla
+
                     bus.publish(Event::TxResult {
                         opportunity: opportunity.clone(),
                         success,
@@ -151,11 +146,10 @@ pub async fn run_executor(
             }
         }
     }
-    
+
     Ok(())
 }
 
-/// RAII guard - scope'tan çıkınca otomatik unlock yapar
 struct UnlockGuard {
     tx_lock: Arc<TxLock>,
     account_address: String,
@@ -170,4 +164,3 @@ impl Drop for UnlockGuard {
         });
     }
 }
-

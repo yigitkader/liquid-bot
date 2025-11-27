@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use std::env;
 use std::path::Path;
-use anyhow::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,24 +45,24 @@ impl Config {
                 .context("Invalid DRY_RUN value (must be 'true' or 'false')")?,
         };
 
-        // Configuration validation
         config.validate()?;
-        
+
         Ok(config)
     }
 
-    /// Configuration validation - production için kritik
     pub fn validate(&self) -> Result<()> {
-        // RPC URL validation
         if !self.rpc_http_url.starts_with("http://") && !self.rpc_http_url.starts_with("https://") {
-            return Err(anyhow::anyhow!("RPC_HTTP_URL must start with http:// or https://"));
+            return Err(anyhow::anyhow!(
+                "RPC_HTTP_URL must start with http:// or https://"
+            ));
         }
 
         if !self.rpc_ws_url.starts_with("ws://") && !self.rpc_ws_url.starts_with("wss://") {
-            return Err(anyhow::anyhow!("RPC_WS_URL must start with ws:// or wss://"));
+            return Err(anyhow::anyhow!(
+                "RPC_WS_URL must start with ws:// or wss://"
+            ));
         }
 
-        // Wallet path validation
         if !Path::new(&self.wallet_path).exists() {
             return Err(anyhow::anyhow!(
                 "Wallet file not found: {}. Please create wallet first.",
@@ -70,7 +70,6 @@ impl Config {
             ));
         }
 
-        // Threshold validation
         if self.hf_liquidation_threshold <= 0.0 || self.hf_liquidation_threshold > 10.0 {
             return Err(anyhow::anyhow!(
                 "HF_LIQUIDATION_THRESHOLD must be between 0.0 and 10.0, got: {}",
@@ -85,8 +84,6 @@ impl Config {
             ));
         }
 
-        // Production safety: Warn if MIN_PROFIT_USD is too low
-        // Transaction fees + gas typically cost $0.1-0.5, so $1 profit leaves very little margin
         if !self.dry_run && self.min_profit_usd < 5.0 {
             log::warn!(
                 "⚠️  MIN_PROFIT_USD={} is very low for production! \
@@ -112,7 +109,6 @@ impl Config {
             ));
         }
 
-        // Poll interval validation
         if self.poll_interval_ms < 100 {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_MS must be >= 100ms, got: {}",
@@ -120,7 +116,6 @@ impl Config {
             ));
         }
 
-        // Production safety check
         if !self.dry_run {
             log::warn!("⚠️  DRY_RUN=false: Bot will send REAL transactions to blockchain!");
             log::warn!("⚠️  Make sure you have tested thoroughly in dry-run mode!");
@@ -129,4 +124,3 @@ impl Config {
         Ok(())
     }
 }
-
