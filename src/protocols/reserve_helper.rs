@@ -44,12 +44,49 @@ pub async fn parse_reserve_account(
     let ltv = reserve.ltv();
     let liquidation_bonus = reserve.liquidation_bonus();
 
-    //todo:
-    // Borrow rate'i hesapla
-    // Gerçek borrow rate'i hesaplamak için utilization rate'e göre config'deki rate'leri kullanmalıyız
-    // Şu an optimal borrow rate'i kullanıyoruz (basit yaklaşım)
-    // Gerçek implementasyonda utilization rate'e göre min/optimal/max arasında interpolasyon yapılmalı
-    let borrow_rate = reserve.config.optimal_borrow_rate as f64 / 100.0; // APY olarak (0.0 - 1.0)
+    // Calculate borrow rate based on utilization rate
+    // Solend uses a piecewise linear function:
+    // - If utilization < optimal: linear interpolation between min and optimal
+    // - If utilization >= optimal: linear interpolation between optimal and max
+    let utilization_rate = if reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as u64 > 0 {
+        let total_liquidity = reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as u64;
+        (reserve.liquidity.borrowed_amount_wads / 1_000_000_000_000_000_000) as f64 / total_liquidity as f64
+    } else {
+        0.0
+    };
+    
+    let optimal_utilization = reserve.config.optimal_utilization_rate as f64 / 100.0;
+    let min_rate = reserve.config.min_borrow_rate as f64 / 100.0;
+    let optimal_rate = reserve.config.optimal_borrow_rate as f64 / 100.0;
+    let max_rate = reserve.config.max_borrow_rate as f64 / 100.0;
+    
+    let borrow_rate = if utilization_rate < optimal_utilization {
+        // Linear interpolation between min and optimal
+        if optimal_utilization > 0.0 {
+            min_rate + (optimal_rate - min_rate) * (utilization_rate / optimal_utilization)
+        } else {
+            min_rate
+        }
+    } else {
+        // Linear interpolation between optimal and max
+        let remaining_utilization = 1.0 - optimal_utilization;
+        if remaining_utilization > 0.0 {
+            let excess_utilization = utilization_rate - optimal_utilization;
+            optimal_rate + (max_rate - optimal_rate) * (excess_utilization / remaining_utilization)
+        } else {
+            optimal_rate
+        }
+    };
+    
+    log::debug!(
+        "Borrow rate calculation: utilization={:.2}%, optimal_util={:.2}%, rate={:.4}% (min={:.2}%, optimal={:.2}%, max={:.2}%)",
+        utilization_rate * 100.0,
+        optimal_utilization * 100.0,
+        borrow_rate * 100.0,
+        min_rate * 100.0,
+        optimal_rate * 100.0,
+        max_rate * 100.0
+    );
     let mint = Some(liquidity_mint);
     let pyth_oracle = reserve.pyth_oracle();
     let switchboard_oracle = reserve.switchboard_oracle();

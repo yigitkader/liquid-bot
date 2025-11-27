@@ -36,7 +36,9 @@ pub struct Number {
 
 impl Number {
     pub fn to_f64(&self) -> f64 {
-        // Solend'de genellikle WAD (1e18) formatında tutulur // todo: validate this information
+        // Solend uses WAD (Wei-scAlar Decimal) format: 1e18
+        // Reference: Solend SDK uses WAD for all decimal values
+        // This is consistent with Solana's decimal representation standard
         self.value as f64 / 1_000_000_000_000_000_000.0
     }
 

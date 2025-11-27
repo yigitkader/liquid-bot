@@ -14,7 +14,8 @@ pub async fn run_data_source(
     protocol: Arc<dyn Protocol>,
     health_manager: Arc<HealthManager>,
 ) -> Result<()> {
-    // İlk versiyonda RPC polling ile başlayalım
-    // todo: İleride config'ten seçim yapılabilir
+    // Data source selection: Currently only RPC polling is implemented
+    // Future: Add WebSocket support and config-based selection
+    // For now, RPC polling is the default and only option
     rpc_poller::run_rpc_poller(bus, config, rpc_client, protocol, health_manager).await
 }

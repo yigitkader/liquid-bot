@@ -44,7 +44,8 @@ impl SolanaClient {
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<solana_sdk::account::Account> {
         self.rate_limiter.wait_if_needed().await;
 
-        // todo RpcClient sync, ama async wrapper kullanabiliriz
+        // Note: RpcClient is synchronous, so we use spawn_blocking to make it async
+        // This is the recommended approach for wrapping sync I/O in async contexts
         let client = Arc::clone(&self.rpc_client);
         let pubkey = *pubkey;
         tokio::task::spawn_blocking(move || {

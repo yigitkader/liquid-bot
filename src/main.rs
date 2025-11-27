@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let solend_protocol = match protocols::solend::SolendProtocol::new() {
+    let solend_protocol = match protocols::solend::SolendProtocol::new_with_config(&config) {
         Ok(proto) => {
             let protocol_id = proto.id().to_string();
             let program_id = proto.program_id();

@@ -22,11 +22,26 @@ impl WalletManager {
             Keypair::from_bytes(&bytes)
                 .context("Failed to create keypair from bytes")?
         } else {
-            // Object format veya başka format - Keypair::read_from_file kullan
-            // todo: Ancak bu fonksiyon deprecated, manuel parse edelim
-            return Err(anyhow::anyhow!(
-                "Unsupported wallet format. Expected JSON array format [1,2,3,...]"
-            ));
+            // Try to parse as base58 encoded secret key (alternative format)
+            // Some wallets export as base58 string
+            if let Ok(secret_key) = bs58::decode(wallet_data.trim())
+                .into_vec()
+                .and_then(|bytes| {
+                    if bytes.len() == 64 {
+                        Ok(bytes)
+                    } else {
+                        Err(bs58::decode::Error::InvalidLength)
+                    }
+                }) {
+                Keypair::from_bytes(&secret_key)
+                    .context("Failed to create keypair from base58 secret key")?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Unsupported wallet format. Expected one of:\n\
+                     - JSON array format: [1,2,3,...]\n\
+                     - Base58 encoded secret key (64 bytes)"
+                ));
+            }
         };
         
         let pubkey = keypair.pubkey();

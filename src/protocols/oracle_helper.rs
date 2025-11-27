@@ -5,9 +5,19 @@ use std::sync::Arc;
 use crate::solana_client::SolanaClient;
 use pyth_sdk_solana::state::SolanaPriceAccount;
 
-pub const PYTH_PROGRAM_ID: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH"; //todo: why this is hardcoded here
+/// Deprecated: Use config values instead. These are kept for backward compatibility.
+pub const PYTH_PROGRAM_ID: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH";
+pub const SWITCHBOARD_PROGRAM_ID: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f";
 
-pub const SWITCHBOARD_PROGRAM_ID: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f";  //todo: why this is hardcoded here
+/// Get Pyth program ID from config or fallback to default
+pub fn get_pyth_program_id(config: Option<&crate::config::Config>) -> &str {
+    config.map(|c| c.pyth_program_id.as_str()).unwrap_or(PYTH_PROGRAM_ID)
+}
+
+/// Get Switchboard program ID from config or fallback to default
+pub fn get_switchboard_program_id(config: Option<&crate::config::Config>) -> &str {
+    config.map(|c| c.switchboard_program_id.as_str()).unwrap_or(SWITCHBOARD_PROGRAM_ID)
+}
 
 fn get_oracle_account_from_mapping(mint: &Pubkey, mapping: &[(&str, &str)], oracle_type: &str) -> Result<Option<Pubkey>> {
     let mint_str = mint.to_string();
@@ -64,10 +74,11 @@ pub fn get_oracle_accounts_from_reserve(
         "⚠️  Oracle accounts not found in reserve, using hardcoded mapping for mint: {}",
         mint
     );
-    log::warn!(//todo: why this is hardcoded here
+    log::warn!(
         "   ⚠️  Hardcoded mapping only supports 5 tokens (USDC, USDT, SOL, ETH, BTC). \
          Other tokens (BONK, RAY, SRM, etc.) will fail! \
-         Ensure reserve account parsing is working correctly."
+         Ensure reserve account parsing is working correctly. \
+         Note: Reserve account parsing should provide oracle addresses automatically."
     );
     get_oracle_accounts_from_mint(&mint)
 }
@@ -165,11 +176,49 @@ pub async fn read_pyth_price(
 }
 
 pub async fn read_switchboard_price(
-    _oracle_account: &Pubkey,
-    _rpc_client: Arc<SolanaClient>,
+    oracle_account: &Pubkey,
+    rpc_client: Arc<SolanaClient>,
 ) -> Result<Option<OraclePrice>> {
-    // TODO: Switchboard oracle parse implementasyonu
-    // Switchboard yapısı Pyth'den farklı, daha karmaşık
+    // Switchboard oracle implementation
+    // Note: Switchboard uses AggregatorAccount structure which is more complex than Pyth
+    // For a full implementation, consider using the switchboard-solana crate
+    // Reference: https://docs.switchboard.xyz/developers/price-feeds
+    
+    let account = match rpc_client.get_account(oracle_account).await {
+        Ok(acc) => acc,
+        Err(e) => {
+            log::debug!("Failed to read Switchboard oracle account {}: {}", oracle_account, e);
+            return Ok(None);
+        }
+    };
+    
+    if account.data.is_empty() {
+        log::debug!("Switchboard oracle account {} is empty", oracle_account);
+        return Ok(None);
+    }
+    
+    // Switchboard AggregatorAccount structure (simplified parsing)
+    // Full structure includes: metadata, name, queue, oracle_request_batch_size, etc.
+    // For now, we'll attempt to parse basic price data
+    // 
+    // Switchboard price feeds typically store:
+    // - Latest round result with price and timestamp
+    // - The structure is more complex and requires the switchboard-solana SDK for proper parsing
+    
+    log::warn!(
+        "Switchboard oracle parsing not fully implemented. \
+         Consider using switchboard-solana crate for full support. \
+         Oracle account: {}",
+        oracle_account
+    );
+    
+    // TODO: Full Switchboard implementation requires:
+    // 1. Add switchboard-solana dependency to Cargo.toml
+    // 2. Parse AggregatorAccount structure
+    // 3. Extract latest round result with price and confidence
+    // 4. Handle timestamp and staleness checks
+    
+    // For now, return None to fallback to Pyth
     Ok(None)
 }
 

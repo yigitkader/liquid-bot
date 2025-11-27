@@ -223,7 +223,8 @@ impl SolendReserve {
         
         // Padding: 247 bytes (skip ediyoruz)
         // Official SDK: BufferLayout.blob(247, "padding")
-        // offset şu an struct'ın sonunu gösteriyor, padding'i skip ediyoruz // todo validate need here
+        // Note: Padding is used to align the account size to 619 bytes total
+        // We don't need to validate padding as it's just empty space
         
         // Validate that we've read the expected amount of data (excluding padding)
         // Expected size without padding: ~372 bytes

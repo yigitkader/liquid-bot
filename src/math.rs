@@ -5,16 +5,19 @@ use crate::protocols::oracle_helper::{get_oracle_accounts_from_mint, read_oracle
 use crate::solana_client::SolanaClient;
 use anyhow::Result;
 use std::sync::Arc;
+use std::str::FromStr;
 
 fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
+    base_fee_lamports: u64,
     sol_price_usd: f64,
 ) -> f64 {
-    // todo: validate is it correct Base transaction fee (Solana base fee)
-    const BASE_FEE_LAMPORTS: u64 = 5_000; // ~0.000005 SOL
+    // Base transaction fee: Solana charges a base fee per transaction
+    // Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
+    // Default: ~5,000 lamports = 0.000005 SOL
     let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
-    let total_fee_lamports = BASE_FEE_LAMPORTS + priority_fee_lamports;
+    let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
     total_fee_sol * sol_price_usd
 }
@@ -28,18 +31,18 @@ fn calculate_slippage_cost_usd(
 
 /// Token swap maliyeti hesaplama (eğer gerekirse)
 ///
-/// todo: validate => Eğer collateral ve debt farklı token'larsa, swap gerekebilir.
+/// Note: Eğer collateral ve debt farklı token'larsa, swap gerekebilir.
 /// Swap maliyeti:
 /// - DEX fee: %0.1 - %0.3 (Jupiter, Raydium)
 /// - Price impact: Slippage'e dahil
-fn calculate_swap_cost_usd(amount_usd: f64, needs_swap: bool) -> f64 {
+fn calculate_swap_cost_usd(amount_usd: f64, needs_swap: bool, dex_fee_bps: u16) -> f64 {
     if !needs_swap {
         return 0.0;
     }
 
-    // DEX fee (örnek: %0.2) // todo : is is correct info?
-    const DEX_FEE_BPS: u16 = 20; // 0.2%
-    amount_usd * (DEX_FEE_BPS as f64 / 10_000.0)
+    // DEX fee: Typical DEX fees are 0.1-0.3% (10-30 bps)
+    // Jupiter and Raydium typically charge around 0.2% (20 bps)
+    amount_usd * (dex_fee_bps as f64 / 10_000.0)
 }
 
 fn select_most_profitable_collateral(
@@ -127,13 +130,40 @@ pub async fn calculate_liquidation_opportunity(
     let seizable_collateral = (seizable_collateral_usd / collateral_token_price_usd) as u64;
 
     const LIQUIDATION_COMPUTE_UNITS: u32 = 200_000;
-    const PRIORITY_FEE_PER_CU: u64 = 1_000; // todo: micro-lamports per CU (config'ten alınabilir)
-    const SOL_PRICE_USD: f64 = 150.0; // todo: SOL fiyatı (yaklaşık, gerçekte oracle'dan alınmalı)
+    
+    // Get SOL price from oracle if available, otherwise use a conservative fallback
+    let sol_price_usd = if let Some(client) = &rpc_client {
+        // Try to get SOL price from oracle (SOL mint: So11111111111111111111111111111111111111112)
+        let sol_mint = solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .unwrap();
+        match get_oracle_accounts_from_mint(&sol_mint) {
+            Ok((pyth, switchboard)) => {
+                match read_oracle_price(pyth.as_ref(), switchboard.as_ref(), Arc::clone(client)).await {
+                    Ok(Some(price)) => {
+                        log::debug!("SOL price from oracle: ${:.2}", price.price);
+                        price.price
+                    }
+                    _ => {
+                        log::warn!("Failed to get SOL price from oracle, using fallback: $150");
+                        150.0 // Fallback
+                    }
+                }
+            }
+            _ => {
+                log::warn!("SOL oracle accounts not found, using fallback: $150");
+                150.0 // Fallback
+            }
+        }
+    } else {
+        log::warn!("RPC client not available, using fallback SOL price: $150");
+        150.0 // Fallback when RPC client not available
+    };
 
     let transaction_fee_usd = calculate_transaction_fee_usd(
         LIQUIDATION_COMPUTE_UNITS,
-        PRIORITY_FEE_PER_CU,
-        SOL_PRICE_USD,
+        config.priority_fee_per_cu,
+        config.base_transaction_fee_lamports,
+        sol_price_usd,
     );
 
     let size_multiplier = if seizable_collateral_usd < 10_000.0 {
@@ -170,51 +200,54 @@ pub async fn calculate_liquidation_opportunity(
                                 confidence_bps
                             }
                             Ok(None) => {
-                                log::warn!("Oracle price not available, using default confidence slippage: 100 bps");
-                                100 // Varsayılan: %1 // todo : is it correct?
+                                log::warn!("Oracle price not available, using default confidence slippage: {} bps", config.default_oracle_confidence_slippage_bps);
+                                config.default_oracle_confidence_slippage_bps
                             }
                             Err(e) => {
-                                log::warn!("Failed to read oracle price: {}, using default confidence slippage: 100 bps", e);
-                                100 // Varsayılan: %1 // todo : is it correct?
+                                log::warn!("Failed to read oracle price: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
+                                config.default_oracle_confidence_slippage_bps
                             }
                         }
                     }
                     Err(e) => {
-                        log::warn!("Failed to get oracle accounts: {}, using default confidence slippage: 100 bps", e);
-                        100 // Varsayılan: %1 // todo : is it correct?
+                        log::warn!("Failed to get oracle accounts: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
+                        config.default_oracle_confidence_slippage_bps
                     }
                 }
             }
             Err(e) => {
-                log::warn!("Failed to parse collateral mint: {}, using default confidence slippage: 100 bps", e);
-                100 // Varsayılan: %1 // todo : is it correct?
+                log::warn!("Failed to parse collateral mint: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
+                config.default_oracle_confidence_slippage_bps
             }
         }
     } else {
-        log::debug!("RPC client not provided, using default oracle confidence slippage: 100 bps");
-        100 // Varsayılan: %1 (RPC client yoksa) // todo : is it correct?
+        log::debug!("RPC client not provided, using default oracle confidence slippage: {} bps", config.default_oracle_confidence_slippage_bps);
+        config.default_oracle_confidence_slippage_bps
     };
 
-    // Total slippage = (todo: neden tahmin?)tahmini slippage + oracle confidence slippage
+    // Total slippage = estimated slippage + oracle confidence slippage
+    // Estimated slippage is based on position size, oracle confidence adds price uncertainty
     let total_slippage_bps = estimated_slippage_bps.saturating_add(oracle_slippage_bps);
     let base_slippage_cost_usd =
         calculate_slippage_cost_usd(seizable_collateral_usd, total_slippage_bps);
 
-    // Güvenlik marjı ekle (%20) - gerçek slippage tahminden daha yüksek olabilir todo: validate
-    let slippage_cost_usd = base_slippage_cost_usd * 1.2;
+    // Güvenlik marjı ekle - gerçek slippage tahminden daha yüksek olabilir
+    // Safety margin multiplier is configurable (default: 1.2 = 20% margin)
+    let slippage_cost_usd = base_slippage_cost_usd * config.slippage_safety_margin_multiplier;
 
     log::debug!(
-        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, total={} bps, cost=${:.4} (with 20% safety margin)",
+        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, total={} bps, cost=${:.4} (with {:.0}% safety margin)",
         estimated_slippage_bps,
         oracle_slippage_bps,
         total_slippage_bps,
-        slippage_cost_usd
+        slippage_cost_usd,
+        (config.slippage_safety_margin_multiplier - 1.0) * 100.0
     );
 
     let needs_swap = collateral_asset.mint != debt_asset.mint;
 
     let swap_cost_usd = if needs_swap {
-        calculate_swap_cost_usd(seizable_collateral_usd, true)
+        calculate_swap_cost_usd(seizable_collateral_usd, true, config.dex_fee_bps)
     } else {
         0.0
     };
@@ -223,16 +256,17 @@ pub async fn calculate_liquidation_opportunity(
     let gross_profit_usd = seizable_collateral_usd - max_liquidatable_debt_usd;
     let estimated_profit_usd = gross_profit_usd - total_cost_usd;
 
-    const MIN_PROFIT_MARGIN_BPS: u16 = 100; // %1 = 100 basis points // todo : is it correct?
+    // Minimum profit margin: ensures we have a buffer above transaction costs
+    // Default: 1% (100 bps) of debt amount
     let min_profit_margin_usd =
-        max_liquidatable_debt_usd * (MIN_PROFIT_MARGIN_BPS as f64 / 10_000.0);
+        max_liquidatable_debt_usd * (config.min_profit_margin_bps as f64 / 10_000.0);
 
     if estimated_profit_usd < min_profit_margin_usd {
         log::debug!(
             "Opportunity rejected: estimated profit ${:.2} < min margin ${:.2} ({}% of debt)",
             estimated_profit_usd,
             min_profit_margin_usd,
-            MIN_PROFIT_MARGIN_BPS as f64 / 100.0
+            config.min_profit_margin_bps as f64 / 100.0
         );
         return Ok(None);
     }
@@ -264,7 +298,7 @@ pub async fn calculate_liquidation_opportunity(
         max_liquidatable_amount: max_liquidatable,
         seizable_collateral,
         liquidation_bonus,
-        estimated_profit_usd, // todo:(neden tahmin?) Zaten konservatif tahmin (slippage, fees, swap dahil)
+        estimated_profit_usd, // Conservative estimate: includes slippage, fees, and swap costs
         target_debt_mint,
         target_collateral_mint,
     }))

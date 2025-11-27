@@ -12,6 +12,19 @@ pub struct Config {
     pub max_slippage_bps: u16,
     pub poll_interval_ms: u64,
     pub dry_run: bool,
+    // Protocol configuration
+    pub solend_program_id: String,
+    pub pyth_program_id: String,
+    pub switchboard_program_id: String,
+    // Fee configuration
+    pub priority_fee_per_cu: u64,
+    pub base_transaction_fee_lamports: u64,
+    pub dex_fee_bps: u16,
+    pub min_profit_margin_bps: u16,
+    pub default_oracle_confidence_slippage_bps: u16,
+    pub slippage_safety_margin_multiplier: f64,
+    // Wallet configuration
+    pub min_reserve_lamports: u64,
 }
 
 impl Config {
@@ -43,6 +56,43 @@ impl Config {
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .context("Invalid DRY_RUN value (must be 'true' or 'false')")?,
+            // Protocol IDs - defaults from mainnet
+            solend_program_id: env::var("SOLEND_PROGRAM_ID")
+                .unwrap_or_else(|_| "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo".to_string()),
+            pyth_program_id: env::var("PYTH_PROGRAM_ID")
+                .unwrap_or_else(|_| "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH".to_string()),
+            switchboard_program_id: env::var("SWITCHBOARD_PROGRAM_ID")
+                .unwrap_or_else(|_| "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f".to_string()),
+            // Fee configuration - defaults based on Solana mainnet
+            priority_fee_per_cu: env::var("PRIORITY_FEE_PER_CU")
+                .unwrap_or_else(|_| "1000".to_string()) // 1000 micro-lamports per CU
+                .parse()
+                .context("Invalid PRIORITY_FEE_PER_CU value")?,
+            base_transaction_fee_lamports: env::var("BASE_TRANSACTION_FEE_LAMPORTS")
+                .unwrap_or_else(|_| "5000".to_string()) // ~0.000005 SOL (Solana base fee)
+                .parse()
+                .context("Invalid BASE_TRANSACTION_FEE_LAMPORTS value")?,
+            dex_fee_bps: env::var("DEX_FEE_BPS")
+                .unwrap_or_else(|_| "20".to_string()) // 0.2% (typical for Jupiter/Raydium)
+                .parse()
+                .context("Invalid DEX_FEE_BPS value")?,
+            min_profit_margin_bps: env::var("MIN_PROFIT_MARGIN_BPS")
+                .unwrap_or_else(|_| "100".to_string()) // 1% minimum profit margin
+                .parse()
+                .context("Invalid MIN_PROFIT_MARGIN_BPS value")?,
+            default_oracle_confidence_slippage_bps: env::var("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS")
+                .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
+                .parse()
+                .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
+            slippage_safety_margin_multiplier: env::var("SLIPPAGE_SAFETY_MARGIN_MULTIPLIER")
+                .unwrap_or_else(|_| "1.2".to_string()) // 20% safety margin
+                .parse()
+                .context("Invalid SLIPPAGE_SAFETY_MARGIN_MULTIPLIER value")?,
+            // Wallet configuration
+            min_reserve_lamports: env::var("MIN_RESERVE_LAMPORTS")
+                .unwrap_or_else(|_| "1000000".to_string()) // 0.001 SOL minimum reserve for transaction fees
+                .parse()
+                .context("Invalid MIN_RESERVE_LAMPORTS value")?,
         };
 
         config.validate()?;
@@ -119,6 +169,28 @@ impl Config {
         if !self.dry_run {
             log::warn!("⚠️  DRY_RUN=false: Bot will send REAL transactions to blockchain!");
             log::warn!("⚠️  Make sure you have tested thoroughly in dry-run mode!");
+        }
+
+        // Validate protocol IDs format (should be base58 encoded pubkeys)
+        if self.solend_program_id.len() < 32 || self.solend_program_id.len() > 44 {
+            log::warn!("⚠️  SOLEND_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.solend_program_id.len());
+        }
+        if self.pyth_program_id.len() < 32 || self.pyth_program_id.len() > 44 {
+            log::warn!("⚠️  PYTH_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.pyth_program_id.len());
+        }
+        if self.switchboard_program_id.len() < 32 || self.switchboard_program_id.len() > 44 {
+            log::warn!("⚠️  SWITCHBOARD_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.switchboard_program_id.len());
+        }
+
+        // Validate fee configuration
+        if self.priority_fee_per_cu == 0 {
+            log::warn!("⚠️  PRIORITY_FEE_PER_CU is 0, transactions may be slow or fail");
+        }
+        if self.dex_fee_bps > 1000 {
+            log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
+        }
+        if self.slippage_safety_margin_multiplier < 1.0 || self.slippage_safety_margin_multiplier > 2.0 {
+            log::warn!("⚠️  SLIPPAGE_SAFETY_MARGIN_MULTIPLIER={} is outside recommended range (1.0-2.0)", self.slippage_safety_margin_multiplier);
         }
 
         Ok(())

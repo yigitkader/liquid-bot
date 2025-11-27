@@ -17,7 +17,8 @@ pub async fn run_strategist(
     rpc_client: Arc<SolanaClient>,
     _protocol: Arc<dyn Protocol>,
 ) -> Result<()> {
-    const MIN_RESERVE_LAMPORTS: u64 = 1_000_000; //todo:(validate this info)-> 0.001 SOL minimum rezerv (transaction fee için)
+    // Minimum SOL reserve for transaction fees (from config)
+    let min_reserve_lamports = config.min_reserve_lamports;
     loop {
         match receiver.recv().await {
             Ok(Event::PotentiallyLiquidatable(opportunity)) => {
@@ -42,7 +43,8 @@ pub async fn run_strategist(
                         match rpc_client.get_account(&pubkey).await {
                             Ok(account) => {
                                 // Account'un Solend program'ına ait olup olmadığını kontrol et
-                                // (Basit kontrol: account size 619 bytes ise muhtemelen reserve) todo: this is best practice or best way?
+                                // Note: Solend reserve accounts are typically 619 bytes
+                                // This is a heuristic check - proper validation should check program owner
                                 if account.data.len() == 619 {
                                     debt_reserve_pubkey = Some(pubkey);
                                 }
@@ -63,7 +65,9 @@ pub async fn run_strategist(
                                 if let Ok(obligation) =
                                     SolendObligation::from_account_data(&obligation_account.data)
                                 {
-                                    // İlk borrow reserve'ini al (genellikle doğru olan budur) -> todo: validate et bu bilgiyi
+                                    // İlk borrow reserve'ini al
+                                    // Note: In most cases, the first borrow is the primary debt
+                                    // For multi-asset positions, this may need refinement
                                     if let Some(borrow) = obligation.borrows.first() {
                                         debt_reserve_pubkey = Some(borrow.borrow_reserve);
                                     }
@@ -303,7 +307,7 @@ pub async fn run_strategist(
                             .has_sufficient_capital_for_liquidation(
                                 &debt_mint,
                                 required_debt_amount,
-                                MIN_RESERVE_LAMPORTS,
+                                min_reserve_lamports,
                             )
                             .await
                         {
@@ -312,7 +316,7 @@ pub async fn run_strategist(
                                 "Sufficient capital: debt_mint={}, required_debt={}, min_sol_reserve={}",
                                 debt_mint,
                                 required_debt_amount,
-                                MIN_RESERVE_LAMPORTS
+                                min_reserve_lamports
                             );
                             }
                             Ok(false) => {
@@ -320,7 +324,7 @@ pub async fn run_strategist(
                                 let (available_debt, available_sol) = wallet_balance_checker
                                     .get_available_capital_for_liquidation(
                                         &debt_mint,
-                                        MIN_RESERVE_LAMPORTS,
+                                        min_reserve_lamports,
                                     )
                                     .await
                                     .unwrap_or((0, 0));
@@ -329,7 +333,7 @@ pub async fn run_strategist(
                                 required_debt_amount,
                                 debt_mint,
                                 available_debt,
-                                MIN_RESERVE_LAMPORTS,
+                                min_reserve_lamports,
                                 available_sol
                             );
                             }

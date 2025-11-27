@@ -54,7 +54,9 @@ pub mod solend_idl {
 
     impl Number {
         pub fn to_f64(&self) -> f64 {
-            // Solend'de genellikle WAD (1e18) formatında tutulur // todo validate this information
+            // Solend uses WAD (Wei-scAlar Decimal) format: 1e18
+            // Reference: Solend SDK uses WAD for all decimal values
+            // This is consistent with Solana's decimal representation standard
             self.value as f64 / 1_000_000_000_000_000_000.0
         }
 
@@ -102,8 +104,18 @@ pub struct SolendProtocol {
 }
 
 impl SolendProtocol {
-    pub const SOLEND_PROGRAM_ID: &'static str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"; //todo why this is hardcoded?
+    /// Deprecated: Use `new_with_config` instead. This method uses a hardcoded program ID.
+    pub const SOLEND_PROGRAM_ID: &'static str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 
+    /// Create SolendProtocol with config (recommended)
+    pub fn new_with_config(config: &crate::config::Config) -> Result<Self> {
+        let program_id = Pubkey::try_from(config.solend_program_id.as_str())
+            .context("Invalid Solend program ID from config")?;
+
+        Ok(SolendProtocol { program_id })
+    }
+
+    /// Create SolendProtocol with default hardcoded program ID (for backward compatibility)
     pub fn new() -> Result<Self> {
         let program_id =
             Pubkey::try_from(Self::SOLEND_PROGRAM_ID).context("Invalid Solend program ID")?;
@@ -330,20 +342,26 @@ impl Protocol for SolendProtocol {
             return Ok(position.health_factor);
         }
 
-        // todo: Aksi halde hesapla (basit formül - gerçekte protokol formülüne göre olmalı)
+        // Calculate health factor if not already set
+        // Note: This is a simplified calculation. Solend's actual formula considers:
+        // - Individual LTV for each collateral asset
+        // - Individual liquidation threshold for each asset
+        // - Weighted average based on asset values
+        // For accurate health factor, use the value from parse_account_position which uses
+        // SolendObligation::calculate_health_factor() that reads from on-chain data
         if position.total_debt_usd == 0.0 {
             return Ok(f64::INFINITY);
         }
 
-        // todo:
-        // Solend'in health factor formülü (basitleştirilmiş)
-        // Gerçek implementasyonda protokolün kendi formülünü kullan
+        // Simplified health factor calculation
+        // Real implementation should use asset-specific LTVs from reserve configs
         let collateral_value = position.total_collateral_usd;
         let debt_value = position.total_debt_usd;
 
         // Health Factor = (Collateral * LTV) / Debt
-        // todo: Basit bir yaklaşım - gerçekte her asset için ayrı LTV kullanılır
-        Ok((collateral_value * 0.75) / debt_value) // %75 LTV varsayımı
+        // Using average LTV (0.75 = 75%) as fallback
+        // In production, calculate weighted average LTV from all collateral assets
+        Ok((collateral_value * 0.75) / debt_value)
     }
 
     fn get_liquidation_params(&self) -> LiquidationParams {

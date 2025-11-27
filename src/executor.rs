@@ -42,8 +42,9 @@ pub async fn run_executor(
                     continue;
                 }
 
-                let unlock_guard = UnlockGuard {
-                    //todo: why this is not used ?
+                // UnlockGuard automatically unlocks the account when dropped
+                // This ensures the lock is released even if an error occurs
+                let _unlock_guard = UnlockGuard {
                     tx_lock: Arc::clone(&tx_lock),
                     account_address: account_address.clone(),
                 };
