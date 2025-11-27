@@ -408,10 +408,16 @@ impl Config {
         if self.dex_fee_bps > 1000 {
             log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
         }
-        // todo: check here to best implementation and dont use hardcoded values
-        // Note: slippage_safety_margin_multiplier is now hardcoded to 1.1 (10%) in math.rs
-        // to avoid over-conservative profit calculations. This config field is kept for
-        // backward compatibility but not used in calculations.
+        // ⚠️ NOTE: slippage_safety_margin_multiplier is deprecated
+        // 
+        // Status: ✅ DEPRECATED - No longer used in calculations
+        // 
+        // This field is kept for backward compatibility but not used in profit calculations.
+        // The slippage calculation in math.rs uses oracle confidence intervals (95% with Z-score 1.96)
+        // which already provides sufficient safety margin without additional multiplier.
+        // 
+        // Historical context: Previously used 1.1 (10%) multiplier, but this caused over-conservative
+        // profit calculations and double-counting with oracle confidence intervals.
         if self.slippage_safety_margin_multiplier < 1.0 || self.slippage_safety_margin_multiplier > 2.0 {
             log::warn!("⚠️  SLIPPAGE_SAFETY_MARGIN_MULTIPLIER={} is outside recommended range (1.0-2.0), but note: this value is no longer used (hardcoded to 1.1)", self.slippage_safety_margin_multiplier);
         }

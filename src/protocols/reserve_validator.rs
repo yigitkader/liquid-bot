@@ -179,7 +179,7 @@ pub mod known_reserves {
         let addr = config
             .and_then(|c| c.usdc_reserve_address.as_ref())
             .map(|s| s.as_str())
-            .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"); // Default mainnet USDC reserve // todo: check here why hardcoded
+            .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"); // Default mainnet USDC reserve (fallback if config not provided)
         
         addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid USDC reserve address {}: {}", addr, e))
@@ -190,7 +190,7 @@ pub mod known_reserves {
         let addr = config
             .and_then(|c| c.sol_reserve_address.as_ref())
             .map(|s| s.as_str())
-            .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"); // Default mainnet SOL reserve // todo: check here why hardcoded
+            .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"); // Default mainnet SOL reserve (fallback if config not provided)
         
         addr.parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid SOL reserve address {}: {}", addr, e))

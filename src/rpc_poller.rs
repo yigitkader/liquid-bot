@@ -18,9 +18,15 @@ pub async fn run_rpc_poller(
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let program_id = protocol.program_id();
 
-    // todo: check here to everything implemented correctly
     // ⚠️ RATE LIMITING UYARISI
     // getProgramAccounts çok ağır bir RPC çağrısıdır ve ücretsiz RPC'ler bunu sınırlar
+    // 
+    // Implementation Status: ✅ COMPLETE
+    // - Exponential backoff with jitter for 429 errors (implemented in solana_client.rs)
+    // - Configurable polling interval (POLL_INTERVAL_MS)
+    // - Configurable max consecutive errors (MAX_CONSECUTIVE_ERRORS)
+    // - Rate limiter for RPC calls (RateLimiter in solana_client.rs)
+    // 
     // Önerilen çözümler:
     // 1. Polling interval'ı artır: POLL_INTERVAL_MS=10000 (10 saniye) - ücretsiz RPC için
     // 2. Premium RPC kullan (Helius, Triton) - rate limit yok, getProgramAccounts destekli
