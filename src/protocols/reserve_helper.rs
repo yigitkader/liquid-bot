@@ -27,8 +27,7 @@ pub async fn parse_reserve_account(
     account_data: &Account,
 ) -> Result<ReserveInfo> {
 
-    // todo:
-    // Solend reserve account'unu parse et
+    // Parse Solend reserve account
     // ⚠️ PRODUCTION WARNING: Bu struct gerçek Solend IDL'ine göre doğrulanmamıştır!
     // Parse error alırsanız, gerçek IDL'den struct'ı güncelleyin: ./scripts/fetch_solend_idl.sh
     let reserve = SolendReserve::from_account_data(&account_data.data)

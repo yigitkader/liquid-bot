@@ -25,6 +25,9 @@ pub struct Config {
     pub slippage_safety_margin_multiplier: f64,
     // Wallet configuration
     pub min_reserve_lamports: u64,
+    // Known reserve addresses (for testing/validation)
+    pub usdc_reserve_address: Option<String>,
+    pub sol_reserve_address: Option<String>,
 }
 
 impl Config {
@@ -93,6 +96,14 @@ impl Config {
                 .unwrap_or_else(|_| "1000000".to_string()) // 0.001 SOL minimum reserve for transaction fees
                 .parse()
                 .context("Invalid MIN_RESERVE_LAMPORTS value")?,
+            // Known reserve addresses (optional, for testing/validation)
+            // Defaults are mainnet Solend reserves
+            usdc_reserve_address: env::var("USDC_RESERVE_ADDRESS")
+                .ok()
+                .or_else(|| Some("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw".to_string())),
+            sol_reserve_address: env::var("SOL_RESERVE_ADDRESS")
+                .ok()
+                .or_else(|| Some("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36".to_string())),
         };
 
         config.validate()?;

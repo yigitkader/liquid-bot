@@ -24,23 +24,27 @@ impl WalletManager {
         } else {
             // Try to parse as base58 encoded secret key (alternative format)
             // Some wallets export as base58 string
-            if let Ok(secret_key) = bs58::decode(wallet_data.trim())
-                .into_vec()
-                .and_then(|bytes| {
+            match bs58::decode(wallet_data.trim()).into_vec() {
+                Ok(bytes) => {
                     if bytes.len() == 64 {
-                        Ok(bytes)
+                        Keypair::from_bytes(&bytes)
+                            .context("Failed to create keypair from base58 secret key")?
                     } else {
-                        Err(bs58::decode::Error::InvalidLength)
+                        return Err(anyhow::anyhow!(
+                            "Invalid base58 secret key length: {} bytes (expected 64 bytes)",
+                            bytes.len()
+                        ));
                     }
-                }) {
-                Keypair::from_bytes(&secret_key)
-                    .context("Failed to create keypair from base58 secret key")?
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Unsupported wallet format. Expected one of:\n\
-                     - JSON array format: [1,2,3,...]\n\
-                     - Base58 encoded secret key (64 bytes)"
-                ));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to decode base58 wallet format: {}. \
+                         Expected one of:\n\
+                         - JSON array format: [1,2,3,...]\n\
+                         - Base58 encoded secret key (64 bytes)",
+                        e
+                    ));
+                }
             }
         };
         
@@ -110,7 +114,7 @@ impl WalletBalanceChecker {
                 use solana_sdk::program_pack::Pack;
                 
                 // Account struct'ını parse et
-                // todo: spl-token 4.0'da Account Pack trait'ini implement ediyor, unpack kullanabiliriz
+                // Note: spl-token 4.0'da Account Pack trait'ini implement ediyor, unpack kullanıyoruz
                 let token_account_state = Account::unpack(&account.data)
                     .map_err(|e| anyhow::anyhow!("Failed to parse token account data: {:?}", e))?;
                 

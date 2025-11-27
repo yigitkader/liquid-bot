@@ -162,17 +162,37 @@ pub struct ReserveInfo {
 pub mod known_reserves {
     use solana_sdk::pubkey::Pubkey;
 
-    pub fn usdc_reserve() -> anyhow::Result<Pubkey> {
-        // Varsayılan USDC reserve adresi (mainnet)
-        let addr = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"; //todo why this is hardcoded?
+    /// Get USDC reserve address from config or fallback to default mainnet address
+    pub fn usdc_reserve(config: Option<&crate::config::Config>) -> anyhow::Result<Pubkey> {
+        let addr = config
+            .and_then(|c| c.usdc_reserve_address.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"); // Default mainnet USDC reserve
+        
         addr.parse::<Pubkey>()
-            .map_err(|e| anyhow::anyhow!("Invalid hardcoded USDC reserve address {}: {}", addr, e))
+            .map_err(|e| anyhow::anyhow!("Invalid USDC reserve address {}: {}", addr, e))
     }
     
-    pub fn sol_reserve() -> anyhow::Result<Pubkey> {
-        // Varsayılan SOL reserve adresi (mainnet)
-        let addr = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"; //todo why this is hardcoded?
+    /// Get SOL reserve address from config or fallback to default mainnet address
+    pub fn sol_reserve(config: Option<&crate::config::Config>) -> anyhow::Result<Pubkey> {
+        let addr = config
+            .and_then(|c| c.sol_reserve_address.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"); // Default mainnet SOL reserve
+        
         addr.parse::<Pubkey>()
-            .map_err(|e| anyhow::anyhow!("Invalid hardcoded SOL reserve address {}: {}", addr, e))
+            .map_err(|e| anyhow::anyhow!("Invalid SOL reserve address {}: {}", addr, e))
+    }
+    
+    /// Legacy function for backward compatibility (uses default addresses)
+    #[deprecated(note = "Use usdc_reserve(Some(&config)) instead")]
+    pub fn usdc_reserve_legacy() -> anyhow::Result<Pubkey> {
+        usdc_reserve(None)
+    }
+    
+    /// Legacy function for backward compatibility (uses default addresses)
+    #[deprecated(note = "Use sol_reserve(Some(&config)) instead")]
+    pub fn sol_reserve_legacy() -> anyhow::Result<Pubkey> {
+        sol_reserve(None)
     }
 }
