@@ -7,6 +7,15 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::str::FromStr;
 
+/// Oracle account read fee per account
+/// When Solana programs read account data during transaction execution,
+/// there's a fee for accessing those accounts (~5,000 lamports per account)
+const ORACLE_READ_FEE_LAMPORTS: u64 = 5_000;
+
+/// Number of oracle accounts typically read during liquidation
+/// Solend program reads Pyth oracle (and potentially Switchboard as fallback)
+const ORACLE_ACCOUNTS_READ: u64 = 1; // Typically 1 (Pyth), sometimes 2 if Switchboard is also read
+
 fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
@@ -16,8 +25,17 @@ fn calculate_transaction_fee_usd(
     // Base transaction fee: Solana charges a base fee per transaction
     // Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
     // Default: ~5,000 lamports = 0.000005 SOL
+    
+    // Priority fee: Based on compute units and priority fee rate
     let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
-    let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
+    
+    // Oracle read fee: When Solend program reads oracle accounts (Pyth/Switchboard) during execution,
+    // there's a fee for accessing those accounts (~5,000 lamports per account)
+    // Note: Even though oracle accounts aren't in the instruction's account list,
+    // the program reads them on-chain and this incurs a fee
+    let oracle_read_fee_lamports = ORACLE_READ_FEE_LAMPORTS * ORACLE_ACCOUNTS_READ;
+    
+    let total_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_lamports;
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
     total_fee_sol * sol_price_usd
 }
@@ -190,9 +208,10 @@ pub async fn calculate_liquidation_opportunity(
                         {
                             Ok(Some(oracle_price)) => {
                                 // Pyth confidence = %68 confidence interval (1 sigma)
-                                // %95 confidence interval için 2 sigma (2x çarpan) kullanılmalı
+                                // %95 confidence interval için Z-score 1.96 kullanılmalı
                                 // Bot %68 confidence kullanırsa → Riski az gösterir
-                                let confidence_95 = oracle_price.confidence * 2.0;
+                                const Z_SCORE_95: f64 = 1.96;
+                                let confidence_95 = oracle_price.confidence * Z_SCORE_95;
                                 let confidence_ratio = confidence_95 / oracle_price.price;
                                 let confidence_bps = (confidence_ratio * 10_000.0) as u16;
                                 log::debug!(
@@ -233,19 +252,18 @@ pub async fn calculate_liquidation_opportunity(
     // Oracle confidence zaten slippage'in bir parçası, double counting yapmamak için
     // estimated_slippage ve oracle_slippage'i toplamak yerine max alıyoruz
     // Bu, oracle confidence'ın zaten price uncertainty'yi temsil ettiğini kabul eder
-    let oracle_adjusted_slippage_bps = estimated_slippage_bps.max(oracle_slippage_bps);
-    let base_slippage_cost_usd =
-        calculate_slippage_cost_usd(seizable_collateral_usd, oracle_adjusted_slippage_bps);
-
-    // Safety margin: 10% (1.1x) yeterli - %20 çok yüksek ve kârı gereksiz azaltıyor
-    // Gerçek slippage genelde tahminlerden çok farklı değil, %10 buffer yeterli
-    let slippage_cost_usd = base_slippage_cost_usd * 1.1;
+    // Oracle confidence 95% confidence interval kullanıyor (Z-score 1.96), bu zaten yeterli güvenlik marjı sağlıyor
+    let final_slippage_bps = estimated_slippage_bps.max(oracle_slippage_bps);
+    
+    // Oracle confidence zaten 95% confidence interval içeriyor, ek safety margin gereksiz
+    // Double counting'i önlemek için direkt hesaplıyoruz
+    let slippage_cost_usd = calculate_slippage_cost_usd(seizable_collateral_usd, final_slippage_bps);
 
     log::debug!(
-        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, adjusted={} bps (max), cost=${:.4} (with 10% safety margin)",
+        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, final={} bps (max), cost=${:.4}",
         estimated_slippage_bps,
         oracle_slippage_bps,
-        oracle_adjusted_slippage_bps,
+        final_slippage_bps,
         slippage_cost_usd
     );
 
@@ -473,10 +491,10 @@ mod tests {
         assert_ne!(hf, wrong_hf, "Health factor should NOT equal the wrong calculation using LTV");
     }
 
-    /// Test transaction fee calculation
+    /// Test transaction fee calculation includes oracle read fee
     /// 
-    /// Note: This test validates the basic fee calculation.
-    /// The oracle read fee is added separately in the actual calculation flow.
+    /// This validates that the oracle account read fee (5,000 lamports) is included
+    /// in the total transaction fee calculation.
     #[test]
     fn test_transaction_fee_calculation() {
         let compute_units = 200_000;
@@ -494,18 +512,20 @@ mod tests {
         // Expected breakdown:
         // Base fee: 5,000 lamports
         // Priority fee: 200,000 CU * 1,000 micro-lamports/CU / 1,000,000 = 200 lamports
-        // Total: 5,200 lamports = 0.0000052 SOL = $0.00078
+        // Oracle read fee: 5,000 lamports (1 account)
+        // Total: 10,200 lamports = 0.0000102 SOL = $0.00153
 
         let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
-        let expected_fee_lamports = base_fee_lamports + priority_fee_lamports;
+        let oracle_read_fee_lamports = 5_000; // ORACLE_READ_FEE_LAMPORTS * ORACLE_ACCOUNTS_READ
+        let expected_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_lamports;
         let expected_fee_sol = expected_fee_lamports as f64 / 1_000_000_000.0;
         let expected_fee_usd = expected_fee_sol * sol_price_usd;
 
-        // Verify the basic fee calculation
+        // Verify the fee calculation includes oracle read fee
         let difference = (fee_usd - expected_fee_usd).abs();
         assert!(
             difference < 0.0001,
-            "Transaction fee calculation. Expected ${:.6}, got ${:.6}, difference ${:.6}",
+            "Transaction fee should include oracle read fee. Expected ${:.6}, got ${:.6}, difference ${:.6}",
             expected_fee_usd,
             fee_usd,
             difference
