@@ -277,8 +277,12 @@ impl Protocol for SolendProtocol {
         let obligation = match SolendObligation::from_account_data(&account_data.data) {
             Ok(obligation) => obligation,
             Err(e) => {
-                log::warn!(
-                    "Failed to parse Solend obligation {}: {}",
+                // Most Solend program accounts are NOT obligations (reserves, markets, config, etc.).
+                // During get_program_accounts scans we optimistically try to parse everything as an
+                // obligation and fall back to `Ok(None)` on failure. This is expected and not an
+                // error condition, so we log it only at debug level to avoid noisy WARN spam.
+                log::debug!(
+                    "Skipping non-obligation Solend account {}: {}",
                     account_address,
                     e
                 );
