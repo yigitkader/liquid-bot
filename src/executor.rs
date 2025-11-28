@@ -84,6 +84,9 @@ pub async fn run_executor(
                     let mut signature = None;
 
                     for attempt in 0..=max_retries {
+                        // -----------------------------------------------------------------
+                        // 1) Balance check (early reject / retry)
+                        // -----------------------------------------------------------------
                         if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
                             use crate::wallet::WalletBalanceChecker;
                             let balance_checker = WalletBalanceChecker::new(
@@ -125,6 +128,50 @@ pub async fn run_executor(
                             }
                         }
                         
+                        // -----------------------------------------------------------------
+                        // 2) FINAL balance re-check immediately before tx build & send
+                        // -----------------------------------------------------------------
+                        if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
+                            use crate::wallet::WalletBalanceChecker;
+                            let balance_checker = WalletBalanceChecker::new(
+                                *wallet.pubkey(),
+                                Arc::clone(&rpc_client),
+                                Some(config.clone()),
+                            );
+
+                            if let Ok(current_balance) = balance_checker.get_token_balance(&debt_mint).await {
+                                let reserved = balance_reservation.get_reserved(&debt_mint).await;
+                                let available = current_balance.saturating_sub(reserved);
+
+                                if available < opportunity.max_liquidatable_amount {
+                                    log::warn!(
+                                        "Final balance check failed right before tx send: required={}, available={}, reserved={}, current={}",
+                                        opportunity.max_liquidatable_amount,
+                                        available,
+                                        reserved,
+                                        current_balance
+                                    );
+
+                                    balance_reservation
+                                        .release(&debt_mint, opportunity.max_liquidatable_amount)
+                                        .await;
+                                    log::debug!("Released reservation due to insufficient balance at final check");
+
+                                    last_error = Some(anyhow::anyhow!(
+                                        "Insufficient balance at final check: required={}, available={}",
+                                        opportunity.max_liquidatable_amount,
+                                        available
+                                    ));
+
+                                    // Bu attempt'ten ve tüm retry'lardan vazgeç
+                                    break;
+                                }
+                            }
+                        }
+
+                        // -----------------------------------------------------------------
+                        // 3) Tx build + sign + send
+                        // -----------------------------------------------------------------
                         match solana_client::execute_liquidation(
                             &opportunity,
                             &config,

@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
     let strategist_receiver = bus.subscribe();
     let executor_receiver = bus.subscribe();
     let logger_receiver = bus.subscribe();
+    let rpc_worker_receiver = bus.subscribe();
     let performance_tracker = Arc::new(performance::PerformanceTracker::new());
 
     log::info!("🔧 Starting worker tasks...");
@@ -212,6 +213,28 @@ async fn main() -> Result<()> {
         }
     });
 
+    let rpc_worker_handle = tokio::spawn({
+        let bus = bus.clone();
+        let config = config.clone();
+        let rpc_client = Arc::clone(&rpc_client);
+        let protocol = Arc::clone(&solend_protocol);
+        async move {
+            log::info!("   ✅ RPC worker started");
+            if let Err(e) = rpc_worker::run_rpc_worker(
+                rpc_worker_receiver,
+                bus,
+                config,
+                rpc_client,
+                protocol,
+            )
+            .await
+            {
+                log::error!("❌ RPC worker error: {}", e);
+            }
+            log::info!("   ⏹️  RPC worker stopped");
+        }
+    });
+
     let health_check_handle = tokio::spawn({
         let health_manager = Arc::clone(&health_manager);
         let performance_tracker = Arc::clone(&performance_tracker);
@@ -277,6 +300,7 @@ async fn main() -> Result<()> {
         _ = strategist_handle => {}
         _ = executor_handle => {}
         _ = logger_handle => {}
+        _ = rpc_worker_handle => {}
         _ = data_source_handle => {}
     }
 

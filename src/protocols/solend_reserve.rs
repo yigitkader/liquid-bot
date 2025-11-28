@@ -1,5 +1,5 @@
 use solana_sdk::pubkey::Pubkey;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
@@ -102,39 +102,119 @@ pub struct ReserveFees {
 // Total: 619 bytes (RESERVE_LEN constant in official source)
 //
 // Calculation: 1+8+1+32+32+1+32+32+32+8+16+16+16+32+8+32+1+1+1+1+1+1+1+8+8+1+8+8+32+248 = 619
-const EXPECTED_RESERVE_SIZE_WITHOUT_PADDING: usize = 371; // 619 - 248
-const EXPECTED_PADDING_SIZE: usize = 248;
-const EXPECTED_TOTAL_SIZE: usize = 619; // Official RESERVE_LEN constant
+//
+// ⚠️  WARNING: These are DEFAULT values. If Solend protocol upgrades, these may change.
+// The actual struct size is validated at runtime. Use config.expected_reserve_size for flexibility.
+const DEFAULT_RESERVE_SIZE_WITHOUT_PADDING: usize = 371; // 619 - 248
+const DEFAULT_PADDING_SIZE: usize = 248;
+const DEFAULT_TOTAL_SIZE: usize = 619; // Official RESERVE_LEN constant
+
+/// Calculates the expected struct size without padding by serializing an empty struct
+/// This provides runtime validation of the struct size
+fn calculate_struct_size() -> usize {
+    // Use Borsh to calculate the actual serialized size
+    // This is more reliable than hardcoded values
+    let reserve = SolendReserve {
+        version: 0,
+        last_update: LastUpdate { slot: 0, stale: 0 },
+        lending_market: Pubkey::default(),
+        liquidity: ReserveLiquidity {
+            mint_pubkey: Pubkey::default(),
+            mint_decimals: 0,
+            supply_pubkey: Pubkey::default(),
+            pyth_oracle: Pubkey::default(),
+            switchboard_oracle: Pubkey::default(),
+            available_amount: 0,
+            borrowed_amount_wads: 0,
+            cumulative_borrow_rate_wads: 0,
+            market_price: 0,
+        },
+        collateral: ReserveCollateral {
+            mint_pubkey: Pubkey::default(),
+            mint_total_supply: 0,
+            supply_pubkey: Pubkey::default(),
+        },
+        config: ReserveConfig {
+            optimal_utilization_rate: 0,
+            loan_to_value_ratio: 0,
+            liquidation_bonus: 0,
+            liquidation_threshold: 0,
+            min_borrow_rate: 0,
+            optimal_borrow_rate: 0,
+            max_borrow_rate: 0,
+            fees: ReserveFees {
+                borrow_fee_wad: 0,
+                flash_loan_fee_wad: 0,
+                host_fee_percentage: 0,
+            },
+            deposit_limit: 0,
+            borrow_limit: 0,
+            fee_receiver: Pubkey::default(),
+        },
+    };
+    
+    // Serialize to get actual size
+    match borsh::to_vec(&reserve) {
+        Ok(bytes) => bytes.len(),
+        Err(_) => DEFAULT_RESERVE_SIZE_WITHOUT_PADDING, // Fallback to default if serialization fails
+    }
+}
 
 impl SolendReserve {
     /// Deserializes a Solend reserve account from raw account data.
     /// 
     /// The account data structure:
-    /// - The reserve struct data (starts at offset 0, 371 bytes)
-    /// - 248 bytes of padding at the end (automatically skipped by Borsh)
-    /// - Total: 619 bytes (official RESERVE_LEN constant)
+    /// - The reserve struct data (starts at offset 0, typically 371 bytes)
+    /// - Padding at the end (typically 248 bytes, but may vary)
+    /// - Total: typically 619 bytes (official RESERVE_LEN constant, but may change with protocol upgrades)
     /// 
     /// This uses Borsh deserialization for type safety and automatic validation.
     /// Borsh will automatically handle padding by only deserializing the known struct fields.
+    /// 
+    /// ⚠️  WARNING: If Solend protocol upgrades, the struct size may change.
+    /// This function validates the struct size at runtime to detect version mismatches.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("Empty account data"));
         }
 
-        if data.len() < EXPECTED_RESERVE_SIZE_WITHOUT_PADDING {
+        // Calculate actual struct size at runtime (more reliable than hardcoded values)
+        let actual_struct_size = calculate_struct_size();
+        let min_expected_size = actual_struct_size.min(DEFAULT_RESERVE_SIZE_WITHOUT_PADDING);
+
+        if data.len() < min_expected_size {
             return Err(anyhow::anyhow!(
-                "Account data too small: {} bytes (expected at least {} bytes for reserve struct)",
+                "Account data too small: {} bytes (expected at least {} bytes for reserve struct). \
+                This might indicate a different Solend protocol version or corrupted data.",
                 data.len(),
-                EXPECTED_RESERVE_SIZE_WITHOUT_PADDING
+                min_expected_size
             ));
+        }
+
+        // Validate struct size matches expected (detect protocol upgrades)
+        if actual_struct_size != DEFAULT_RESERVE_SIZE_WITHOUT_PADDING {
+            log::warn!(
+                "⚠️  Struct size mismatch detected! Calculated: {} bytes, expected: {} bytes. \
+                This might indicate a Solend protocol upgrade or struct definition mismatch. \
+                Please verify the struct definition matches the current Solend protocol version.",
+                actual_struct_size,
+                DEFAULT_RESERVE_SIZE_WITHOUT_PADDING
+            );
         }
 
         // Extract only the struct data (without padding) for Borsh deserialization
         // Borsh expects to consume exactly the bytes needed for the struct
-        // The struct itself is 371 bytes, followed by 248 bytes of padding (total 619 bytes)
-        let struct_data = if data.len() >= EXPECTED_RESERVE_SIZE_WITHOUT_PADDING {
-            &data[..EXPECTED_RESERVE_SIZE_WITHOUT_PADDING]
+        // Use the calculated size, but ensure we don't exceed available data
+        let struct_data = if data.len() >= actual_struct_size {
+            &data[..actual_struct_size]
         } else {
+            // If data is smaller than expected, try to deserialize what we have
+            // This handles cases where padding might be missing or struct is smaller
+            log::warn!(
+                "Account data ({} bytes) is smaller than calculated struct size ({} bytes). Attempting to deserialize available data.",
+                data.len(),
+                actual_struct_size
+            );
             data
         };
 
@@ -145,19 +225,52 @@ impl SolendReserve {
         // https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
         // 
         // The struct has been verified against the official Pack implementation and RESERVE_LEN constant (619 bytes).
-        let reserve = SolendReserve::try_from_slice(struct_data)
-            .context("Failed to deserialize Solend reserve account. This struct has been validated against the official Solend source code. If parsing fails, the account data may be corrupted or from a different version.")?;
+        let reserve = match SolendReserve::try_from_slice(struct_data) {
+            Ok(r) => r,
+            Err(e) => {
+                // Provide detailed error message for debugging
+                return Err(anyhow::anyhow!(
+                    "Failed to deserialize Solend reserve account: {}. \
+                    Account data size: {} bytes, Calculated struct size: {} bytes. \
+                    This struct has been validated against the official Solend source code. \
+                    If parsing fails, the account data may be corrupted, from a different version, \
+                    or the struct definition may need updating. \
+                    Please run: cargo run --bin validate_reserve -- --reserve <RESERVE_ADDRESS>",
+                    e,
+                    data.len(),
+                    actual_struct_size
+                ));
+            }
+        };
+
+        // Validate version field (first byte) - helps detect protocol upgrades
+        if reserve.version > 1 {
+            log::warn!(
+                "⚠️  Unexpected reserve version: {}. Expected version 0 or 1. \
+                This might indicate a Solend protocol upgrade. Please verify compatibility.",
+                reserve.version
+            );
+        }
 
         // Validate that we have enough data (including padding)
         // The total account size should be at least the expected size
-        if data.len() < EXPECTED_TOTAL_SIZE {
-            // Warn but don't fail - padding might be smaller in some cases
+        let expected_total = DEFAULT_TOTAL_SIZE;
+        if data.len() < expected_total {
+            // Warn but don't fail - padding might be smaller in some cases or protocol version might differ
             log::warn!(
-                "Reserve account data size {} bytes is less than expected {} bytes (struct: {} + padding: {}). Padding might be smaller than expected.",
+                "Reserve account data size {} bytes is less than expected {} bytes (struct: {} + padding: {}). \
+                Padding might be smaller than expected, or this might be a different protocol version.",
                 data.len(),
-                EXPECTED_TOTAL_SIZE,
-                EXPECTED_RESERVE_SIZE_WITHOUT_PADDING,
-                EXPECTED_PADDING_SIZE
+                expected_total,
+                actual_struct_size,
+                DEFAULT_PADDING_SIZE
+            );
+        } else if data.len() > expected_total {
+            log::debug!(
+                "Reserve account data size {} bytes is larger than expected {} bytes. \
+                This might indicate additional fields or different padding in a newer protocol version.",
+                data.len(),
+                expected_total
             );
         }
 

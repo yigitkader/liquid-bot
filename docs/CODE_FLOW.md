@@ -91,7 +91,7 @@ The bot uses an **event-driven architecture** with loosely-coupled components. A
 **Key Functions:**
 - `analyzer.rs::run_analyzer()` - Main analyzer loop
 - `math.rs::calculate_liquidation_opportunity()` - Profit calculation
-- `math.rs::calculate_health_factor()` - Health factor calculation
+- `protocol.rs::Protocol::calculate_health_factor()` - Protocol-specific health factor (uses liquidation_threshold)
 
 **References:**
 - Solend SDK: https://github.com/solendprotocol/solend-sdk

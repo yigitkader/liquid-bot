@@ -4,6 +4,7 @@ pub mod event;
 pub mod event_bus;
 pub mod data_source;
 pub mod rpc_poller;
+pub mod rpc_worker;
 pub mod ws_listener;
 pub mod analyzer;
 pub mod strategist;

@@ -72,6 +72,37 @@ else
     print_error "Reserve validation test failed to run"
 fi
 
+# --- Oracle option & IDL runtime validation (non-fatal, but important) ---
+print_info "Checking oracle_option field and oracle layout against real mainnet data..."
+if [ -x "scripts/check_oracle_option.sh" ]; then
+    if scripts/check_oracle_option.sh 2>&1 | tee /tmp/oracle_option_test.log; then
+        if grep -q "oracle_option =" /tmp/oracle_option_test.log; then
+            print_success "oracle_option runtime check completed (see details above)"
+        else
+            print_warning "oracle_option script ran but expected output not found - please review /tmp/oracle_option_test.log"
+        fi
+    else
+        print_warning "oracle_option runtime check script failed to run"
+    fi
+else
+    print_warning "scripts/check_oracle_option.sh not executable or missing - skip oracle_option runtime check"
+fi
+
+print_info "Optionally refreshing official Solend IDL (structure drift detection)..."
+if [ -x "scripts/fetch_solend_idl.sh" ]; then
+    if scripts/fetch_solend_idl.sh 2>&1 | tee /tmp/solend_idl_fetch.log; then
+        if grep -q "Reserve account found in IDL" /tmp/solend_idl_fetch.log; then
+            print_success "Official Solend IDL fetched and Reserve account found (manual diff recommended for upgrades)"
+        else
+            print_warning "Solend IDL fetched but Reserve account not clearly detected - review idl/solend_official.json"
+        fi
+    else
+        print_warning "Failed to fetch/update official Solend IDL - network/CLI issue?"
+    fi
+else
+    print_warning "scripts/fetch_solend_idl.sh not executable or missing - skip IDL refresh"
+fi
+
 # ============================================================================
 # 2. OBLIGATION PARSING TEST
 # ============================================================================

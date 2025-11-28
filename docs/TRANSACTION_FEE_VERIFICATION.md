@@ -1,3 +1,94 @@
+### Transaction Fee Verification Guide
+
+**Amaç:**  
+`math.rs::calculate_transaction_fee_usd` fonksiyonunun ürettiği tahmini ücretin, gerçek mainnet işlem ücretleriyle uyumlu olduğunu doğrulamak (±10% tolerans).
+
+---
+
+### 1. Hazırlık
+
+- **Mod:** Önce `DRY_RUN=true` ile botu çalıştırın ve fee loglarını gözlemleyin.
+- **RPC:** Mainnet RPC endpoint'i kullanın (mümkünse premium sağlayıcı).
+- **Config:** Aşağıdaki alanların doğru olduğundan emin olun:
+  - `liquidation_compute_units`
+  - `priority_fee_per_cu`
+  - `base_transaction_fee_lamports`
+
+---
+
+### 2. İlk Gerçek Likidasyon ile Doğrulama Adımları
+
+1. **Dry-run ile fee tahminini kontrol edin**
+   - Komut:
+     - `DRY_RUN=true cargo run`
+   - Loglarda şu satırları bulun:
+     - `💰 Transaction Fee Breakdown: ...`
+   - Buradaki `total=... lamports (... SOL = $... USD)` kısmı sizin **tahmini ücretinizdir**.
+
+2. **Gerçek bir liquidation işlemi gönderin**
+   - Komut:
+     - `DRY_RUN=false MIN_PROFIT_USD=1.0 cargo run`
+   - Executor loglarında transaction imzasını göreceksiniz:
+     - `Liquidation transaction sent: <SIGNATURE>`
+
+3. **Solscan'de gerçek fee'yi kontrol edin**
+   - `https://solscan.io/tx/<SIGNATURE>` adresine gidin.
+   - `Fee` alanını not alın (SOL veya lamports olarak).
+
+4. **Karşılaştırma**
+   - Hesaplama:
+     - `diff = |fee_actual - fee_estimated|`
+     - `ratio = diff / fee_actual`
+   - Kriter:
+     - `ratio <= 0.10` (yani fark ≤ %10) ise **kabul edilebilir**.
+     - Daha büyük fark varsa:
+       - `liquidation_compute_units` veya `priority_fee_per_cu` değerleriniz gerçeklerden sapmış olabilir.
+
+---
+
+### 3. Sapma Durumunda Ayarlama
+
+- **Gerçek fee > Tahmin**:
+  - `liquidation_compute_units` veya `priority_fee_per_cu` çok düşük olabilir.
+  - Adım adım artırın:
+    - Önce gerçek işlemlerde görülen `compute units` tüketimini inceleyin.
+    - Config’teki `liquidation_compute_units` değerini buna yaklaştırın (+ bir güvenlik payı).
+    - Gerekirse `priority_fee_per_cu` değerini güncelleyin.
+
+- **Gerçek fee < Tahmin**:
+  - Tahmin çok konservatif olabilir (bu genelde problem değildir).
+  - İsterseniz `liquidation_compute_units` veya `priority_fee_per_cu` biraz azaltarak daha gerçekçi bir tahmin elde edebilirsiniz.
+
+---
+
+### 4. Formül Referansı
+
+`calculate_transaction_fee_usd` içinde kullanılan formül:
+
+- **Priority fee (lamports):**
+  - `priority_fee_lamports = (compute_units * priority_fee_per_cu) / 1_000_000`
+  - `priority_fee_per_cu` mikro-lamports cinsindendir (μlamports/CU).
+
+- **Toplam fee (lamports):**
+  - `total_fee_lamports = base_fee_lamports + priority_fee_lamports`
+
+- **USD karşılığı:**
+  - `total_fee_sol = total_fee_lamports / 1_000_000_000`
+  - `total_fee_usd = total_fee_sol * sol_price_usd`
+
+**Notlar:**
+- Oracle account read'leri için **ayrı bir ücret yoktur**; hepsi base transaction fee’ye dahildir.
+- Bu nedenle `_oracle_read_fee_lamports` ve `_oracle_accounts_read` parametreleri **deprecated** bırakılmıştır, hesapta kullanılmaz.
+
+---
+
+### 5. Kabul Kriteri (Production)
+
+- En az 1–3 gerçek liquidation işlemi için:
+  - Tahmini ücret ile gerçek ücret arasındaki fark **%10'dan küçük veya eşit** olmalıdır.
+- Bu sağlandığında:
+  - Config değerleriniz ve `calculate_transaction_fee_usd` formülü **production için güvenli** kabul edilebilir.
+
 # Transaction Fee Verification Guide
 
 ## ⚠️ CRITICAL: VERIFICATION REQUIRED

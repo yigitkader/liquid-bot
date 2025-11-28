@@ -20,6 +20,21 @@ pub async fn run_logger(
                         position.health_factor
                     );
                 }
+                Event::PriceUpdate { mint, price, confidence, timestamp } => {
+                    log::debug!(
+                        "Price update: mint={}, price=${:.4}, confidence=${:.4}, timestamp={}",
+                        mint, price, confidence, timestamp
+                    );
+                }
+                Event::SlotUpdate { slot } => {
+                    log::debug!("Slot update: slot={}", slot);
+                }
+                Event::AccountCheckRequest { account_address, reason } => {
+                    log::debug!(
+                        "Account check requested: {} (reason: {})",
+                        account_address, reason
+                    );
+                }
                 Event::PotentiallyLiquidatable(opp) => {
                     metrics.opportunities_found += 1;
                     health_manager.record_opportunity().await;

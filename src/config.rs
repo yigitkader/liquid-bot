@@ -317,10 +317,12 @@ impl Config {
                 .parse()
                 .context("Invalid RETRY_JITTER_MAX_MS value")?,
             // Jupiter API configuration
+            // Default: enabled (safest - uses real-time slippage from Jupiter)
+            // If you want to use the estimated slippage model instead, explicitly set USE_JUPITER_API=false
             use_jupiter_api: env::var("USE_JUPITER_API")
-                .unwrap_or_else(|_| "false".to_string())
+                .unwrap_or_else(|_| "true".to_string())
                 .parse()
-                .unwrap_or(false), // Default: disabled (use estimated slippage model)
+                .unwrap_or(true),
             // Note: WebSocket is now always used as primary data source (best practice)
             // RPC polling is used as automatic fallback if WebSocket fails
         };

@@ -454,14 +454,6 @@ pub async fn calculate_liquidation_opportunity(
     }))
 }
 
-pub fn calculate_health_factor(total_collateral_usd: f64, total_debt_usd: f64, ltv: f64) -> f64 {
-    if total_debt_usd == 0.0 {
-        return f64::INFINITY;
-    }
-
-    (total_collateral_usd * ltv) / total_debt_usd
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
