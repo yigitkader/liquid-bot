@@ -109,8 +109,11 @@ impl Config {
                 .unwrap_or_else(|_| "50".to_string())
                 .parse()
                 .context("Invalid MAX_SLIPPAGE_BPS value")?,
+            // RPC polling interval:
+            // - Default increased to 30000ms (30s) to be more friendly to free/public RPC endpoints
+            // - WebSocket is primary data source; RPC polling is only a fallback, so higher interval is fine
             poll_interval_ms: env::var("POLL_INTERVAL_MS")
-                .unwrap_or_else(|_| "10000".to_string()) // Default: 10s (safe for free RPC endpoints)
+                .unwrap_or_else(|_| "30000".to_string()) // Default: 30s (safer for free RPC endpoints)
                 .parse()
                 .context("Invalid POLL_INTERVAL_MS value")?,
             dry_run: env::var("DRY_RUN")
@@ -274,8 +277,10 @@ impl Config {
                 .parse()
                 .context("Invalid WS_LISTENER_SLEEP_SECONDS value")?,
             // RPC polling configuration
+            // Increase default max_consecutive_errors to be more tolerant of transient
+            // rate limit errors on free/public RPC endpoints.
             max_consecutive_errors: env::var("MAX_CONSECUTIVE_ERRORS")
-                .unwrap_or_else(|_| "10".to_string())
+                .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .context("Invalid MAX_CONSECUTIVE_ERRORS value")?,
             // Reserve validation configuration
