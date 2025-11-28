@@ -1,15 +1,17 @@
 //! Comprehensive System Validation Test
 //!
-//! Bu binary, tüm sistemin çalışması için gereken:
-//! - Config'lerin doğruluğunu
-//! - Adreslerin (program ID, lending market, reserve'ler) doğruluğunu
-//! - Account'ların (obligation, reserve) doğru parse edildiğini
-//! - PDA'ların doğru türetildiğini
-//! - Instruction formatlarının doğru olduğunu
-//! - Oracle account'larının doğru olduğunu
-//! - Tüm sistemin birbirleriyle uyumlu çalıştığını
+//! This binary validates all system components required for operation:
+//! - Configuration correctness
+//! - Address validity (program ID, lending market, reserves)
+//! - Account parsing (obligation, reserve)
+//! - PDA derivation correctness
+//! - Instruction format correctness
+//! - Oracle account reading
+//! - System integration integrity
 //!
-//! garanti eder.
+//! Reference:
+//! - Solend Protocol: https://docs.solend.fi/
+//! - Solana PDAs: https://docs.solana.com/developing/programming-model/calling-between-programs#program-derived-addresses
 
 use anyhow::{Context, Result};
 use clap::Parser;

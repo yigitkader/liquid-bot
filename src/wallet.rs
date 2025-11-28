@@ -5,6 +5,7 @@ use solana_sdk::{
 };
 use std::fs;
 use std::path::Path;
+use crate::balance_reservation::BalanceChecker;
 
 pub struct WalletManager {
     keypair: Keypair,
@@ -191,6 +192,14 @@ impl WalletBalanceChecker {
                 Ok(false)
             }
         }
+    }
+}
+
+// Implement BalanceChecker trait for WalletBalanceChecker
+// This allows it to be used with BalanceReservation::try_reserve_with_check
+impl BalanceChecker for WalletBalanceChecker {
+    async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64> {
+        WalletBalanceChecker::get_token_balance(self, mint).await
     }
 }
 

@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// Forward declaration to avoid circular dependency
+pub trait BalanceChecker: Send + Sync {
+    async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64>;
+}
+
 /// Tracks reserved balances to prevent race conditions when multiple
 /// liquidation opportunities are processed in parallel.
 /// 
@@ -92,6 +97,63 @@ impl BalanceReservation {
             if *reserved_amount == 0 {
                 reserved.remove(mint);
             }
+        }
+    }
+
+    /// ✅ ATOMIC: Balance check and reservation in one operation
+    /// 
+    /// This method atomically checks the balance and reserves it, preventing race conditions
+    /// where balance is checked and then reserved separately (gap between operations).
+    /// 
+    /// Returns Some(ReservationGuard) if reservation succeeds, None otherwise.
+    /// The reservation is automatically released when the guard is dropped.
+    /// 
+    /// This is the recommended method to use instead of:
+    /// 1. get_token_balance() 
+    /// 2. reserve() 
+    /// 
+    /// Because there's a race condition gap between steps 1 and 2.
+    pub async fn try_reserve_with_check<BC: BalanceChecker>(
+        &self,
+        mint: &Pubkey,
+        amount: u64,
+        balance_checker: &BC,
+    ) -> Result<Option<ReservationGuard>> {
+        // Atomically: check balance and reserve in one operation
+        // This prevents race conditions where balance is checked, then another
+        // opportunity reserves it before this one can reserve it.
+        
+        // Step 1: Get current balance (this is the only async operation outside the lock)
+        let actual_balance = balance_checker.get_token_balance(mint).await?;
+        
+        // Step 2: Immediately reserve (with lock held)
+        // This minimizes the gap between balance check and reservation
+        let mut reserved = self.reserved.write().await;
+        
+        let currently_reserved = reserved.get(mint).copied().unwrap_or(0);
+        let available = actual_balance.saturating_sub(currently_reserved);
+        
+        if available >= amount {
+            *reserved.entry(*mint).or_insert(0) += amount;
+            
+            // Release lock before returning guard
+            drop(reserved);
+            
+            Ok(Some(ReservationGuard {
+                reservation: Arc::clone(&self.reserved),
+                mint: *mint,
+                amount,
+            }))
+        } else {
+            log::debug!(
+                "Atomic reservation failed: mint={}, required={}, available={}, reserved={}, actual={}",
+                mint,
+                amount,
+                available,
+                currently_reserved,
+                actual_balance
+            );
+            Ok(None)
         }
     }
 }

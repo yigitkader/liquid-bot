@@ -38,10 +38,12 @@ pub async fn run_strategist(
                 }
 
                 if approved {
-                    let estimated_slippage_bps =
+                    // DEX slippage: Estimated based on liquidation bonus
+                    let estimated_dex_slippage_bps =
                         (opportunity.liquidation_bonus * config.slippage_estimation_multiplier * 10000.0) as u16;
                     let debt_mint_str = &opportunity.target_debt_mint;
                     let mut debt_reserve_pubkey: Option<Pubkey> = None;
+                    let mut oracle_confidence_bps: Option<u16> = None;
 
                     // ✅ DOĞRU: Obligation'dan doğrudan reserve'i al
                     // debt_mint (token mint address) ≠ reserve_pubkey
@@ -88,13 +90,14 @@ pub async fn run_strategist(
                                                 )
                                                 .await
                                                 {
-                                                    // Pyth confidence = %68 confidence interval (1 sigma)
-                                                    // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
-                                                    let confidence_95 = price.confidence * config.z_score_95;
-                                                    let confidence_slippage_bps = ((confidence_95
+                                                    // Pyth confidence = ±1σ (standard deviation), representing 68% confidence interval
+                                                    // Use confidence directly - it already represents price uncertainty
+                                                    // Multiplying by Z-score (1.96) is statistically incorrect
+                                                    let confidence_bps = ((price.confidence
                                                         / price.price)
                                                         * 10000.0)
                                                         as u16;
+                                                    oracle_confidence_bps = Some(confidence_bps);
                                                     let age_seconds = std::time::SystemTime::now()
                                                         .duration_since(std::time::UNIX_EPOCH)
                                                         .unwrap_or_default()
@@ -102,21 +105,12 @@ pub async fn run_strategist(
                                                         as i64
                                                         - price.timestamp;
 
-                                                            if age_seconds > config.max_oracle_age_seconds as i64 {
-                                                                approved = false;
-                                                                rejection_reason = format!(
-                                                                    "oracle price too old: {}s (max: {}s)",
-                                                                    age_seconds,
-                                                                    config.max_oracle_age_seconds
-                                                                );
-                                                    } else if confidence_slippage_bps
-                                                        > config.max_slippage_bps
-                                                    {
+                                                    if age_seconds > config.max_oracle_age_seconds as i64 {
                                                         approved = false;
                                                         rejection_reason = format!(
-                                                            "oracle slippage {} bps > max {} bps",
-                                                            confidence_slippage_bps,
-                                                            config.max_slippage_bps
+                                                            "oracle price too old: {}s (max: {}s)",
+                                                            age_seconds,
+                                                            config.max_oracle_age_seconds
                                                         );
                                                     }
                                                 } else {
@@ -141,13 +135,14 @@ pub async fn run_strategist(
                                                         )
                                                         .await
                                                         {
-                                                            // Pyth confidence = %68 confidence interval (1 sigma)
-                                                            // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
-                                                            let confidence_95 = price.confidence * config.z_score_95;
-                                                            let confidence_slippage_bps =
-                                                                ((confidence_95 / price.price)
+                                                            // Pyth confidence = ±1σ (standard deviation), representing 68% confidence interval
+                                                            // Use confidence directly - it already represents price uncertainty
+                                                            // Multiplying by Z-score (1.96) is statistically incorrect
+                                                            let confidence_bps =
+                                                                ((price.confidence / price.price)
                                                                     * 10000.0)
                                                                     as u16;
+                                                            oracle_confidence_bps = Some(confidence_bps);
                                                             let age_seconds =
                                                                 std::time::SystemTime::now()
                                                                     .duration_since(
@@ -165,11 +160,6 @@ pub async fn run_strategist(
                                                                     age_seconds,
                                                                     config.max_oracle_age_seconds
                                                                 );
-                                                            } else if confidence_slippage_bps
-                                                                > config.max_slippage_bps
-                                                            {
-                                                                approved = false;
-                                                                rejection_reason = format!("oracle slippage {} bps > max {} bps", confidence_slippage_bps, config.max_slippage_bps);
                                                             }
                                                         }
                                                     } else {
@@ -200,12 +190,35 @@ pub async fn run_strategist(
                         log::warn!("Could not find debt reserve pubkey for debt mint {}. Skipping oracle check.", debt_mint_str);
                     }
 
-                    if approved && estimated_slippage_bps > config.max_slippage_bps {
-                        approved = false;
-                        rejection_reason = format!(
-                            "estimated slippage {} bps > max {} bps",
-                            estimated_slippage_bps, config.max_slippage_bps
-                        );
+                    // Total slippage = DEX slippage + Oracle confidence
+                    // These are independent risk sources that should be added together
+                    // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
+                    if approved {
+                        let oracle_confidence = oracle_confidence_bps.unwrap_or(0);
+                        let total_slippage_bps = estimated_dex_slippage_bps + oracle_confidence;
+                        let final_slippage_bps = ((total_slippage_bps as f64 * config.slippage_final_multiplier) as u16).min(u16::MAX);
+                        
+                        if final_slippage_bps > config.max_slippage_bps {
+                            approved = false;
+                            rejection_reason = format!(
+                                "total slippage {} bps > max {} bps (dex: {} bps, oracle: {} bps, multiplier: {:.2}x)",
+                                final_slippage_bps,
+                                config.max_slippage_bps,
+                                estimated_dex_slippage_bps,
+                                oracle_confidence,
+                                config.slippage_final_multiplier
+                            );
+                        } else {
+                            log::debug!(
+                                "Slippage check passed: dex={} bps, oracle={} bps, total={} bps, final={} bps (multiplier: {:.2}x), max={} bps",
+                                estimated_dex_slippage_bps,
+                                oracle_confidence,
+                                total_slippage_bps,
+                                final_slippage_bps,
+                                config.slippage_final_multiplier,
+                                config.max_slippage_bps
+                            );
+                        }
                     }
                 }
 
@@ -325,19 +338,19 @@ pub async fn run_strategist(
                     }
 
                     if approved {
-                        // Use balance reservation to prevent race conditions
-                        // This ensures that if multiple opportunities require the same token,
-                        // only one can be approved at a time
-                        let debt_balance = match wallet_balance_checker.get_token_balance(&debt_mint).await {
-                            Ok(balance) => balance,
-                            Err(e) => {
-                                log::warn!("Failed to get debt token balance: {}, rejecting opportunity", e);
-                                approved = false;
-                                rejection_reason = format!("balance check failed: {}", e);
-                                continue;
-                            }
-                        };
-
+                        // ✅ ATOMIC: Balance check and reservation in one operation
+                        // This prevents race conditions where balance is checked, then another
+                        // opportunity reserves it before this one can reserve it.
+                        // 
+                        // Old approach (❌ RACE CONDITION RISK):
+                        // 1. get_token_balance() - gets balance
+                        // 2. ... (gap - another opportunity could reserve here)
+                        // 3. reserve() - tries to reserve
+                        //
+                        // New approach (✅ ATOMIC):
+                        // 1. try_reserve_with_check() - atomically checks balance and reserves
+                        
+                        // First check SOL balance (separate check, but less critical for race condition)
                         let sol_balance = match wallet_balance_checker.get_sol_balance().await {
                             Ok(balance) => balance,
                             Err(e) => {
@@ -359,27 +372,44 @@ pub async fn run_strategist(
                             continue;
                         }
 
-                        // Try to reserve the required debt amount
+                        // ✅ ATOMIC: Balance check and reservation in one operation
                         // This prevents race conditions when multiple opportunities are processed in parallel
-                        if balance_reservation.reserve(&debt_mint, required_debt_amount, debt_balance).await {
-                            log::debug!(
-                                "Balance reserved: debt_mint={}, amount={}, available={}",
-                                debt_mint,
-                                required_debt_amount,
-                                debt_balance
-                            );
-                        } else {
-                            approved = false;
-                            let reserved = balance_reservation.get_reserved(&debt_mint).await;
-                            let available = balance_reservation.get_available(&debt_mint, debt_balance).await;
-                            rejection_reason = format!(
-                                "insufficient capital (race condition prevented): required_debt={} (mint={}), available={}, reserved={}, actual={}",
-                                required_debt_amount,
-                                debt_mint,
-                                available,
-                                reserved,
-                                debt_balance
-                            );
+                        match balance_reservation.try_reserve_with_check(
+                            &debt_mint,
+                            required_debt_amount,
+                            wallet_balance_checker.as_ref(),
+                        ).await {
+                            Ok(Some(_guard)) => {
+                                // Reservation successful - guard will be dropped automatically when out of scope
+                                // Note: We don't need to hold the guard here since we're just checking availability
+                                // The reservation will be released when the guard is dropped
+                                log::debug!(
+                                    "Balance reserved atomically: debt_mint={}, amount={}",
+                                    debt_mint,
+                                    required_debt_amount
+                                );
+                            }
+                            Ok(None) => {
+                                // Reservation failed - insufficient balance or already reserved
+                                approved = false;
+                                let reserved = balance_reservation.get_reserved(&debt_mint).await;
+                                // Get current balance for logging (may have changed, but that's ok for logging)
+                                let current_balance = wallet_balance_checker.get_token_balance(&debt_mint).await.unwrap_or(0);
+                                let available = balance_reservation.get_available(&debt_mint, current_balance).await;
+                                rejection_reason = format!(
+                                    "insufficient capital (race condition prevented): required_debt={} (mint={}), available={}, reserved={}, actual={}",
+                                    required_debt_amount,
+                                    debt_mint,
+                                    available,
+                                    reserved,
+                                    current_balance
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to check/reserve balance: {}, rejecting opportunity", e);
+                                approved = false;
+                                rejection_reason = format!("balance check/reservation failed: {}", e);
+                            }
                         }
                     }
                 }

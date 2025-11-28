@@ -22,7 +22,10 @@ pub struct Config {
     pub dex_fee_bps: u16,
     pub min_profit_margin_bps: u16,
     pub default_oracle_confidence_slippage_bps: u16,
-    pub slippage_safety_margin_multiplier: f64,
+    // Slippage final multiplier: Applied to total slippage (DEX + Oracle) as a safety margin
+    // Default: 1.1 (10% safety margin) to account for model uncertainty
+    // This is applied after summing DEX slippage and oracle confidence intervals
+    pub slippage_final_multiplier: f64,
     // Wallet configuration
     pub min_reserve_lamports: u64,
     // Known reserve addresses (for testing/validation)
@@ -39,6 +42,9 @@ pub struct Config {
     pub oracle_mappings_json: Option<String>,
     // Oracle configuration
     pub max_oracle_age_seconds: u64,
+    // ❌ DEPRECATED: Oracle read fee doesn't exist in Solana
+    // Solana's base transaction fee covers all account reads, including oracle accounts
+    // These fields are kept for backward compatibility but are no longer used in calculations
     pub oracle_read_fee_lamports: u64,
     pub oracle_accounts_read: u64,
     // Transaction configuration
@@ -152,10 +158,10 @@ impl Config {
                 .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
                 .parse()
                 .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
-            slippage_safety_margin_multiplier: env::var("SLIPPAGE_SAFETY_MARGIN_MULTIPLIER")
-                .unwrap_or_else(|_| "1.1".to_string()) // 10% safety margin (reduced from 20% to avoid over-conservative profit calculation)
+            slippage_final_multiplier: env::var("SLIPPAGE_FINAL_MULTIPLIER")
+                .unwrap_or_else(|_| "1.1".to_string()) // 10% safety margin for model uncertainty
                 .parse()
-                .context("Invalid SLIPPAGE_SAFETY_MARGIN_MULTIPLIER value")?,
+                .context("Invalid SLIPPAGE_FINAL_MULTIPLIER value")?,
             // Wallet configuration
             min_reserve_lamports: env::var("MIN_RESERVE_LAMPORTS")
                 .unwrap_or_else(|_| "1000000".to_string()) // 0.001 SOL minimum reserve for transaction fees
@@ -188,6 +194,10 @@ impl Config {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .context("Invalid MAX_ORACLE_AGE_SECONDS value (must be u64)")?,
+            // ❌ DEPRECATED: Oracle read fee doesn't exist in Solana
+            // Solana's base transaction fee covers all account reads, including oracle accounts
+            // These fields are kept for backward compatibility but are no longer used in calculations
+            // Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
             oracle_read_fee_lamports: env::var("ORACLE_READ_FEE_LAMPORTS")
                 .unwrap_or_else(|_| "5000".to_string())
                 .parse()
@@ -407,19 +417,6 @@ impl Config {
         }
         if self.dex_fee_bps > 1000 {
             log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
-        }
-        // ⚠️ NOTE: slippage_safety_margin_multiplier is deprecated
-        // 
-        // Status: ✅ DEPRECATED - No longer used in calculations
-        // 
-        // This field is kept for backward compatibility but not used in profit calculations.
-        // The slippage calculation in math.rs uses oracle confidence intervals (95% with Z-score 1.96)
-        // which already provides sufficient safety margin without additional multiplier.
-        // 
-        // Historical context: Previously used 1.1 (10%) multiplier, but this caused over-conservative
-        // profit calculations and double-counting with oracle confidence intervals.
-        if self.slippage_safety_margin_multiplier < 1.0 || self.slippage_safety_margin_multiplier > 2.0 {
-            log::warn!("⚠️  SLIPPAGE_SAFETY_MARGIN_MULTIPLIER={} is outside recommended range (1.0-2.0), but note: this value is no longer used (hardcoded to 1.1)", self.slippage_safety_margin_multiplier);
         }
 
         Ok(())

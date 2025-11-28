@@ -124,7 +124,7 @@ pub async fn run_executor(
                                         "Liquidation attempt {} failed for account {}: {}. Retrying in {}ms...",
                                         attempt + 1,
                                         account_address,
-                                        last_error.as_ref().unwrap(),
+                                        last_error.as_ref().expect("last_error should be Some() here"),
                                         delay_ms
                                     );
                                     sleep(Duration::from_millis(delay_ms)).await;

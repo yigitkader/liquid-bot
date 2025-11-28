@@ -1,6 +1,10 @@
 //! Direct Obligation Test Helper
 //!
-//! Bu binary, obligation account bulma için rehberlik sağlar.
+//! This binary provides guidance for finding obligation accounts.
+//!
+//! Reference:
+//! - Solend Dashboard: https://solend.fi/dashboard
+//! - Solana Explorer: https://explorer.solana.com/
 
 use anyhow::{Context, Result};
 use clap::Parser;

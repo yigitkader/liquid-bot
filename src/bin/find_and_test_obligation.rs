@@ -1,6 +1,10 @@
 //! Find and Test Solend Obligation Accounts
 //!
-//! Bu binary, Solend mainnet'te obligation account'larını bulur ve test eder.
+//! This binary finds and tests Solend obligation accounts on mainnet.
+//!
+//! Reference:
+//! - Solend Dashboard: https://solend.fi/dashboard
+//! - Solend Protocol: https://docs.solend.fi/
 
 use anyhow::{Context, Result};
 use clap::Parser;

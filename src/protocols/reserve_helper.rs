@@ -66,11 +66,19 @@ pub async fn parse_reserve_account(
     /// Validation: Matches Solend SDK behavior for borrow rate calculation
     /// 
     /// WAD format constant: 1e18 (from Solend's WAD format)
+    /// 
+    /// ✅ DOĞRU: Overflow kontrolü + precision koruma
+    /// - available_amount'u WAD formatına çevir (u64 → u128 * WAD)
+    /// - Toplam liquidity'yi WAD formatında hesapla
+    /// - Utilization rate'i f64 division ile hesapla (precision korunur)
     const WAD: u128 = 1_000_000_000_000_000_000;
     
-    let utilization_rate = if reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / WAD) as u64 > 0 {
-        let total_liquidity = reserve.liquidity.available_amount + (reserve.liquidity.borrowed_amount_wads / WAD) as u64;
-        (reserve.liquidity.borrowed_amount_wads / WAD) as f64 / total_liquidity as f64
+    // Convert available_amount to WAD format to match borrowed_amount_wads
+    let available_wads = (reserve.liquidity.available_amount as u128) * WAD;
+    let total_liquidity_wads = available_wads + reserve.liquidity.borrowed_amount_wads;
+    
+    let utilization_rate = if total_liquidity_wads > 0 {
+        (reserve.liquidity.borrowed_amount_wads as f64) / (total_liquidity_wads as f64)
     } else {
         0.0
     };
@@ -127,13 +135,13 @@ pub async fn parse_reserve_account(
     
     if pyth_oracle.is_none() && switchboard_oracle.is_none() {
         log::debug!("No oracle found for reserve {} (both are default)", reserve_pubkey);
-    } else if pyth_oracle.is_some() && switchboard_oracle.is_some() {
+    } else if let (Some(pyth), Some(switchboard)) = (pyth_oracle.as_ref(), switchboard_oracle.as_ref()) {
         log::debug!("Both oracles present for reserve {}: pyth={}, switchboard={}", 
-            reserve_pubkey, pyth_oracle.unwrap(), switchboard_oracle.unwrap());
-    } else if pyth_oracle.is_some() {
-        log::debug!("Only Pyth oracle present for reserve {}: {}", reserve_pubkey, pyth_oracle.unwrap());
-    } else {
-        log::debug!("Only Switchboard oracle present for reserve {}: {}", reserve_pubkey, switchboard_oracle.unwrap());
+            reserve_pubkey, pyth, switchboard);
+    } else if let Some(pyth) = pyth_oracle.as_ref() {
+        log::debug!("Only Pyth oracle present for reserve {}: {}", reserve_pubkey, pyth);
+    } else if let Some(switchboard) = switchboard_oracle.as_ref() {
+        log::debug!("Only Switchboard oracle present for reserve {}: {}", reserve_pubkey, switchboard);
     }
 
     log::debug!(

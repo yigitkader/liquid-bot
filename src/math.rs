@@ -7,39 +7,46 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::str::FromStr;
 
-// Oracle fees are now configurable via Config struct
-// Defaults: ORACLE_READ_FEE_LAMPORTS=5000, ORACLE_ACCOUNTS_READ=1
-
 /// Calculate transaction fee in USD
 /// 
 /// Transaction fee consists of:
 /// 1. Base fee: Solana's base transaction fee (~5,000 lamports)
 ///    Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
+///    This covers all account reads, including oracle accounts (Pyth/Switchboard)
 /// 2. Priority fee: Based on compute units and priority fee rate
 ///    Formula: (compute_units * priority_fee_per_cu) / 1_000_000
 ///    This ensures transaction is included in blocks during high congestion
-/// 3. Oracle read fee: Fee for reading oracle accounts on-chain (~5,000 lamports per account)
-///    Solend program reads Pyth/Switchboard oracle accounts during execution
-///    Note: Oracle accounts are NOT in instruction account list, but program reads them on-chain
 /// 
-/// Total fee = base_fee + priority_fee + oracle_read_fee
+/// Total fee = base_fee + priority_fee
+/// 
+/// ✅ DOĞRULANMIŞ: Oracle account okumaları için ayrı ücret YOK
+/// - Solana'da on-chain programlar account okumak için ücret ödemez
+/// - Base transaction fee tüm account okumalarını kapsar
+/// - Oracle accounts (Pyth/Switchboard) instruction'da yok, program on-chain okur
+/// - Ancak bu okumalar base fee içinde, ek ücret yok
 /// 
 /// Validation:
 /// - Base fee: Verified against Solana documentation (5,000 lamports standard)
 /// - Priority fee: Configurable via PRIORITY_FEE_PER_CU (default: 1,000 micro-lamports/CU)
-/// - Oracle fee: Estimated based on account read costs (~5,000 lamports per account)
+/// 
+/// Reference:
+/// - Solana fees: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
+/// - Oracle accounts are NOT in instruction (see solend.rs:506-507)
 fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
     base_fee_lamports: u64,
-    oracle_read_fee_lamports: u64,
-    oracle_accounts_read: u64,
+    _oracle_read_fee_lamports: u64, // ❌ DEPRECATED: Oracle read fee doesn't exist in Solana
+    _oracle_accounts_read: u64,     // ❌ DEPRECATED: Kept for backward compatibility
     sol_price_usd: f64,
 ) -> f64 {
     // Base transaction fee: Solana charges a base fee per transaction
     // Reference: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
     // Standard: 5,000 lamports = 0.000005 SOL
     // This is a fixed fee per transaction, regardless of size
+    // ✅ IMPORTANT: Base fee covers ALL account reads, including oracle accounts
+    // Oracle accounts (Pyth/Switchboard) are read on-chain by the program,
+    // but this doesn't incur additional fees - it's covered by the base fee
     
     // Priority fee: Based on compute units and priority fee rate
     // Formula: (compute_units * priority_fee_per_cu) / 1_000_000
@@ -47,14 +54,11 @@ fn calculate_transaction_fee_usd(
     // This ensures transaction is included in blocks during high congestion
     let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
     
-    // Oracle read fee: When Solend program reads oracle accounts (Pyth/Switchboard) during execution,
-    // there's a fee for accessing those accounts (~5,000 lamports per account)
-    // Note: Even though oracle accounts aren't in the instruction's account list,
-    // the program reads them on-chain and this incurs a fee
-    // Typically 1 oracle account is read (Pyth), sometimes 2 if Switchboard is also read
-    let oracle_read_fee_total = oracle_read_fee_lamports * oracle_accounts_read;
+    // ❌ REMOVED: Oracle read fee doesn't exist in Solana
+    // Solana's base transaction fee covers all account reads, including oracle accounts
+    // There is no separate fee for reading accounts on-chain
     
-    let total_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_total;
+    let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
     total_fee_sol * sol_price_usd
 }
@@ -179,8 +183,10 @@ pub async fn calculate_liquidation_opportunity(
     // Get SOL price from oracle if available, otherwise use a conservative fallback
     let sol_price_usd = if let Some(client) = &rpc_client {
         // Try to get SOL price from oracle (SOL mint: So11111111111111111111111111111111111111112)
-        let sol_mint = solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
-            .unwrap();
+        // ✅ Using compile-time constant to avoid panic risk
+        use solana_sdk::pubkey;
+        const SOL_MINT: solana_sdk::pubkey::Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+        let sol_mint = SOL_MINT;
         match get_oracle_accounts_from_mint(&sol_mint, Some(config)) {
             Ok((pyth, switchboard)) => {
                 match read_oracle_price(pyth.as_ref(), switchboard.as_ref(), Arc::clone(client), Some(config)).await {
@@ -221,8 +227,8 @@ pub async fn calculate_liquidation_opportunity(
         config.liquidation_compute_units,
         config.priority_fee_per_cu,
         config.base_transaction_fee_lamports,
-        config.oracle_read_fee_lamports,
-        config.oracle_accounts_read,
+        config.oracle_read_fee_lamports, // ❌ DEPRECATED: Not used, kept for backward compatibility
+        config.oracle_accounts_read,     // ❌ DEPRECATED: Not used, kept for backward compatibility
         sol_price_usd,
     );
 
@@ -246,9 +252,11 @@ pub async fn calculate_liquidation_opportunity(
         config.slippage_multiplier_medium  // Medium trades: moderate slippage
     };
 
-    let estimated_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
+    // DEX slippage: Trade size-based slippage due to liquidity depth
+    let estimated_dex_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
 
-    let oracle_slippage_bps = if let Some(client) = &rpc_client {
+    // Oracle confidence: Price uncertainty from oracle (±1σ, 68% confidence interval)
+    let oracle_confidence_bps = if let Some(client) = &rpc_client {
         match collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>() {
             Ok(mint_pubkey) => {
                 match get_oracle_accounts_from_mint(&mint_pubkey, Some(config)) {
@@ -262,17 +270,15 @@ pub async fn calculate_liquidation_opportunity(
                         .await
                         {
                             Ok(Some(oracle_price)) => {
-                                // Pyth confidence = %68 confidence interval (1 sigma)
-                                // %95 confidence interval için Z-score kullanılmalı (default: 1.96)
-                                // Bot %68 confidence kullanırsa → Riski az gösterir
-                                let confidence_95 = oracle_price.confidence * config.z_score_95;
-                                let confidence_ratio = confidence_95 / oracle_price.price;
+                                // Pyth confidence = ±1σ (standard deviation), representing 68% confidence interval
+                                // Use confidence directly - it already represents price uncertainty
+                                // Multiplying by Z-score (1.96) is statistically incorrect
+                                let confidence_ratio = oracle_price.confidence / oracle_price.price;
                                 let confidence_bps = (confidence_ratio * 10_000.0) as u16;
                                 log::debug!(
-                                    "Oracle confidence slippage: {} bps (confidence_68: ${:.4}, confidence_95: ${:.4}, price: ${:.4})",
+                                    "Oracle confidence slippage: {} bps (confidence: ${:.4}, price: ${:.4})",
                                     confidence_bps,
                                     oracle_price.confidence,
-                                    confidence_95,
                                     oracle_price.price
                                 );
                                 confidence_bps
@@ -303,31 +309,30 @@ pub async fn calculate_liquidation_opportunity(
         config.default_oracle_confidence_slippage_bps
     };
 
-    // Final slippage calculation: Use maximum of estimated slippage and oracle confidence
+    // Final slippage calculation: Sum DEX slippage and oracle confidence
     // 
-    // We use MAX instead of SUM to avoid double-counting:
-    // - estimated_slippage: DEX liquidity-based slippage (trade size dependent)
-    // - oracle_slippage: Price uncertainty from oracle confidence (95% confidence interval)
+    // These represent different sources of risk that should be added together:
+    // - DEX slippage: Execution price vs oracle price due to liquidity depth (trade size dependent)
+    // - Oracle confidence: Uncertainty in oracle price itself (Pyth's ±1σ confidence)
     // 
-    // These represent different sources of uncertainty:
-    // - DEX slippage: Execution price vs oracle price due to liquidity
-    // - Oracle confidence: Uncertainty in oracle price itself
+    // These are independent risk sources:
+    // - DEX slippage: Risk from executing trade at worse price than oracle due to low liquidity
+    // - Oracle confidence: Risk that oracle price itself is inaccurate
     // 
-    // Using MAX is conservative and prevents double-counting, as both represent
-    // price uncertainty but from different sources. The higher value represents
-    // the dominant source of uncertainty for this trade.
-    // 
-    // Oracle confidence uses 95% confidence interval (Z-score 1.96), which already
-    // provides sufficient safety margin. No additional safety margin needed.
-    let final_slippage_bps = estimated_slippage_bps.max(oracle_slippage_bps);
+    // Total risk = DEX slippage + Oracle uncertainty
+    // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
+    let total_slippage_bps = estimated_dex_slippage_bps + oracle_confidence_bps;
+    let final_slippage_bps = ((total_slippage_bps as f64 * config.slippage_final_multiplier) as u16).min(u16::MAX);
     
     let slippage_cost_usd = calculate_slippage_cost_usd(seizable_collateral_usd, final_slippage_bps);
 
     log::debug!(
-        "Slippage calculation: estimated={} bps, oracle_confidence={} bps, final={} bps (max), cost=${:.4}",
-        estimated_slippage_bps,
-        oracle_slippage_bps,
+        "Slippage calculation: dex={} bps, oracle_confidence={} bps, total={} bps, final={} bps (multiplier: {:.2}x), cost=${:.4}",
+        estimated_dex_slippage_bps,
+        oracle_confidence_bps,
+        total_slippage_bps,
         final_slippage_bps,
+        config.slippage_final_multiplier,
         slippage_cost_usd
     );
 
@@ -470,7 +475,7 @@ mod tests {
             dex_fee_bps: dex_fee_bps,
             min_profit_margin_bps: 100,
             default_oracle_confidence_slippage_bps: 50,
-            slippage_safety_margin_multiplier: 1.0,
+            slippage_final_multiplier: 1.1,
             min_reserve_lamports: 1_000_000,
             usdc_reserve_address: None,
             sol_reserve_address: None,
@@ -504,7 +509,8 @@ mod tests {
             retry_jitter_max_ms: 1_000,
         };
 
-        let protocol = Arc::new(SolendProtocol::new().unwrap());
+        let protocol = Arc::new(SolendProtocol::new()
+            .expect("SolendProtocol::new() should succeed in tests"));
 
         // Calculate opportunity (without RPC client for unit test)
         let result = calculate_liquidation_opportunity(
@@ -551,7 +557,8 @@ mod tests {
         use crate::protocols::solend::SolendProtocol;
         use crate::protocol::Protocol;
 
-        let protocol = SolendProtocol::new().unwrap();
+        let protocol = SolendProtocol::new()
+            .expect("SolendProtocol::new() should succeed in tests");
 
         // Create position with known values
         // LTV = 75%, Liquidation Threshold = 80%
@@ -583,10 +590,175 @@ mod tests {
         assert_ne!(hf, wrong_hf, "Health factor should NOT equal the wrong calculation using LTV");
     }
 
-    /// Test transaction fee calculation includes oracle read fee
+    /// Test health factor calculation against real mainnet obligation
     /// 
-    /// This validates that the oracle account read fee (5,000 lamports) is included
-    /// in the total transaction fee calculation.
+    /// This integration test validates health factor calculation using a real Solend obligation
+    /// from mainnet. To run this test:
+    /// 
+    /// 1. Set environment variables:
+    ///    - TEST_OBLIGATION_ADDRESS: A real Solend obligation address from mainnet
+    ///    - TEST_EXPECTED_HEALTH_FACTOR: Expected health factor from Solend Dashboard (optional)
+    ///    - RPC_HTTP_URL: RPC endpoint (defaults to mainnet)
+    /// 
+    /// 2. Find a real obligation:
+    ///    - Visit https://solend.fi/dashboard and find an obligation
+    ///    - Or use: cargo run --bin find_my_obligation
+    /// 
+    /// 3. Run test:
+    ///    cargo test test_health_factor_against_mainnet -- --nocapture --test-threads=1
+    /// 
+    /// If TEST_EXPECTED_HEALTH_FACTOR is not set, the test will log the calculated value
+    /// for manual comparison with Solend Dashboard.
+    /// 
+    /// ✅ DOĞRULANMIŞ: Health factor uses liquidation threshold, not LTV
+    /// This test validates against real mainnet data to ensure correctness.
+    #[tokio::test]
+    #[ignore] // Ignored by default - requires RPC and real obligation address
+    async fn test_health_factor_against_mainnet() {
+        use crate::protocols::solend::SolendProtocol;
+        use crate::protocol::Protocol;
+        use crate::solana_client::SolanaClient;
+        use solana_sdk::pubkey::Pubkey;
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        // Get obligation address from environment
+        let obligation_address_str = std::env::var("TEST_OBLIGATION_ADDRESS")
+            .expect("TEST_OBLIGATION_ADDRESS environment variable must be set");
+        
+        let obligation_address = Pubkey::from_str(&obligation_address_str)
+            .expect("Invalid TEST_OBLIGATION_ADDRESS format");
+
+        // Get RPC URL from environment or use default
+        let rpc_url = std::env::var("RPC_HTTP_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+        println!("🔍 Testing health factor calculation with real mainnet obligation:");
+        println!("   Obligation: {}", obligation_address);
+        println!("   RPC URL: {}", rpc_url);
+        println!();
+
+        // Create RPC client
+        let rpc_client = Arc::new(SolanaClient::new(rpc_url.clone())
+            .expect("Failed to create RPC client"));
+
+        // Fetch obligation account
+        let account = rpc_client.get_account(&obligation_address).await
+            .expect("Failed to fetch obligation account from RPC");
+
+        // Parse obligation
+        let protocol = SolendProtocol::new()
+            .expect("SolendProtocol::new() should succeed in integration test");
+        let position = protocol.parse_account_position(
+            &obligation_address,
+            &account,
+            Some(Arc::clone(&rpc_client)),
+        )
+        .await
+        .expect("Failed to parse obligation account")
+        .expect("Account is not a valid Solend obligation");
+
+        // Calculate health factor using our implementation
+        let calculated_hf = protocol.calculate_health_factor(&position)
+            .expect("Failed to calculate health factor");
+
+        println!("📊 Health Factor Calculation Results:");
+        println!("   Total Collateral: ${:.2}", position.total_collateral_usd);
+        println!("   Total Debt: ${:.2}", position.total_debt_usd);
+        println!("   Calculated Health Factor: {:.4}", calculated_hf);
+        println!();
+
+        // Show collateral breakdown with liquidation threshold
+        println!("📋 Collateral Assets (using Liquidation Threshold for weighted calculation):");
+        let mut total_weighted_collateral = 0.0;
+        for asset in &position.collateral_assets {
+            let weighted = asset.amount_usd * asset.liquidation_threshold;
+            total_weighted_collateral += weighted;
+            println!("   - {}: ${:.2} (LTV: {:.1}%, LT: {:.1}%, Weighted: ${:.2})",
+                asset.mint, asset.amount_usd, 
+                asset.ltv * 100.0, asset.liquidation_threshold * 100.0, weighted);
+        }
+        println!("   Total Weighted Collateral: ${:.2}", total_weighted_collateral);
+        println!();
+
+        // Show debt breakdown
+        println!("📋 Debt Assets:");
+        for asset in &position.debt_assets {
+            println!("   - {}: ${:.2} (Borrow Rate: {:.2}%)",
+                asset.mint, asset.amount_usd, asset.borrow_rate * 100.0);
+        }
+        println!();
+
+        // Show calculation breakdown
+        println!("📐 Health Factor Calculation:");
+        println!("   Weighted Collateral = ${:.2}", total_weighted_collateral);
+        println!("   Total Debt = ${:.2}", position.total_debt_usd);
+        println!("   Health Factor = ${:.2} / ${:.2} = {:.4}",
+            total_weighted_collateral, position.total_debt_usd, calculated_hf);
+        println!();
+
+        // Verify against expected value if provided
+        if let Ok(expected_hf_str) = std::env::var("TEST_EXPECTED_HEALTH_FACTOR") {
+            let expected_hf: f64 = expected_hf_str.parse()
+                .expect("Invalid TEST_EXPECTED_HEALTH_FACTOR format");
+            
+            println!("✅ Expected Health Factor (from Solend Dashboard): {:.4}", expected_hf);
+            println!("   Calculated Health Factor: {:.4}", calculated_hf);
+            
+            let tolerance = 0.01; // ±0.01 tolerance
+            let difference = (calculated_hf - expected_hf).abs();
+            
+            if difference < tolerance {
+                println!("   ✅ PASS: Difference ({:.4}) is within tolerance ({:.2})", difference, tolerance);
+            } else {
+                println!("   ❌ FAIL: Difference ({:.4}) exceeds tolerance ({:.2})", difference, tolerance);
+                println!();
+                println!("   ⚠️  This may indicate:");
+                println!("      - Oracle price differences (timing)");
+                println!("      - Implementation bug (check liquidation threshold usage)");
+                println!("      - Solend Dashboard using different oracle prices");
+                panic!("Health factor mismatch: expected {:.4}, got {:.4}, difference {:.4}",
+                    expected_hf, calculated_hf, difference);
+            }
+        } else {
+            println!("⚠️  TEST_EXPECTED_HEALTH_FACTOR not set - skipping validation");
+            println!("   To validate, set TEST_EXPECTED_HEALTH_FACTOR=<value from Solend Dashboard>");
+            println!("   Then compare manually with: https://solend.fi/dashboard");
+            println!();
+            println!("   Example:");
+            println!("     export TEST_OBLIGATION_ADDRESS=<obligation_pubkey>");
+            println!("     export TEST_EXPECTED_HEALTH_FACTOR=1.23");
+            println!("     cargo test test_health_factor_against_mainnet -- --nocapture");
+        }
+
+        // Additional validation: Ensure we're using liquidation threshold, not LTV
+        let hf_using_ltv: f64 = if position.total_debt_usd > 0.0 {
+            let mut weighted_ltv = 0.0;
+            for asset in &position.collateral_assets {
+                weighted_ltv += asset.amount_usd * asset.ltv;
+            }
+            weighted_ltv / position.total_debt_usd
+        } else {
+            f64::INFINITY
+        };
+
+        println!("🔍 Validation Check:");
+        println!("   Health Factor (using LT): {:.4}", calculated_hf);
+        println!("   Health Factor (using LTV - WRONG): {:.4}", hf_using_ltv);
+        
+        if (calculated_hf - hf_using_ltv).abs() < 0.0001 {
+            panic!("❌ CRITICAL: Health factor matches LTV calculation! This indicates a bug - should use liquidation threshold, not LTV!");
+        } else {
+            println!("   ✅ PASS: Health factor correctly uses liquidation threshold (not LTV)");
+        }
+    }
+
+    /// Test transaction fee calculation (oracle read fee removed)
+    /// 
+    /// This validates that transaction fee calculation is correct:
+    /// - Base fee: 5,000 lamports (covers all account reads, including oracle accounts)
+    /// - Priority fee: Based on compute units
+    /// - ❌ NO oracle read fee: Solana doesn't charge separate fees for account reads
     #[test]
     fn test_transaction_fee_calculation() {
         let compute_units = 200_000;
@@ -598,31 +770,31 @@ mod tests {
             compute_units,
             priority_fee_per_cu,
             base_fee_lamports,
-            5_000, // oracle_read_fee_lamports
-            1,     // oracle_accounts_read
+            5_000, // oracle_read_fee_lamports (deprecated, not used)
+            1,     // oracle_accounts_read (deprecated, not used)
             sol_price_usd,
         );
 
         // Expected breakdown:
-        // Base fee: 5,000 lamports
+        // Base fee: 5,000 lamports (covers all account reads, including oracle accounts)
         // Priority fee: 200,000 CU * 1,000 micro-lamports/CU / 1,000,000 = 200 lamports
-        // Oracle read fee: 5,000 lamports (1 account)
-        // Total: 10,200 lamports = 0.0000102 SOL = $0.00153
+        // ❌ NO oracle read fee: Solana doesn't charge separate fees for account reads
+        // Total: 5,200 lamports = 0.0000052 SOL = $0.00078
 
         let priority_fee_lamports = (compute_units as u64) * priority_fee_per_cu / 1_000_000;
-        let oracle_read_fee_lamports = 5_000; // ORACLE_READ_FEE_LAMPORTS * ORACLE_ACCOUNTS_READ
-        let expected_fee_lamports = base_fee_lamports + priority_fee_lamports + oracle_read_fee_lamports;
+        let expected_fee_lamports = base_fee_lamports + priority_fee_lamports;
         let expected_fee_sol = expected_fee_lamports as f64 / 1_000_000_000.0;
         let expected_fee_usd = expected_fee_sol * sol_price_usd;
 
-        // Verify the fee calculation includes oracle read fee
+        // Verify the fee calculation (oracle read fee removed)
         let difference = (fee_usd - expected_fee_usd).abs();
         assert!(
             difference < 0.0001,
-            "Transaction fee should include oracle read fee. Expected ${:.6}, got ${:.6}, difference ${:.6}",
+            "Transaction fee calculation incorrect. Expected ${:.6}, got ${:.6}, difference ${:.6}",
             expected_fee_usd,
             fee_usd,
             difference
         );
     }
 }
+

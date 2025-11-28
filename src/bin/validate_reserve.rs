@@ -1,21 +1,25 @@
 //! Validate Solend Reserve Account Structure
 //!
-//! Bu binary, gerçek Solend mainnet reserve account'larını parse ederek
-//! struct yapısının doğruluğunu doğrular.
+//! This binary validates the Solend reserve account structure by parsing
+//! real mainnet reserve accounts and verifying the struct layout.
 //!
-//! Kullanım:
+//! Usage:
 //! ```bash
 //! cargo run --bin validate_reserve -- \
 //!   --rpc-url https://api.mainnet-beta.solana.com \
 //!   --reserve BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw
 //! ```
+//!
+//! Reference:
+//! - Solend Protocol: https://docs.solend.fi/
+//! - Solend Program: https://github.com/solendprotocol/solana-program-library
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
-// Modüller lib.rs'den geliyor
+// Modules are defined in lib.rs
 use liquid_bot::solana_client::SolanaClient;
 use liquid_bot::protocols::reserve_validator;
 
@@ -35,7 +39,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Logger başlat
+    // Initialize logger
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
@@ -49,18 +53,18 @@ async fn main() -> Result<()> {
     log::info!("RPC URL: {}", args.rpc_url);
     log::info!("Reserve: {}", args.reserve);
 
-    // Reserve pubkey'ini parse et
+    // Parse reserve pubkey
     let reserve_pubkey = args.reserve
         .parse::<Pubkey>()
         .context("Invalid reserve pubkey format")?;
 
-    // RPC client oluştur
+    // Create RPC client
     let rpc_client = Arc::new(
         SolanaClient::new(args.rpc_url.clone())
             .context("Failed to create RPC client")?
     );
 
-    // Reserve account'unu validate et
+    // Validate reserve account
     // Note: Config not available in binary, using default expected size (619 bytes)
     let result = reserve_validator::validate_reserve_structure(
         rpc_client,

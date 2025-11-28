@@ -1,6 +1,10 @@
 //! Find and Test My Obligation Account
 //!
-//! Bu binary, projeye eklenmiş cüzdanın obligation account'larını bulur ve test eder.
+//! This binary finds and tests obligation accounts for the configured wallet.
+//!
+//! Reference:
+//! - Solend Dashboard: https://solend.fi/dashboard
+//! - Solend Protocol: https://docs.solend.fi/
 
 use anyhow::{Context, Result};
 use clap::Parser;

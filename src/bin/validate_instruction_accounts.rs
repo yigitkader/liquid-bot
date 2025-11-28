@@ -1,13 +1,18 @@
 //! Validate Solend Liquidation Instruction Account Order
 //!
-//! Bu binary, gerçek bir mainnet liquidation transaction'ını fetch edip
-//! instruction accounts array'ini bizim implementation ile karşılaştırır.
+//! This binary fetches a real mainnet liquidation transaction and compares
+//! the instruction accounts array with our implementation.
 //!
-//! Kullanım:
+//! Usage:
 //! ```bash
 //! cargo run --bin validate_instruction_accounts -- \
 //!   --tx <TRANSACTION_SIGNATURE> \
 //!   --rpc-url https://api.mainnet-beta.solana.com
+//! ```
+//!
+//! Reference:
+//! - Solend Program: https://github.com/solendprotocol/solana-program-library
+//! - Instruction Format: See protocols/solend.rs::build_liquidation_instruction()
 //! ```
 
 use anyhow::{Context, Result};
