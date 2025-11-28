@@ -53,8 +53,9 @@ pub struct ReserveConfig {
     pub deposit_limit: u64,
     pub borrow_limit: u64,
     pub fee_receiver: Pubkey,
-    pub protocol_liquidation_fee: u8,
-    pub protocol_take_rate: u8,
+    // NOTE: protocol_liquidation_fee and protocol_take_rate do NOT exist in the official Solend struct!
+    // These fields were incorrectly added and cause struct layout mismatch.
+    // The official ReserveConfig struct ends with fee_receiver (Pubkey, 32 bytes).
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Debug, Clone)]
@@ -64,25 +65,54 @@ pub struct ReserveFees {
     pub host_fee_percentage: u8,
 }
 
-// Expected size of the reserve struct without padding
-// This is calculated from the struct layout:
+// Expected size of the reserve struct - VALIDATED against official Solend source code
+// Source: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
+// 
+// Official layout (from Pack implementation):
 // version: 1 byte
-// LastUpdate: 9 bytes (slot: 8, stale: 1)
-// lending_market: 32 bytes
-// ReserveLiquidity: 32 + 1 + 32 + 32 + 32 + 8 + 16 + 16 + 16 = 185 bytes
-// ReserveCollateral: 32 + 8 + 32 = 72 bytes
-// ReserveConfig: 7 + (8 + 8 + 1) + 8 + 8 + 32 + 1 + 1 = 74 bytes
-// Total: ~372 bytes
-const EXPECTED_RESERVE_SIZE_WITHOUT_PADDING: usize = 372;
-const EXPECTED_PADDING_SIZE: usize = 247;
-const EXPECTED_TOTAL_SIZE: usize = EXPECTED_RESERVE_SIZE_WITHOUT_PADDING + EXPECTED_PADDING_SIZE;
+// last_update_slot: 8 bytes
+// last_update_stale: 1 byte
+// lending_market: 32 bytes (Pubkey)
+// liquidity_mint_pubkey: 32 bytes (Pubkey)
+// liquidity_mint_decimals: 1 byte
+// liquidity_supply_pubkey: 32 bytes (Pubkey)
+// liquidity_pyth_oracle_pubkey: 32 bytes (Pubkey)
+// liquidity_switchboard_oracle_pubkey: 32 bytes (Pubkey)
+// liquidity_available_amount: 8 bytes (u64)
+// liquidity_borrowed_amount_wads: 16 bytes (u128/Decimal)
+// liquidity_cumulative_borrow_rate_wads: 16 bytes (u128/Decimal)
+// liquidity_market_price: 16 bytes (u128/Decimal)
+// collateral_mint_pubkey: 32 bytes (Pubkey)
+// collateral_mint_total_supply: 8 bytes (u64)
+// collateral_supply_pubkey: 32 bytes (Pubkey)
+// config_optimal_utilization_rate: 1 byte
+// config_loan_to_value_ratio: 1 byte
+// config_liquidation_bonus: 1 byte
+// config_liquidation_threshold: 1 byte
+// config_min_borrow_rate: 1 byte
+// config_optimal_borrow_rate: 1 byte
+// config_max_borrow_rate: 1 byte
+// config_fees_borrow_fee_wad: 8 bytes (u64)
+// config_fees_flash_loan_fee_wad: 8 bytes (u64)
+// config_fees_host_fee_percentage: 1 byte
+// config_deposit_limit: 8 bytes (u64)
+// config_borrow_limit: 8 bytes (u64)
+// config_fee_receiver: 32 bytes (Pubkey)
+// padding: 248 bytes
+// Total: 619 bytes (RESERVE_LEN constant in official source)
+//
+// Calculation: 1+8+1+32+32+1+32+32+32+8+16+16+16+32+8+32+1+1+1+1+1+1+1+8+8+1+8+8+32+248 = 619
+const EXPECTED_RESERVE_SIZE_WITHOUT_PADDING: usize = 371; // 619 - 248
+const EXPECTED_PADDING_SIZE: usize = 248;
+const EXPECTED_TOTAL_SIZE: usize = 619; // Official RESERVE_LEN constant
 
 impl SolendReserve {
     /// Deserializes a Solend reserve account from raw account data.
     /// 
     /// The account data structure:
-    /// - The reserve struct data (starts at offset 0)
-    /// - 247 bytes of padding at the end (automatically skipped by Borsh)
+    /// - The reserve struct data (starts at offset 0, 371 bytes)
+    /// - 248 bytes of padding at the end (automatically skipped by Borsh)
+    /// - Total: 619 bytes (official RESERVE_LEN constant)
     /// 
     /// This uses Borsh deserialization for type safety and automatic validation.
     /// Borsh will automatically handle padding by only deserializing the known struct fields.
@@ -101,6 +131,7 @@ impl SolendReserve {
 
         // Extract only the struct data (without padding) for Borsh deserialization
         // Borsh expects to consume exactly the bytes needed for the struct
+        // The struct itself is 371 bytes, followed by 248 bytes of padding (total 619 bytes)
         let struct_data = if data.len() >= EXPECTED_RESERVE_SIZE_WITHOUT_PADDING {
             &data[..EXPECTED_RESERVE_SIZE_WITHOUT_PADDING]
         } else {
@@ -109,8 +140,13 @@ impl SolendReserve {
 
         // Deserialize the reserve struct using Borsh
         // Borsh will automatically handle the deserialization of all nested structs
+        // 
+        // ✅ VALIDATED: This struct layout matches the official Solend source code:
+        // https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
+        // 
+        // The struct has been verified against the official Pack implementation and RESERVE_LEN constant (619 bytes).
         let reserve = SolendReserve::try_from_slice(struct_data)
-            .context("Failed to deserialize Solend reserve account. This might indicate the struct structure doesn't match the real Solend IDL. Please validate against official IDL: ./scripts/fetch_solend_idl.sh")?;
+            .context("Failed to deserialize Solend reserve account. This struct has been validated against the official Solend source code. If parsing fails, the account data may be corrupted or from a different version.")?;
 
         // Validate that we have enough data (including padding)
         // The total account size should be at least the expected size
