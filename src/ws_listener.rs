@@ -173,6 +173,20 @@ pub async fn run_ws_listener(
                 break;
             }
             Err(e) => {
+                let error_str = e.to_string();
+                
+                // Check if this is a "Method not found" or "subscription not supported" error
+                // These indicate the RPC endpoint doesn't support WebSocket subscriptions
+                // In this case, fail immediately to trigger RPC polling fallback
+                if error_str.contains("Method not found") 
+                    || error_str.contains("subscription not supported")
+                    || error_str.contains("code: -32601") {
+                    log::error!("❌ WebSocket subscriptions not supported by this RPC endpoint");
+                    log::warn!("⚠️  The endpoint '{}' does not support 'programSubscribe' method", ws_url);
+                    log::info!("💡 Falling back to RPC polling (this will be handled by data_source)");
+                    return Err(e);
+                }
+                
                 consecutive_errors += 1;
                 let error_msg = format!("WebSocket error: {}", e);
                 log::error!("{} (consecutive errors: {})", error_msg, consecutive_errors);
@@ -328,6 +342,17 @@ async fn connect_and_listen(
                                 log::info!("✅ Subscribed to program accounts (subscription ID: {})", sub_id);
                                 health_manager.record_successful_poll().await;
                             } else if let Some(error) = response.error {
+                                // Check if this is a "Method not found" error (code: -32601)
+                                // This indicates the RPC endpoint doesn't support WebSocket subscriptions
+                                if error.code == -32601 {
+                                    return Err(anyhow::anyhow!(
+                                        "WebSocket subscription not supported by RPC endpoint: {} (code: {}). \
+                                        This endpoint does not support 'programSubscribe' method. \
+                                        Please use a premium RPC provider (Helius, Triton, QuickNode) or the bot will fallback to RPC polling.",
+                                        error.message,
+                                        error.code
+                                    ));
+                                }
                                 return Err(anyhow::anyhow!(
                                     "Subscription error: {} (code: {})",
                                     error.message,

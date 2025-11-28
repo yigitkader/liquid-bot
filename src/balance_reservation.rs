@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Forward declaration to avoid circular dependency
+#[allow(async_fn_in_trait)] // Internal trait, async fn is acceptable here
 pub trait BalanceChecker: Send + Sync {
     async fn get_token_balance(&self, mint: &Pubkey) -> Result<u64>;
 }

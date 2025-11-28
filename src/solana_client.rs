@@ -16,6 +16,7 @@ use tokio::time::{sleep, Duration};
 pub struct SolanaClient {
     rpc_client: Arc<RpcClient>,
     rpc_url: String,
+    #[allow(dead_code)] // Reserved for future use when we need to query with different commitment levels
     commitment: CommitmentConfig,
     rate_limiter: Arc<RateLimiter>,
 }

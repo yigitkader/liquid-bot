@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 
 pub struct TxLock {
     locked_accounts: Arc<RwLock<HashSet<String>>>,
+    #[allow(dead_code)] // Reserved for future use when implementing automatic lock expiration
     lock_duration: Duration,
 }
 
