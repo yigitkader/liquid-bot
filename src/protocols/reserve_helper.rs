@@ -71,11 +71,27 @@ pub async fn parse_reserve_account(
     /// - available_amount'u WAD formatına çevir (u64 → u128 * WAD)
     /// - Toplam liquidity'yi WAD formatında hesapla
     /// - Utilization rate'i f64 division ile hesapla (precision korunur)
+    /// - ✅ DÜZELTME: checked_mul kullanarak overflow riskini önle
     const WAD: u128 = 1_000_000_000_000_000_000;
     
     // Convert available_amount to WAD format to match borrowed_amount_wads
-    let available_wads = (reserve.liquidity.available_amount as u128) * WAD;
-    let total_liquidity_wads = available_wads + reserve.liquidity.borrowed_amount_wads;
+    // ✅ DÜZELTME: checked_mul kullanarak overflow riskini önle
+    let available_wads = (reserve.liquidity.available_amount as u128)
+        .checked_mul(WAD)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Overflow in available_wads calculation: available_amount={}, WAD={}",
+            reserve.liquidity.available_amount,
+            WAD
+        ))?;
+    
+    // ✅ DÜZELTME: checked_add kullanarak overflow riskini önle
+    let total_liquidity_wads = available_wads
+        .checked_add(reserve.liquidity.borrowed_amount_wads)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Overflow in total_liquidity_wads calculation: available_wads={}, borrowed_amount_wads={}",
+            available_wads,
+            reserve.liquidity.borrowed_amount_wads
+        ))?;
     
     let utilization_rate = if total_liquidity_wads > 0 {
         (reserve.liquidity.borrowed_amount_wads as f64) / (total_liquidity_wads as f64)
@@ -119,15 +135,18 @@ pub async fn parse_reserve_account(
     let pyth_oracle_raw = reserve.pyth_oracle();
     let switchboard_oracle_raw = reserve.switchboard_oracle();
     
-    // Solend'in gerçek kodunda oracle_option YOK!
-    // Her iki oracle da account'ta var, hangisinin aktif olduğu program tarafından belirlenir
-    // Default pubkey (111...111) olmayan oracle'ı aktif kabul ediyoruz
-    let pyth_oracle = if pyth_oracle_raw != Pubkey::default() {
+    // ✅ DÜZELTME: oracle_option field'ı kullanılıyor
+    // oracle_option: 0 = None, 1 = Pyth, 2 = Switchboard
+    let oracle_option = reserve.oracle_option();
+    
+    // oracle_option'a göre aktif oracle'ı belirle
+    // Ayrıca default pubkey kontrolü de yap (güvenlik için)
+    let pyth_oracle = if oracle_option == 1 && pyth_oracle_raw != Pubkey::default() {
         Some(pyth_oracle_raw)
     } else {
         None
     };
-    let switchboard_oracle = if switchboard_oracle_raw != Pubkey::default() {
+    let switchboard_oracle = if oracle_option == 2 && switchboard_oracle_raw != Pubkey::default() {
         Some(switchboard_oracle_raw)
     } else {
         None

@@ -131,6 +131,28 @@ pub async fn run_executor(
                         // -----------------------------------------------------------------
                         // 2) FINAL balance re-check immediately before tx build & send
                         // -----------------------------------------------------------------
+                        // ✅ CRITICAL: Final balance check to prevent race condition
+                        // 
+                        // Race Condition Protection:
+                        // There's a small gap between balance check and reservation in
+                        // balance_reservation.rs::try_reserve_with_check():
+                        //   - Step 1: RPC call to get balance (async, outside lock)
+                        //   - Step 2: Lock acquisition and reservation (inside lock)
+                        // 
+                        // During this gap, another transaction could consume the balance.
+                        // This final check immediately before transaction send ensures:
+                        //   1. We don't send transactions that will fail (saves fees)
+                        //   2. We catch any balance changes that occurred after reservation
+                        //   3. We release the reservation if balance is insufficient
+                        // 
+                        // This two-layer protection (reservation + final check) is sufficient
+                        // because:
+                        //   - Reservation prevents parallel opportunities from over-reserving
+                        //   - Final check prevents sending transactions that will fail
+                        //   - The gap is minimal (only between RPC call and lock acquisition)
+                        //   - Final check happens immediately before tx send (minimal gap)
+                        // 
+                        // See balance_reservation.rs for more details on the reservation layer.
                         if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
                             use crate::wallet::WalletBalanceChecker;
                             let balance_checker = WalletBalanceChecker::new(
@@ -151,6 +173,10 @@ pub async fn run_executor(
                                         reserved,
                                         current_balance
                                     );
+                                    log::warn!(
+                                        "   This can happen if balance was consumed between reservation and final check. \
+                                         Reservation is released to allow other opportunities to proceed."
+                                    );
 
                                     balance_reservation
                                         .release(&debt_mint, opportunity.max_liquidatable_amount)
@@ -158,13 +184,22 @@ pub async fn run_executor(
                                     log::debug!("Released reservation due to insufficient balance at final check");
 
                                     last_error = Some(anyhow::anyhow!(
-                                        "Insufficient balance at final check: required={}, available={}",
+                                        "Insufficient balance at final check: required={}, available={} \
+                                         (balance may have been consumed by another transaction between reservation and final check)",
                                         opportunity.max_liquidatable_amount,
                                         available
                                     ));
 
                                     // Bu attempt'ten ve tüm retry'lardan vazgeç
                                     break;
+                                } else {
+                                    log::debug!(
+                                        "✅ Final balance check passed: required={}, available={}, reserved={}, current={}",
+                                        opportunity.max_liquidatable_amount,
+                                        available,
+                                        reserved,
+                                        current_balance
+                                    );
                                 }
                             }
                         }

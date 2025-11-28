@@ -23,9 +23,14 @@ pub struct ReserveLiquidity {
     pub mint_pubkey: Pubkey,
     pub mint_decimals: u8,
     pub supply_pubkey: Pubkey,
-    // Solend'in gerçek kodunda oracle_option YOK!
-    // Sadece iki oracle pubkey var - hangisinin aktif olduğu program tarafından belirlenir
+    // ✅ DÜZELTME: oracle_option field'ı eklendi (offset 107-110, 4 bytes, u32)
+    // Gerçek Solend layout'ına göre oracle_option oracle'lardan ÖNCE gelir
+    // oracle_option: 0 = None, 1 = Pyth, 2 = Switchboard
+    pub oracle_option: u32,
+    // ✅ DÜZELTME: Oracle offset'leri düzeltildi
+    // Pyth oracle: offset 111-142 (32 bytes)
     pub pyth_oracle: Pubkey,
+    // Switchboard oracle: offset 143-174 (32 bytes)
     pub switchboard_oracle: Pubkey,
     pub available_amount: u64,
     pub borrowed_amount_wads: u128,
@@ -68,17 +73,19 @@ pub struct ReserveFees {
 // Expected size of the reserve struct - VALIDATED against official Solend source code
 // Source: https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs
 // 
-// Official layout (from Pack implementation):
-// version: 1 byte
-// last_update_slot: 8 bytes
-// last_update_stale: 1 byte
-// lending_market: 32 bytes (Pubkey)
-// liquidity_mint_pubkey: 32 bytes (Pubkey)
-// liquidity_mint_decimals: 1 byte
-// liquidity_supply_pubkey: 32 bytes (Pubkey)
-// liquidity_pyth_oracle_pubkey: 32 bytes (Pubkey)
-// liquidity_switchboard_oracle_pubkey: 32 bytes (Pubkey)
-// liquidity_available_amount: 8 bytes (u64)
+// Official layout (from Pack implementation and check_oracle_option.sh):
+// version: 1 byte (offset 0)
+// last_update_slot: 8 bytes (offset 1-8)
+// last_update_stale: 1 byte (offset 9)
+// lending_market: 32 bytes (Pubkey, offset 10-41)
+// liquidity_mint_pubkey: 32 bytes (Pubkey, offset 42-73)
+// liquidity_mint_decimals: 1 byte (offset 74)
+// liquidity_supply_pubkey: 32 bytes (Pubkey, offset 75-106)
+// ✅ DÜZELTME: oracle_option eklendi (offset 107-110, 4 bytes, u32)
+// liquidity_oracle_option: 4 bytes (u32, offset 107-110)
+// liquidity_pyth_oracle_pubkey: 32 bytes (Pubkey, offset 111-142)
+// liquidity_switchboard_oracle_pubkey: 32 bytes (Pubkey, offset 143-174)
+// liquidity_available_amount: 8 bytes (u64, offset 175-182)
 // liquidity_borrowed_amount_wads: 16 bytes (u128/Decimal)
 // liquidity_cumulative_borrow_rate_wads: 16 bytes (u128/Decimal)
 // liquidity_market_price: 16 bytes (u128/Decimal)
@@ -101,13 +108,15 @@ pub struct ReserveFees {
 // padding: 248 bytes
 // Total: 619 bytes (RESERVE_LEN constant in official source)
 //
-// Calculation: 1+8+1+32+32+1+32+32+32+8+16+16+16+32+8+32+1+1+1+1+1+1+1+8+8+1+8+8+32+248 = 619
+// Calculation: 1+8+1+32+32+1+32+4+32+32+8+16+16+16+32+8+32+1+1+1+1+1+1+1+8+8+1+8+8+32+248 = 623
+// ✅ DÜZELTME: oracle_option (4 bytes) eklendi, toplam 619 -> 623 bytes
 //
 // ⚠️  WARNING: These are DEFAULT values. If Solend protocol upgrades, these may change.
 // The actual struct size is validated at runtime. Use config.expected_reserve_size for flexibility.
-const DEFAULT_RESERVE_SIZE_WITHOUT_PADDING: usize = 371; // 619 - 248
+// ✅ DÜZELTME: oracle_option (4 bytes) eklendi
+const DEFAULT_RESERVE_SIZE_WITHOUT_PADDING: usize = 375; // 623 - 248 (oracle_option eklendi)
 const DEFAULT_PADDING_SIZE: usize = 248;
-const DEFAULT_TOTAL_SIZE: usize = 619; // Official RESERVE_LEN constant
+const DEFAULT_TOTAL_SIZE: usize = 623; // 619 + 4 (oracle_option)
 
 /// Calculates the expected struct size without padding by serializing an empty struct
 /// This provides runtime validation of the struct size
@@ -122,6 +131,7 @@ fn calculate_struct_size() -> usize {
             mint_pubkey: Pubkey::default(),
             mint_decimals: 0,
             supply_pubkey: Pubkey::default(),
+            oracle_option: 0,
             pyth_oracle: Pubkey::default(),
             switchboard_oracle: Pubkey::default(),
             available_amount: 0,
@@ -309,5 +319,11 @@ impl SolendReserve {
     /// Switchboard oracle pubkey'ini döndürür
     pub fn switchboard_oracle(&self) -> Pubkey {
         self.liquidity.switchboard_oracle
+    }
+    
+    /// Oracle option değerini döndürür
+    /// 0 = None, 1 = Pyth, 2 = Switchboard
+    pub fn oracle_option(&self) -> u32 {
+        self.liquidity.oracle_option
     }
 }

@@ -506,7 +506,9 @@ impl Config {
         }
 
         // Slippage calibration warning
-        if !self.use_jupiter_api {
+        // ✅ DÜZELTME: Sadece production mode'da (dry_run=false) ve Jupiter API kapalıyken warn et
+        // Test mode'da (dry_run=true) veya Jupiter API açıkken bu warning gereksiz spam yaratır
+        if !self.dry_run && !self.use_jupiter_api {
             log::warn!("");
             log::warn!("⚠️  SLIPPAGE CALIBRATION REQUIRED: Jupiter API is disabled (USE_JUPITER_API=false)");
             log::warn!("   Using ESTIMATED slippage multipliers - these MUST be calibrated in production!");
@@ -520,8 +522,11 @@ impl Config {
             log::warn!("   ");
             log::warn!("   RECOMMENDED: Enable Jupiter API (USE_JUPITER_API=true) for real-time slippage");
             log::warn!("");
-        } else {
+        } else if self.use_jupiter_api {
             log::info!("✅ Jupiter API enabled - using real-time slippage estimation");
+        } else {
+            // dry_run=true && use_jupiter_api=false - test mode, warning gerekmez
+            log::debug!("Slippage calibration warning skipped (dry-run mode)");
         }
 
         Ok(())

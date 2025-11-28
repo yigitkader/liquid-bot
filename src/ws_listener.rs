@@ -172,10 +172,10 @@ pub async fn run_ws_listener(
     health_manager: Arc<HealthManager>,
 ) -> Result<()> {
     let program_id = protocol.program_id();
-    // Primary WebSocket URL from config
-    let mut ws_url = config.rpc_ws_url.clone();
     // Fallback WebSocket URL: Solana'nın resmi WS endpoint'i (programSubscribe %100 destekli)
     let fallback_ws_url = "wss://api.mainnet-beta.solana.com".to_string();
+    
+    // ✅ DÜZELTME: Config mutation yerine direkt doğru URL'yi seç
     // Eğer HTTP endpoint Helius ise ve WS endpoint de Helius'u işaret ediyorsa,
     // Helius WS'in `programSubscribe` desteği olmadığı bilindiği için en baştan
     // Solana'nın resmi WS endpoint'ine yönlen.
@@ -185,12 +185,17 @@ pub async fn run_ws_listener(
     // - Loglar daha temiz olur
     // - HTTP tarafında Helius'un tüm avantajlarını (yüksek rate limit vb.) kullanmaya devam ederiz
     let http_is_helius = config.rpc_http_url.to_lowercase().contains("helius");
-    let ws_is_helius = ws_url.to_lowercase().contains("helius");
-    if http_is_helius && ws_is_helius {
+    let ws_is_helius = config.rpc_ws_url.to_lowercase().contains("helius");
+    let is_helius_combo = http_is_helius && ws_is_helius;
+    
+    // ✅ DÜZELTME: Config mutation yerine direkt doğru URL'yi seç
+    let mut ws_url = if is_helius_combo {
         log::info!("💡 Helius HTTP + Helius WS algılandı. Helius WS `programSubscribe` desteklemediği için, WebSocket endpoint'i otomatik olarak Solana'nın resmi WS'ine taşınıyor.");
-        log::info!("   WS: {} -> {}", ws_url, fallback_ws_url);
-        ws_url = fallback_ws_url.clone();
-    }
+        log::info!("   WS: {} -> {}", config.rpc_ws_url, fallback_ws_url);
+        fallback_ws_url.clone()
+    } else {
+        config.rpc_ws_url.clone()
+    };
     let mut tried_fallback_ws = false;
     let mut reconnect_delay = Duration::from_secs(1);
     let max_reconnect_delay = Duration::from_secs(60);
@@ -231,15 +236,24 @@ pub async fn run_ws_listener(
     // Step 1.5: Discover oracle accounts from reserves
     // This collects all oracle accounts (Pyth/Switchboard) from reserve accounts
     // so we can subscribe to price feed updates
+    // 
+    // ✅ FIXED: Reserve struct layout corrected - oracle_option field added, oracle offsets fixed
     log::info!("🔍 Discovering oracle accounts from reserves...");
     let oracle_accounts = discover_oracle_accounts(&rpc_client, &protocol).await;
     let oracle_accounts = match oracle_accounts {
         Ok(accounts) => {
             log::info!("✅ Found {} oracle accounts to subscribe", accounts.len());
             if !accounts.is_empty() {
-                log::debug!("Oracle accounts: {:?}", accounts.iter().map(|info| info.oracle_account).collect::<Vec<_>>());
+                log::debug!("Sample oracle accounts: {:?}", accounts.iter().take(5).map(|info| info.oracle_account).collect::<Vec<_>>());
             }
-            accounts
+            // Limit to reasonable number to prevent WebSocket overload
+            // If too many, only use first 100 (most important ones)
+            if accounts.len() > 100 {
+                log::warn!("⚠️  Found {} oracle accounts, limiting to first 100 to prevent WebSocket overload", accounts.len());
+                accounts.into_iter().take(100).collect()
+            } else {
+                accounts
+            }
         }
         Err(e) => {
             log::warn!("⚠️  Oracle discovery failed: {}. Price feed subscriptions will be skipped.", e);
@@ -285,10 +299,12 @@ pub async fn run_ws_listener(
 
                     // Eğer şu anda Helius (veya başka bir HTTP endpoint) kullanıyorsak ve WS de aynı
                     // endpoint'i gösteriyorsa, WS'i otomatik olarak Solana'nın resmi WS'ine taşımayı dene.
+                    // ✅ DÜZELTME: Aynı mantığı kullan, ama daha temiz
                     let http_is_helius = config.rpc_http_url.to_lowercase().contains("helius");
                     let ws_is_helius = ws_url.to_lowercase().contains("helius");
+                    let is_helius_combo = http_is_helius && ws_is_helius;
 
-                    if http_is_helius && ws_is_helius && !tried_fallback_ws {
+                    if is_helius_combo && !tried_fallback_ws {
                         log::info!("💡 Helius HTTP + Helius WS kombinasyonu algılandı, ancak WS programSubscribe desteklemiyor.");
                         log::info!(
                             "   Otomatik çözüm: WebSocket endpoint'i Solana'nın resmi WS'ine alınacak: {} -> {}",
@@ -417,10 +433,16 @@ async fn discover_oracle_accounts(
 
     // Scan accounts to find reserves
     let mut parse_errors = 0;
+    let mut first_parse_error: Option<String> = None;
+    let mut sample_accounts_checked = 0;
+    const MAX_SAMPLE_ACCOUNTS: usize = 100; // Check first 100 accounts to detect parsing issues early
+    
     for (account_pubkey, account) in accounts {
         // Try to parse as reserve account
         // Note: We use reserve_helper to parse reserves
         use crate::protocols::reserve_helper::parse_reserve_account;
+        
+        sample_accounts_checked += 1;
         
         match parse_reserve_account(&account_pubkey, &account).await {
             Ok(reserve_info) => {
@@ -458,8 +480,29 @@ async fn discover_oracle_accounts(
             }
             Err(e) => {
                 // Not a reserve account, skip silently (most accounts are not reserves)
-                // Only log if we're getting many errors (might indicate a problem)
+                // But track errors to detect if struct layout is wrong
                 parse_errors += 1;
+                
+                // Save first parse error for detailed reporting
+                if first_parse_error.is_none() {
+                    first_parse_error = Some(format!("Account {}: {}", account_pubkey, e));
+                }
+                
+                // Early detection: If first 100 accounts all fail to parse, struct layout is likely wrong
+                if sample_accounts_checked >= MAX_SAMPLE_ACCOUNTS && reserve_count == 0 {
+                    log::error!("❌ CRITICAL: First {} accounts all failed to parse as reserves!", MAX_SAMPLE_ACCOUNTS);
+                    log::error!("   This indicates the reserve struct layout is INCORRECT!");
+                    log::error!("   First parse error: {}", first_parse_error.as_ref().unwrap());
+                    log::error!("   ");
+                    log::error!("   ACTION REQUIRED:");
+                    log::error!("   1. Check src/protocols/solend_reserve.rs struct layout");
+                    log::error!("   2. Run: ./scripts/check_oracle_option.sh to verify offsets");
+                    log::error!("   3. Compare with official Solend source code");
+                    log::error!("   ");
+                    // Continue scanning but we know there's a problem
+                }
+                
+                // Only log first few errors to avoid spam
                 if parse_errors <= 5 {
                     log::debug!("Account {} is not a reserve: {}", account_pubkey, e);
                 }
@@ -478,11 +521,35 @@ async fn discover_oracle_accounts(
         oracle_accounts.len()
     );
     
+    // ❌ CRITICAL CHECK: If no reserves found, struct layout is 100% wrong
     if reserve_count == 0 {
-        log::warn!("⚠️  No reserves found during oracle discovery. This might indicate:");
-        log::warn!("   1. Protocol program ID is incorrect");
-        log::warn!("   2. No reserves exist for this protocol");
-        log::warn!("   3. Reserve parsing is failing (check version compatibility)");
+        log::error!("❌ CRITICAL ERROR: No reserves found during oracle discovery!");
+        log::error!("   Scanned {} accounts, but 0 reserves were successfully parsed.", total_accounts);
+        log::error!("   ");
+        log::error!("   This means the reserve struct layout in src/protocols/solend_reserve.rs is INCORRECT!");
+        log::error!("   ");
+        log::error!("   Possible causes:");
+        log::error!("   1. Struct field order is wrong");
+        log::error!("   2. Field types are wrong (u8 vs u32, etc.)");
+        log::error!("   3. Missing fields (e.g., oracle_option)");
+        log::error!("   4. Wrong offsets (oracle positions incorrect)");
+        log::error!("   ");
+        log::error!("   ACTION REQUIRED:");
+        log::error!("   1. Run: ./scripts/check_oracle_option.sh to check real reserve layout");
+        log::error!("   2. Compare with official Solend source code:");
+        log::error!("      https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/state/reserve.rs");
+        log::error!("   3. Update src/protocols/solend_reserve.rs struct to match");
+        log::error!("   ");
+        if let Some(ref first_error) = first_parse_error {
+            log::error!("   First parse error: {}", first_error);
+        }
+        log::error!("   ");
+        
+        // Return empty vector but log critical error
+        // Bot can continue without oracle discovery, but this needs to be fixed
+        log::error!("   Oracle discovery will be skipped due to struct layout mismatch.");
+        log::error!("   Bot will continue running, but price feed subscriptions will not work.");
+        return Ok(Vec::new());
     }
     
     if oracle_accounts.is_empty() && reserve_count > 0 {

@@ -326,13 +326,46 @@ pub async fn calculate_liquidation_opportunity(
     // If Jupiter API is enabled, this will be replaced with real-time market data
     let estimated_dex_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
 
-    let oracle_confidence_bps = if let Some(client) = &rpc_client {
+    // Calculate gross profit first (needed for oracle confidence adjustment)
+    let gross_profit_usd = seizable_collateral_usd - max_liquidatable_debt_usd;
+
+    // ✅ DÜZELTME: Oracle confidence'ı hem collateral hem debt için al
+    // Oracle confidence, price uncertainty'yi temsil eder ve hem collateral hem debt değerlerini etkiler
+    let collateral_oracle_confidence_bps = if let Some(client) = &rpc_client {
         get_oracle_confidence_bps(&collateral_asset.mint, client, config).await
             .unwrap_or(config.default_oracle_confidence_slippage_bps)
     } else {
         config.default_oracle_confidence_slippage_bps
     };
-
+    
+    let debt_oracle_confidence_bps = if let Some(client) = &rpc_client {
+        get_oracle_confidence_bps(&debt_asset.mint, client, config).await
+            .unwrap_or(config.default_oracle_confidence_slippage_bps)
+    } else {
+        config.default_oracle_confidence_slippage_bps
+    };
+    
+    // ✅ DÜZELTME: Oracle confidence'ı gross profit'e uygula (worst-case scenario)
+    // Worst case: Collateral value düşer (price - confidence), debt value artar (price + confidence)
+    // Bu, profitability'yi daha conservative hale getirir
+    let collateral_oracle_uncertainty_usd = seizable_collateral_usd * (collateral_oracle_confidence_bps as f64 / 10_000.0);
+    let debt_oracle_uncertainty_usd = max_liquidatable_debt_usd * (debt_oracle_confidence_bps as f64 / 10_000.0);
+    let total_oracle_uncertainty_usd = collateral_oracle_uncertainty_usd + debt_oracle_uncertainty_usd;
+    
+    // Adjusted gross profit: Worst-case scenario (collateral down, debt up)
+    let adjusted_gross_profit_usd = gross_profit_usd - total_oracle_uncertainty_usd;
+    
+    log::debug!(
+        "Oracle confidence impact: collateral={} bps (${:.4}), debt={} bps (${:.4}), total_uncertainty=${:.4}, adjusted_gross_profit=${:.2} (original=${:.2})",
+        collateral_oracle_confidence_bps,
+        collateral_oracle_uncertainty_usd,
+        debt_oracle_confidence_bps,
+        debt_oracle_uncertainty_usd,
+        total_oracle_uncertainty_usd,
+        adjusted_gross_profit_usd,
+        gross_profit_usd
+    );
+    
     // Final slippage calculation: Sum DEX slippage and oracle confidence
     // 
     // These represent different sources of risk that should be added together:
@@ -345,6 +378,10 @@ pub async fn calculate_liquidation_opportunity(
     // 
     // Total risk = DEX slippage + Oracle uncertainty
     // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
+    // 
+    // ✅ DÜZELTME: Oracle confidence'ı slippage'e de ekle (execution risk)
+    // Ama ayrıca gross profit'e de uyguladık (price uncertainty)
+    let max_oracle_confidence_bps = collateral_oracle_confidence_bps.max(debt_oracle_confidence_bps);
     
     let needs_swap = collateral_asset.mint != debt_asset.mint;
     
@@ -380,16 +417,18 @@ pub async fn calculate_liquidation_opportunity(
         estimated_dex_slippage_bps
     };
     
-    let total_slippage_bps = final_dex_slippage_bps + oracle_confidence_bps;
+    // ✅ DÜZELTME: Oracle confidence'ı slippage'e ekle (execution risk)
+    // Ama gross profit'e de uyguladık (price uncertainty), bu yüzden slippage'de sadece execution risk'i kullan
+    let total_slippage_bps = final_dex_slippage_bps + max_oracle_confidence_bps;
     let final_slippage_bps = ((total_slippage_bps as f64 * config.slippage_final_multiplier) as u16).min(u16::MAX);
     
     let slippage_cost_usd = calculate_slippage_cost_usd(seizable_collateral_usd, final_slippage_bps);
 
     log::debug!(
-        "Slippage calculation: dex={} bps ({}), oracle_confidence={} bps, total={} bps, final={} bps (multiplier: {:.2}x), cost=${:.4}",
+        "Slippage calculation: dex={} bps ({}), oracle_confidence={} bps (max of collateral/debt), total={} bps, final={} bps (multiplier: {:.2}x), cost=${:.4}",
         final_dex_slippage_bps,
         if config.use_jupiter_api && needs_swap { "Jupiter API" } else { "estimated" },
-        oracle_confidence_bps,
+        max_oracle_confidence_bps,
         total_slippage_bps,
         final_slippage_bps,
         config.slippage_final_multiplier,
@@ -403,8 +442,10 @@ pub async fn calculate_liquidation_opportunity(
     };
 
     let total_cost_usd = transaction_fee_usd + slippage_cost_usd + swap_cost_usd;
-    let gross_profit_usd = seizable_collateral_usd - max_liquidatable_debt_usd;
-    let estimated_profit_usd = gross_profit_usd - total_cost_usd;
+    
+    // ✅ DÜZELTME: Adjusted gross profit kullan (oracle uncertainty dahil)
+    // Bu, profitability'yi daha conservative hale getirir
+    let estimated_profit_usd = adjusted_gross_profit_usd - total_cost_usd;
 
     // Minimum profit margin: ensures we have a buffer above transaction costs
     // Default: 1% (100 bps) of debt amount
