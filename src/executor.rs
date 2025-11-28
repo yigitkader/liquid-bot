@@ -8,7 +8,6 @@ use crate::solana_client::{self, SolanaClient};
 use crate::tx_lock::TxLock;
 use crate::wallet::WalletManager;
 use anyhow::Result;
-use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};

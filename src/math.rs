@@ -554,6 +554,7 @@ mod tests {
             event_bus_buffer_size: 1000,
             health_manager_max_error_age_seconds: 300,
             retry_jitter_max_ms: 1_000,
+            use_jupiter_api: false,
         };
 
         let protocol = Arc::new(SolendProtocol::new()
@@ -665,8 +666,6 @@ mod tests {
         use crate::protocols::solend::SolendProtocol;
         use crate::protocol::Protocol;
         use crate::solana_client::SolanaClient;
-        use solana_sdk::pubkey::Pubkey;
-        use std::str::FromStr;
         use std::sync::Arc;
 
         // Get obligation address from environment

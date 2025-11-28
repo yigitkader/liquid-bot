@@ -419,66 +419,64 @@ async fn test_profit_calculation_against_known_opportunity() {
     
     // Calculate profit
     use liquid_bot::math::calculate_liquidation_opportunity;
-    let config = match Config::from_env() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("❌ Failed to load config: {}", e);
-            eprintln!("   Using default config values");
-            Config::from_env().unwrap_or_else(|_| {
-                // Create minimal config for testing
-                Config {
-                    rpc_http_url: "https://api.mainnet-beta.solana.com".to_string(),
-                    rpc_ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
-                    wallet_path: "./secret/bot-wallet.json".to_string(),
-                    hf_liquidation_threshold: 1.0,
-                    min_profit_usd: 5.0,
-                    max_slippage_bps: 50,
-                    poll_interval_ms: 10000,
-                    dry_run: true,
-                    solend_program_id: "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo".to_string(),
-                    pyth_program_id: "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH".to_string(),
-                    switchboard_program_id: "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f".to_string(),
-                    priority_fee_per_cu: 1000,
-                    base_transaction_fee_lamports: 5000,
-                    dex_fee_bps: 20,
-                    min_profit_margin_bps: 100,
-                    default_oracle_confidence_slippage_bps: 100,
-                    slippage_final_multiplier: 1.1,
-                    min_reserve_lamports: 1000000,
-                    usdc_reserve_address: None,
-                    sol_reserve_address: None,
-                    associated_token_program_id: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string(),
-                    sol_price_fallback_usd: 150.0,
-                    oracle_mappings_json: None,
-                    max_oracle_age_seconds: 60,
-                    oracle_read_fee_lamports: 5000,
-                    oracle_accounts_read: 1,
-                    liquidation_compute_units: 200000,
-                    z_score_95: 1.96,
-                    slippage_size_small_threshold_usd: 10000.0,
-                    slippage_size_large_threshold_usd: 100000.0,
-                    slippage_multiplier_small: 0.5,
-                    slippage_multiplier_medium: 0.6,
-                    slippage_multiplier_large: 0.8,
-                    slippage_estimation_multiplier: 0.5,
-                    tx_lock_timeout_seconds: 60,
-                    max_retries: 3,
-                    initial_retry_delay_ms: 1000,
-                    default_compute_units: 200000,
-                    default_priority_fee_per_cu: 1000,
-                    ws_listener_sleep_seconds: 60,
-                    max_consecutive_errors: 10,
-                    expected_reserve_size: 619,
-                    liquidation_bonus: 0.05,
-                    close_factor: 0.5,
-                    max_liquidation_slippage: 0.01,
-                    event_bus_buffer_size: 1000,
-                    health_manager_max_error_age_seconds: 300,
-                    retry_jitter_max_ms: 1000,
-                }
-            })
-        }
-    };
+    let config = Config::from_env().unwrap_or_else(|e| {
+        eprintln!("❌ Failed to load config: {}", e);
+        eprintln!("   Using default config values");
+        Config::from_env().unwrap_or_else(|_| {
+            // Create minimal config for testing
+            Config {
+                rpc_http_url: "https://api.mainnet-beta.solana.com".to_string(),
+                rpc_ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
+                wallet_path: "./secret/bot-wallet.json".to_string(),
+                hf_liquidation_threshold: 1.0,
+                min_profit_usd: 5.0,
+                max_slippage_bps: 50,
+                poll_interval_ms: 10000,
+                dry_run: true,
+                solend_program_id: "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo".to_string(),
+                pyth_program_id: "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH".to_string(),
+                switchboard_program_id: "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f".to_string(),
+                priority_fee_per_cu: 1000,
+                base_transaction_fee_lamports: 5000,
+                dex_fee_bps: 20,
+                min_profit_margin_bps: 100,
+                default_oracle_confidence_slippage_bps: 100,
+                slippage_final_multiplier: 1.1,
+                min_reserve_lamports: 1000000,
+                usdc_reserve_address: None,
+                sol_reserve_address: None,
+                associated_token_program_id: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string(),
+                sol_price_fallback_usd: 150.0,
+                oracle_mappings_json: None,
+                max_oracle_age_seconds: 60,
+                oracle_read_fee_lamports: 5000,
+                oracle_accounts_read: 1,
+                liquidation_compute_units: 200000,
+                z_score_95: 1.96,
+                slippage_size_small_threshold_usd: 10000.0,
+                slippage_size_large_threshold_usd: 100000.0,
+                slippage_multiplier_small: 0.5,
+                slippage_multiplier_medium: 0.6,
+                slippage_multiplier_large: 0.8,
+                slippage_estimation_multiplier: 0.5,
+                tx_lock_timeout_seconds: 60,
+                max_retries: 3,
+                initial_retry_delay_ms: 1000,
+                default_compute_units: 200000,
+                default_priority_fee_per_cu: 1000,
+                ws_listener_sleep_seconds: 60,
+                max_consecutive_errors: 10,
+                expected_reserve_size: 619,
+                liquidation_bonus: 0.05,
+                close_factor: 0.5,
+                max_liquidation_slippage: 0.01,
+                event_bus_buffer_size: 1000,
+                health_manager_max_error_age_seconds: 300,
+                retry_jitter_max_ms: 1000,
+                use_jupiter_api: false,
+            }
+        })
+    });
     
     let opportunity = match calculate_liquidation_opportunity(
         &position,
@@ -558,14 +556,6 @@ async fn test_instruction_building_against_known_tx() {
             eprintln!("❌ Skipping test: TEST_LIQUIDATION_TX not set");
             eprintln!("   Set TEST_LIQUIDATION_TX=<transaction_signature> to run this test");
             eprintln!("   Example: export TEST_LIQUIDATION_TX=5j7s8...");
-            return;
-        }
-    };
-    
-    let rpc_client = match get_rpc_client() {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("❌ Failed to create RPC client: {}", e);
             return;
         }
     };
