@@ -85,8 +85,7 @@ pub struct Config {
     pub retry_jitter_max_ms: u64,
     // Jupiter API configuration
     pub use_jupiter_api: bool, // Enable real-time slippage estimation from Jupiter API
-    // Data source configuration
-    pub use_websocket: bool, // Use WebSocket instead of RPC polling (recommended for production)
+    // Note: WebSocket is now the default data source. RPC polling is used as fallback only.
 }
 
 impl Config {
@@ -317,16 +316,38 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false), // Default: disabled (use estimated slippage model)
-            // Data source configuration
-            use_websocket: env::var("USE_WEBSOCKET")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false), // Default: false (use RPC polling)
+            // Note: WebSocket is now always used as primary data source (best practice)
+            // RPC polling is used as automatic fallback if WebSocket fails
         };
 
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// Detects if the RPC endpoint is a free/public endpoint
+    /// Free endpoints have strict rate limits (1 req/10s for getProgramAccounts)
+    pub fn is_free_rpc_endpoint(&self) -> bool {
+        let url_lower = self.rpc_http_url.to_lowercase();
+        // Common free/public Solana RPC endpoints
+        url_lower.contains("api.mainnet-beta.solana.com")
+            || url_lower.contains("api.devnet.solana.com")
+            || url_lower.contains("api.testnet.solana.com")
+            || url_lower.contains("solana-api.projectserum.com")
+    }
+
+    /// Detects if the RPC endpoint is a premium provider
+    /// Premium providers typically have higher rate limits or no limits
+    pub fn is_premium_rpc_endpoint(&self) -> bool {
+        let url_lower = self.rpc_http_url.to_lowercase();
+        // Common premium RPC providers
+        url_lower.contains("helius")
+            || url_lower.contains("triton")
+            || url_lower.contains("quicknode")
+            || url_lower.contains("alchemy")
+            || url_lower.contains("ankr")
+            || url_lower.contains("getblock")
+            || url_lower.contains("rpcpool")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -396,18 +417,62 @@ impl Config {
         }
 
         // ⚠️ getProgramAccounts rate limiting uyarısı
-        if self.poll_interval_ms < 10000 {
-            log::warn!(
-                "⚠️  POLL_INTERVAL_MS={}ms is very short for getProgramAccounts on free RPC endpoints!",
+        // WebSocket artık varsayılan, ama RPC polling fallback olarak kullanılabilir
+        // Fallback durumunda rate limiting kontrolü yap
+        let is_free_rpc = self.is_free_rpc_endpoint();
+        let is_premium_rpc = self.is_premium_rpc_endpoint();
+        
+        if is_free_rpc && self.poll_interval_ms < 10000 {
+            log::error!(
+                "🚨 OPERASYONEL RİSK: Free RPC endpoint + kısa polling interval!"
+            );
+            log::error!(
+                "   RPC: {} (ücretsiz endpoint tespit edildi)",
+                self.rpc_http_url
+            );
+            log::error!(
+                "   POLL_INTERVAL_MS: {}ms (önerilen: 10000ms minimum)",
                 self.poll_interval_ms
             );
-            log::warn!(
-                "⚠️  Free RPC endpoints typically limit getProgramAccounts to 1 req/10s"
+            log::error!(
+                "   Free RPC'ler getProgramAccounts için 1 req/10s limit koyar!"
             );
+            log::error!("");
+            log::error!("   ÇÖZÜM SEÇENEKLERİ:");
+            log::error!("   1. Polling interval'ı artır: POLL_INTERVAL_MS=10000");
+            log::error!("   2. WebSocket kullanılacak (varsayılan, önerilen)");
+            log::error!("   3. Premium RPC kullan: Helius, Triton, QuickNode");
+            log::error!("");
+        } else if self.poll_interval_ms < 10000 {
             log::warn!(
-                "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) for free RPC, or use premium RPC/WebSocket"
+                "⚠️  POLL_INTERVAL_MS={}ms is very short for getProgramAccounts!",
+                self.poll_interval_ms
             );
+            if !is_premium_rpc {
+                log::warn!(
+                    "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) minimum for RPC polling fallback"
+                );
+            } else {
+                log::warn!(
+                    "⚠️  Premium RPC detected, but still recommend POLL_INTERVAL_MS>=5000ms for getProgramAccounts"
+                );
+            }
         }
+        
+        // Free RPC + kısa polling interval uyarısı (fallback durumu için)
+        if is_free_rpc {
+            log::warn!("");
+            log::warn!("💡 NOT: WebSocket varsayılan olarak kullanılacak.");
+            log::warn!("   Eğer WebSocket başarısız olursa RPC polling fallback olarak devreye girecek.");
+            log::warn!("   Fallback durumunda free RPC + kısa polling interval sorun yaratabilir.");
+            log::warn!("");
+        }
+        
+        // WebSocket varsayılan olarak kullanılacak (best practice)
+        log::info!("✅ WebSocket will be used as primary data source (best practice)");
+        log::info!("   - Real-time updates (<100ms latency)");
+        log::info!("   - No rate limits");
+        log::info!("   - RPC polling will be used as fallback if WebSocket fails");
 
         if !self.dry_run {
             log::warn!("⚠️  DRY_RUN=false: Bot will send REAL transactions to blockchain!");

@@ -31,13 +31,41 @@ pub async fn run_rpc_poller(
     // 1. Polling interval'ı artır: POLL_INTERVAL_MS=10000 (10 saniye) - ücretsiz RPC için
     // 2. Premium RPC kullan (Helius, Triton) - rate limit yok, getProgramAccounts destekli
     // 3. WebSocket kullan (önerilir) - account subscription, real-time updates, rate limit yok
-    if poll_interval.as_secs() < 10 {
+    
+    let is_free_rpc = config.is_free_rpc_endpoint();
+    let is_premium_rpc = config.is_premium_rpc_endpoint();
+    
+    if is_free_rpc && poll_interval.as_secs() < 10 {
+        log::error!(
+            "🚨 OPERASYONEL RİSK: Free RPC endpoint + kısa polling interval!"
+        );
+        log::error!(
+            "   RPC: {} (ücretsiz endpoint)",
+            config.rpc_http_url
+        );
+        log::error!(
+            "   Polling interval: {}ms (önerilen: 10000ms minimum)",
+            config.poll_interval_ms
+        );
+        log::error!(
+            "   Free RPC'ler getProgramAccounts için 1 req/10s limit koyar!"
+        );
+        log::error!("");
+        log::error!("   Bu konfigürasyon rate limit hatalarına yol açacaktır!");
+        log::error!("   Exponential backoff var ama production'da sorun çıkarabilir.");
+        log::error!("");
+                log::error!("   ÇÖZÜM:");
+                log::error!("   1. POLL_INTERVAL_MS=10000 (10 saniye) ayarlayın");
+                log::error!("   2. WebSocket bağlantısını düzeltin (varsayılan, önerilen)");
+                log::error!("   3. VEYA Premium RPC kullanın (Helius, Triton, QuickNode)");
+        log::error!("");
+    } else if poll_interval.as_secs() < 10 && !is_premium_rpc {
         log::warn!(
-            "⚠️  Polling interval {}ms is too short for getProgramAccounts on free RPC endpoints!",
+            "⚠️  Polling interval {}ms is too short for getProgramAccounts!",
             config.poll_interval_ms
         );
         log::warn!(
-            "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) for free RPC, or use premium RPC/WebSocket"
+            "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) minimum for RPC polling fallback"
         );
     }
 

@@ -67,8 +67,8 @@ cp .env.example .env
    - `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
    - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, **production için önerilen: 5.0-10.0**, test için: 1.0)
    - `MAX_SLIPPAGE_BPS`: Maksimum slippage (basis points, önerilen: 50-100)
-   - `POLL_INTERVAL_MS`: Polling aralığı (milisaniye, **ücretsiz RPC için önerilen: 10000**, premium RPC için: 2000-5000)
-   - `USE_WEBSOCKET`: WebSocket kullan (true/false, **production için önerilen: true**)
+   - `POLL_INTERVAL_MS`: RPC polling fallback aralığı (milisaniye, **ücretsiz RPC için önerilen: 10000**, premium RPC için: 2000-5000)
+     - **Not**: WebSocket varsayılan olarak kullanılır. Bu değer sadece WebSocket başarısız olursa fallback için kullanılır.
    - `DRY_RUN`: Test modu (true/false, **ilk kullanımda mutlaka true!**)
 
    Detaylı açıklamalar için aşağıdaki bölümlere bakın.
@@ -94,11 +94,12 @@ Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir.
   - **Production için önerilen: $5-10** (transaction fee + gas maliyetleri için yeterli margin)
   - **Test için: $1** (sadece test amaçlı, production'da kullanmayın!)
 - **DRY_RUN**: `true` ise gerçek transaction gönderilmez, sadece simüle edilir
-- **USE_WEBSOCKET**: `true` ise WebSocket kullanılır (önerilir), `false` ise RPC polling kullanılır
-- **POLL_INTERVAL_MS**: RPC polling aralığı (sadece USE_WEBSOCKET=false iken kullanılır)
+- **WebSocket**: **Varsayılan olarak kullanılır** (best practice - real-time updates, no rate limits)
+  - WebSocket başarısız olursa otomatik olarak RPC polling'e fallback yapılır
+- **POLL_INTERVAL_MS**: RPC polling fallback aralığı (WebSocket başarısız olursa kullanılır)
   - **Ücretsiz RPC için: 10000ms (10 saniye)** - getProgramAccounts rate limit'i nedeniyle
   - **Premium RPC için: 2000-5000ms (2-5 saniye)**
-  - **WebSocket kullanıldığında: Kullanılmaz** (real-time updates)
+  - **WebSocket aktifken: Kullanılmaz** (real-time updates)
 
 ### RPC Rate Limiting ve WebSocket
 
@@ -116,20 +117,21 @@ Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir.
   - Diğer RPC çağrıları: 100-1000+ req/s
   - **Çözüm**: `POLL_INTERVAL_MS=2000-5000` (2-5 saniye) kullanabilirsiniz
 
-#### ✅ WebSocket Kullanımı (Önerilir)
+#### ✅ WebSocket Kullanımı (Varsayılan - Best Practice)
 
-WebSocket kullanımı production için **şiddetle önerilir**:
+WebSocket **varsayılan olarak kullanılır** (best practice):
 
 - **Avantajlar**:
   - **Real-time updates**: <100ms latency (RPC polling'den çok daha hızlı)
   - **Rate limit yok**: Push-based, pull-based değil
   - **Düşük gecikme**: Likidasyon fırsatlarını ilk siz görürsünüz
   - **Stabil**: Premium RPC sağlayıcıları WebSocket'i destekler
+  - **Otomatik fallback**: WebSocket başarısız olursa RPC polling'e geçer
 
 - **Kullanım**:
   ```bash
-  USE_WEBSOCKET=true
   RPC_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+  # WebSocket otomatik olarak kullanılacak, flag gerekmez
   ```
 
 - **Premium RPC Sağlayıcıları**:
@@ -149,7 +151,7 @@ WebSocket kullanımı production için **şiddetle önerilir**:
 | Ücretsiz RPC | ⚠️ Rate limit sorunu | ⚠️ Sınırlı destek |
 | Premium RPC | ✅ Çalışır | ✅ Önerilir |
 
-**Öneri**: Production için `USE_WEBSOCKET=true` kullanın ve premium RPC sağlayıcısı seçin.
+**Not**: WebSocket varsayılan olarak kullanılır. Premium RPC sağlayıcısı kullanmanız önerilir (Helius, Triton, QuickNode).
 
 ## 🔧 Geliştirme Durumu
 
