@@ -67,10 +67,11 @@ cp .env.example .env
    - `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
    - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, **production için önerilen: 5.0-10.0**, test için: 1.0)
    - `MAX_SLIPPAGE_BPS`: Maksimum slippage (basis points, önerilen: 50-100)
-   - `POLL_INTERVAL_MS`: Polling aralığı (milisaniye, önerilen: 2000-5000)
+   - `POLL_INTERVAL_MS`: Polling aralığı (milisaniye, **ücretsiz RPC için önerilen: 10000**, premium RPC için: 2000-5000)
+   - `USE_WEBSOCKET`: WebSocket kullan (true/false, **production için önerilen: true**)
    - `DRY_RUN`: Test modu (true/false, **ilk kullanımda mutlaka true!**)
 
-   Detaylı açıklamalar için `.env.example` dosyasına bakın.
+   Detaylı açıklamalar için aşağıdaki bölümlere bakın.
 
 ## 🏃 Çalıştırma
 
@@ -84,7 +85,7 @@ cargo run --release
 
 ## ⚙️ Konfigürasyon
 
-Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir. Detaylar için `.env.example` dosyasına bakın.
+Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir.
 
 ### Önemli Parametreler
 
@@ -93,6 +94,62 @@ Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir. D
   - **Production için önerilen: $5-10** (transaction fee + gas maliyetleri için yeterli margin)
   - **Test için: $1** (sadece test amaçlı, production'da kullanmayın!)
 - **DRY_RUN**: `true` ise gerçek transaction gönderilmez, sadece simüle edilir
+- **USE_WEBSOCKET**: `true` ise WebSocket kullanılır (önerilir), `false` ise RPC polling kullanılır
+- **POLL_INTERVAL_MS**: RPC polling aralığı (sadece USE_WEBSOCKET=false iken kullanılır)
+  - **Ücretsiz RPC için: 10000ms (10 saniye)** - getProgramAccounts rate limit'i nedeniyle
+  - **Premium RPC için: 2000-5000ms (2-5 saniye)**
+  - **WebSocket kullanıldığında: Kullanılmaz** (real-time updates)
+
+### RPC Rate Limiting ve WebSocket
+
+#### ⚠️ RPC Rate Limiting Sorunu
+
+`getProgramAccounts` çağrısı çok ağır bir RPC çağrısıdır ve ücretsiz RPC endpoint'leri bunu sınırlar:
+
+- **Ücretsiz RPC (api.mainnet-beta.solana.com)**:
+  - `getProgramAccounts`: **1 req/10s limit** (çok kısıtlayıcı!)
+  - Diğer RPC çağrıları: ~10-40 req/s
+  - **Çözüm**: `POLL_INTERVAL_MS=10000` (10 saniye) kullanın
+
+- **Premium RPC (Helius, Triton, QuickNode, Alchemy)**:
+  - `getProgramAccounts`: Rate limit yok veya çok yüksek
+  - Diğer RPC çağrıları: 100-1000+ req/s
+  - **Çözüm**: `POLL_INTERVAL_MS=2000-5000` (2-5 saniye) kullanabilirsiniz
+
+#### ✅ WebSocket Kullanımı (Önerilir)
+
+WebSocket kullanımı production için **şiddetle önerilir**:
+
+- **Avantajlar**:
+  - **Real-time updates**: <100ms latency (RPC polling'den çok daha hızlı)
+  - **Rate limit yok**: Push-based, pull-based değil
+  - **Düşük gecikme**: Likidasyon fırsatlarını ilk siz görürsünüz
+  - **Stabil**: Premium RPC sağlayıcıları WebSocket'i destekler
+
+- **Kullanım**:
+  ```bash
+  USE_WEBSOCKET=true
+  RPC_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+  ```
+
+- **Premium RPC Sağlayıcıları**:
+  - **Helius** (Önerilir - Free tier var): https://www.helius.dev/
+  - **Triton**: https://triton.one/
+  - **QuickNode**: https://www.quicknode.com/
+  - **Alchemy**: https://www.alchemy.com/solana
+
+#### RPC Polling vs WebSocket
+
+| Özellik | RPC Polling | WebSocket |
+|---------|-------------|-----------|
+| Latency | 2-10 saniye | <100ms |
+| Rate Limits | Var (özellikle ücretsiz RPC) | Yok |
+| Karmaşıklık | Düşük | Orta |
+| Production Uygunluğu | Sınırlı | ✅ Önerilir |
+| Ücretsiz RPC | ⚠️ Rate limit sorunu | ⚠️ Sınırlı destek |
+| Premium RPC | ✅ Çalışır | ✅ Önerilir |
+
+**Öneri**: Production için `USE_WEBSOCKET=true` kullanın ve premium RPC sağlayıcısı seçin.
 
 ## 🔧 Geliştirme Durumu
 

@@ -85,6 +85,8 @@ pub struct Config {
     pub retry_jitter_max_ms: u64,
     // Jupiter API configuration
     pub use_jupiter_api: bool, // Enable real-time slippage estimation from Jupiter API
+    // Data source configuration
+    pub use_websocket: bool, // Use WebSocket instead of RPC polling (recommended for production)
 }
 
 impl Config {
@@ -315,6 +317,11 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false), // Default: disabled (use estimated slippage model)
+            // Data source configuration
+            use_websocket: env::var("USE_WEBSOCKET")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false), // Default: false (use RPC polling)
         };
 
         config.validate()?;
