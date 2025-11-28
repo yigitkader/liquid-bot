@@ -83,6 +83,8 @@ pub struct Config {
     pub health_manager_max_error_age_seconds: u64,
     // Retry jitter configuration
     pub retry_jitter_max_ms: u64,
+    // Jupiter API configuration
+    pub use_jupiter_api: bool, // Enable real-time slippage estimation from Jupiter API
 }
 
 impl Config {
@@ -308,6 +310,11 @@ impl Config {
                 .unwrap_or_else(|_| "1000".to_string())
                 .parse()
                 .context("Invalid RETRY_JITTER_MAX_MS value")?,
+            // Jupiter API configuration
+            use_jupiter_api: env::var("USE_JUPITER_API")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false), // Default: disabled (use estimated slippage model)
         };
 
         config.validate()?;

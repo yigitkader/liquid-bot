@@ -2,10 +2,10 @@ use crate::config::Config;
 use crate::domain::{AccountPosition, LiquidationOpportunity};
 use crate::protocol::Protocol;
 use crate::protocols::oracle_helper::{get_oracle_accounts_from_mint, read_oracle_price};
+use crate::protocols::jupiter_api::get_slippage_estimate;
 use crate::solana_client::SolanaClient;
 use anyhow::Result;
 use std::sync::Arc;
-use std::str::FromStr;
 
 /// Calculate transaction fee in USD
 /// 
@@ -32,7 +32,17 @@ use std::str::FromStr;
 /// Reference:
 /// - Solana fees: https://docs.solana.com/developing/programming-model/runtime#transaction-fees
 /// - Oracle accounts are NOT in instruction (see solend.rs:506-507)
-fn calculate_transaction_fee_usd(
+/// Calculate transaction fee in USD with detailed logging
+/// 
+/// ⚠️ VERIFICATION REQUIRED: This calculation should be validated against real mainnet transactions
+/// 
+/// To verify:
+/// 1. Run in dry-run mode and check logs for fee breakdown
+/// 2. Execute real liquidation transaction and get signature
+/// 3. Check transaction fee on Solana Explorer: https://solscan.io/tx/<signature>
+/// 4. Compare actual vs estimated fee (should be within 10%)
+/// 5. Adjust config values if needed (see docs/TRANSACTION_FEE_VERIFICATION.md)
+pub fn calculate_transaction_fee_usd(
     compute_units: u32,
     priority_fee_per_cu: u64,
     base_fee_lamports: u64,
@@ -60,7 +70,28 @@ fn calculate_transaction_fee_usd(
     
     let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
     let total_fee_sol = total_fee_lamports as f64 / 1_000_000_000.0;
-    total_fee_sol * sol_price_usd
+    let total_fee_usd = total_fee_sol * sol_price_usd;
+    
+    // ⚠️ VERIFICATION: Log fee breakdown for validation
+    // This helps verify the calculation against real mainnet transactions
+    log::debug!(
+        "💰 Transaction Fee Breakdown: \
+         base={} lamports ({:.9} SOL), \
+         priority={} lamports ({:.9} SOL, {} CU × {} μlamports/CU), \
+         total={} lamports ({:.9} SOL = ${:.6} USD) \
+         [⚠️ VERIFICATION REQUIRED: Compare with real mainnet tx fees]",
+        base_fee_lamports,
+        base_fee_lamports as f64 / 1_000_000_000.0,
+        priority_fee_lamports,
+        priority_fee_lamports as f64 / 1_000_000_000.0,
+        compute_units,
+        priority_fee_per_cu,
+        total_fee_lamports,
+        total_fee_sol,
+        total_fee_usd
+    );
+    
+    total_fee_usd
 }
 
 fn calculate_slippage_cost_usd(
@@ -234,16 +265,20 @@ pub async fn calculate_liquidation_opportunity(
 
     // Slippage estimation based on trade size
     // Larger trades have higher slippage due to liquidity depth
-    // Size multipliers are conservative estimates based on typical DEX liquidity:
+    // 
+    // ⚠️ CALIBRATION REQUIRED: Size multipliers are conservative estimates based on typical DEX liquidity.
+    // These should be calibrated against real mainnet liquidation data:
+    // 1. Measure actual slippage from successful liquidations
+    // 2. Compare with estimated slippage for different trade sizes
+    // 3. Adjust multipliers based on actual vs estimated slippage
+    // 
+    // Current estimates (to be calibrated):
     // - Small trades (<$10k): 0.5x multiplier (lower slippage, better liquidity)
     // - Medium trades ($10k-$100k): 0.6x multiplier (moderate slippage)
     // - Large trades (>$100k): 0.8x multiplier (higher slippage, lower liquidity)
     // 
-    // These multipliers are applied to max_slippage_bps to get estimated slippage
-    // Actual slippage may vary based on:
-    // - DEX liquidity depth at execution time
-    // - Market volatility
-    // - Oracle confidence intervals
+    // Alternative: Use Jupiter API for real-time slippage estimation (set USE_JUPITER_API=true)
+    // Jupiter API provides actual market data instead of estimated multipliers
     let size_multiplier = if seizable_collateral_usd < config.slippage_size_small_threshold_usd {
         config.slippage_multiplier_small  // Small trades: better liquidity, lower slippage
     } else if seizable_collateral_usd > config.slippage_size_large_threshold_usd {
@@ -253,6 +288,8 @@ pub async fn calculate_liquidation_opportunity(
     };
 
     // DEX slippage: Trade size-based slippage due to liquidity depth
+    // This is an estimated slippage based on trade size multipliers
+    // If Jupiter API is enabled, this will be replaced with real-time market data
     let estimated_dex_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
 
     // Oracle confidence: Price uncertainty from oracle (±1σ, 68% confidence interval)
@@ -321,22 +358,51 @@ pub async fn calculate_liquidation_opportunity(
     // 
     // Total risk = DEX slippage + Oracle uncertainty
     // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
-    let total_slippage_bps = estimated_dex_slippage_bps + oracle_confidence_bps;
+    
+    let needs_swap = collateral_asset.mint != debt_asset.mint;
+    
+    // If swap is needed and Jupiter API is enabled, get real-time slippage estimate
+    let final_dex_slippage_bps = if needs_swap && config.use_jupiter_api {
+        match (
+            collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>(),
+            debt_asset.mint.parse::<solana_sdk::pubkey::Pubkey>(),
+        ) {
+            (Ok(collateral_mint), Ok(debt_mint)) => {
+                // Get real-time slippage from Jupiter API
+                // Amount is in token's smallest unit (e.g., lamports for SOL)
+                get_slippage_estimate(
+                    &collateral_mint,
+                    &debt_mint,
+                    seizable_collateral,
+                    estimated_dex_slippage_bps,
+                    true, // use_jupiter_api
+                )
+                .await
+            }
+            _ => {
+                log::warn!("Failed to parse mint addresses for Jupiter API, using estimated slippage");
+                estimated_dex_slippage_bps
+            }
+        }
+    } else {
+        estimated_dex_slippage_bps
+    };
+    
+    let total_slippage_bps = final_dex_slippage_bps + oracle_confidence_bps;
     let final_slippage_bps = ((total_slippage_bps as f64 * config.slippage_final_multiplier) as u16).min(u16::MAX);
     
     let slippage_cost_usd = calculate_slippage_cost_usd(seizable_collateral_usd, final_slippage_bps);
 
     log::debug!(
-        "Slippage calculation: dex={} bps, oracle_confidence={} bps, total={} bps, final={} bps (multiplier: {:.2}x), cost=${:.4}",
-        estimated_dex_slippage_bps,
+        "Slippage calculation: dex={} bps ({}), oracle_confidence={} bps, total={} bps, final={} bps (multiplier: {:.2}x), cost=${:.4}",
+        final_dex_slippage_bps,
+        if config.use_jupiter_api && needs_swap { "Jupiter API" } else { "estimated" },
         oracle_confidence_bps,
         total_slippage_bps,
         final_slippage_bps,
         config.slippage_final_multiplier,
         slippage_cost_usd
     );
-
-    let needs_swap = collateral_asset.mint != debt_asset.mint;
 
     let swap_cost_usd = if needs_swap {
         calculate_swap_cost_usd(seizable_collateral_usd, true, config.dex_fee_bps)

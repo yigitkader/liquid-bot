@@ -113,6 +113,19 @@ impl BalanceReservation {
     /// 2. reserve() 
     /// 
     /// Because there's a race condition gap between steps 1 and 2.
+    /// 
+    /// ⚠️ RACE CONDITION NOTE:
+    /// There's still a small gap between:
+    /// - Step 1: RPC call to get balance (async, outside lock)
+    /// - Step 2: Lock acquisition and reservation (inside lock)
+    /// 
+    /// During this gap, another transaction could consume the balance.
+    /// To fully protect against this, the executor performs a final balance check
+    /// immediately before sending the transaction (see executor.rs).
+    /// 
+    /// This two-layer protection ensures:
+    /// 1. Reservation prevents parallel opportunities from over-reserving
+    /// 2. Final check prevents sending transactions that will fail
     pub async fn try_reserve_with_check<BC: BalanceChecker>(
         &self,
         mint: &Pubkey,
@@ -124,6 +137,9 @@ impl BalanceReservation {
         // opportunity reserves it before this one can reserve it.
         
         // Step 1: Get current balance (this is the only async operation outside the lock)
+        // ⚠️ NOTE: There's a small gap here - between RPC call and lock acquisition,
+        // another transaction could consume the balance. The executor performs a final
+        // balance check before sending the transaction to protect against this.
         let actual_balance = balance_checker.get_token_balance(mint).await?;
         
         // Step 2: Immediately reserve (with lock held)

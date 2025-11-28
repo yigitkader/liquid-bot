@@ -118,54 +118,31 @@ pub async fn run_strategist(
                                                 }
                                             }
                                             Err(e) => {
-                                                log::warn!("Failed to get oracle accounts from reserve {}: {}", reserve_pubkey, e);
-                                                // Fallback: Hardcoded mapping dene (sadece 5 token için çalışır)
-                                                if let Ok(debt_mint) =
-                                                    Pubkey::try_from(debt_mint_str.as_str())
-                                                {
-                                                    use crate::protocols::oracle_helper::get_oracle_accounts_from_mint;
-                                                    if let Ok((pyth, switchboard)) =
-                                                        get_oracle_accounts_from_mint(&debt_mint, Some(&config))
-                                                    {
-                                                        if let Ok(Some(price)) = read_oracle_price(
-                                                            pyth.as_ref(),
-                                                            switchboard.as_ref(),
-                                                            Arc::clone(&rpc_client),
-                                                            Some(&config),
-                                                        )
-                                                        .await
-                                                        {
-                                                            // Pyth confidence = ±1σ (standard deviation), representing 68% confidence interval
-                                                            // Use confidence directly - it already represents price uncertainty
-                                                            // Multiplying by Z-score (1.96) is statistically incorrect
-                                                            let confidence_bps =
-                                                                ((price.confidence / price.price)
-                                                                    * 10000.0)
-                                                                    as u16;
-                                                            oracle_confidence_bps = Some(confidence_bps);
-                                                            let age_seconds =
-                                                                std::time::SystemTime::now()
-                                                                    .duration_since(
-                                                                        std::time::UNIX_EPOCH,
-                                                                    )
-                                                                    .unwrap_or_default()
-                                                                    .as_secs()
-                                                                    as i64
-                                                                    - price.timestamp;
-
-                                                            if age_seconds > config.max_oracle_age_seconds as i64 {
-                                                                approved = false;
-                                                                rejection_reason = format!(
-                                                                    "oracle price too old: {}s (max: {}s)",
-                                                                    age_seconds,
-                                                                    config.max_oracle_age_seconds
-                                                                );
-                                                            }
-                                                        }
-                                                    } else {
-                                                        log::warn!("⚠️  No oracle accounts found for debt mint {} (not in hardcoded mapping). Reserve-based lookup failed. This token may not be supported.", debt_mint);
-                                                    }
-                                                }
+                                                // ❌ CRITICAL: Reserve parsing artık doğru çalışıyor (#1'de doğrulandı)
+                                                // Eğer reserve'den oracle bulunamazsa, bu bir hata durumudur.
+                                                // Hardcoded mapping'e fallback yapılmaz - bu sadece 5 token destekler
+                                                // ve BONK, RAY, SRM, MNGO gibi token'lar için başarısız olur.
+                                                log::error!(
+                                                    "❌ CRITICAL: Failed to get oracle accounts from reserve {}: {}",
+                                                    reserve_pubkey,
+                                                    e
+                                                );
+                                                log::error!(
+                                                    "   Reserve parsing is working correctly (#1 validated), so this indicates: \
+                                                    1. Reserve account configuration issue (oracle addresses not set), \
+                                                    2. Reserve account data corruption, or \
+                                                    3. Reserve account version mismatch. \
+                                                    Hardcoded mapping fallback is disabled to prevent incorrect oracle usage."
+                                                );
+                                                // Fallback kaldırıldı - hata durumunda işlemi durdur
+                                                // Bu, yanlış oracle kullanımını ve potansiyel para kaybını önler
+                                                // Oracle bulunamadığı için bu liquidation opportunity'si reddedilir
+                                                approved = false;
+                                                rejection_reason = format!(
+                                                    "oracle accounts not found in reserve {}: {}",
+                                                    reserve_pubkey,
+                                                    e
+                                                );
                                             }
                                         }
                                     }

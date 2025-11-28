@@ -127,13 +127,16 @@ fn parse_oracle_mappings_from_json(
 
 /// ✅ ÖNERİLEN: Reserve account'tan oracle'ı al
 /// Bu fonksiyon tüm Solend token'larını destekler (20+ token)
-/// Hardcoded mapping sadece fallback olarak kullanılır
 /// 
 /// Solend'de her reserve account oracle adreslerini içerir:
 /// - pyth_oracle: Pyth oracle pubkey
 /// - switchboard_oracle: Switchboard oracle pubkey
 /// 
-/// Bu fonksiyon önce reserve'den oracle'ı alır, yoksa hardcoded mapping'e fallback yapar
+/// ⚠️ CRITICAL: Reserve parsing artık doğru çalışıyor (#1'de doğrulandı).
+/// Eğer reserve'den oracle bulunamazsa, bu bir parsing hatası veya reserve yapılandırma hatasıdır.
+/// Hardcoded mapping'e fallback yapılmaz - hata döndürülür.
+/// 
+/// Bu, BONK, RAY, SRM, MNGO gibi token'lar için oracle'ın doğru okunmasını garanti eder.
 pub fn get_oracle_accounts_from_reserve(
     reserve_info: &crate::protocols::reserve_helper::ReserveInfo,
 ) -> Result<(Option<Pubkey>, Option<Pubkey>)> {
@@ -149,23 +152,24 @@ pub fn get_oracle_accounts_from_reserve(
         return Ok((pyth, switchboard));
     }
     
-    // Fallback: Reserve'de oracle yoksa hardcoded mapping kullan
-    // ⚠️ Bu sadece 5 token destekliyor (USDC, USDT, SOL, ETH, BTC)
+    // ❌ CRITICAL ERROR: Reserve'den oracle bulunamadı
+    // Reserve parsing artık doğru çalışıyor (#1'de doğrulandı), bu yüzden bu bir hata durumudur.
+    // Hardcoded mapping'e fallback yapılmaz - bu sadece 5 token destekler ve diğer token'lar için başarısız olur.
     let mint = reserve_info.liquidity_mint
         .or(reserve_info.collateral_mint)
         .ok_or_else(|| anyhow::anyhow!("No mint found in reserve info"))?;
     
-    log::warn!(
-        "⚠️  Oracle accounts not found in reserve account, falling back to hardcoded mapping for mint: {}",
-        mint
-    );
-    log::warn!(
-        "   ⚠️  Hardcoded mapping only supports 5 tokens (USDC, USDT, SOL, ETH, BTC). \
-         Other tokens (BONK, RAY, SRM, MNGO, etc.) will fail! \
-         Ensure reserve account parsing is working correctly. \
-         Note: Reserve account parsing should provide oracle addresses automatically."
-    );
-    get_oracle_accounts_from_mint(&mint, None)
+    Err(anyhow::anyhow!(
+        "❌ CRITICAL: No oracle accounts found for mint {} in reserve account {}! \
+         Reserve parsing is working correctly (#1 validated), so this indicates either: \
+         1. Reserve account configuration issue (oracle addresses not set in reserve), \
+         2. Reserve account data corruption, or \
+         3. Reserve account version mismatch. \
+         Hardcoded mapping fallback is disabled to prevent incorrect oracle usage for unsupported tokens (BONK, RAY, SRM, MNGO, etc.). \
+         Please check the reserve account configuration on-chain.",
+        mint,
+        reserve_info.reserve_pubkey
+    ))
 }
 
 /// Get oracle accounts from mint (fallback method)

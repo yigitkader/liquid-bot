@@ -27,5 +27,6 @@ pub mod protocols {
     pub mod solend_reserve;
     pub mod oracle_helper;
     pub mod reserve_validator;
+    pub mod jupiter_api;
 }
 
