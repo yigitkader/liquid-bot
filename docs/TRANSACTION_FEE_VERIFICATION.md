@@ -1,8 +1,15 @@
 # Transaction Fee Verification Guide
 
-## ⚠️ VERIFICATION REQUIRED
+## ⚠️ CRITICAL: VERIFICATION REQUIRED
 
-Transaction fee calculation needs to be validated against real mainnet transactions.
+Transaction fee calculation **MUST be validated** against real mainnet transactions after the first liquidation.
+
+**Risk:** Unverified fee calculations can lead to:
+- Incorrect profit estimates
+- Transaction failures (insufficient compute units)
+- Missed opportunities (overestimated fees)
+
+**Action Required:** After first real liquidation, verify fees on Solscan and adjust config if needed.
 
 ## Current Implementation
 
@@ -39,25 +46,34 @@ Check logs for fee breakdown:
    total=5200 lamports (0.000005200 SOL = $0.000780 USD)
 ```
 
-### 2. Mainnet Transaction Verification
+### 2. Mainnet Transaction Verification (REQUIRED After First Liquidation)
 
-After executing a real liquidation transaction:
+**⚠️ IMPORTANT:** After your first real liquidation transaction, you **MUST** verify the fee calculation.
 
 1. **Get Transaction Signature**
    - Transaction signature is logged: `✅ Liquidation transaction sent: <signature>`
    - Or check logs for: `Liquidation transaction sent: <signature>`
+   - Example: `5j7s8K9L0M1N2O3P4Q5R6S7T8U9V0W1X2Y3Z4A5B6C7D8E9F0G1H2`
 
 2. **Check Transaction on Solana Explorer**
    - Visit: https://solscan.io/tx/<signature>
    - Or: https://explorer.solana.com/tx/<signature>
    - Look for "Transaction Fee" section
+   - Record: Actual fee (lamports), Compute Units Consumed
 
 3. **Compare with Estimated Fee**
-   - Actual fee should be close to estimated fee (~5,200 lamports)
-   - If difference > 10%, adjust config values:
-     - `LIQUIDATION_COMPUTE_UNITS` - if actual CU differs
-     - `PRIORITY_FEE_PER_CU` - if priority fee differs
-     - `BASE_TRANSACTION_FEE_LAMPORTS` - should always be 5,000
+   - **Expected tolerance:** ±10% difference is acceptable
+   - **If difference > 10%:** Adjust config values immediately:
+     ```bash
+     # If actual CU > configured:
+     export LIQUIDATION_COMPUTE_UNITS=250000  # Increase from 200000
+     
+     # If actual priority fee > estimated:
+     export PRIORITY_FEE_PER_CU=2000  # Increase from 1000 (high congestion)
+     
+     # Base fee should always be 5,000 (do not change)
+     ```
+   - **If difference < 10%:** Fee calculation is accurate ✅
 
 ### 3. Compute Unit Verification
 

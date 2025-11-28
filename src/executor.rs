@@ -49,11 +49,29 @@ pub async fn run_executor(
                 };
 
                 if config.dry_run {
+                    use crate::math::calculate_transaction_fee_usd;
+                    let sol_price_usd = config.sol_price_fallback_usd;
+                    let estimated_tx_fee_usd = calculate_transaction_fee_usd(
+                        config.liquidation_compute_units,
+                        config.priority_fee_per_cu,
+                        config.base_transaction_fee_lamports,
+                        config.oracle_read_fee_lamports,
+                        config.oracle_accounts_read,
+                        sol_price_usd,
+                    );
+                    
                     log::info!(
                         "DRY RUN: Would execute liquidation for account {} (profit=${:.2})",
                         account_address,
                         opportunity.estimated_profit_usd
                     );
+                    log::info!("   Estimated transaction fee: ${:.6} USD", estimated_tx_fee_usd);
+                    log::info!("");
+                    log::info!("   ⚠️  After first real liquidation, verify fee on Solscan:");
+                    log::info!("      - Compare actual vs estimated fee (should be within ±10%)");
+                    log::info!("      - See docs/TRANSACTION_FEE_VERIFICATION.md for details");
+                    log::info!("");
+                    
                     bus.publish(Event::TxResult {
                         opportunity: opportunity.clone(),
                         success: true,
@@ -73,23 +91,34 @@ pub async fn run_executor(
                                 Arc::clone(&rpc_client),
                                 Some(config.clone()),
                             );
+                            
                             if let Ok(current_balance) = balance_checker.get_token_balance(&debt_mint).await {
                                 let reserved = balance_reservation.get_reserved(&debt_mint).await;
                                 let available = current_balance.saturating_sub(reserved);
                                 
                                 if available < opportunity.max_liquidatable_amount {
-                                    let error_msg = format!(
-                                        "Insufficient balance: required={}, available={}, reserved={}, current={}",
+                                    log::warn!(
+                                        "Balance insufficient at execution time: required={}, available={}, reserved={}, current={}",
                                         opportunity.max_liquidatable_amount,
                                         available,
                                         reserved,
                                         current_balance
                                     );
+                                    
+                                    balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                                    log::debug!("Released reservation due to insufficient balance");
+                                    
                                     if attempt == max_retries {
-                                        last_error = Some(anyhow::anyhow!(error_msg));
+                                        last_error = Some(anyhow::anyhow!(
+                                            "Insufficient balance after all retries: required={}, available={}",
+                                            opportunity.max_liquidatable_amount,
+                                            available
+                                        ));
                                         break;
                                     }
+                                    
                                     let retry_delay = Duration::from_millis(initial_retry_delay_ms * (attempt + 1) as u64);
+                                    log::debug!("Retrying after {}ms (balance might be freed by another transaction)", retry_delay.as_millis());
                                     sleep(retry_delay).await;
                                     continue;
                                 }
@@ -109,6 +138,14 @@ pub async fn run_executor(
                                 signature = Some(sig.clone());
                                 success = true;
                                 log::info!("Liquidation transaction sent: {}", sig);
+                                
+                                log::info!("");
+                                log::info!("🔍 TRANSACTION FEE VERIFICATION REQUIRED:");
+                                log::info!("   1. Check transaction on Solscan: https://solscan.io/tx/{}", sig);
+                                log::info!("   2. Compare actual fee vs estimated fee (should be within ±10%)");
+                                log::info!("   3. Verify compute units consumed (should be < configured limit)");
+                                log::info!("   4. Adjust config if needed (see docs/TRANSACTION_FEE_VERIFICATION.md)");
+                                log::info!("");
 
                                 if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
                                     balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;

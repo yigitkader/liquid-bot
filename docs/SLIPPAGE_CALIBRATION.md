@@ -1,8 +1,17 @@
 # Slippage Calculation Calibration Guide
 
-## ⚠️ CALIBRATION REQUIRED
+## ⚠️ CRITICAL: CALIBRATION REQUIRED
 
-The slippage calculation model uses estimated multipliers that should be calibrated against real mainnet liquidation data.
+The slippage calculation model uses **ESTIMATED multipliers** that **MUST be calibrated** against real mainnet liquidation data in production.
+
+**Risk:** Using uncalibrated multipliers can lead to:
+- Unprofitable liquidations (actual slippage > estimated)
+- Missed opportunities (overly conservative estimates)
+- Model uncertainty errors
+
+**Solution:** 
+1. **Recommended:** Enable Jupiter API for real-time slippage (`USE_JUPITER_API=true`)
+2. **Alternative:** Calibrate multipliers after first 10-20 liquidations (see below)
 
 ## Current Implementation
 
@@ -62,14 +71,24 @@ export USE_JUPITER_API=true
 
 ### Option 2: Calibrate Multipliers from Real Data
 
+**⚠️ IMPORTANT:** If Jupiter API is disabled, you **MUST** calibrate multipliers after the first 10-20 liquidations in production.
+
 Measure actual slippage from successful liquidations and adjust multipliers:
 
-1. **Collect Data:**
+1. **Collect Data (After 10-20 Liquidations):**
    ```bash
-   # After successful liquidations, check transaction signatures
-   # On Solana Explorer, check:
-   # - Actual swap price vs oracle price
-   # - Price impact percentage
+   # After successful liquidations, check transaction signatures from logs
+   # Example log output:
+   # "Liquidation transaction sent: 5j7s8K9L0M1N2O3P4Q5R6S7T8U9V0W1X2Y3Z4A5B6C7D8E9F0G1H2"
+   
+   # On Solscan, check each transaction:
+   # https://solscan.io/tx/<signature>
+   
+   # For each transaction, record:
+   # - Trade size (USD)
+   # - Oracle price (from Pyth/Switchboard at time of liquidation)
+   # - Execution price (from swap transaction)
+   # - Price impact percentage (if available)
    ```
 
 2. **Calculate Actual Slippage:**

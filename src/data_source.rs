@@ -43,33 +43,38 @@ pub async fn run_data_source(
             Ok(())
         }
         Err(e) => {
-            // WebSocket failed - fallback to RPC polling
             log::error!("❌ WebSocket failed: {}", e);
-            log::warn!("");
             log::warn!("⚠️  Falling back to RPC polling...");
-            log::warn!("   This is less optimal but will keep the bot running");
-            log::warn!("   Consider fixing WebSocket connection for best performance");
-            log::warn!("");
             
             let is_free_rpc = config.is_free_rpc_endpoint();
+            let mut safe_config = config.clone();
+            let mut interval_adjusted = false;
             
-            if is_free_rpc {
-                log::warn!("⚠️  OPERASYONEL RİSK: Free RPC endpoint + RPC polling fallback!");
-                log::warn!("   Free RPC'ler getProgramAccounts için 1 req/10s limit koyar");
-                log::warn!("   POLL_INTERVAL_MS={}ms kullanılıyor", config.poll_interval_ms);
-                if config.poll_interval_ms < 10000 {
-                    log::error!("   ⚠️  Polling interval çok kısa! Rate limit hataları bekleniyor.");
-                    log::error!("   Önerilen: POLL_INTERVAL_MS=10000 (10s) minimum");
-                }
+            if is_free_rpc && safe_config.poll_interval_ms < 10000 {
+                log::error!("🚨 OPERASYONEL RİSK: Free RPC + kısa polling interval!");
+                log::error!("   Free RPC'ler getProgramAccounts için 1 req/10s limit koyar");
+                log::error!("   Mevcut POLL_INTERVAL_MS: {}ms (çok kısa!)", safe_config.poll_interval_ms);
+                log::error!("");
+                log::error!("   ⚠️  Otomatik düzeltme: POLL_INTERVAL_MS=10000ms'e ayarlanıyor");
+                log::error!("   Bu production'da rate limit hatalarını önler");
+                log::error!("");
+                safe_config.poll_interval_ms = 10000;
+                interval_adjusted = true;
+            }
+            
+            if interval_adjusted {
+                log::warn!("💡 Önerilen çözümler:");
+                log::warn!("   1. WebSocket bağlantısını düzeltin (varsayılan, önerilen)");
+                log::warn!("   2. Premium RPC kullanın (Helius, Triton, QuickNode)");
+                log::warn!("   3. POLL_INTERVAL_MS=10000 (veya daha fazla) ayarlayın");
                 log::warn!("");
             }
             
-            // Fallback to RPC polling
             log::info!("📡 Using RPC polling as fallback data source");
-            log::info!("   Poll interval: {}ms", config.poll_interval_ms);
-            log::info!("   RPC endpoint: {}", config.rpc_http_url);
+            log::info!("   Poll interval: {}ms", safe_config.poll_interval_ms);
+            log::info!("   RPC endpoint: {}", safe_config.rpc_http_url);
             
-            rpc_poller::run_rpc_poller(bus, config, rpc_client, protocol, health_manager).await
+            rpc_poller::run_rpc_poller(bus, safe_config, rpc_client, protocol, health_manager).await
         }
     }
 }

@@ -297,18 +297,21 @@ pub async fn calculate_liquidation_opportunity(
     // Slippage estimation based on trade size
     // Larger trades have higher slippage due to liquidity depth
     // 
-    // ⚠️ CALIBRATION REQUIRED: Size multipliers are conservative estimates based on typical DEX liquidity.
-    // These should be calibrated against real mainnet liquidation data:
-    // 1. Measure actual slippage from successful liquidations
-    // 2. Compare with estimated slippage for different trade sizes
-    // 3. Adjust multipliers based on actual vs estimated slippage
+    // ⚠️ CRITICAL: Size multipliers are ESTIMATES based on typical DEX liquidity.
+    // These MUST be calibrated against real mainnet liquidation data in production!
     // 
-    // Current estimates (to be calibrated):
+    // If USE_JUPITER_API=false (estimated slippage mode):
+    // 1. After first 10-20 liquidations, measure actual slippage from Solscan
+    // 2. Compare actual vs estimated slippage for different trade sizes
+    // 3. Adjust multipliers in config based on actual measurements
+    // 4. See docs/SLIPPAGE_CALIBRATION.md for detailed instructions
+    // 
+    // Current estimates (REQUIRES CALIBRATION):
     // - Small trades (<$10k): 0.5x multiplier (lower slippage, better liquidity)
     // - Medium trades ($10k-$100k): 0.6x multiplier (moderate slippage)
     // - Large trades (>$100k): 0.8x multiplier (higher slippage, lower liquidity)
     // 
-    // Alternative: Use Jupiter API for real-time slippage estimation (set USE_JUPITER_API=true)
+    // RECOMMENDED: Use Jupiter API for real-time slippage (set USE_JUPITER_API=true)
     // Jupiter API provides actual market data instead of estimated multipliers
     let size_multiplier = if seizable_collateral_usd < config.slippage_size_small_threshold_usd {
         config.slippage_multiplier_small  // Small trades: better liquidity, lower slippage
@@ -344,6 +347,14 @@ pub async fn calculate_liquidation_opportunity(
     // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
     
     let needs_swap = collateral_asset.mint != debt_asset.mint;
+    
+    if !config.use_jupiter_api && needs_swap {
+        log::warn!(
+            "⚠️  Using ESTIMATED slippage (Jupiter API disabled). \
+             Calibration required after first 10-20 liquidations. \
+             See docs/SLIPPAGE_CALIBRATION.md for instructions."
+        );
+    }
     
     let final_dex_slippage_bps = if needs_swap && config.use_jupiter_api {
         match (

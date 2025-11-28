@@ -77,14 +77,10 @@ pub fn get_oracle_accounts_from_reserve(
         return Ok((reserve_info.pyth_oracle, reserve_info.switchboard_oracle));
     }
     
-    let mint = reserve_info.liquidity_mint
-        .or(reserve_info.collateral_mint)
-        .ok_or_else(|| anyhow::anyhow!("No mint found in reserve info"))?;
-    
     Err(anyhow::anyhow!(
-        "No oracle accounts found for mint {} in reserve account {}. \
-         This indicates reserve account configuration issue, data corruption, or version mismatch.",
-        mint,
+        "CRITICAL: No oracle accounts found in reserve {}. \
+         This indicates reserve data corruption or version mismatch. \
+         DO NOT proceed with liquidation without oracle data.",
         reserve_info.reserve_pubkey
     ))
 }

@@ -498,6 +498,25 @@ impl Config {
             log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
         }
 
+        // Slippage calibration warning
+        if !self.use_jupiter_api {
+            log::warn!("");
+            log::warn!("⚠️  SLIPPAGE CALIBRATION REQUIRED: Jupiter API is disabled (USE_JUPITER_API=false)");
+            log::warn!("   Using ESTIMATED slippage multipliers - these MUST be calibrated in production!");
+            log::warn!("   ");
+            log::warn!("   After first 10-20 liquidations:");
+            log::warn!("   1. Measure actual slippage from Solscan transactions");
+            log::warn!("   2. Compare with estimated slippage for different trade sizes");
+            log::warn!("   3. Adjust multipliers: SLIPPAGE_MULTIPLIER_SMALL/MEDIUM/LARGE");
+            log::warn!("   ");
+            log::warn!("   See docs/SLIPPAGE_CALIBRATION.md for detailed instructions");
+            log::warn!("   ");
+            log::warn!("   RECOMMENDED: Enable Jupiter API (USE_JUPITER_API=true) for real-time slippage");
+            log::warn!("");
+        } else {
+            log::info!("✅ Jupiter API enabled - using real-time slippage estimation");
+        }
+
         Ok(())
     }
 }
