@@ -153,6 +153,58 @@ WebSocket **varsayılan olarak kullanılır** (best practice):
 
 **Not**: WebSocket varsayılan olarak kullanılır. Premium RPC sağlayıcısı kullanmanız önerilir (Helius, Triton, QuickNode).
 
+## 📋 Production Checklist
+
+Production'a geçmeden önce **mutlaka** aşağıdaki checklist'i tamamlayın:
+
+### Hızlı Test
+
+Tüm testleri otomatik olarak çalıştırmak için:
+
+```bash
+./scripts/production_checklist.sh
+```
+
+### Manuel Testler
+
+1. **Struct Validation Test**
+   ```bash
+   cargo run --bin validate_reserve -- --reserve BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw
+   ```
+
+2. **Obligation Parsing Test**
+   ```bash
+   cargo run --bin find_my_obligation
+   ```
+
+3. **System Integration Test**
+   ```bash
+   cargo run --bin validate_system
+   ```
+
+4. **Dry-Run Test (24 saat)**
+   ```bash
+   DRY_RUN=true cargo run
+   ```
+   Log'larda şunları kontrol edin:
+   - `✅ WebSocket connected`
+   - `✅ Subscribed to program accounts`
+   - Opportunity detection
+   - Profit calculation
+   - Fee breakdown
+   - Slippage estimation
+
+5. **Small Capital Test**
+   ```bash
+   DRY_RUN=false MIN_PROFIT_USD=1.0 cargo run
+   ```
+   ⚠️ **UYARI:** Bu gerçek transaction'lar gönderir! İlk 5-10 transaction'ı dikkatle izleyin.
+
+### Detaylı Dokümanlar
+
+- [Production Checklist](docs/PRODUCTION_CHECKLIST.md) - Detaylı checklist ve açıklamalar
+- [Production Quick Reference](docs/PRODUCTION_QUICK_REFERENCE.md) - Hızlı komut referansı
+
 ## 🔧 Geliştirme Durumu
 
 Bu proje şu anda **Production-Ready** aşamasındadır.
