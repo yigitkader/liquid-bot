@@ -6,7 +6,11 @@ use dotenv::dotenv;
 use env_logger;
 use liquid_bot::protocol::Protocol;
 use liquid_bot::shutdown::ShutdownManager;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio;
 use tokio::signal;
 
@@ -14,12 +18,37 @@ use tokio::signal;
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    env_logger::Builder::from_default_env()
+    // Create logs directory if it doesn't exist
+    let logs_dir = Path::new("logs");
+    if !logs_dir.exists() {
+        fs::create_dir_all(logs_dir)?;
+    }
+
+    // Generate log filename with timestamp
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let log_filename = format!("logs/bot_{}.log", timestamp);
+    let log_file = fs::File::create(&log_filename)?;
+
+    // Create a writer that writes to both file and stderr
+    let mut logger = env_logger::Builder::from_default_env();
+    logger
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
         .format_module_path(false)
-        .format_target(false)
-        .init();
+        .format_target(false);
+
+    // Write to both file and stderr
+    logger.target(env_logger::Target::Pipe(Box::new(MultiWriter::new(
+        log_file,
+        std::io::stderr(),
+    ))));
+
+    logger.init();
+
+    log::info!("📝 Logging to file: {}", log_filename);
 
     log::info!("🚀 Starting Solana Liquidation Bot (Production Mode)");
     log::info!("Version: {}", env!("CARGO_PKG_VERSION"));
@@ -315,4 +344,31 @@ async fn main() -> Result<()> {
 
     log::info!("👋 Shutdown complete. Goodbye!");
     Ok(())
+}
+
+/// MultiWriter writes to multiple writers simultaneously
+struct MultiWriter {
+    file: fs::File,
+    stderr: std::io::Stderr,
+}
+
+impl MultiWriter {
+    fn new(file: fs::File, stderr: std::io::Stderr) -> Self {
+        Self { file, stderr }
+    }
+}
+
+impl Write for MultiWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Write to both file and stderr
+        self.file.write_all(buf)?;
+        self.stderr.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        self.stderr.flush()?;
+        Ok(())
+    }
 }

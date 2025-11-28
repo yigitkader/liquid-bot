@@ -416,6 +416,7 @@ async fn discover_oracle_accounts(
     let mut reserve_count = 0;
 
     // Scan accounts to find reserves
+    let mut parse_errors = 0;
     for (account_pubkey, account) in accounts {
         // Try to parse as reserve account
         // Note: We use reserve_helper to parse reserves
@@ -429,33 +430,66 @@ async fn discover_oracle_accounts(
                 let mint = reserve_info.liquidity_mint.or(reserve_info.collateral_mint);
                 
                 // Extract oracle accounts with mint mapping
+                // Filter out default/empty pubkeys (these indicate no oracle configured)
                 if let Some(pyth_oracle) = reserve_info.pyth_oracle {
-                    oracle_accounts.push(OracleAccountInfo {
-                        oracle_account: pyth_oracle,
-                        mint,
-                        label: format!("pyth_{}", account_pubkey),
-                    });
+                    if pyth_oracle != Pubkey::default() {
+                        oracle_accounts.push(OracleAccountInfo {
+                            oracle_account: pyth_oracle,
+                            mint,
+                            label: format!("pyth_{}", account_pubkey),
+                        });
+                        log::debug!("Found Pyth oracle: {} for reserve {}", pyth_oracle, account_pubkey);
+                    } else {
+                        log::debug!("Reserve {} has default/empty Pyth oracle, skipping", account_pubkey);
+                    }
                 }
                 if let Some(switchboard_oracle) = reserve_info.switchboard_oracle {
-                    oracle_accounts.push(OracleAccountInfo {
-                        oracle_account: switchboard_oracle,
-                        mint,
-                        label: format!("switchboard_{}", account_pubkey),
-                    });
+                    if switchboard_oracle != Pubkey::default() {
+                        oracle_accounts.push(OracleAccountInfo {
+                            oracle_account: switchboard_oracle,
+                            mint,
+                            label: format!("switchboard_{}", account_pubkey),
+                        });
+                        log::debug!("Found Switchboard oracle: {} for reserve {}", switchboard_oracle, account_pubkey);
+                    } else {
+                        log::debug!("Reserve {} has default/empty Switchboard oracle, skipping", account_pubkey);
+                    }
                 }
             }
-            Err(_) => {
-                // Not a reserve account, skip
+            Err(e) => {
+                // Not a reserve account, skip silently (most accounts are not reserves)
+                // Only log if we're getting many errors (might indicate a problem)
+                parse_errors += 1;
+                if parse_errors <= 5 {
+                    log::debug!("Account {} is not a reserve: {}", account_pubkey, e);
+                }
             }
         }
     }
+    
+    if parse_errors > 5 {
+        log::debug!("Skipped {} non-reserve accounts during oracle discovery", parse_errors);
+    }
 
-    log::debug!(
+    log::info!(
         "Oracle discovery: scanned {} accounts, found {} reserves, extracted {} oracle accounts",
         total_accounts,
         reserve_count,
         oracle_accounts.len()
     );
+    
+    if reserve_count == 0 {
+        log::warn!("⚠️  No reserves found during oracle discovery. This might indicate:");
+        log::warn!("   1. Protocol program ID is incorrect");
+        log::warn!("   2. No reserves exist for this protocol");
+        log::warn!("   3. Reserve parsing is failing (check version compatibility)");
+    }
+    
+    if oracle_accounts.is_empty() && reserve_count > 0 {
+        log::warn!("⚠️  Found {} reserves but no oracle accounts. This might indicate:", reserve_count);
+        log::warn!("   1. Reserves don't have oracle accounts configured");
+        log::warn!("   2. Oracle accounts are default/empty pubkeys");
+    }
 
     // Remove duplicates (same oracle account might be used by multiple reserves)
     oracle_accounts.sort_by_key(|info| info.oracle_account);

@@ -1,5 +1,4 @@
 use crate::domain::{AccountPosition, LiquidationOpportunity};
-use solana_sdk::pubkey::Pubkey;
 
 #[derive(Debug, Clone)]
 pub enum Event {
