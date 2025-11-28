@@ -237,7 +237,7 @@ pub async fn run_ws_listener(
         Ok(accounts) => {
             log::info!("✅ Found {} oracle accounts to subscribe", accounts.len());
             if !accounts.is_empty() {
-                log::debug!("Oracle accounts: {:?}", accounts.iter().map(|(p, _)| p).collect::<Vec<_>>());
+                log::debug!("Oracle accounts: {:?}", accounts.iter().map(|info| info.oracle_account).collect::<Vec<_>>());
             }
             accounts
         }
@@ -411,6 +411,7 @@ async fn discover_oracle_accounts(
         .await
         .context("Failed to fetch program accounts for oracle discovery")?;
 
+    let total_accounts = accounts.len();
     let mut oracle_accounts = Vec::new();
     let mut reserve_count = 0;
 
@@ -451,7 +452,7 @@ async fn discover_oracle_accounts(
 
     log::debug!(
         "Oracle discovery: scanned {} accounts, found {} reserves, extracted {} oracle accounts",
-        accounts.len(),
+        total_accounts,
         reserve_count,
         oracle_accounts.len()
     );
