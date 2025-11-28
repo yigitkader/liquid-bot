@@ -19,6 +19,7 @@ pub mod balance_reservation;
 pub mod shutdown;
 pub mod health;
 pub mod performance;
+pub mod utils;
 
 pub mod protocols {
     pub mod solend;

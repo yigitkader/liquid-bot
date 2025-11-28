@@ -4,8 +4,39 @@ use crate::protocol::Protocol;
 use crate::protocols::oracle_helper::{get_oracle_accounts_from_mint, read_oracle_price};
 use crate::protocols::jupiter_api::get_slippage_estimate;
 use crate::solana_client::SolanaClient;
+use crate::utils;
 use anyhow::Result;
 use std::sync::Arc;
+
+async fn get_oracle_confidence_bps(
+    mint_str: &str,
+    rpc_client: &Arc<SolanaClient>,
+    config: &Config,
+) -> Option<u16> {
+    let mint_pubkey = utils::parse_pubkey_opt(mint_str)?;
+    let (pyth, switchboard) = get_oracle_accounts_from_mint(&mint_pubkey, Some(config)).ok()?;
+    
+    if let Ok(Some(price)) = read_oracle_price(
+        pyth.as_ref(),
+        switchboard.as_ref(),
+        Arc::clone(rpc_client),
+        Some(config),
+    )
+    .await
+    {
+        let confidence_ratio = price.confidence / price.price;
+        let confidence_bps = (confidence_ratio * 10_000.0) as u16;
+        log::debug!(
+            "Oracle confidence slippage: {} bps (confidence: ${:.4}, price: ${:.4})",
+            confidence_bps,
+            price.confidence,
+            price.price
+        );
+        return Some(confidence_bps);
+    }
+    
+    None
+}
 
 /// Calculate transaction fee in USD
 /// 
@@ -292,57 +323,10 @@ pub async fn calculate_liquidation_opportunity(
     // If Jupiter API is enabled, this will be replaced with real-time market data
     let estimated_dex_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
 
-    // Oracle confidence: Price uncertainty from oracle (±1σ, 68% confidence interval)
     let oracle_confidence_bps = if let Some(client) = &rpc_client {
-        match collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>() {
-            Ok(mint_pubkey) => {
-                match get_oracle_accounts_from_mint(&mint_pubkey, Some(config)) {
-                    Ok((pyth, switchboard)) => {
-                        match read_oracle_price(
-                            pyth.as_ref(),
-                            switchboard.as_ref(),
-                            Arc::clone(client),
-                            Some(config),
-                        )
-                        .await
-                        {
-                            Ok(Some(oracle_price)) => {
-                                // Pyth confidence = ±1σ (standard deviation), representing 68% confidence interval
-                                // Use confidence directly - it already represents price uncertainty
-                                // Multiplying by Z-score (1.96) is statistically incorrect
-                                let confidence_ratio = oracle_price.confidence / oracle_price.price;
-                                let confidence_bps = (confidence_ratio * 10_000.0) as u16;
-                                log::debug!(
-                                    "Oracle confidence slippage: {} bps (confidence: ${:.4}, price: ${:.4})",
-                                    confidence_bps,
-                                    oracle_price.confidence,
-                                    oracle_price.price
-                                );
-                                confidence_bps
-                            }
-                            Ok(None) => {
-                                log::warn!("Oracle price not available, using default confidence slippage: {} bps", config.default_oracle_confidence_slippage_bps);
-                                config.default_oracle_confidence_slippage_bps
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to read oracle price: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
-                                config.default_oracle_confidence_slippage_bps
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to get oracle accounts: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
-                        config.default_oracle_confidence_slippage_bps
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to parse collateral mint: {}, using default confidence slippage: {} bps", e, config.default_oracle_confidence_slippage_bps);
-                config.default_oracle_confidence_slippage_bps
-            }
-        }
+        get_oracle_confidence_bps(&collateral_asset.mint, client, config).await
+            .unwrap_or(config.default_oracle_confidence_slippage_bps)
     } else {
-        log::debug!("RPC client not provided, using default oracle confidence slippage: {} bps", config.default_oracle_confidence_slippage_bps);
         config.default_oracle_confidence_slippage_bps
     };
 
@@ -361,21 +345,18 @@ pub async fn calculate_liquidation_opportunity(
     
     let needs_swap = collateral_asset.mint != debt_asset.mint;
     
-    // If swap is needed and Jupiter API is enabled, get real-time slippage estimate
     let final_dex_slippage_bps = if needs_swap && config.use_jupiter_api {
         match (
-            collateral_asset.mint.parse::<solana_sdk::pubkey::Pubkey>(),
-            debt_asset.mint.parse::<solana_sdk::pubkey::Pubkey>(),
+            crate::utils::parse_pubkey_opt(&collateral_asset.mint),
+            crate::utils::parse_pubkey_opt(&debt_asset.mint),
         ) {
-            (Ok(collateral_mint), Ok(debt_mint)) => {
-                // Get real-time slippage from Jupiter API
-                // Amount is in token's smallest unit (e.g., lamports for SOL)
+            (Some(collateral_mint), Some(debt_mint)) => {
                 get_slippage_estimate(
                     &collateral_mint,
                     &debt_mint,
                     seizable_collateral,
                     estimated_dex_slippage_bps,
-                    true, // use_jupiter_api
+                    true,
                 )
                 .await
             }
@@ -692,7 +673,7 @@ mod tests {
         let obligation_address_str = std::env::var("TEST_OBLIGATION_ADDRESS")
             .expect("TEST_OBLIGATION_ADDRESS environment variable must be set");
         
-        let obligation_address = Pubkey::from_str(&obligation_address_str)
+        let obligation_address = crate::utils::parse_pubkey(&obligation_address_str)
             .expect("Invalid TEST_OBLIGATION_ADDRESS format");
 
         // Get RPC URL from environment or use default

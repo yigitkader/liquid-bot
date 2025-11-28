@@ -14,6 +14,34 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 
+fn build_liquidation_accounts(
+    source_liquidity: Pubkey,
+    destination_collateral: Pubkey,
+    repay_reserve: Pubkey,
+    repay_reserve_liquidity_supply: Pubkey,
+    withdraw_reserve: Pubkey,
+    withdraw_reserve_collateral_supply: Pubkey,
+    obligation: Pubkey,
+    lending_market: Pubkey,
+    lending_market_authority: Pubkey,
+    liquidator: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(source_liquidity, false),
+        AccountMeta::new(destination_collateral, false),
+        AccountMeta::new(repay_reserve, false),
+        AccountMeta::new(repay_reserve_liquidity_supply, false),
+        AccountMeta::new(withdraw_reserve, false),
+        AccountMeta::new(withdraw_reserve_collateral_supply, false),
+        AccountMeta::new(obligation, false),
+        AccountMeta::new_readonly(lending_market, false),
+        AccountMeta::new_readonly(lending_market_authority, false),
+        AccountMeta::new_readonly(liquidator, true),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+    ]
+}
+
 // Solend IDL account structures
 pub mod solend_idl {
     use borsh::{BorshDeserialize, BorshSerialize};
@@ -361,67 +389,25 @@ impl Protocol for SolendProtocol {
             return Ok(position.health_factor);
         }
 
-        /// Calculate health factor using Solend's formula
-        /// 
-        /// ⚠️ CRITICAL: Solend uses Liquidation Threshold, NOT LTV for health factor calculation!
-        /// 
-        /// Definitions:
-        /// - LTV (Loan-to-Value): Maximum borrowing ratio (e.g., 75%)
-        ///   Used to determine how much can be borrowed initially
-        /// - Liquidation Threshold: When liquidation is triggered (e.g., 80%)
-        ///   Used to calculate health factor and determine liquidation eligibility
-        /// 
-        /// Health Factor Formula:
-        ///   HF = (Weighted Collateral) / Total Debt
-        ///   Where Weighted Collateral = Σ(Collateral × Liquidation Threshold)
-        /// 
-        /// Example:
-        ///   - Collateral: $1,000
-        ///   - Debt: $800
-        ///   - LTV: 75%
-        ///   - Liquidation Threshold: 80%
-        ///   
-        ///   Health Factor = ($1,000 × 0.80) / $800 = 1.0
-        ///   (NOT: $1,000 × 0.75 / $800 = 0.9375)
-        /// 
-        /// Reference: Solend SDK src/state/obligation.ts
-        ///   const weightedCollateral = deposits.reduce(
-        ///     (sum, d) => sum + d.marketValue * reserve.config.liquidationThreshold,
-        ///     0
-        ///   );
-        ///   const healthFactor = weightedCollateral / totalBorrow;
-        /// 
-        /// Validation: This implementation matches Solend SDK behavior exactly.
-        /// Health factor < 1.0 means the position is liquidatable.
         if position.total_debt_usd == 0.0 {
             return Ok(f64::INFINITY);
         }
 
-        // Use liquidation threshold (not LTV) for weighted collateral calculation
-        let mut weighted_collateral = 0.0;
-        for asset in &position.collateral_assets {
-            weighted_collateral += asset.amount_usd * asset.liquidation_threshold;
-        }
-
-        // Health Factor = Weighted Collateral / Total Debt
-        let health_factor = weighted_collateral / position.total_debt_usd;
+        let weighted_collateral: f64 = position
+            .collateral_assets
+            .iter()
+            .map(|asset| asset.amount_usd * asset.liquidation_threshold)
+            .sum();
         
-        Ok(health_factor)
+        Ok(weighted_collateral / position.total_debt_usd)
     }
 
     fn get_liquidation_params(&self) -> LiquidationParams {
-        // Use config values if available, otherwise use Solend protocol defaults
         let config = self.config.as_ref();
         LiquidationParams {
-            liquidation_bonus: config
-                .map(|c| c.liquidation_bonus)
-                .unwrap_or(0.05), // Default: 5% liquidation bonus
-            close_factor: config
-                .map(|c| c.close_factor)
-                .unwrap_or(0.5), // Default: 50% close factor
-            max_liquidation_slippage: config
-                .map(|c| c.max_liquidation_slippage)
-                .unwrap_or(0.01), // Default: 1% max slippage
+            liquidation_bonus: config.map(|c| c.liquidation_bonus).unwrap_or(0.05),
+            close_factor: config.map(|c| c.close_factor).unwrap_or(0.5),
+            max_liquidation_slippage: config.map(|c| c.max_liquidation_slippage).unwrap_or(0.01),
         }
     }
 
@@ -431,128 +417,48 @@ impl Protocol for SolendProtocol {
         liquidator: &Pubkey,
         rpc_client: Option<Arc<SolanaClient>>,
     ) -> Result<Instruction> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"global:liquidateObligation");
-        let discriminator: [u8; 8] = hasher.finalize()[0..8]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to create discriminator"))?;
-        
-        log::info!(
-            "Using Anchor discriminator format: discriminator={:02x?}, amount={}",
-            discriminator,
-            opportunity.max_liquidatable_amount
-        );
-        
-        let (
-            source_liquidity,
-            destination_collateral,
-            obligation,
-            lending_market,
-            lending_market_authority,
-            repay_reserve,
-            repay_reserve_liquidity_supply,
-            withdraw_reserve,
-            withdraw_reserve_collateral_supply,
-            _withdraw_reserve_collateral_mint, // Not used in instruction, only for ATA derivation
-        ) = if let Some(rpc) = rpc_client.as_ref() {
-            self.resolve_liquidation_accounts(opportunity, liquidator, rpc)
-                .await?
-        } else {
-            log::warn!("⚠️  RPC client not provided, using placeholder accounts");
-            (
-                Pubkey::default(),
-                Pubkey::default(),
-                Pubkey::default(),
-                self.program_id,
-                Pubkey::default(),
-                Pubkey::default(),
-                Pubkey::default(),
-                Pubkey::default(),
-                Pubkey::default(),
-                Pubkey::default(),
-            )
+        let discriminator: [u8; 8] = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"global:liquidateObligation");
+            hasher.finalize()[0..8]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to create discriminator"))?
         };
-
-        // ⚠️ CRITICAL: Account order must match Solend program exactly!
-        // 
-        // Implementation Status: ✅ VERIFIED
-        // This order is based on Solend's processor.rs source code:
-        // https://github.com/solendprotocol/solana-program-library/blob/master/token-lending/program/src/processor.rs
-        // fn process_liquidate_obligation
-        //
-        // Verification: Can be validated using validate_instruction_accounts binary:
-        //   cargo run --bin validate_instruction_accounts -- --tx <LIQUIDATION_TX_SIGNATURE>
-        //
-        // Account order (12 accounts):
-        // 1. sourceLiquidity, 2. destinationCollateral, 3. repayReserve, 4. repayReserveLiquiditySupply,
-        // 5. withdrawReserve, 6. withdrawReserveCollateralSupply, 7. obligation, 8. lendingMarket,
-        // 9. lendingMarketAuthority, 10. userTransferAuthority, 11. clock, 12. tokenProgram
-        //   Compare the accounts array order with this implementation
-        //
-        // Account order (per Solend source code):
-        // 1. source_liquidity_info
-        // 2. destination_collateral_info
-        // 3. repay_reserve_info
-        // 4. repay_reserve_liquidity_supply_info
-        // 5. withdraw_reserve_info
-        // 6. withdraw_reserve_collateral_supply_info
-        // 7. obligation_info
-        // 8. lending_market_info
-        // 9. lending_market_authority_info
-        // 10. user_transfer_authority_info (liquidator)
-        // 11. clock (Sysvar)
-        // 12. token_program_id
-        //
-        // NOTE: Oracle accounts (Pyth/Switchboard) are NOT included in the instruction.
-        // The program reads oracle prices from on-chain accounts, not instruction arguments.
-        let accounts = vec![
-            // 1. sourceLiquidity - liquidator's token account for debt (isMut: true, isSigner: false)
-            AccountMeta::new(source_liquidity, false),
-            // 2. destinationCollateral - liquidator's token account for collateral (isMut: true, isSigner: false)
-            AccountMeta::new(destination_collateral, false),
-            // 3. repayReserve - the reserve we're repaying debt to (isMut: true, isSigner: false)
-            AccountMeta::new(repay_reserve, false),
-            // 4. repayReserveLiquiditySupply - liquidity supply token account of repay reserve (isMut: true, isSigner: false)
-            AccountMeta::new(repay_reserve_liquidity_supply, false),
-            // 5. withdrawReserve - the reserve we're withdrawing collateral from (isMut: true, isSigner: false)
-            AccountMeta::new(withdraw_reserve, false),
-            // 6. withdrawReserveCollateralSupply - collateral supply token account of withdraw reserve (isMut: true, isSigner: false)
-            AccountMeta::new(withdraw_reserve_collateral_supply, false),
-            // 7. obligation - obligation account being liquidated (isMut: true, isSigner: false)
-            AccountMeta::new(obligation, false),
-            // 8. lendingMarket - lending market account (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market, false),
-            // 9. lendingMarketAuthority - lending market authority PDA (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(lending_market_authority, false),
-            // 10. userTransferAuthority - liquidator pubkey (isMut: false, isSigner: true)
-            AccountMeta::new_readonly(*liquidator, true),
-            // 11. clock - Clock sysvar (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
-            // 12. tokenProgram - SPL Token program (isMut: false, isSigner: false)
-            AccountMeta::new_readonly(spl_token::id(), false),
-        ];
-
         
-        if accounts.len() != 12 {
-            return Err(anyhow::anyhow!(
-                "Account count mismatch: expected 12 accounts (per Solend program code), got {}",
-                accounts.len()
-            ));
-        }
+        let accounts = if let Some(rpc) = rpc_client.as_ref() {
+            let (
+                source_liquidity,
+                destination_collateral,
+                obligation,
+                lending_market,
+                lending_market_authority,
+                repay_reserve,
+                repay_reserve_liquidity_supply,
+                withdraw_reserve,
+                withdraw_reserve_collateral_supply,
+                _,
+            ) = self.resolve_liquidation_accounts(opportunity, liquidator, rpc).await?;
+            
+            build_liquidation_accounts(
+                source_liquidity,
+                destination_collateral,
+                repay_reserve,
+                repay_reserve_liquidity_supply,
+                withdraw_reserve,
+                withdraw_reserve_collateral_supply,
+                obligation,
+                lending_market,
+                lending_market_authority,
+                *liquidator,
+            )
+        } else {
+            log::warn!("RPC client not provided, using placeholder accounts");
+            return Err(anyhow::anyhow!("RPC client required for liquidation"));
+        };
         
         let mut data = Vec::with_capacity(16);
         data.extend_from_slice(&discriminator);
         data.extend_from_slice(&opportunity.max_liquidatable_amount.to_le_bytes());
-
-        log::debug!(
-            "Instruction data: discriminator={:02x?}, amount={}, data_len={}, data_hex={}",
-            discriminator,
-            opportunity.max_liquidatable_amount,
-            data.len(),
-            data.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        );
 
         Ok(Instruction {
             program_id: self.program_id,
