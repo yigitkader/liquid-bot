@@ -10,7 +10,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::sync::Arc;
+use sha2::Digest;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -38,31 +40,42 @@ struct SubscribeError {
     message: String,
 }
 
-/// Account update notification from Solana PubSub API
+/// Program notification from Solana PubSub API
+/// Format: https://docs.solana.com/api/websocket#programsubscribe
 #[derive(Deserialize, Debug)]
-struct AccountNotification {
+struct ProgramNotification {
     jsonrpc: String,
     method: String,
-    params: AccountNotificationParams,
+    params: ProgramNotificationParams,
 }
 
 #[derive(Deserialize, Debug)]
-struct AccountNotificationParams {
-    result: AccountNotificationResult,
+struct ProgramNotificationParams {
+    result: ProgramNotificationResult,
     subscription: u64,
 }
 
 #[derive(Deserialize, Debug)]
-struct AccountNotificationResult {
-    #[serde(rename = "account")]
-    account: AccountData,
+struct ProgramNotificationResult {
     #[serde(rename = "context")]
     context: NotificationContext,
+    #[serde(rename = "value")]
+    value: ProgramAccountValue,
 }
 
 #[derive(Deserialize, Debug)]
 struct NotificationContext {
     slot: u64,
+}
+
+/// Program account value in notification
+/// This contains the account pubkey and account data
+#[derive(Deserialize, Debug)]
+struct ProgramAccountValue {
+    #[serde(rename = "pubkey")]
+    pubkey: String, // Account pubkey as string
+    #[serde(rename = "account")]
+    account: AccountData,
 }
 
 #[derive(Deserialize, Debug)]
@@ -74,10 +87,19 @@ struct AccountData {
     rent_epoch: u64,
 }
 
+/// Account cache for tracking known accounts
+/// Used to identify accounts from WebSocket notifications
+type AccountCache = Arc<tokio::sync::RwLock<HashMap<String, Pubkey>>>;
+
 /// WebSocket listener - account değişikliklerini dinler
 /// 
 /// Solana WebSocket PubSub API kullanarak program account'larını real-time dinler.
 /// Bu yaklaşım RPC polling'den çok daha hızlıdır (<100ms latency) ve rate limit sorunu yoktur.
+/// 
+/// Strategy:
+/// 1. Initial account discovery: RPC ile tüm program account'larını fetch et ve cache'le
+/// 2. WebSocket subscription: programSubscribe ile değişiklikleri dinle
+/// 3. Real-time updates: Gelen bildirimleri parse et ve event bus'a yayınla
 pub async fn run_ws_listener(
     bus: EventBus,
     config: Config,
@@ -87,7 +109,6 @@ pub async fn run_ws_listener(
 ) -> Result<()> {
     let program_id = protocol.program_id();
     let ws_url = config.rpc_ws_url.clone();
-    let mut subscription_id_counter = 1u64;
     let mut reconnect_delay = Duration::from_secs(1);
     let max_reconnect_delay = Duration::from_secs(60);
     let mut consecutive_errors = 0u32;
@@ -100,6 +121,33 @@ pub async fn run_ws_listener(
     );
     log::info!("   WebSocket URL: {}", ws_url);
 
+    // Step 1: Initial account discovery via RPC
+    // This ensures we have all existing accounts before starting WebSocket
+    log::info!("🔍 Performing initial account discovery via RPC...");
+    let account_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    
+    match initial_account_discovery(
+        &rpc_client,
+        &protocol,
+        &bus,
+        Arc::clone(&account_cache),
+        Arc::clone(&health_manager),
+    )
+    .await
+    {
+        Ok(count) => {
+            log::info!("✅ Initial discovery complete: {} accounts found and cached", count);
+            consecutive_errors = 0; // Reset on successful discovery
+        }
+        Err(e) => {
+            log::warn!("⚠️  Initial discovery failed: {}. Continuing with WebSocket only.", e);
+            // Continue anyway - WebSocket will still work for new accounts
+        }
+    }
+
+    // Step 2: Start WebSocket listener
+    let mut subscription_id_counter = 1u64;
+
     loop {
         match connect_and_listen(
             &ws_url,
@@ -108,6 +156,7 @@ pub async fn run_ws_listener(
             Arc::clone(&rpc_client),
             protocol.as_ref(),
             Arc::clone(&health_manager),
+            Arc::clone(&account_cache),
             &mut subscription_id_counter,
         )
         .await
@@ -146,6 +195,63 @@ pub async fn run_ws_listener(
     Ok(())
 }
 
+/// Initial account discovery: Fetch all program accounts via RPC and cache them
+async fn initial_account_discovery(
+    rpc_client: &Arc<SolanaClient>,
+    protocol: &Arc<dyn Protocol>,
+    bus: &EventBus,
+    account_cache: AccountCache,
+    health_manager: Arc<HealthManager>,
+) -> Result<usize> {
+    let program_id = protocol.program_id();
+
+    // Fetch all program accounts
+    let accounts = rpc_client
+        .get_program_accounts(&program_id)
+        .await
+        .context("Failed to fetch program accounts for initial discovery")?;
+
+    log::debug!(
+        "Fetched {} accounts for initial discovery (program: {})",
+        accounts.len(),
+        program_id
+    );
+
+    let mut position_count = 0;
+    let mut cache = account_cache.write().await;
+
+    // Process each account
+    for (account_pubkey, account) in accounts {
+        // Cache the account pubkey (using account data hash as key for lookup)
+        // Note: We hash the raw account data for cache lookup
+        let account_data_hash = format!("{:x}", sha2::Sha256::digest(&account.data));
+        cache.insert(account_data_hash, account_pubkey);
+
+        // Parse and publish position
+        match protocol
+            .parse_account_position(&account_pubkey, &account, Some(Arc::clone(rpc_client)))
+            .await
+        {
+            Ok(Some(position)) => {
+                bus.publish(Event::AccountUpdated(position))
+                    .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))?;
+                position_count += 1;
+            }
+            Ok(None) => {
+                // This account is not a position (e.g., market account, reserve account, etc.)
+                // Ignore it
+            }
+            Err(e) => {
+                log::warn!("Failed to parse account {}: {}", account_pubkey, e);
+                // Continue on parse error
+            }
+        }
+    }
+
+    health_manager.record_successful_poll().await;
+    Ok(position_count)
+}
+
 async fn connect_and_listen(
     ws_url: &str,
     program_id: &Pubkey,
@@ -153,6 +259,7 @@ async fn connect_and_listen(
     rpc_client: Arc<SolanaClient>,
     protocol: &dyn Protocol,
     health_manager: Arc<HealthManager>,
+    account_cache: AccountCache,
     subscription_id_counter: &mut u64,
 ) -> Result<()> {
     // Connect to WebSocket
@@ -166,6 +273,7 @@ async fn connect_and_listen(
 
     // Subscribe to program accounts
     // Solana PubSub API: programSubscribe method
+    // Documentation: https://docs.solana.com/api/websocket#programsubscribe
     let subscribe_request = SubscribeRequest {
         jsonrpc: "2.0".to_string(),
         id: *subscription_id_counter,
@@ -194,6 +302,7 @@ async fn connect_and_listen(
     // Wait for subscription confirmation
     let mut subscription_id: Option<u64> = None;
     let mut confirmed = false;
+    let mut consecutive_errors = 0u32;
 
     // Read messages with timeout
     loop {
@@ -208,8 +317,8 @@ async fn connect_and_listen(
                             if let Some(sub_id) = response.result {
                                 subscription_id = Some(sub_id);
                                 confirmed = true;
-                                log::info!("✅ Subscribed to program accounts (subscription ID: {})", sub_id);
                                 consecutive_errors = 0; // Reset on successful subscription
+                                log::info!("✅ Subscribed to program accounts (subscription ID: {})", sub_id);
                                 health_manager.record_successful_poll().await;
                             } else if let Some(error) = response.error {
                                 return Err(anyhow::anyhow!(
@@ -221,32 +330,38 @@ async fn connect_and_listen(
                             continue;
                         }
 
-                        // Try to parse as account notification
-                        // Note: Solana programSubscribe notifications have a different structure
-                        // We need to extract the account pubkey from the notification
-                        if let Ok(notification) = serde_json::from_str::<AccountNotification>(&text) {
-                            if notification.method == "accountNotification" || notification.method == "programNotification" {
+                        // Try to parse as program notification
+                        // Format: https://docs.solana.com/api/websocket#programsubscribe
+                        // The notification contains the account pubkey in params.result.value.pubkey
+                        if let Ok(notification) = serde_json::from_str::<ProgramNotification>(&text) {
+                            if notification.method == "programNotification" {
                                 if let Some(sub_id) = subscription_id {
                                     if notification.params.subscription == sub_id {
-                                        // For programSubscribe, we need to get the account pubkey
-                                        // The account pubkey is typically in the notification params
-                                        // Let's parse it from the raw JSON
-                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                                            if let Some(params) = parsed.get("params") {
-                                                if let Some(result) = params.get("result") {
-                                                    // Try to find account pubkey in the result
-                                                    // For programSubscribe, the account pubkey might be in a different field
-                                                    // Let's use a more flexible approach
-                                                    handle_program_notification(
-                                                        &text,
-                                                        &notification.params.result.account,
-                                                        bus,
-                                                        Arc::clone(&rpc_client),
-                                                        protocol,
-                                                        Arc::clone(&health_manager),
-                                                    )
-                                                    .await?;
+                                        // Extract account pubkey from notification
+                                        let account_pubkey_str = &notification.params.result.value.pubkey;
+                                        match account_pubkey_str.parse::<Pubkey>() {
+                                            Ok(account_pubkey) => {
+                                                // Process the notification
+                                                if let Err(e) = handle_program_notification(
+                                                    account_pubkey,
+                                                    &notification.params.result.value.account,
+                                                    bus,
+                                                    Arc::clone(&rpc_client),
+                                                    protocol,
+                                                    Arc::clone(&health_manager),
+                                                    Arc::clone(&account_cache),
+                                                )
+                                                .await
+                                                {
+                                                    log::warn!("Failed to handle program notification: {}", e);
+                                                    consecutive_errors += 1;
+                                                } else {
+                                                    consecutive_errors = 0; // Reset on success
                                                 }
+                                            }
+                                            Err(e) => {
+                                                log::warn!("Failed to parse account pubkey '{}': {}", account_pubkey_str, e);
+                                                consecutive_errors += 1;
                                             }
                                         }
                                     }
@@ -254,28 +369,37 @@ async fn connect_and_listen(
                             }
                             continue;
                         }
-                        
-                        // Also try to parse as a generic notification (fallback)
+
+                        // Fallback: Try to parse as generic JSON to extract pubkey
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(method) = parsed.get("method").and_then(|m| m.as_str()) {
-                                if method == "programNotification" || method == "accountNotification" {
+                                if method == "programNotification" {
                                     if let Some(params) = parsed.get("params") {
                                         if let Some(result) = params.get("result") {
-                                            // Extract account data
-                                            if let Some(account_data) = result.get("account") {
-                                                if let Ok(account) = serde_json::from_value::<AccountData>(account_data.clone()) {
-                                                    // Try to extract account pubkey from the notification
-                                                    // For programSubscribe, we might need to get it from a different field
-                                                    // For now, we'll need to use a workaround
-                                                    handle_program_notification(
-                                                        &text,
-                                                        &account,
-                                                        bus,
-                                                        Arc::clone(&rpc_client),
-                                                        protocol,
-                                                        Arc::clone(&health_manager),
-                                                    )
-                                                    .await?;
+                                            if let Some(value) = result.get("value") {
+                                                if let Some(pubkey_str) = value.get("pubkey").and_then(|p| p.as_str()) {
+                                                    if let Ok(account_pubkey) = pubkey_str.parse::<Pubkey>() {
+                                                        if let Some(account_data) = value.get("account") {
+                                                            if let Ok(account) = serde_json::from_value::<AccountData>(account_data.clone()) {
+                                                                if let Err(e) = handle_program_notification(
+                                                                    account_pubkey,
+                                                                    &account,
+                                                                    bus,
+                                                                    Arc::clone(&rpc_client),
+                                                                    protocol,
+                                                                    Arc::clone(&health_manager),
+                                                                    Arc::clone(&account_cache),
+                                                                )
+                                                                .await
+                                                                {
+                                                                    log::warn!("Failed to handle program notification (fallback): {}", e);
+                                                                    consecutive_errors += 1;
+                                                                } else {
+                                                                    consecutive_errors = 0;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -322,54 +446,26 @@ async fn connect_and_listen(
 }
 
 async fn handle_program_notification(
-    raw_json: &str,
+    account_pubkey: Pubkey,
     account_data: &AccountData,
     bus: &EventBus,
     rpc_client: Arc<SolanaClient>,
     protocol: &dyn Protocol,
     health_manager: Arc<HealthManager>,
+    account_cache: AccountCache,
 ) -> Result<()> {
-    // For programSubscribe, we need to extract the account pubkey from the notification
-    // The account pubkey is typically in params.result.account or a similar field
-    // Let's parse the raw JSON to find it
-    let parsed: serde_json::Value = serde_json::from_str(raw_json)
-        .context("Failed to parse notification JSON")?;
-    
-    // Try to find account pubkey in various possible locations
-    let account_pubkey = if let Some(params) = parsed.get("params") {
-        if let Some(result) = params.get("result") {
-            // Check if there's a pubkey field
-            if let Some(pubkey_str) = result.get("pubkey").and_then(|p| p.as_str()) {
-                pubkey_str.parse::<Pubkey>().ok()
-            } else if let Some(account_obj) = result.get("account") {
-                // Sometimes the pubkey is nested in the account object
-                account_obj.get("pubkey").and_then(|p| p.as_str())
-                    .and_then(|s| s.parse::<Pubkey>().ok())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // If we couldn't find the pubkey in the notification, we can't process it
-    // This is a limitation - we need the account address to parse the position
-    // In a production system, you might want to fetch all program accounts initially
-    // and maintain a mapping, or use a different subscription method
-    let account_pubkey = match account_pubkey {
-        Some(pk) => pk,
-        None => {
-            log::debug!("Could not extract account pubkey from notification, skipping");
-            return Ok(());
-        }
-    };
-
-    // Decode base64 account data
+    // Update account cache
+    // Decode account data first, then hash it for cache lookup
     let account_bytes = base64::decode(&account_data.data[0])
-        .context("Failed to decode base64 account data")?;
+        .context("Failed to decode account data for cache")?;
+    let account_data_hash = format!("{:x}", sha2::Sha256::digest(&account_bytes));
+    {
+        let mut cache = account_cache.write().await;
+        cache.insert(account_data_hash, account_pubkey);
+    }
+
+    // Account bytes already decoded above for cache
+    // Reuse the decoded bytes
 
     // Parse owner pubkey
     let owner_pubkey = account_data.owner.parse::<Pubkey>()

@@ -208,6 +208,7 @@ pub async fn get_slippage_estimate(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
     use super::*;
     use solana_sdk::pubkey::Pubkey;
 
