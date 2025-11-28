@@ -5,6 +5,7 @@ use crate::event_bus::EventBus;
 use crate::health::HealthManager;
 use crate::protocol::Protocol;
 use crate::solana_client::SolanaClient;
+use base64::{Engine as _, engine::general_purpose};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,9 @@ struct SubscribeRequest {
 /// WebSocket subscription response from Solana PubSub API
 #[derive(Deserialize, Debug)]
 struct SubscribeResponse {
+    #[allow(dead_code)]
     jsonrpc: String,
+    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<u64>, // Subscription ID
     error: Option<SubscribeError>,
@@ -44,6 +47,7 @@ struct SubscribeError {
 /// Format: https://docs.solana.com/api/websocket#programsubscribe
 #[derive(Deserialize, Debug)]
 struct ProgramNotification {
+    #[allow(dead_code)]
     jsonrpc: String,
     method: String,
     params: ProgramNotificationParams,
@@ -58,6 +62,7 @@ struct ProgramNotificationParams {
 #[derive(Deserialize, Debug)]
 struct ProgramNotificationResult {
     #[serde(rename = "context")]
+    #[allow(dead_code)]
     context: NotificationContext,
     #[serde(rename = "value")]
     value: ProgramAccountValue,
@@ -65,6 +70,7 @@ struct ProgramNotificationResult {
 
 #[derive(Deserialize, Debug)]
 struct NotificationContext {
+    #[allow(dead_code)]
     slot: u64,
 }
 
@@ -303,6 +309,7 @@ async fn connect_and_listen(
     let mut subscription_id: Option<u64> = None;
     let mut confirmed = false;
     let mut consecutive_errors = 0u32;
+    const MAX_CONSECUTIVE_NOTIFICATION_ERRORS: u32 = 100; // Max errors before reconnecting
 
     // Read messages with timeout
     loop {
@@ -355,6 +362,13 @@ async fn connect_and_listen(
                                                 {
                                                     log::warn!("Failed to handle program notification: {}", e);
                                                     consecutive_errors += 1;
+                                                    if consecutive_errors >= MAX_CONSECUTIVE_NOTIFICATION_ERRORS {
+                                                        log::error!(
+                                                            "Too many consecutive notification errors ({}), reconnecting...",
+                                                            consecutive_errors
+                                                        );
+                                                        return Ok(()); // Will trigger reconnect
+                                                    }
                                                 } else {
                                                     consecutive_errors = 0; // Reset on success
                                                 }
@@ -394,6 +408,13 @@ async fn connect_and_listen(
                                                                 {
                                                                     log::warn!("Failed to handle program notification (fallback): {}", e);
                                                                     consecutive_errors += 1;
+                                                                    if consecutive_errors >= MAX_CONSECUTIVE_NOTIFICATION_ERRORS {
+                                                                        log::error!(
+                                                                            "Too many consecutive notification errors ({}), reconnecting...",
+                                                                            consecutive_errors
+                                                                        );
+                                                                        return Ok(()); // Will trigger reconnect
+                                                                    }
                                                                 } else {
                                                                     consecutive_errors = 0;
                                                                 }
@@ -456,7 +477,8 @@ async fn handle_program_notification(
 ) -> Result<()> {
     // Update account cache
     // Decode account data first, then hash it for cache lookup
-    let account_bytes = base64::decode(&account_data.data[0])
+    let account_bytes = general_purpose::STANDARD
+        .decode(&account_data.data[0])
         .context("Failed to decode account data for cache")?;
     let account_data_hash = format!("{:x}", sha2::Sha256::digest(&account_bytes));
     {
