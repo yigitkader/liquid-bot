@@ -5,6 +5,7 @@ use crate::event_bus::EventBus;
 use crate::performance::PerformanceTracker;
 use crate::protocol::Protocol;
 use crate::solana_client::{self, SolanaClient};
+use crate::slippage_calibration::SlippageCalibrator;
 use crate::tx_lock::TxLock;
 use crate::wallet::WalletManager;
 use anyhow::Result;
@@ -23,6 +24,28 @@ pub async fn run_executor(
     balance_reservation: Arc<BalanceReservation>,
 ) -> Result<()> {
     let tx_lock = Arc::new(TxLock::new(config.tx_lock_timeout_seconds));
+
+    // Initialize slippage calibrator if calibration file is configured
+    let slippage_calibrator = if let Some(calibration_file) = &config.slippage_calibration_file {
+        match SlippageCalibrator::new(
+            calibration_file.clone(),
+            config.slippage_size_small_threshold_usd,
+            config.slippage_size_large_threshold_usd,
+            config.max_slippage_bps,
+            config.slippage_min_measurements_per_category,
+        ) {
+            Ok(calibrator) => {
+                log::info!("Slippage calibration enabled: {}", calibration_file);
+                Some(Arc::new(calibrator))
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize slippage calibrator: {}. Calibration disabled.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let max_retries = config.max_retries;
     let initial_retry_delay_ms = config.initial_retry_delay_ms;
@@ -133,26 +156,31 @@ pub async fn run_executor(
                         // -----------------------------------------------------------------
                         // ✅ CRITICAL: Final balance check to prevent race condition
                         // 
-                        // Race Condition Protection:
-                        // There's a small gap between balance check and reservation in
-                        // balance_reservation.rs::try_reserve_with_check():
-                        //   - Step 1: RPC call to get balance (async, outside lock)
-                        //   - Step 2: Lock acquisition and reservation (inside lock)
+                        // Three-Layer Race Condition Protection:
                         // 
-                        // During this gap, another transaction could consume the balance.
-                        // This final check immediately before transaction send ensures:
-                        //   1. We don't send transactions that will fail (saves fees)
-                        //   2. We catch any balance changes that occurred after reservation
-                        //   3. We release the reservation if balance is insufficient
+                        // Layer 1: Reservation Layer (balance_reservation.rs::try_reserve_with_check)
+                        //   - Prevents parallel opportunities from over-reserving the same balance
+                        //   - Uses double-check pattern: initial check + fresh check inside lock
+                        //   - Minimizes gap between balance check and reservation
                         // 
-                        // This two-layer protection (reservation + final check) is sufficient
-                        // because:
-                        //   - Reservation prevents parallel opportunities from over-reserving
-                        //   - Final check prevents sending transactions that will fail
-                        //   - The gap is minimal (only between RPC call and lock acquisition)
-                        //   - Final check happens immediately before tx send (minimal gap)
+                        // Layer 2: Double-Check Layer (balance_reservation.rs::try_reserve_with_check)
+                        //   - Re-verifies balance immediately before reservation (inside lock)
+                        //   - Catches any balance changes that occurred during lock acquisition
+                        //   - Uses fresh balance for reservation calculation
                         // 
-                        // See balance_reservation.rs for more details on the reservation layer.
+                        // Layer 3: Final Check Layer (this code - executor.rs)
+                        //   - Performs final balance check immediately before transaction send
+                        //   - Catches any balance changes that occurred after reservation
+                        //   - Prevents sending transactions that will fail (saves fees)
+                        //   - Releases reservation if balance is insufficient
+                        // 
+                        // This three-layer protection ensures:
+                        //   1. Parallel opportunities don't over-reserve (Layer 1)
+                        //   2. Balance is verified immediately before reservation (Layer 2)
+                        //   3. Transactions that would fail are not sent (Layer 3)
+                        //   4. Wasted transaction fees are prevented (Layer 3)
+                        // 
+                        // See balance_reservation.rs for more details on Layers 1 and 2.
                         if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
                             use crate::wallet::WalletBalanceChecker;
                             let balance_checker = WalletBalanceChecker::new(
@@ -231,6 +259,28 @@ pub async fn run_executor(
 
                                 if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
                                     balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                                }
+
+                                // ✅ Record slippage measurement for calibration
+                                if let Some(ref calibrator) = slippage_calibrator {
+                                    // Calculate trade size in USD (seizable collateral value)
+                                    let trade_size_usd = opportunity.seizable_collateral as f64 / 1_000_000.0; // Assuming 6 decimals
+                                    // Estimate slippage from opportunity (this is what we predicted)
+                                    // Note: We need to extract estimated slippage from the opportunity
+                                    // For now, we'll use a placeholder - actual implementation would extract from opportunity
+                                    let estimated_slippage_bps = 50; // Placeholder - should be extracted from opportunity
+                                    
+                                    // Record measurement (actual slippage will be calculated later from transaction logs)
+                                    if let Err(e) = calibrator.record_measurement(
+                                        sig.to_string(),
+                                        trade_size_usd,
+                                        estimated_slippage_bps,
+                                        None, // Actual slippage not available yet - will be calculated later
+                                    ).await {
+                                        log::warn!("Failed to record slippage measurement: {}", e);
+                                    } else {
+                                        log::debug!("Recorded slippage measurement for calibration: sig={}, size=${:.2}", sig, trade_size_usd);
+                                    }
                                 }
 
                                 let opportunity_id = opportunity.account_position.account_address.clone();

@@ -85,6 +85,9 @@ pub struct Config {
     pub retry_jitter_max_ms: u64,
     // Jupiter API configuration
     pub use_jupiter_api: bool, // Enable real-time slippage estimation from Jupiter API
+    // Slippage calibration configuration
+    pub slippage_calibration_file: Option<String>, // Path to slippage calibration JSON file
+    pub slippage_min_measurements_per_category: usize, // Minimum measurements per category for calibration
     // Note: WebSocket is now the default data source. RPC polling is used as fallback only.
 }
 
@@ -323,6 +326,14 @@ impl Config {
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
+            // Slippage calibration configuration
+            slippage_calibration_file: env::var("SLIPPAGE_CALIBRATION_FILE")
+                .ok()
+                .or_else(|| Some("slippage_calibration.json".to_string())), // Default file
+            slippage_min_measurements_per_category: env::var("SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
             // Note: WebSocket is now always used as primary data source (best practice)
             // RPC polling is used as automatic fallback if WebSocket fails
         };

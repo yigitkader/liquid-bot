@@ -89,8 +89,15 @@ async fn main() -> Result<()> {
             println!("  LTV: {:.2}%", info.ltv * 100.0);
             println!("  Liquidation Bonus: {:.2}%", info.liquidation_bonus * 100.0);
             println!("\n🔮 Oracle Information:");
-            println!("  Note: Solend's real code has NO oracle_option field!");
-            println!("  Both oracles are stored directly in the account.");
+            println!("  Oracle Option: {} ({})", 
+                info.oracle_option,
+                match info.oracle_option {
+                    0 => "None - no oracle",
+                    1 => "Pyth - active",
+                    2 => "Switchboard - active",
+                    _ => "UNEXPECTED - not 0, 1, or 2!"
+                }
+            );
             if let Some(pyth) = info.pyth_oracle {
                 println!("  ✅ Pyth Oracle: {}", pyth);
             } else {

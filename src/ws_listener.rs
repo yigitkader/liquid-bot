@@ -13,6 +13,7 @@ use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::Digest;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -36,6 +37,9 @@ struct SubscribeResponse {
     result: Option<u64>, // Subscription ID
     error: Option<SubscribeError>,
 }
+
+// Global flag to prevent spamming Helius HTTP+WS warning on every reconnect
+static HELIUS_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Deserialize, Debug)]
 struct SubscribeError {
@@ -190,8 +194,16 @@ pub async fn run_ws_listener(
     
     // ✅ DÜZELTME: Config mutation yerine direkt doğru URL'yi seç
     let mut ws_url = if is_helius_combo {
-        log::info!("💡 Helius HTTP + Helius WS algılandı. Helius WS `programSubscribe` desteklemediği için, WebSocket endpoint'i otomatik olarak Solana'nın resmi WS'ine taşınıyor.");
-        log::info!("   WS: {} -> {}", config.rpc_ws_url, fallback_ws_url);
+        // ✅ WARNING sadece ilk kez göster (reconnect loop'larında spam olmasın)
+        if !HELIUS_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "⚠️  Helius HTTP + Helius WS algılandı. Helius WS `programSubscribe` desteklemediği için, \
+                 WebSocket endpoint'i otomatik olarak Solana'nın resmi WS'ine taşınıyor. \
+                 WS: {} -> {}",
+                config.rpc_ws_url,
+                fallback_ws_url
+            );
+        }
         fallback_ws_url.clone()
     } else {
         config.rpc_ws_url.clone()
@@ -305,12 +317,15 @@ pub async fn run_ws_listener(
                     let is_helius_combo = http_is_helius && ws_is_helius;
 
                     if is_helius_combo && !tried_fallback_ws {
-                        log::info!("💡 Helius HTTP + Helius WS kombinasyonu algılandı, ancak WS programSubscribe desteklemiyor.");
-                        log::info!(
-                            "   Otomatik çözüm: WebSocket endpoint'i Solana'nın resmi WS'ine alınacak: {} -> {}",
-                            ws_url,
-                            fallback_ws_url
-                        );
+                        // ✅ Bu uyarı da sadece ilk kez gösterilsin (global flag ile kontrol)
+                        if !HELIUS_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
+                            log::warn!(
+                                "⚠️  Helius HTTP + Helius WS kombinasyonu algılandı, ancak WS programSubscribe desteklemiyor. \
+                                 WebSocket endpoint'i Solana'nın resmi WS'ine alınacak: {} -> {}",
+                                ws_url,
+                                fallback_ws_url
+                            );
+                        }
                         ws_url = fallback_ws_url.clone();
                         tried_fallback_ws = true;
                         log::info!("🔁 Retrying WebSocket connection with fallback WS endpoint...");

@@ -20,6 +20,7 @@ pub mod balance_reservation;
 pub mod shutdown;
 pub mod health;
 pub mod performance;
+pub mod slippage_calibration;
 pub mod utils;
 
 pub mod protocols {

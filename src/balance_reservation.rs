@@ -101,7 +101,7 @@ impl BalanceReservation {
         }
     }
 
-    /// ✅ ATOMIC: Balance check and reservation in one operation
+    /// ✅ ATOMIC: Balance check and reservation in one operation with double-check pattern
     /// 
     /// This method atomically checks the balance and reserves it, preventing race conditions
     /// where balance is checked and then reserved separately (gap between operations).
@@ -115,54 +115,61 @@ impl BalanceReservation {
     /// 
     /// Because there's a race condition gap between steps 1 and 2.
     /// 
-    /// ⚠️ RACE CONDITION NOTE:
-    /// There's still a small gap between:
-    /// - Step 1: RPC call to get balance (async, outside lock)
-    /// - Step 2: Lock acquisition and reservation (inside lock)
+    /// ✅ DOUBLE-CHECK PATTERN: Try-with-verify
+    /// This method uses a double-check pattern to minimize race conditions:
+    /// 1. **First Check** (outside lock): Get initial balance via RPC
+    /// 2. **Lock Acquisition**: Acquire write lock on reservation map
+    /// 3. **Second Check** (inside lock): Re-verify balance hasn't changed
+    ///    - If balance changed, log warning and use fresh balance
+    /// 4. **Reservation**: Reserve amount if sufficient balance available
     /// 
-    /// During this gap, another transaction could consume the balance.
+    /// This pattern ensures:
+    /// - Balance is verified immediately before reservation (minimal gap)
+    /// - Any balance changes during lock acquisition are detected
+    /// - Reservation uses the most up-to-date balance information
     /// 
-    /// ✅ PROTECTION: Two-Layer Defense
-    /// To fully protect against this race condition, the executor performs a final balance check
-    /// immediately before sending the transaction (see executor.rs lines 132-170).
+    /// ✅ ADDITIONAL PROTECTION: Final Check Layer (executor.rs)
+    /// The executor performs a final balance check immediately before sending the transaction
+    /// (see executor.rs lines 132-170). This provides a third layer of protection:
+    /// - Catches any balance changes that occurred after reservation
+    /// - Prevents sending transactions that will fail (saves fees)
+    /// - Releases reservation if balance is insufficient
     /// 
-    /// This two-layer protection ensures:
+    /// This three-layer protection ensures maximum safety:
     /// 1. **Reservation Layer** (this method): Prevents parallel opportunities from over-reserving
-    ///    - Minimizes the gap by immediately acquiring lock after balance check
-    ///    - Prevents multiple opportunities from reserving the same balance
-    /// 
-    /// 2. **Final Check Layer** (executor.rs): Prevents sending transactions that will fail
-    ///    - Checks balance immediately before transaction send (minimal gap)
-    ///    - Releases reservation if balance is insufficient
-    ///    - Prevents wasted transaction fees on failed transactions
-    /// 
-    /// The gap is minimal and acceptable because:
-    /// - The gap only exists between RPC call and lock acquisition (typically < 1ms)
-    /// - Final check happens immediately before tx send (another < 1ms gap)
-    /// - Total gap is typically < 2ms, which is acceptable for liquidation bot use case
-    /// - Final check catches any balance changes that occurred during the gap
+    /// 2. **Double-Check Layer** (this method): Verifies balance immediately before reservation
+    /// 3. **Final Check Layer** (executor.rs): Prevents sending transactions that will fail
     pub async fn try_reserve_with_check<BC: BalanceChecker>(
         &self,
         mint: &Pubkey,
         amount: u64,
         balance_checker: &BC,
     ) -> Result<Option<ReservationGuard>> {
-        // Atomically: check balance and reserve in one operation
-        // This prevents race conditions where balance is checked, then another
-        // opportunity reserves it before this one can reserve it.
+        // Step 1: Get initial balance (outside lock)
+        // This is the first check to quickly determine if reservation might succeed
+        let initial_balance = balance_checker.get_token_balance(mint).await?;
         
-        // Step 1: Get current balance (this is the only async operation outside the lock)
-        // ⚠️ NOTE: There's a small gap here - between RPC call and lock acquisition,
-        // another transaction could consume the balance. The executor performs a final
-        // balance check before sending the transaction to protect against this.
-        let actual_balance = balance_checker.get_token_balance(mint).await?;
-        
-        // Step 2: Immediately reserve (with lock held)
-        // This minimizes the gap between balance check and reservation
+        // Step 2: Acquire lock and perform double-check
+        // Lock is held during the second check to ensure atomicity
         let mut reserved = self.reserved.write().await;
         
+        // Step 3: ✅ DOUBLE CHECK: Re-verify balance inside lock
+        // This catches any balance changes that occurred between Step 1 and lock acquisition
+        let fresh_balance = balance_checker.get_token_balance(mint).await?;
+        
+        if fresh_balance != initial_balance {
+            log::warn!(
+                "Balance changed during reservation: mint={}, initial={}, fresh={}, delta={}",
+                mint,
+                initial_balance,
+                fresh_balance,
+                fresh_balance as i64 - initial_balance as i64
+            );
+        }
+        
+        // Use fresh balance for reservation calculation
         let currently_reserved = reserved.get(mint).copied().unwrap_or(0);
-        let available = actual_balance.saturating_sub(currently_reserved);
+        let available = fresh_balance.saturating_sub(currently_reserved);
         
         if available >= amount {
             *reserved.entry(*mint).or_insert(0) += amount;
@@ -177,12 +184,13 @@ impl BalanceReservation {
             }))
         } else {
             log::debug!(
-                "Atomic reservation failed: mint={}, required={}, available={}, reserved={}, actual={}",
+                "Atomic reservation failed: mint={}, required={}, available={}, reserved={}, fresh_balance={}, initial_balance={}",
                 mint,
                 amount,
                 available,
                 currently_reserved,
-                actual_balance
+                fresh_balance,
+                initial_balance
             );
             Ok(None)
         }

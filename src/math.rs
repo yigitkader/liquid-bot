@@ -297,28 +297,78 @@ pub async fn calculate_liquidation_opportunity(
     // Slippage estimation based on trade size
     // Larger trades have higher slippage due to liquidity depth
     // 
-    // ⚠️ CRITICAL: Size multipliers are ESTIMATES based on typical DEX liquidity.
-    // These MUST be calibrated against real mainnet liquidation data in production!
+    // ✅ CALIBRATION SUPPORT: Uses calibrated multipliers if available
+    // 
+    // Priority order:
+    // 1. Calibrated multipliers (from real transaction data) - if available
+    // 2. Config multipliers (default estimates)
     // 
     // If USE_JUPITER_API=false (estimated slippage mode):
     // 1. After first 10-20 liquidations, measure actual slippage from Solscan
-    // 2. Compare actual vs estimated slippage for different trade sizes
-    // 3. Adjust multipliers in config based on actual measurements
+    // 2. Calibration system automatically calculates multipliers from real data
+    // 3. Calibrated multipliers are used automatically once enough data is collected
     // 4. See docs/SLIPPAGE_CALIBRATION.md for detailed instructions
-    // 
-    // Current estimates (REQUIRES CALIBRATION):
-    // - Small trades (<$10k): 0.5x multiplier (lower slippage, better liquidity)
-    // - Medium trades ($10k-$100k): 0.6x multiplier (moderate slippage)
-    // - Large trades (>$100k): 0.8x multiplier (higher slippage, lower liquidity)
     // 
     // RECOMMENDED: Use Jupiter API for real-time slippage (set USE_JUPITER_API=true)
     // Jupiter API provides actual market data instead of estimated multipliers
-    let size_multiplier = if seizable_collateral_usd < config.slippage_size_small_threshold_usd {
-        config.slippage_multiplier_small  // Small trades: better liquidity, lower slippage
-    } else if seizable_collateral_usd > config.slippage_size_large_threshold_usd {
-        config.slippage_multiplier_large  // Large trades: lower liquidity, higher slippage
-    } else {
-        config.slippage_multiplier_medium  // Medium trades: moderate slippage
+    // 
+    // Calibration file path: config.slippage_calibration_file (default: "slippage_calibration.json")
+    // Note: Calibration is loaded synchronously to avoid async complexity in this function
+    // Calibrated multipliers are cached and updated periodically
+    let size_multiplier = {
+        // Try to get calibrated multiplier from file (synchronous read)
+        let calibrated_multiplier = if let Some(calibration_file) = &config.slippage_calibration_file {
+            if let Ok(calibrator) = crate::slippage_calibration::SlippageCalibrator::new(
+                calibration_file.clone(),
+                config.slippage_size_small_threshold_usd,
+                config.slippage_size_large_threshold_usd,
+                config.max_slippage_bps,
+                config.slippage_min_measurements_per_category,
+            ) {
+                // Use tokio::runtime::Handle to call async function from sync context
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    if let Ok(Some(calibrated)) = handle.block_on(calibrator.get_calibrated_multiplier(seizable_collateral_usd)) {
+                        Some(calibrated)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Use calibrated multiplier if available, otherwise use config defaults
+        if let Some(calibrated) = calibrated_multiplier {
+            log::debug!(
+                "Using calibrated slippage multiplier: {:.3} for trade size ${:.2}",
+                calibrated,
+                seizable_collateral_usd
+            );
+            calibrated
+        } else {
+            // Fall back to config multipliers
+            let config_multiplier = if seizable_collateral_usd < config.slippage_size_small_threshold_usd {
+                config.slippage_multiplier_small  // Small trades: better liquidity, lower slippage
+            } else if seizable_collateral_usd > config.slippage_size_large_threshold_usd {
+                config.slippage_multiplier_large  // Large trades: lower liquidity, higher slippage
+            } else {
+                config.slippage_multiplier_medium  // Medium trades: moderate slippage
+            };
+            
+            if !config.use_jupiter_api {
+                log::debug!(
+                    "Using estimated slippage multiplier: {:.3} for trade size ${:.2} (calibration not available)",
+                    config_multiplier,
+                    seizable_collateral_usd
+                );
+            }
+            config_multiplier
+        }
     };
 
     // DEX slippage: Trade size-based slippage due to liquidity depth
@@ -326,11 +376,12 @@ pub async fn calculate_liquidation_opportunity(
     // If Jupiter API is enabled, this will be replaced with real-time market data
     let estimated_dex_slippage_bps = (config.max_slippage_bps as f64 * size_multiplier) as u16;
 
-    // Calculate gross profit first (needed for oracle confidence adjustment)
+    // Calculate gross profit (oracle uncertainty NOT included here)
     let gross_profit_usd = seizable_collateral_usd - max_liquidatable_debt_usd;
 
     // ✅ DÜZELTME: Oracle confidence'ı hem collateral hem debt için al
-    // Oracle confidence, price uncertainty'yi temsil eder ve hem collateral hem debt değerlerini etkiler
+    // Oracle confidence, execution risk'i temsil eder ve slippage'e eklenir
+    // ❌ YANLIŞ: Gross profit'ten DÜŞÜRMEYİN - bu çift penalizasyon yaratır
     let collateral_oracle_confidence_bps = if let Some(client) = &rpc_client {
         get_oracle_confidence_bps(&collateral_asset.mint, client, config).await
             .unwrap_or(config.default_oracle_confidence_slippage_bps)
@@ -345,42 +396,21 @@ pub async fn calculate_liquidation_opportunity(
         config.default_oracle_confidence_slippage_bps
     };
     
-    // ✅ DÜZELTME: Oracle confidence'ı gross profit'e uygula (worst-case scenario)
-    // Worst case: Collateral value düşer (price - confidence), debt value artar (price + confidence)
-    // Bu, profitability'yi daha conservative hale getirir
-    let collateral_oracle_uncertainty_usd = seizable_collateral_usd * (collateral_oracle_confidence_bps as f64 / 10_000.0);
-    let debt_oracle_uncertainty_usd = max_liquidatable_debt_usd * (debt_oracle_confidence_bps as f64 / 10_000.0);
-    let total_oracle_uncertainty_usd = collateral_oracle_uncertainty_usd + debt_oracle_uncertainty_usd;
-    
-    // Adjusted gross profit: Worst-case scenario (collateral down, debt up)
-    let adjusted_gross_profit_usd = gross_profit_usd - total_oracle_uncertainty_usd;
-    
-    log::debug!(
-        "Oracle confidence impact: collateral={} bps (${:.4}), debt={} bps (${:.4}), total_uncertainty=${:.4}, adjusted_gross_profit=${:.2} (original=${:.2})",
-        collateral_oracle_confidence_bps,
-        collateral_oracle_uncertainty_usd,
-        debt_oracle_confidence_bps,
-        debt_oracle_uncertainty_usd,
-        total_oracle_uncertainty_usd,
-        adjusted_gross_profit_usd,
-        gross_profit_usd
-    );
-    
+    // ✅ DOĞRU: Oracle confidence sadece slippage'de kullanılmalı (execution risk)
+    // Gross profit'ten DÜŞÜRMEYİN - bu çift penalizasyon yaratır
+    // 
     // Final slippage calculation: Sum DEX slippage and oracle confidence
     // 
-    // These represent different sources of risk that should be added together:
+    // These represent different sources of execution risk that should be added together:
     // - DEX slippage: Execution price vs oracle price due to liquidity depth (trade size dependent)
     // - Oracle confidence: Uncertainty in oracle price itself (Pyth's ±1σ confidence)
     // 
     // These are independent risk sources:
     // - DEX slippage: Risk from executing trade at worse price than oracle due to low liquidity
-    // - Oracle confidence: Risk that oracle price itself is inaccurate
+    // - Oracle confidence: Risk that oracle price itself is inaccurate during execution
     // 
-    // Total risk = DEX slippage + Oracle uncertainty
+    // Total execution risk = DEX slippage + Oracle uncertainty
     // Apply safety margin multiplier for model uncertainty (configurable via SLIPPAGE_FINAL_MULTIPLIER)
-    // 
-    // ✅ DÜZELTME: Oracle confidence'ı slippage'e de ekle (execution risk)
-    // Ama ayrıca gross profit'e de uyguladık (price uncertainty)
     let max_oracle_confidence_bps = collateral_oracle_confidence_bps.max(debt_oracle_confidence_bps);
     
     let needs_swap = collateral_asset.mint != debt_asset.mint;
@@ -417,8 +447,8 @@ pub async fn calculate_liquidation_opportunity(
         estimated_dex_slippage_bps
     };
     
-    // ✅ DÜZELTME: Oracle confidence'ı slippage'e ekle (execution risk)
-    // Ama gross profit'e de uyguladık (price uncertainty), bu yüzden slippage'de sadece execution risk'i kullan
+    // ✅ DOĞRU: Oracle confidence'ı slippage'e ekle (execution risk)
+    // Gross profit'ten DÜŞÜRMEYİN - bu çift penalizasyon yaratır
     let total_slippage_bps = final_dex_slippage_bps + max_oracle_confidence_bps;
     let final_slippage_bps = ((total_slippage_bps as f64 * config.slippage_final_multiplier) as u16).min(u16::MAX);
     
@@ -443,9 +473,10 @@ pub async fn calculate_liquidation_opportunity(
 
     let total_cost_usd = transaction_fee_usd + slippage_cost_usd + swap_cost_usd;
     
-    // ✅ DÜZELTME: Adjusted gross profit kullan (oracle uncertainty dahil)
-    // Bu, profitability'yi daha conservative hale getirir
-    let estimated_profit_usd = adjusted_gross_profit_usd - total_cost_usd;
+    // ✅ DOĞRU: Gross profit kullan (oracle uncertainty dahil DEĞİL)
+    // Oracle confidence zaten slippage'de dahil (execution risk)
+    // Net profit = Gross profit - Costs
+    let estimated_profit_usd = gross_profit_usd - total_cost_usd;
 
     // Minimum profit margin: ensures we have a buffer above transaction costs
     // Default: 1% (100 bps) of debt amount

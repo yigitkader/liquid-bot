@@ -135,18 +135,15 @@ pub async fn parse_reserve_account(
     let pyth_oracle_raw = reserve.pyth_oracle();
     let switchboard_oracle_raw = reserve.switchboard_oracle();
     
-    // ✅ DÜZELTME: oracle_option field'ı kullanılıyor
-    // oracle_option: 0 = None, 1 = Pyth, 2 = Switchboard
-    let oracle_option = reserve.oracle_option();
-    
-    // oracle_option'a göre aktif oracle'ı belirle
-    // Ayrıca default pubkey kontrolü de yap (güvenlik için)
-    let pyth_oracle = if oracle_option == 1 && pyth_oracle_raw != Pubkey::default() {
+    // ✅ VALIDATED: oracle_option field does NOT exist in real Solend reserve struct
+    // Determine active oracle by checking if pubkey is not default
+    // Default pubkey (all zeros) means oracle is not set
+    let pyth_oracle = if pyth_oracle_raw != Pubkey::default() {
         Some(pyth_oracle_raw)
     } else {
         None
     };
-    let switchboard_oracle = if oracle_option == 2 && switchboard_oracle_raw != Pubkey::default() {
+    let switchboard_oracle = if switchboard_oracle_raw != Pubkey::default() {
         Some(switchboard_oracle_raw)
     } else {
         None
