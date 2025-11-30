@@ -1,393 +1,207 @@
-// Modüller artık lib.rs'de tanımlı
-use liquid_bot::*;
-
-use anyhow::Result;
+// Structure.md'ye göre main.rs - Event-driven architecture
+use anyhow::{Context, Result};
 use dotenv::dotenv;
-use env_logger;
-use liquid_bot::protocol::Protocol;
-use liquid_bot::shutdown::ShutdownManager;
+use log;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
-use tokio;
 use tokio::signal;
+use tokio::time::{sleep, Duration};
+
+use liquid_bot::core::config::Config;
+use liquid_bot::core::events::EventBus;
+use liquid_bot::blockchain::rpc_client::RpcClient;
+use liquid_bot::blockchain::ws_client::WsClient;
+use liquid_bot::engine::scanner::Scanner;
+use liquid_bot::engine::analyzer::Analyzer;
+use liquid_bot::engine::validator::Validator;
+use liquid_bot::engine::executor::Executor;
+use liquid_bot::strategy::balance_manager::BalanceManager;
+use liquid_bot::utils::cache::AccountCache;
+use liquid_bot::utils::metrics::Metrics;
+use liquid_bot::protocol::Protocol;
+use liquid_bot::protocol::solend::SolendProtocol;
+
+use solana_sdk::signature::{Keypair, Signer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
-
-    // Create logs directory if it doesn't exist
-    let logs_dir = Path::new("logs");
-    if !logs_dir.exists() {
-        fs::create_dir_all(logs_dir)?;
-    }
-
-    // Generate log filename with timestamp
-    let timestamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let log_filename = format!("logs/bot_{}.log", timestamp);
-    let log_file = fs::File::create(&log_filename)?;
-
-    // Create a writer that writes to both file and stderr
-    let mut logger = env_logger::Builder::from_default_env();
-    logger
+    // Initialize logging
+    env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
-        .format_module_path(false)
-        .format_target(false);
+        .init();
 
-    // Write to both file and stderr
-    logger.target(env_logger::Target::Pipe(Box::new(MultiWriter::new(
-        log_file,
-        std::io::stderr(),
-    ))));
+    dotenv().ok();
 
-    logger.init();
+    log::info!("🚀 Starting Solana Liquidation Bot");
 
-    log::info!("📝 Logging to file: {}", log_filename);
+    // 1. Load config
+    let config = Config::from_env()
+        .context("Failed to load configuration")?;
+    config.validate()
+        .context("Configuration validation failed")?;
 
-    log::info!("🚀 Starting Solana Liquidation Bot (Production Mode)");
-    log::info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    log::info!("✅ Configuration loaded");
 
-    let config = match config::Config::from_env() {
-        Ok(cfg) => {
-            log::info!("✅ Configuration loaded and validated");
-            log::info!("   RPC: {}", cfg.rpc_http_url);
-            log::info!("   Wallet: {}", cfg.wallet_path);
-            log::info!("   Dry Run: {}", cfg.dry_run);
-            log::info!("   HF Threshold: {}", cfg.hf_liquidation_threshold);
-            log::info!("   Min Profit: ${}", cfg.min_profit_usd);
-            cfg
-        }
-        Err(e) => {
-            log::error!("❌ Configuration validation failed: {}", e);
-            log::error!("Please check your .env file and configuration values");
-            return Err(e);
-        }
-    };
+    // 2. Initialize components
+    let rpc = Arc::new(
+        RpcClient::new(config.rpc_http_url.clone())
+            .context("Failed to create RPC client")?
+    );
+    log::info!("✅ RPC client initialized");
 
-    let shutdown_manager = Arc::new(ShutdownManager::new());
+    let mut ws = WsClient::new(config.rpc_ws_url.clone());
+    ws.connect().await
+        .context("Failed to connect WebSocket")?;
+    let ws = Arc::new(ws);
+    log::info!("✅ WebSocket client initialized");
 
-    let health_manager = Arc::new(health::HealthManager::new(config.health_manager_max_error_age_seconds));
-    let balance_reservation = Arc::new(balance_reservation::BalanceReservation::new());
+    // Load wallet
+    let wallet_keypair = load_wallet(&config.wallet_path)
+        .context("Failed to load wallet")?;
+    let wallet = Arc::new(wallet_keypair);
+    let wallet_pubkey = wallet.pubkey();
+    log::info!("✅ Wallet loaded: {}", wallet_pubkey);
 
-    let shutdown = shutdown_manager.clone();
-    tokio::spawn(async move {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to create SIGTERM handler");
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("Failed to create SIGINT handler");
-
-        tokio::select! {
-            _ = sigterm.recv() => {
-                log::info!("📡 Received SIGTERM, initiating graceful shutdown...");
-                shutdown.shutdown();
-            }
-            _ = sigint.recv() => {
-                log::info!("📡 Received SIGINT (Ctrl+C), initiating graceful shutdown...");
-                shutdown.shutdown();
-            }
-        }
-    });
-
-    log::info!("🔑 Loading wallet from: {}", config.wallet_path);
-    let wallet = match wallet::WalletManager::from_file(&config.wallet_path) {
-        Ok(w) => {
-            log::info!("✅ Wallet loaded: {}", w.pubkey());
-            Arc::new(w)
-        }
-        Err(e) => {
-            log::error!("❌ Failed to load wallet: {}", e);
-            return Err(e);
-        }
-    };
-
-    log::info!("🌐 Connecting to RPC: {}", config.rpc_http_url);
-    let rpc_client = match solana_client::SolanaClient::new(config.rpc_http_url.clone()) {
-        Ok(client) => {
-            log::info!("✅ RPC client connected");
-            Arc::new(client)
-        }
-        Err(e) => {
-            log::error!("❌ Failed to connect to RPC: {}", e);
-            return Err(e);
-        }
-    };
-
-    // ✅ CRITICAL: Run startup validation before proceeding
-    // This ensures all structs, protocols, and configurations are compatible
-    // with real-world Solend mainnet data
-    log::info!("");
-    if let Err(e) = startup_validation::validate_startup(&config, &rpc_client).await {
-        log::error!("❌ Startup validation FAILED!");
-        log::error!("   Error: {}", e);
-        log::error!("");
-        log::error!("   ⚠️  CRITICAL: The bot cannot run safely with the current configuration.");
-        log::error!("   Please fix the validation errors above before proceeding.");
-        log::error!("");
-        log::error!("   💡 Tip: Run manually for detailed output:");
-        log::error!("      cargo run --bin validate_system -- --verbose");
-        log::error!("");
-        return Err(anyhow::anyhow!(
-            "Startup validation failed - bot cannot run safely. Fix validation errors and try again."
-        ));
-    }
-
-    let solend_protocol = match protocols::solend::SolendProtocol::new_with_config(&config) {
-        Ok(proto) => {
-            let protocol_id = proto.id().to_string();
-            let program_id = proto.program_id();
-            log::info!(
-                "✅ Protocol initialized: {} (program: {})",
-                protocol_id,
-                program_id
-            );
-            Arc::new(proto) as Arc<dyn protocol::Protocol>
-        }
-        Err(e) => {
-            log::error!("❌ Failed to initialize protocol: {}", e);
-            return Err(e);
-        }
-    };
-
-    let bus = event_bus::EventBus::new(config.event_bus_buffer_size);
+    // 3. Create event bus
+    let event_bus = EventBus::new(config.event_bus_buffer_size);
     log::info!("✅ Event bus initialized");
 
-    let analyzer_receiver = bus.subscribe();
-    let strategist_receiver = bus.subscribe();
-    let executor_receiver = bus.subscribe();
-    let logger_receiver = bus.subscribe();
-    let rpc_worker_receiver = bus.subscribe();
-    let performance_tracker = Arc::new(performance::PerformanceTracker::new());
+    // 4. Create managers
+    let balance_manager = Arc::new(
+        BalanceManager::new(Arc::clone(&rpc), wallet_pubkey)
+    );
+    log::info!("✅ Balance manager initialized");
 
-    log::info!("🔧 Starting worker tasks...");
+    let metrics = Arc::new(Metrics::new());
+    log::info!("✅ Metrics initialized");
 
-    let wallet_balance_checker = Arc::new(wallet::WalletBalanceChecker::new(
-        *wallet.pubkey(),
-        Arc::clone(&rpc_client),
-        Some(config.clone()),
-    ));
+    let cache = Arc::new(AccountCache::new());
+    log::info!("✅ Account cache initialized");
 
-    let analyzer_handle = tokio::spawn({
-        let bus = bus.clone();
-        let config = config.clone();
-        let performance_tracker = Arc::clone(&performance_tracker);
-        let protocol = Arc::clone(&solend_protocol);
-        let rpc_client = Arc::clone(&rpc_client);
-        async move {
-            log::info!("   ✅ Analyzer worker started");
-            if let Err(e) = analyzer::run_analyzer(
-                analyzer_receiver,
-                bus,
-                config,
-                performance_tracker,
-                protocol,
-                Some(rpc_client),
-            )
-            .await
-            {
-                log::error!("❌ Analyzer worker error: {}", e);
-            }
-            log::info!("   ⏹️  Analyzer worker stopped");
-        }
-    });
+    // 5. Initialize protocol
+    let protocol: Arc<dyn Protocol> = Arc::new(
+        SolendProtocol::new(&config)
+            .context("Failed to initialize Solend protocol")?
+    );
+    log::info!("✅ Protocol initialized: {} (program: {})", protocol.id(), protocol.program_id());
 
-    let strategist_handle = tokio::spawn({
-        let bus = bus.clone();
-        let config = config.clone();
-        let wallet_balance_checker = Arc::clone(&wallet_balance_checker);
-        let rpc_client = Arc::clone(&rpc_client);
-        let protocol = Arc::clone(&solend_protocol);
-        let balance_reservation = Arc::clone(&balance_reservation);
-        async move {
-            log::info!("   ✅ Strategist worker started");
-            if let Err(e) = strategist::run_strategist(
-                strategist_receiver,
-                bus,
-                config,
-                wallet_balance_checker,
-                rpc_client,
-                protocol,
-                balance_reservation,
-            )
-            .await
-            {
-                log::error!("❌ Strategist worker error: {}", e);
-            }
-            log::info!("   ⏹️  Strategist worker stopped");
-        }
-    });
-
-    let executor_handle = tokio::spawn({
-        let bus = bus.clone();
-        let config = config.clone();
-        let wallet = Arc::clone(&wallet);
-        let protocol = Arc::clone(&solend_protocol);
-        let rpc_client = Arc::clone(&rpc_client);
-        let performance_tracker = Arc::clone(&performance_tracker);
-        let balance_reservation = Arc::clone(&balance_reservation);
-        async move {
-            log::info!("   ✅ Executor worker started");
-            if let Err(e) = executor::run_executor(
-                executor_receiver,
-                bus,
-                config,
-                wallet,
-                protocol,
-                rpc_client,
-                performance_tracker,
-                balance_reservation,
-            )
-            .await
-            {
-                log::error!("❌ Executor worker error: {}", e);
-            }
-            log::info!("   ⏹️  Executor worker stopped");
-        }
-    });
-
-    let logger_handle = tokio::spawn({
-        let health_manager = Arc::clone(&health_manager);
-        async move {
-            log::info!("   ✅ Logger worker started");
-            if let Err(e) = logger::run_logger(logger_receiver, health_manager).await {
-                log::error!("❌ Logger worker error: {}", e);
-            }
-            log::info!("   ⏹️  Logger worker stopped");
-        }
-    });
-
-    let rpc_worker_handle = tokio::spawn({
-        let bus = bus.clone();
-        let config = config.clone();
-        let rpc_client = Arc::clone(&rpc_client);
-        let protocol = Arc::clone(&solend_protocol);
-        async move {
-            log::info!("   ✅ RPC worker started");
-            if let Err(e) = rpc_worker::run_rpc_worker(
-                rpc_worker_receiver,
-                bus,
-                config,
-                rpc_client,
-                protocol,
-            )
-            .await
-            {
-                log::error!("❌ RPC worker error: {}", e);
-            }
-            log::info!("   ⏹️  RPC worker stopped");
-        }
-    });
-
-    let health_check_handle = tokio::spawn({
-        let health_manager = Arc::clone(&health_manager);
-        let performance_tracker = Arc::clone(&performance_tracker);
-        async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let is_healthy = health_manager.check_health().await;
-                let status = health_manager.get_status().await;
-                performance_tracker.log_metrics().await;
-
-                if !is_healthy {
-                    log::warn!(
-                        "⚠️  Health check failed: consecutive_errors={}, last_error={:?}",
-                        status.consecutive_errors,
-                        status.last_error
-                    );
-                } else {
-                    log::debug!(
-                        "✅ Health check passed: opportunities={}, tx={}/{}",
-                        status.total_opportunities,
-                        status.successful_transactions,
-                        status.total_transactions
-                    );
-                }
-            }
-        }
-    });
-
-    log::info!("✅ All workers started");
-    log::info!("🎯 Bot is running. Press Ctrl+C to stop gracefully.");
-
-    let data_source_handle = tokio::spawn({
-        let bus = bus.clone();
-        let config = config.clone();
-        let rpc_client = Arc::clone(&rpc_client);
-        let protocol = Arc::clone(&solend_protocol);
-        let health_manager = Arc::clone(&health_manager);
-        async move {
-            log::info!("   ✅ Data source worker started");
-            if let Err(e) =
-                data_source::run_data_source(bus, config, rpc_client, protocol, health_manager)
-                    .await
-            {
-                log::error!("❌ Data source error: {}", e);
-            }
-            log::info!("   ⏹️  Data source worker stopped");
-        }
-    });
-
-    let mut shutdown_rx = shutdown_manager.subscribe();
-    let _ = shutdown_rx.recv().await;
-
-    log::info!("🛑 Shutdown signal received, waiting for workers to finish...");
-
-    health_check_handle.abort();
-
-    tokio::select! {
-        _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
-            log::warn!("⚠️  Shutdown timeout reached, forcing exit");
-        }
-        _ = analyzer_handle => {}
-        _ = strategist_handle => {}
-        _ = executor_handle => {}
-        _ = logger_handle => {}
-        _ = rpc_worker_handle => {}
-        _ = data_source_handle => {}
-    }
-
-    let final_status = health_manager.get_status().await;
-    log::info!(
-        "📊 Final stats: opportunities={}, tx={}/{}, healthy={}",
-        final_status.total_opportunities,
-        final_status.successful_transactions,
-        final_status.total_transactions,
-        final_status.is_healthy
+    // 6. Spawn workers (Structure.md'ye göre)
+    let scanner = Scanner::new(
+        Arc::clone(&rpc),
+        Arc::clone(&ws),
+        Arc::clone(&protocol),
+        event_bus.clone(),
+        Arc::clone(&cache),
+    );
+    let analyzer = Analyzer::new(
+        event_bus.clone(),
+        Arc::clone(&protocol),
+        config.clone(),
+    );
+    let validator = Validator::new(
+        event_bus.clone(),
+        Arc::clone(&balance_manager),
+        config.clone(),
+        Arc::clone(&rpc),
+    );
+    let executor = Executor::new(
+        event_bus.clone(),
+        Arc::clone(&rpc),
+        Arc::clone(&wallet),
+        Arc::clone(&protocol),
+        Arc::clone(&balance_manager),
+        config.clone(),
     );
 
-    log::info!("👋 Shutdown complete. Goodbye!");
+    tokio::spawn(async move {
+        if let Err(e) = scanner.run().await {
+            log::error!("Scanner error: {}", e);
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = analyzer.run().await {
+            log::error!("Analyzer error: {}", e);
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = validator.run().await {
+            log::error!("Validator error: {}", e);
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = executor.run().await {
+            log::error!("Executor error: {}", e);
+        }
+    });
+    
+    log::info!("✅ All workers started");
+
+    // 6. Metrics logger
+    let metrics_clone = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            let summary = metrics_clone.get_summary().await;
+            log::info!("📊 Metrics: Opportunities: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
+                summary.opportunities,
+                summary.tx_sent,
+                summary.tx_success,
+                summary.success_rate * 100.0,
+                summary.total_profit,
+                summary.avg_latency_ms,
+                summary.p95_latency_ms
+            );
+        }
+    });
+
+    log::info!("✅ All components initialized");
+    log::info!("⏳ Waiting for shutdown signal (Ctrl+C)...");
+
+    // 7. Wait for shutdown signal
+    signal::ctrl_c().await
+        .context("Failed to listen for shutdown signal")?;
+
+    log::info!("🛑 Shutting down gracefully...");
     Ok(())
 }
 
-/// MultiWriter writes to multiple writers simultaneously
-struct MultiWriter {
-    file: fs::File,
-    stderr: std::io::Stderr,
-}
-
-impl MultiWriter {
-    fn new(file: fs::File, stderr: std::io::Stderr) -> Self {
-        Self { file, stderr }
-    }
-}
-
-impl Write for MultiWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Write to both file and stderr
-        self.file.write_all(buf)?;
-        self.stderr.write_all(buf)?;
-        Ok(buf.len())
+fn load_wallet(path: &str) -> Result<Keypair> {
+    let wallet_path = Path::new(path);
+    
+    if !wallet_path.exists() {
+        return Err(anyhow::anyhow!("Wallet file not found: {}", path));
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()?;
-        self.stderr.flush()?;
-        Ok(())
+    let keypair_bytes = fs::read(wallet_path)
+        .context("Failed to read wallet file")?;
+
+    // Try to parse as JSON keypair first (Solana CLI format)
+    if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
+        if keypair.len() == 64 {
+            return Keypair::from_bytes(&keypair)
+                .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+        }
     }
+
+    // Try to parse as raw bytes (64 bytes)
+    if keypair_bytes.len() == 64 {
+        return Keypair::from_bytes(&keypair_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+    }
+
+    // Try to parse as base58 string
+    if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
+        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim())
+            .into_vec()
+        {
+            if keypair_bytes_decoded.len() == 64 {
+                return Keypair::from_bytes(&keypair_bytes_decoded)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Invalid wallet format: expected 64 bytes, JSON array, or base58 string"))
 }

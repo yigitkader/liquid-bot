@@ -1,0 +1,65 @@
+use crate::blockchain::rpc_client::RpcClient;
+use anyhow::Result;
+use pyth_sdk_solana::state::SolanaPriceAccount;
+use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
+
+pub struct PythOracle;
+
+#[derive(Debug, Clone)]
+pub struct PriceData {
+    pub price: f64,
+    pub confidence: f64,
+    pub expo: i32,
+    pub timestamp: i64,
+}
+
+impl PythOracle {
+    pub async fn read_price(
+        account: &Pubkey,
+        rpc: Arc<RpcClient>,
+    ) -> Result<PriceData> {
+        let account_data = rpc.get_account(account).await?;
+        Self::parse_pyth_account(&account_data.data)
+    }
+
+    pub fn parse_pyth_account(data: &[u8]) -> Result<PriceData> {
+        // Use pyth-sdk-solana
+        // Pyth program ID from mainnet
+        let pyth_program_id = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH"
+            .parse::<Pubkey>()
+            .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
+        
+        // account_to_feed needs Account struct, not just bytes
+        let mut account = solana_sdk::account::Account {
+            lamports: 0,
+            data: data.to_vec(),
+            owner: pyth_program_id, // Real Pyth program ID
+            executable: false,
+            rent_epoch: 0,
+        };
+        
+        let feed = SolanaPriceAccount::account_to_feed(
+            &pyth_program_id, // Real Pyth program ID
+            &mut account
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to parse Pyth account: {}", e))?;
+        
+        // Get latest price
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
+            .as_secs() as i64;
+        
+        let price_data = feed.get_price_no_older_than(current_time, 60)
+            .ok_or_else(|| anyhow::anyhow!("Price data is too old"))?;
+        
+        Ok(PriceData {
+            price: price_data.price as f64 * 10_f64.powi(price_data.expo),
+            confidence: price_data.conf as f64 * 10_f64.powi(price_data.expo),
+            expo: price_data.expo,
+            timestamp: price_data.publish_time,
+        })
+    }
+}
+

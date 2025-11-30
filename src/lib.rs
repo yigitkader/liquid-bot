@@ -1,36 +1,48 @@
-pub mod config;
-pub mod domain;
-pub mod event;
-pub mod event_bus;
-pub mod data_source;
-pub mod rpc_poller;
-pub mod rpc_worker;
-pub mod ws_listener;
-pub mod analyzer;
-pub mod strategist;
-pub mod executor;
-pub mod logger;
-pub mod solana_client;
-pub mod math;
-pub mod wallet;
-pub mod protocol;
-pub mod tx_lock;
-pub mod rate_limiter;
-pub mod balance_reservation;
-pub mod shutdown;
-pub mod health;
-pub mod performance;
-pub mod slippage_calibration;
-pub mod utils;
-pub mod startup_validation;
-
-pub mod protocols {
-    pub mod solend;
-    pub mod solend_accounts;
-    pub mod reserve_helper;
-    pub mod solend_reserve;
-    pub mod oracle_helper;
-    pub mod reserve_validator;
-    pub mod jupiter_api;
+// Core modules
+pub mod core {
+    pub mod config;
+    pub mod events;
+    pub mod types;
+    pub mod error;
 }
 
+// Blockchain modules
+pub mod blockchain {
+    pub mod rpc_client;
+    pub mod ws_client;
+    pub mod transaction;
+    // rate_limiter removed - not in Structure.md
+}
+
+// Protocol modules  
+pub mod protocol;
+
+// Engine modules
+pub mod engine {
+    pub mod scanner;
+    pub mod analyzer;
+    pub mod validator;
+    pub mod executor;
+}
+
+// Strategy modules
+pub mod strategy {
+    pub mod profit_calculator;
+    pub mod slippage_estimator;
+    pub mod balance_manager;
+}
+
+// Utils modules
+pub mod utils {
+    pub mod cache;
+    pub mod metrics;
+    pub mod helpers;
+}
+
+// Re-exports
+pub use core::{config, events, types, error};
+pub use blockchain::{rpc_client, ws_client, transaction};
+pub use engine::{scanner, analyzer, validator, executor};
+pub use strategy::{profit_calculator, slippage_estimator, balance_manager};
+pub use utils::{cache, metrics, helpers};
+pub use protocol::Protocol;

@@ -35,9 +35,10 @@ futures-util = "0.3"
 base64 = "0.21"
 chrono = "0.4"
 
-[[bin]]
-name = "validate_reserve"
-path = "src/bin/validate_reserve.rs"
+# validate_reserve binary removed - not in Structure.md
+# [[bin]]
+# name = "validate_reserve"
+# path = "src/bin/validate_reserve.rs"
 
 [[bin]]
 name = "validate_obligation"

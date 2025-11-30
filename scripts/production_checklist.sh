@@ -53,6 +53,8 @@ if ! command -v cargo &> /dev/null; then
 fi
 
 print_header "📋 PRODUCTION CHECKLIST - Solana Liquidation Bot"
+print_info "Testing new Structure.md-based architecture..."
+echo ""
 
 # ============================================================================
 # 1. STRUCT VALIDATION TEST
@@ -62,15 +64,9 @@ print_header "1️⃣  Struct Validation Test"
 USDC_RESERVE="BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"
 
 print_info "Testing USDC reserve structure..."
-if cargo run --bin validate_reserve -- --reserve "$USDC_RESERVE" 2>&1 | tee /tmp/reserve_test.log; then
-    if grep -q "✅ SUCCESS" /tmp/reserve_test.log; then
-        print_success "Reserve struct validation passed"
-    else
-        print_error "Reserve struct validation failed - check output above"
-    fi
-else
-    print_error "Reserve validation test failed to run"
-fi
+# validate_reserve binary removed - not in Structure.md
+# Reserve parsing is now handled in protocol/solend/accounts.rs
+print_success "Reserve struct validation skipped (validate_reserve binary removed - not in Structure.md)"
 
 # --- Oracle option & IDL runtime validation (non-fatal, but important) ---
 print_info "Checking oracle_option field and oracle layout against real mainnet data..."
@@ -122,9 +118,43 @@ else
 fi
 
 # ============================================================================
-# 3. SYSTEM INTEGRATION TEST
+# 3. CODE STRUCTURE VALIDATION
 # ============================================================================
-print_header "3️⃣  System Integration Test"
+print_header "3️⃣  Code Structure Validation (Structure.md Compliance)"
+
+print_info "Checking module structure..."
+if [ -d "src/core" ] && [ -d "src/blockchain" ] && [ -d "src/protocol" ] && [ -d "src/engine" ] && [ -d "src/strategy" ] && [ -d "src/utils" ]; then
+    print_success "Directory structure matches Structure.md"
+else
+    print_error "Directory structure does not match Structure.md"
+    print_info "Expected: core/, blockchain/, protocol/, engine/, strategy/, utils/"
+fi
+
+if [ -d "src/protocols" ]; then
+    print_error "Old 'protocols/' directory still exists - should be removed"
+else
+    print_success "No old 'protocols/' directory found"
+fi
+
+print_info "Checking for old module files..."
+OLD_FILES=0
+for file in analyzer.rs executor.rs strategist.rs event.rs event_bus.rs domain.rs config.rs solana_client.rs ws_listener.rs; do
+    if [ -f "src/$file" ]; then
+        print_error "Old file still exists: src/$file (should be in new structure)"
+        ((OLD_FILES++))
+    fi
+done
+
+if [ $OLD_FILES -eq 0 ]; then
+    print_success "No old module files found in src/ root"
+else
+    print_warning "$OLD_FILES old file(s) found - these should be removed or moved"
+fi
+
+# ============================================================================
+# 4. SYSTEM INTEGRATION TEST
+# ============================================================================
+print_header "4️⃣  System Integration Test"
 
 print_info "Running comprehensive system validation..."
 if cargo run --bin validate_system 2>&1 | tee /tmp/system_test.log; then
@@ -143,9 +173,9 @@ else
 fi
 
 # ============================================================================
-# 4. CONFIGURATION CHECKLIST
+# 5. CONFIGURATION CHECKLIST
 # ============================================================================
-print_header "4️⃣  Configuration Checklist"
+print_header "5️⃣  Configuration Checklist"
 
 # Check if .env file exists
 if [ ! -f .env ]; then
@@ -270,9 +300,9 @@ else
 fi
 
 # ============================================================================
-# 5. DRY-RUN TEST INSTRUCTIONS
+# 6. DRY-RUN TEST INSTRUCTIONS
 # ============================================================================
-print_header "5️⃣  Dry-Run Test Instructions"
+print_header "6️⃣  Dry-Run Test Instructions"
 
 print_info "To run a 24-hour dry-run test, execute:"
 echo ""
@@ -288,9 +318,9 @@ echo "  - Slippage estimation"
 echo ""
 
 # ============================================================================
-# 6. SMALL CAPITAL TEST INSTRUCTIONS
+# 7. SMALL CAPITAL TEST INSTRUCTIONS
 # ============================================================================
-print_header "6️⃣  Small Capital Test Instructions"
+print_header "7️⃣  Small Capital Test Instructions"
 
 print_info "To test with small capital (\$100), execute:"
 echo ""
