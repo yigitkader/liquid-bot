@@ -11,7 +11,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::Digest;
@@ -251,7 +252,69 @@ pub async fn run_ws_listener(
     // 
     // ✅ FIXED: Reserve struct layout corrected - oracle_option field added, oracle offsets fixed
     log::info!("🔍 Discovering oracle accounts from reserves...");
-    let oracle_accounts = discover_oracle_accounts(&rpc_client, &protocol).await;
+    
+    // ✅ Retry oracle discovery with exponential backoff (RPC rate limiting is common)
+    let oracle_accounts = {
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 3;
+        const INITIAL_RETRY_DELAY_MS: u64 = 2000;
+        
+        loop {
+            match discover_oracle_accounts(&rpc_client, &protocol).await {
+                Ok(accounts) => {
+                    if retry_count > 0 {
+                        log::info!("✅ Oracle discovery succeeded after {} retry(ies)", retry_count);
+                    }
+                    break Ok(accounts);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    
+                    if retry_count > MAX_RETRIES {
+                        // Check if it's a rate limit error
+                        let error_msg = e.to_string();
+                        let is_rate_limit = error_msg.contains("429") || 
+                                           error_msg.contains("rate limit") || 
+                                           error_msg.contains("too many requests");
+                        
+                        if is_rate_limit {
+                            log::warn!(
+                                "⚠️  Oracle discovery failed after {} retries due to RPC rate limiting.",
+                                MAX_RETRIES
+                            );
+                            log::warn!(
+                                "   This is common on free RPC endpoints. Bot will continue with on-demand oracle reading."
+                            );
+                            log::warn!(
+                                "   💡 Tip: Use premium RPC (Helius, Triton) or increase POLL_INTERVAL_MS to avoid rate limits."
+                            );
+                        } else {
+                            log::warn!(
+                                "⚠️  Oracle discovery failed after {} retries: {}",
+                                MAX_RETRIES,
+                                error_msg
+                            );
+                            log::warn!(
+                                "   Bot will continue with on-demand oracle reading (liquidation will still work)."
+                            );
+                        }
+                        break Err(e);
+                    } else {
+                        let delay_ms = INITIAL_RETRY_DELAY_MS * (1 << (retry_count - 1)); // Exponential backoff
+                        log::warn!(
+                            "⚠️  Oracle discovery failed (attempt {}/{}): {}. Retrying in {}ms...",
+                            retry_count,
+                            MAX_RETRIES,
+                            e,
+                            delay_ms
+                        );
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+    };
+    
     let oracle_accounts = match oracle_accounts {
         Ok(accounts) => {
             // To avoid overloading the WebSocket endpoint with thousands of
@@ -291,8 +354,9 @@ pub async fn run_ws_listener(
                 accounts
             }
         }
-        Err(e) => {
-            log::warn!("⚠️  Oracle discovery failed: {}. Price feed subscriptions will be skipped.", e);
+        Err(_) => {
+            // Error already logged above with detailed information
+            log::info!("ℹ️  Continuing without real-time price feed subscriptions. Oracle prices will be read on-demand during liquidation validation.");
             Vec::new()
         }
     };
@@ -422,14 +486,19 @@ async fn initial_account_discovery(
         .await
         .context("Failed to fetch program accounts for initial discovery")?;
 
+    let total_accounts = accounts.len();
     log::debug!(
         "Fetched {} accounts for initial discovery (program: {})",
-        accounts.len(),
+        total_accounts,
         program_id
     );
 
     let mut position_count = 0;
+    let mut parse_errors = 0;
+    let mut non_position_count = 0;
     let mut cache = account_cache.write().await;
+
+    log::info!("   Processing {} accounts to find obligation positions...", total_accounts);
 
     // Process each account
     for (account_pubkey, account) in accounts {
@@ -444,18 +513,55 @@ async fn initial_account_discovery(
             .await
         {
             Ok(Some(position)) => {
+                log::debug!("✅ Found obligation position: {} (HF: {:.4})", account_pubkey, position.health_factor);
                 bus.publish(Event::AccountUpdated(position))
                     .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))?;
                 position_count += 1;
             }
             Ok(None) => {
                 // This account is not a position (e.g., market account, reserve account, etc.)
-                // Ignore it
+                non_position_count += 1;
             }
             Err(e) => {
-                log::warn!("Failed to parse account {}: {}", account_pubkey, e);
+                parse_errors += 1;
+                // Log detailed info for first few errors to help diagnose struct issues
+                if parse_errors <= 5 {
+                    log::warn!("⚠️  Parse error #{} (account: {}): {}", parse_errors, account_pubkey, e);
+                    
+                    // If this is a critical error (not just "not an obligation"), log more details
+                    let error_str = e.to_string();
+                    if error_str.contains("deserialize") || error_str.contains("struct") || error_str.contains("layout") {
+                        log::warn!(
+                            "   This might indicate a struct layout mismatch. \
+                             Check src/protocols/solend_idl.rs for obligation struct definition."
+                        );
+                    }
+                } else if parse_errors == 6 {
+                    log::warn!(
+                        "   ... (suppressing further parse error logs to avoid spam, {} total parse errors so far)",
+                        parse_errors
+                    );
+                }
                 // Continue on parse error
             }
+        }
+    }
+
+    log::info!(
+        "   Initial discovery summary: {} positions found, {} non-positions, {} parse errors",
+        position_count,
+        non_position_count,
+        parse_errors
+    );
+
+    if position_count == 0 && total_accounts > 0 {
+        log::warn!("⚠️  WARNING: No obligation positions found in {} accounts!", total_accounts);
+        log::warn!("   This might indicate:");
+        log::warn!("   1. Obligation struct layout is incorrect");
+        log::warn!("   2. All accounts are reserves/markets (not obligations)");
+        log::warn!("   3. Parse errors are preventing position detection");
+        if parse_errors > 0 {
+            log::warn!("   {} parse errors occurred - check logs above for details", parse_errors);
         }
     }
 
@@ -471,6 +577,34 @@ struct OracleAccountInfo {
     label: String,
 }
 
+/// Validates that a pubkey is a valid oracle account (not default/empty/invalid)
+/// Filters out:
+/// - Default pubkey (11111111111111111111111111111111)
+/// - Invalid pubkeys starting with 1111111111111111111111111111111 (like 11111111111111111111111111111112)
+/// - System program pubkey
+fn is_valid_oracle_pubkey(pubkey: &Pubkey) -> bool {
+    let default_pubkey = Pubkey::default();
+    let system_program = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+    
+    // Reject default pubkey
+    if *pubkey == default_pubkey || *pubkey == system_program {
+        return false;
+    }
+    
+    // Reject pubkeys that are mostly '1's (invalid oracle accounts)
+    // These are typically parse errors or uninitialized data
+    let pubkey_str = pubkey.to_string();
+    if pubkey_str.starts_with("1111111111111111111111111111111") {
+        // Count non-'1' characters - if less than 5, it's likely invalid
+        let non_one_count = pubkey_str.chars().filter(|&c| c != '1').count();
+        if non_one_count < 5 {
+            return false;
+        }
+    }
+    
+    true
+}
+
 /// Discover oracle accounts from reserve accounts
 /// This scans all program accounts to find reserves and extracts their oracle accounts
 async fn discover_oracle_accounts(
@@ -484,7 +618,7 @@ async fn discover_oracle_accounts(
         .context("Failed to fetch program accounts for oracle discovery")?;
 
     let total_accounts = accounts.len();
-    let mut oracle_accounts = Vec::new();
+    let mut oracle_accounts_vec = Vec::new();
     let mut reserve_count = 0;
 
     // Scan accounts to find reserves
@@ -508,29 +642,29 @@ async fn discover_oracle_accounts(
                 let mint = reserve_info.liquidity_mint.or(reserve_info.collateral_mint);
                 
                 // Extract oracle accounts with mint mapping
-                // Filter out default/empty pubkeys (these indicate no oracle configured)
+                // Filter out default/empty pubkeys and invalid pubkeys (these indicate no oracle configured or parse error)
                 if let Some(pyth_oracle) = reserve_info.pyth_oracle {
-                    if pyth_oracle != Pubkey::default() {
-                        oracle_accounts.push(OracleAccountInfo {
+                    if is_valid_oracle_pubkey(&pyth_oracle) {
+                        oracle_accounts_vec.push(OracleAccountInfo {
                             oracle_account: pyth_oracle,
                             mint,
                             label: format!("pyth_{}", account_pubkey),
                         });
                         log::debug!("Found Pyth oracle: {} for reserve {}", pyth_oracle, account_pubkey);
                     } else {
-                        log::debug!("Reserve {} has default/empty Pyth oracle, skipping", account_pubkey);
+                        log::debug!("Reserve {} has invalid/empty Pyth oracle ({}), skipping", account_pubkey, pyth_oracle);
                     }
                 }
                 if let Some(switchboard_oracle) = reserve_info.switchboard_oracle {
-                    if switchboard_oracle != Pubkey::default() {
-                        oracle_accounts.push(OracleAccountInfo {
+                    if is_valid_oracle_pubkey(&switchboard_oracle) {
+                        oracle_accounts_vec.push(OracleAccountInfo {
                             oracle_account: switchboard_oracle,
                             mint,
                             label: format!("switchboard_{}", account_pubkey),
                         });
                         log::debug!("Found Switchboard oracle: {} for reserve {}", switchboard_oracle, account_pubkey);
                     } else {
-                        log::debug!("Reserve {} has default/empty Switchboard oracle, skipping", account_pubkey);
+                        log::debug!("Reserve {} has invalid/empty Switchboard oracle ({}), skipping", account_pubkey, switchboard_oracle);
                     }
                 }
             }
@@ -570,12 +704,30 @@ async fn discover_oracle_accounts(
         log::debug!("Skipped {} non-reserve accounts during oracle discovery", parse_errors);
     }
 
+    // Remove duplicate oracle accounts (same pubkey)
+    let mut seen_oracles = HashSet::new();
+    let mut unique_oracle_accounts = Vec::new();
+    let mut duplicate_count = 0;
+    let total_oracle_count = oracle_accounts_vec.len();
+    
+    for oracle_info in oracle_accounts_vec {
+        if seen_oracles.insert(oracle_info.oracle_account) {
+            unique_oracle_accounts.push(oracle_info);
+        } else {
+            duplicate_count += 1;
+        }
+    }
+    
     log::info!(
-        "Oracle discovery: scanned {} accounts, found {} reserves, extracted {} oracle accounts",
+        "Oracle discovery: scanned {} accounts, found {} reserves, extracted {} oracle accounts ({} duplicates removed, {} unique)",
         total_accounts,
         reserve_count,
-        oracle_accounts.len()
+        total_oracle_count,
+        duplicate_count,
+        unique_oracle_accounts.len()
     );
+    
+    let mut oracle_accounts = unique_oracle_accounts;
     
     // ❌ CRITICAL CHECK: If no reserves found, struct layout is 100% wrong
     if reserve_count == 0 {

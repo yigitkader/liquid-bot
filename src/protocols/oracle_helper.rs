@@ -77,12 +77,16 @@ pub fn get_oracle_accounts_from_reserve(
         return Ok((reserve_info.pyth_oracle, reserve_info.switchboard_oracle));
     }
     
-    Err(anyhow::anyhow!(
-        "CRITICAL: No oracle accounts found in reserve {}. \
-         This indicates reserve data corruption or version mismatch. \
-         DO NOT proceed with liquidation without oracle data.",
+    // ⚠️ Warning but not error - some reserves may not have oracle configured
+    // This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin)
+    log::warn!(
+        "No oracle accounts found for reserve {}. \
+         This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin). \
+         Proceeding with estimated pricing.",
         reserve_info.reserve_pubkey
-    ))
+    );
+    
+    Ok((None, None)) // Return None instead of error
 }
 
 pub fn get_oracle_accounts_from_mint(

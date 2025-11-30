@@ -4,7 +4,9 @@
 //! 
 //! These tests verify:
 //! 1. Oracle accounts are correctly read from reserve accounts
-//! 2. Error handling when oracle accounts are not found (no fallback)
+//! 2. When oracle accounts are not found, returns Ok((None, None)) (not error)
+//!    - This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin)
+//!    - The caller should handle this case appropriately (e.g., reject opportunity)
 //! 3. Integration with reserve parsing
 
 use anyhow::Result;
@@ -98,8 +100,10 @@ fn test_get_oracle_accounts_from_reserve_with_switchboard_only() {
 }
 
 #[test]
-fn test_get_oracle_accounts_from_reserve_no_oracles_returns_error() {
-    // Test case: Reserve with no oracles - should return error (no fallback)
+fn test_get_oracle_accounts_from_reserve_no_oracles_returns_none() {
+    // Test case: Reserve with no oracles - should return Ok((None, None)) (not error)
+    // This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin)
+    // The caller should handle this case appropriately (e.g., reject opportunity)
     let reserve_pubkey = Pubkey::new_unique();
     let mint = Pubkey::new_unique();
     
@@ -119,29 +123,17 @@ fn test_get_oracle_accounts_from_reserve_no_oracles_returns_error() {
     };
     
     let result = get_oracle_accounts_from_reserve(&reserve_info);
-    assert!(result.is_err(), "Should return error when no oracles are found");
+    assert!(result.is_ok(), "Should return Ok when no oracles are found (not error)");
     
-    let error = result.unwrap_err();
-    let error_msg = error.to_string();
-    
-    // Verify error message contains critical information
-    assert!(
-        error_msg.contains("CRITICAL") || error_msg.contains("No oracle accounts found"),
-        "Error message should indicate critical failure"
-    );
-    assert!(
-        error_msg.contains(&mint.to_string()) || error_msg.contains(&reserve_pubkey.to_string()),
-        "Error message should include mint or reserve pubkey"
-    );
-    assert!(
-        error_msg.contains("fallback") || error_msg.contains("disabled"),
-        "Error message should mention that fallback is disabled"
-    );
+    let (pyth, switchboard) = result.unwrap();
+    assert_eq!(pyth, None, "Pyth oracle should be None");
+    assert_eq!(switchboard, None, "Switchboard oracle should be None");
 }
 
 #[test]
-fn test_get_oracle_accounts_from_reserve_no_mint_returns_error() {
-    // Test case: Reserve with no oracles and no mint - should return error
+fn test_get_oracle_accounts_from_reserve_no_mint_returns_none() {
+    // Test case: Reserve with no oracles and no mint - should return Ok((None, None))
+    // This is acceptable - the caller should handle this case appropriately
     let reserve_info = ReserveInfo {
         reserve_pubkey: Pubkey::new_unique(),
         mint: None,
@@ -158,13 +150,10 @@ fn test_get_oracle_accounts_from_reserve_no_mint_returns_error() {
     };
     
     let result = get_oracle_accounts_from_reserve(&reserve_info);
-    assert!(result.is_err(), "Should return error when no mint is found");
+    assert!(result.is_ok(), "Should return Ok when no oracles are found (not error)");
     
-    let error = result.unwrap_err();
-    let error_msg = error.to_string();
-    assert!(
-        error_msg.contains("No mint found") || error_msg.contains("mint"),
-        "Error message should indicate mint is missing"
-    );
+    let (pyth, switchboard) = result.unwrap();
+    assert_eq!(pyth, None, "Pyth oracle should be None");
+    assert_eq!(switchboard, None, "Switchboard oracle should be None");
 }
 

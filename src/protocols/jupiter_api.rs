@@ -190,18 +190,26 @@ pub async fn get_slippage_estimate(
         }
         Ok(None) => {
             log::warn!(
-                "⚠️  Jupiter API returned no data, using estimated slippage: {} bps",
+                "⚠️  Jupiter API returned no data, falling back to estimated slippage"
+            );
+            log::warn!(
+                "   Estimated: {} bps (USE WITH CAUTION - may be inaccurate)",
                 estimated_slippage_bps
             );
-            estimated_slippage_bps
+            // Apply conservative multiplier for safety (1.5x)
+            ((estimated_slippage_bps as f64 * 1.5) as u16).min(u16::MAX)
         }
         Err(e) => {
             log::warn!(
-                "⚠️  Jupiter API failed: {}, using estimated slippage: {} bps",
-                e,
+                "⚠️  Jupiter API failed: {}, falling back to estimated slippage",
+                e
+            );
+            log::warn!(
+                "   Estimated: {} bps (USE WITH CAUTION - may be inaccurate)",
                 estimated_slippage_bps
             );
-            estimated_slippage_bps
+            // Apply conservative multiplier for safety (1.5x)
+            ((estimated_slippage_bps as f64 * 1.5) as u16).min(u16::MAX)
         }
     }
 }

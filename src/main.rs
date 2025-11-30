@@ -118,6 +118,25 @@ async fn main() -> Result<()> {
         }
     };
 
+    // ✅ CRITICAL: Run startup validation before proceeding
+    // This ensures all structs, protocols, and configurations are compatible
+    // with real-world Solend mainnet data
+    log::info!("");
+    if let Err(e) = startup_validation::validate_startup(&config, &rpc_client).await {
+        log::error!("❌ Startup validation FAILED!");
+        log::error!("   Error: {}", e);
+        log::error!("");
+        log::error!("   ⚠️  CRITICAL: The bot cannot run safely with the current configuration.");
+        log::error!("   Please fix the validation errors above before proceeding.");
+        log::error!("");
+        log::error!("   💡 Tip: Run manually for detailed output:");
+        log::error!("      cargo run --bin validate_system -- --verbose");
+        log::error!("");
+        return Err(anyhow::anyhow!(
+            "Startup validation failed - bot cannot run safely. Fix validation errors and try again."
+        ));
+    }
+
     let solend_protocol = match protocols::solend::SolendProtocol::new_with_config(&config) {
         Ok(proto) => {
             let protocol_id = proto.id().to_string();

@@ -239,18 +239,52 @@ impl SolendReserve {
         let reserve = match SolendReserve::try_from_slice(struct_data) {
             Ok(r) => r,
             Err(e) => {
-                // Provide detailed error message for debugging
-                return Err(anyhow::anyhow!(
-                    "Failed to deserialize Solend reserve account: {}. \
-                    Account data size: {} bytes, Calculated struct size: {} bytes. \
-                    This struct has been validated against the official Solend source code. \
-                    If parsing fails, the account data may be corrupted, from a different version, \
-                    or the struct definition may need updating. \
-                    Please run: cargo run --bin validate_reserve -- --reserve <RESERVE_ADDRESS>",
+                // Provide detailed error message with hex dump for debugging
+                let hex_dump: String = data
+                    .iter()
+                    .take(256) // First 256 bytes
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .chunks(32)
+                    .map(|chunk| chunk.join(" "))
+                    .collect::<Vec<_>>()
+                    .join("\n      ");
+                
+                // Extract key field offsets for debugging
+                let version_byte = if data.len() > 0 { Some(data[0]) } else { None };
+                let mint_pubkey_start = if data.len() >= 43 {
+                    Some(format!("{:?}", &data[42..74]))
+                } else {
+                    None
+                };
+                
+                let mut error_msg = format!(
+                    "Failed to deserialize Solend reserve account: {}\n   Account data size: {} bytes\n   Calculated struct size: {} bytes\n   First 256 bytes (hex):\n      {}",
                     e,
                     data.len(),
-                    actual_struct_size
-                ));
+                    actual_struct_size,
+                    hex_dump
+                );
+                
+                if let Some(version) = version_byte {
+                    error_msg.push_str(&format!("\n   Version byte (offset 0): 0x{:02x} ({})", version, version));
+                }
+                
+                if let Some(ref mint) = mint_pubkey_start {
+                    error_msg.push_str(&format!("\n   Mint pubkey (offset 42-73): {}", mint));
+                }
+                
+                error_msg.push_str(
+                    "\n   This struct has been validated against the official Solend source code.\n   \
+                     If parsing fails, the account data may be:\n   \
+                     1. Corrupted\n   \
+                     2. From a different protocol version\n   \
+                     3. Not a reserve account (might be obligation/market/config)\n   \
+                     4. Struct definition needs updating\n   \
+                     Please run: cargo run --bin validate_reserve -- --reserve <RESERVE_ADDRESS>"
+                );
+                
+                return Err(anyhow::anyhow!(error_msg));
             }
         };
 

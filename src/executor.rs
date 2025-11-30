@@ -10,8 +10,12 @@ use crate::tx_lock::TxLock;
 use crate::wallet::WalletManager;
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
+
+// Transaction counter for fee verification (first 10 transactions)
+static TX_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run_executor(
     mut receiver: broadcast::Receiver<Event>,
@@ -108,133 +112,84 @@ pub async fn run_executor(
 
                     for attempt in 0..=max_retries {
                         // -----------------------------------------------------------------
-                        // 1) Balance check (early reject / retry)
+                        // FINAL balance check and re-reserve immediately before tx build & send
                         // -----------------------------------------------------------------
-                        if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
-                            use crate::wallet::WalletBalanceChecker;
-                            let balance_checker = WalletBalanceChecker::new(
-                                *wallet.pubkey(),
-                                Arc::clone(&rpc_client),
-                                Some(config.clone()),
-                            );
-                            
-                            if let Ok(current_balance) = balance_checker.get_token_balance(&debt_mint).await {
-                                let reserved = balance_reservation.get_reserved(&debt_mint).await;
-                                let available = current_balance.saturating_sub(reserved);
-                                
-                                if available < opportunity.max_liquidatable_amount {
-                                    log::warn!(
-                                        "Balance insufficient at execution time: required={}, available={}, reserved={}, current={}",
-                                        opportunity.max_liquidatable_amount,
-                                        available,
-                                        reserved,
-                                        current_balance
-                                    );
-                                    
-                                    balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
-                                    log::debug!("Released reservation due to insufficient balance");
-                                    
-                                    if attempt == max_retries {
-                                        last_error = Some(anyhow::anyhow!(
-                                            "Insufficient balance after all retries: required={}, available={}",
-                                            opportunity.max_liquidatable_amount,
-                                            available
-                                        ));
-                                        break;
-                                    }
-                                    
-                                    let retry_delay = Duration::from_millis(initial_retry_delay_ms * (attempt + 1) as u64);
-                                    log::debug!("Retrying after {}ms (balance might be freed by another transaction)", retry_delay.as_millis());
-                                    sleep(retry_delay).await;
-                                    continue;
-                                }
+                        // ✅ CRITICAL: Re-reserve balance right before transaction send to prevent race condition
+                        // 
+                        // Problem: Guard from strategist is dropped before executor, creating a gap
+                        // Solution: Re-reserve in executor right before final check and hold guard until tx is sent
+                        // 
+                        // This ensures:
+                        //   1. Balance is verified immediately before reservation (atomic check+reserve)
+                        //   2. Guard is held during transaction build and send (prevents parallel usage)
+                        //   3. Guard is automatically released when dropped (after tx send or on error)
+                        // 
+                        // This eliminates the race condition gap between strategist reservation and executor execution.
+                        let debt_mint = match crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
+                            Ok(mint) => mint,
+                            Err(e) => {
+                                last_error = Some(anyhow::anyhow!("Invalid debt mint: {}", e));
+                                break;
                             }
-                        }
+                        };
                         
-                        // -----------------------------------------------------------------
-                        // 2) FINAL balance re-check immediately before tx build & send
-                        // -----------------------------------------------------------------
-                        // ✅ CRITICAL: Final balance check to prevent race condition
-                        // 
-                        // Three-Layer Race Condition Protection:
-                        // 
-                        // Layer 1: Reservation Layer (balance_reservation.rs::try_reserve_with_check)
-                        //   - Prevents parallel opportunities from over-reserving the same balance
-                        //   - Uses double-check pattern: initial check + fresh check inside lock
-                        //   - Minimizes gap between balance check and reservation
-                        // 
-                        // Layer 2: Double-Check Layer (balance_reservation.rs::try_reserve_with_check)
-                        //   - Re-verifies balance immediately before reservation (inside lock)
-                        //   - Catches any balance changes that occurred during lock acquisition
-                        //   - Uses fresh balance for reservation calculation
-                        // 
-                        // Layer 3: Final Check Layer (this code - executor.rs)
-                        //   - Performs final balance check immediately before transaction send
-                        //   - Catches any balance changes that occurred after reservation
-                        //   - Prevents sending transactions that will fail (saves fees)
-                        //   - Releases reservation if balance is insufficient
-                        // 
-                        // This three-layer protection ensures:
-                        //   1. Parallel opportunities don't over-reserve (Layer 1)
-                        //   2. Balance is verified immediately before reservation (Layer 2)
-                        //   3. Transactions that would fail are not sent (Layer 3)
-                        //   4. Wasted transaction fees are prevented (Layer 3)
-                        // 
-                        // See balance_reservation.rs for more details on Layers 1 and 2.
-                        if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
-                            use crate::wallet::WalletBalanceChecker;
-                            let balance_checker = WalletBalanceChecker::new(
-                                *wallet.pubkey(),
-                                Arc::clone(&rpc_client),
-                                Some(config.clone()),
-                            );
-
-                            if let Ok(current_balance) = balance_checker.get_token_balance(&debt_mint).await {
-                                let reserved = balance_reservation.get_reserved(&debt_mint).await;
-                                let available = current_balance.saturating_sub(reserved);
-
-                                if available < opportunity.max_liquidatable_amount {
-                                    log::warn!(
-                                        "Final balance check failed right before tx send: required={}, available={}, reserved={}, current={}",
-                                        opportunity.max_liquidatable_amount,
-                                        available,
-                                        reserved,
-                                        current_balance
-                                    );
-                                    log::warn!(
-                                        "   This can happen if balance was consumed between reservation and final check. \
-                                         Reservation is released to allow other opportunities to proceed."
-                                    );
-
-                                    balance_reservation
-                                        .release(&debt_mint, opportunity.max_liquidatable_amount)
-                                        .await;
-                                    log::debug!("Released reservation due to insufficient balance at final check");
-
-                                    last_error = Some(anyhow::anyhow!(
-                                        "Insufficient balance at final check: required={}, available={} \
-                                         (balance may have been consumed by another transaction between reservation and final check)",
-                                        opportunity.max_liquidatable_amount,
-                                        available
-                                    ));
-
-                                    // Bu attempt'ten ve tüm retry'lardan vazgeç
-                                    break;
-                                } else {
-                                    log::debug!(
-                                        "✅ Final balance check passed: required={}, available={}, reserved={}, current={}",
-                                        opportunity.max_liquidatable_amount,
-                                        available,
-                                        reserved,
-                                        current_balance
-                                    );
-                                }
+                        use crate::wallet::WalletBalanceChecker;
+                        let balance_checker = WalletBalanceChecker::new(
+                            *wallet.pubkey(),
+                            Arc::clone(&rpc_client),
+                            Some(config.clone()),
+                        );
+                        
+                        // ✅ Re-reserve with guard to prevent race condition
+                        // Guard is held in scope to prevent race condition - automatically released when dropped
+                        let _balance_guard = match balance_reservation
+                            .try_reserve_with_check(&debt_mint, opportunity.max_liquidatable_amount, &balance_checker)
+                            .await
+                        {
+                            Ok(Some(guard)) => {
+                                log::debug!(
+                                    "✅ Re-reserved balance for execution: mint={}, amount={}",
+                                    debt_mint,
+                                    opportunity.max_liquidatable_amount
+                                );
+                                guard
                             }
-                        }
+                            Ok(None) => {
+                                log::warn!(
+                                    "Balance no longer available at execution time: required={}, mint={}",
+                                    opportunity.max_liquidatable_amount,
+                                    debt_mint
+                                );
+                                
+                                // Release any previous reservation
+                                balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                                
+                                if attempt == max_retries {
+                                    last_error = Some(anyhow::anyhow!(
+                                        "Insufficient balance after all retries: required={}, mint={}",
+                                        opportunity.max_liquidatable_amount,
+                                        debt_mint
+                                    ));
+                                    break;
+                                }
+                                
+                                let retry_delay = Duration::from_millis(initial_retry_delay_ms * (attempt + 1) as u64);
+                                log::debug!("Retrying after {}ms (balance might be freed by another transaction)", retry_delay.as_millis());
+                                sleep(retry_delay).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to re-reserve balance: {}", e);
+                                last_error = Some(e);
+                                break;
+                            }
+                        };
 
                         // -----------------------------------------------------------------
-                        // 3) Tx build + sign + send
+                        // 3) Tx build + sign + send (guard is held during this operation)
                         // -----------------------------------------------------------------
+                        // ✅ Guard is held during transaction send - prevents race condition
+                        // Guard will be automatically released when dropped (after tx send or on error)
                         match solana_client::execute_liquidation(
                             &opportunity,
                             &config,
@@ -247,19 +202,33 @@ pub async fn run_executor(
                             Ok(sig) => {
                                 signature = Some(sig.clone());
                                 success = true;
-                                log::info!("Liquidation transaction sent: {}", sig);
                                 
-                                log::info!("");
-                                log::info!("🔍 TRANSACTION FEE VERIFICATION REQUIRED:");
-                                log::info!("   1. Check transaction on Solscan: https://solscan.io/tx/{}", sig);
-                                log::info!("   2. Compare actual fee vs estimated fee (should be within ±10%)");
-                                log::info!("   3. Verify compute units consumed (should be < configured limit)");
-                                log::info!("   4. Adjust config if needed (see docs/TRANSACTION_FEE_VERIFICATION.md)");
-                                log::info!("");
-
-                                if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
-                                    balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                                // Increment transaction counter
+                                let tx_count = TX_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                
+                                log::info!("Liquidation transaction sent: {} (transaction #{})", sig, tx_count);
+                                
+                                // ✅ Fee verification for first 10 transactions
+                                if tx_count <= 10 {
+                                    log::info!("");
+                                    log::info!("🔍 TRANSACTION FEE VERIFICATION REQUIRED (Transaction #{}/10):", tx_count);
+                                    log::info!("   1. Check transaction on Solscan: https://solscan.io/tx/{}", sig);
+                                    log::info!("   2. Compare actual fee vs estimated fee (should be within ±10%)");
+                                    log::info!("   3. Verify compute units consumed (should be < configured limit)");
+                                    log::info!("   4. Adjust config if needed (see docs/TRANSACTION_FEE_VERIFICATION.md)");
+                                    log::info!("");
+                                    log::info!("   ⚠️  IMPORTANT: Verify fee accuracy for first 10 transactions!");
+                                    log::info!("      If fee estimation error >10%, adjust config values.");
+                                    log::info!("");
+                                } else if tx_count == 11 {
+                                    log::info!("");
+                                    log::info!("✅ Fee verification period complete (10 transactions verified)");
+                                    log::info!("   Continuing with normal operation. Monitor fee accuracy periodically.");
+                                    log::info!("");
                                 }
+
+                                // ✅ Guard is automatically released when dropped here
+                                // No need to manually release - guard's Drop impl handles it
 
                                 // ✅ Record slippage measurement for calibration
                                 if let Some(ref calibrator) = slippage_calibrator {
@@ -312,8 +281,15 @@ pub async fn run_executor(
                     }
 
                     if !success {
+                        // ✅ If we had a guard, it's already released by Drop
+                        // Only manually release if we didn't get a guard (shouldn't happen, but safety check)
                         if let Ok(debt_mint) = crate::utils::parse_pubkey(&opportunity.target_debt_mint) {
-                            balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                            // Check if there's still a reservation (guard might have been dropped)
+                            let reserved = balance_reservation.get_reserved(&debt_mint).await;
+                            if reserved > 0 {
+                                log::debug!("Releasing remaining reservation: mint={}, reserved={}", debt_mint, reserved);
+                                balance_reservation.release(&debt_mint, opportunity.max_liquidatable_amount).await;
+                            }
                         }
                         if let Some(ref err) = last_error {
                             log::error!("All {} attempts failed for account {}: {}", max_retries + 1, account_address, err);

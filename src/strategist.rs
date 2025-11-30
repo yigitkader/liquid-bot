@@ -36,6 +36,17 @@ async fn check_oracle_price(
     let reserve_info = parse_reserve_account(reserve_pubkey, &reserve_account).await?;
     let (pyth, switchboard) = get_oracle_accounts_from_reserve(&reserve_info)?;
     
+    // ✅ CRITICAL: If no oracle accounts found, return None immediately
+    // This is different from oracle accounts existing but price read failing
+    if pyth.is_none() && switchboard.is_none() {
+        log::debug!(
+            "No oracle accounts found for reserve {}. Cannot proceed without oracle data.",
+            reserve_pubkey
+        );
+        return Ok(None); // Oracle accounts yok - bu durumda None döndür
+    }
+    
+    // Oracle accounts exist, try to read price
     if let Some(price) = read_oracle_price(
         pyth.as_ref(),
         switchboard.as_ref(),
@@ -61,7 +72,12 @@ async fn check_oracle_price(
         return Ok(Some(confidence_bps));
     }
     
-    Ok(None)
+    // Oracle accounts exist but price read failed (e.g., oracle data corrupted, network issue)
+    // This is different from no oracle accounts - return error to indicate data issue
+    Err(anyhow::anyhow!(
+        "Oracle accounts exist for reserve {} but price read failed. This may indicate oracle data corruption or network issue.",
+        reserve_pubkey
+    ))
 }
 
 fn check_slippage(
@@ -228,21 +244,42 @@ async fn validate_opportunity(
         get_debt_reserve(&opportunity.account_position.account_address, rpc_client.clone()).await
     {
         match check_oracle_price(&reserve_pubkey, config, rpc_client.clone()).await {
-            Ok(confidence) => confidence,
+            Ok(Some(confidence)) => Some(confidence),
+            Ok(None) => {
+                // ✅ No oracle accounts found for reserve - reject opportunity
+                // This is the case where get_oracle_accounts_from_reserve returned (None, None)
+                log::warn!(
+                    "No oracle accounts found for reserve {}. Cannot proceed with liquidation without oracle data. Rejecting opportunity.",
+                    reserve_pubkey
+                );
+                return Err(anyhow::anyhow!(
+                    "No oracle accounts found for reserve {} - cannot proceed without price data",
+                    reserve_pubkey
+                ));
+            }
             Err(e) => {
+                // Oracle accounts exist but price read failed (e.g., oracle too old, data corrupted)
                 log::error!("Failed to check oracle price for reserve {}: {}", reserve_pubkey, e);
                 return Err(e);
             }
         }
     } else {
+        // Could not find debt reserve - this is a different issue
         log::warn!(
-            "Could not find debt reserve for obligation {}. Skipping oracle check.",
+            "Could not find debt reserve for obligation {}. Cannot proceed without reserve data. Rejecting opportunity.",
             opportunity.account_position.account_address
         );
-        None
+        return Err(anyhow::anyhow!(
+            "Could not find debt reserve for obligation {} - cannot proceed without reserve data",
+            opportunity.account_position.account_address
+        ));
     };
     
-    check_slippage(estimated_dex_slippage_bps, oracle_confidence_bps, config)?;
+    // ✅ At this point, oracle_confidence_bps should always be Some(...)
+    // If it's None, that's a logic error - we should have rejected earlier
+    let oracle_confidence_bps = oracle_confidence_bps.expect("Oracle confidence should be Some at this point - this is a logic error");
+    
+    check_slippage(estimated_dex_slippage_bps, Some(oracle_confidence_bps), config)?;
     
     let debt_mint = utils::parse_pubkey(&opportunity.target_debt_mint)?;
     let collateral_mint = utils::parse_pubkey(&opportunity.target_collateral_mint)?;

@@ -379,18 +379,43 @@ pub async fn calculate_liquidation_opportunity(
     // ✅ DÜZELTME: Oracle confidence'ı hem collateral hem debt için al
     // Oracle confidence, execution risk'i temsil eder ve slippage'e eklenir
     // ❌ YANLIŞ: Gross profit'ten DÜŞÜRMEYİN - bu çift penalizasyon yaratır
+    // ✅ GÜVENLİ YAKLAŞIM: Oracle okunamadığında opportunity'yi reddet
     let collateral_oracle_confidence_bps = if let Some(client) = &rpc_client {
-        get_oracle_confidence_bps(&collateral_asset.mint, client, config).await
-            .unwrap_or(config.default_oracle_confidence_slippage_bps)
+        match get_oracle_confidence_bps(&collateral_asset.mint, client, config).await {
+            Some(bps) => bps,
+            None => {
+                log::warn!(
+                    "Oracle confidence not available for collateral mint {}. Rejecting opportunity for safety.",
+                    collateral_asset.mint
+                );
+                return Ok(None);
+            }
+        }
     } else {
-        config.default_oracle_confidence_slippage_bps
+        log::warn!(
+            "RPC client not available, cannot read oracle confidence for collateral mint {}. Rejecting opportunity for safety.",
+            collateral_asset.mint
+        );
+        return Ok(None);
     };
     
     let debt_oracle_confidence_bps = if let Some(client) = &rpc_client {
-        get_oracle_confidence_bps(&debt_asset.mint, client, config).await
-            .unwrap_or(config.default_oracle_confidence_slippage_bps)
+        match get_oracle_confidence_bps(&debt_asset.mint, client, config).await {
+            Some(bps) => bps,
+            None => {
+                log::warn!(
+                    "Oracle confidence not available for debt mint {}. Rejecting opportunity for safety.",
+                    debt_asset.mint
+                );
+                return Ok(None);
+            }
+        }
     } else {
-        config.default_oracle_confidence_slippage_bps
+        log::warn!(
+            "RPC client not available, cannot read oracle confidence for debt mint {}. Rejecting opportunity for safety.",
+            debt_asset.mint
+        );
+        return Ok(None);
     };
     
     // ✅ DOĞRU: Oracle confidence sadece slippage'de kullanılmalı (execution risk)
@@ -426,6 +451,7 @@ pub async fn calculate_liquidation_opportunity(
             crate::utils::parse_pubkey_opt(&debt_asset.mint),
         ) {
             (Some(collateral_mint), Some(debt_mint)) => {
+                // get_slippage_estimate already handles Jupiter API fallback with conservative multiplier
                 get_slippage_estimate(
                     &collateral_mint,
                     &debt_mint,
@@ -436,8 +462,13 @@ pub async fn calculate_liquidation_opportunity(
                 .await
             }
             _ => {
-                log::warn!("Failed to parse mint addresses for Jupiter API, using estimated slippage");
-                estimated_dex_slippage_bps
+                log::warn!("⚠️  Failed to parse mint addresses for Jupiter API, using estimated slippage");
+                log::warn!(
+                    "   Estimated: {} bps (USE WITH CAUTION - may be inaccurate)",
+                    estimated_dex_slippage_bps
+                );
+                // Apply conservative multiplier for safety
+                ((estimated_dex_slippage_bps as f64 * 1.5) as u16).min(u16::MAX)
             }
         }
     } else {

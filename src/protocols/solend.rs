@@ -274,6 +274,38 @@ impl Protocol for SolendProtocol {
             return Ok(None);
         }
         
+        // ⚠️ CRITICAL: Filter by account size to avoid trying to parse reserves as obligations
+        // Reserve accounts are typically 619-1300 bytes (with padding)
+        // Obligation accounts are typically smaller (200-800 bytes depending on deposits/borrows)
+        // If account is exactly 1300 bytes, it's almost certainly a reserve, not an obligation
+        let data_size = account_data.data.len();
+        if data_size >= 1200 {
+            // Very large accounts (>=1200 bytes) are almost certainly reserves, not obligations
+            // Skip parsing to avoid false errors
+            log::debug!(
+                "Skipping large account {} ({} bytes) - likely a reserve, not an obligation",
+                account_address,
+                data_size
+            );
+            return Ok(None);
+        }
+        
+        // Check first byte - if it's a high version number (>=200), it's likely a reserve
+        if data_size > 0 {
+            let first_byte = account_data.data[0];
+            if first_byte >= 200 {
+                // Reserve version numbers are typically 0, 1, or high numbers (252-255)
+                // Obligation version is typically 0 or 1
+                log::debug!(
+                    "Skipping account {} with high version byte 0x{:02x} ({} - likely a reserve)",
+                    account_address,
+                    first_byte,
+                    first_byte
+                );
+                return Ok(None);
+            }
+        }
+        
         let obligation = match SolendObligation::from_account_data(&account_data.data) {
             Ok(obligation) => obligation,
             Err(e) => {
@@ -281,11 +313,57 @@ impl Protocol for SolendProtocol {
                 // During get_program_accounts scans we optimistically try to parse everything as an
                 // obligation and fall back to `Ok(None)` on failure. This is expected and not an
                 // error condition, so we log it only at debug level to avoid noisy WARN spam.
+                // However, if we're in initial discovery and finding 0 obligations, we need more detail.
                 log::debug!(
                     "Skipping non-obligation Solend account {}: {}",
                     account_address,
                     e
                 );
+                
+                // Log detailed info for first few parse errors to help diagnose struct issues
+                static PARSE_ERROR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let error_count = PARSE_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                if error_count < 3 {
+                    let data_size = account_data.data.len();
+                    let hex_dump: String = account_data.data
+                        .iter()
+                        .take(128) // First 128 bytes
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .chunks(32)
+                        .map(|chunk| chunk.join(" "))
+                        .collect::<Vec<_>>()
+                        .join("\n      ");
+                    
+                    log::warn!(
+                        "⚠️  Obligation parse error #{} (account: {}):\n   Error: {}\n   Data size: {} bytes\n   First 128 bytes (hex):\n      {}",
+                        error_count + 1,
+                        account_address,
+                        e,
+                        data_size,
+                        hex_dump
+                    );
+                    
+                    // Try to extract version byte if possible
+                    if data_size > 0 {
+                        let version_byte = account_data.data[0];
+                        log::warn!(
+                            "   First byte (version?): 0x{:02x} ({})",
+                            version_byte,
+                            version_byte
+                        );
+                    }
+                    
+                    // Check if it might be a reserve instead
+                    if data_size > 100 {
+                        log::warn!(
+                            "   Note: This might be a reserve account (not an obligation). \
+                             Reserves are expected and not an error."
+                        );
+                    }
+                }
+                
                 return Ok(None);
             }
         };

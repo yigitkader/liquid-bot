@@ -22,6 +22,7 @@ pub mod health;
 pub mod performance;
 pub mod slippage_calibration;
 pub mod utils;
+pub mod startup_validation;
 
 pub mod protocols {
     pub mod solend;
