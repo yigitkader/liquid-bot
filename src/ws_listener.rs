@@ -254,15 +254,39 @@ pub async fn run_ws_listener(
     let oracle_accounts = discover_oracle_accounts(&rpc_client, &protocol).await;
     let oracle_accounts = match oracle_accounts {
         Ok(accounts) => {
+            // To avoid overloading the WebSocket endpoint with thousands of
+            // account subscriptions, we cap the number of live oracle
+            // subscriptions. This is especially important on shared/public
+            // RPC endpoints where aggressive subscription patterns can cause
+            // disconnects or rate limiting.
+            //
+            // In practice genelde birkaç temel market (SOL, USDC, stables, blue‑chip)
+            // yeterli oluyor; tüm long‑tail oracle'ları real‑time izlemenin
+            // marjinal getirisi düşük, yükü yüksek.
+            const MAX_ORACLE_SUBSCRIPTIONS: usize = 64;
+
             log::info!("✅ Found {} oracle accounts to subscribe", accounts.len());
             if !accounts.is_empty() {
-                log::debug!("Sample oracle accounts: {:?}", accounts.iter().take(5).map(|info| info.oracle_account).collect::<Vec<_>>());
+                log::debug!(
+                    "Sample oracle accounts: {:?}",
+                    accounts
+                        .iter()
+                        .take(5)
+                        .map(|info| info.oracle_account)
+                        .collect::<Vec<_>>()
+                );
             }
-            // Limit to reasonable number to prevent WebSocket overload
-            // If too many, only use first 100 (most important ones)
-            if accounts.len() > 100 {
-                log::warn!("⚠️  Found {} oracle accounts, limiting to first 100 to prevent WebSocket overload", accounts.len());
-                accounts.into_iter().take(100).collect()
+
+            if accounts.len() > MAX_ORACLE_SUBSCRIPTIONS {
+                log::warn!(
+                    "⚠️  Found {} oracle accounts, limiting to first {} to prevent WebSocket overload",
+                    accounts.len(),
+                    MAX_ORACLE_SUBSCRIPTIONS
+                );
+                accounts
+                    .into_iter()
+                    .take(MAX_ORACLE_SUBSCRIPTIONS)
+                    .collect()
             } else {
                 accounts
             }
@@ -291,9 +315,26 @@ pub async fn run_ws_listener(
         .await
         {
             Ok(()) => {
-                // Normal shutdown (shouldn't happen in production)
-                log::info!("WebSocket connection closed normally");
-                break;
+                // WebSocket bağlantısı sunucu tarafından normal şekilde kapatıldı.
+                // Production'da bu durumda da otomatik olarak yeniden bağlanmak istiyoruz.
+                log::warn!(
+                    "WebSocket connection closed normally by server, reconnecting with backoff (this should be rare in production)"
+                );
+
+                // Hata sayacını sıfırla (bu normal bir durum)
+                consecutive_errors = 0;
+
+                // Küçük bir backoff ile yeniden dene
+                let jitter_ms = rand::thread_rng().gen_range(0..500);
+                let backoff = reconnect_delay.min(max_reconnect_delay) + Duration::from_millis(jitter_ms);
+                log::warn!("Reconnecting after normal close in {:.2}s...", backoff.as_secs_f64());
+                sleep(backoff).await;
+
+                // Bir sonraki denemede reconnect_delay'i hafifçe artır
+                reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
+
+                // Döngüye devam et (yeni WebSocket bağlantısı kurulacak)
+                continue;
             }
             Err(e) => {
                 let error_str = e.to_string();
@@ -655,37 +696,64 @@ async fn connect_and_listen(
     // Subscribe to oracle account updates (price feeds)
     // Solana PubSub API: accountSubscribe method
     // Documentation: https://docs.solana.com/api/websocket#accountsubscribe
+    //
+    // To avoid a burst of hundreds of subscribe requests on connect (which can
+    // trigger disconnects on some providers), we:
+    // - Send subscriptions in small batches
+    // - Add a short delay between batches
     let mut oracle_subscription_ids: Vec<(Pubkey, u64)> = Vec::new();
-    
-    for oracle_info in oracle_accounts {
-        let account_subscribe_request = SubscribeRequest {
-            jsonrpc: "2.0".to_string(),
-            id: *subscription_id_counter,
-            method: "accountSubscribe".to_string(),
-            params: vec![
-                json!(oracle_info.oracle_account.to_string()),
-                json!({
-                    "encoding": "base64",
-                    "commitment": "confirmed"
-                }),
-            ],
-        };
-
-        let account_request_json = serde_json::to_string(&account_subscribe_request)
-            .context("Failed to serialize account subscribe request")?;
-
-        log::info!("📤 Sending accountSubscribe request for oracle: {} ({})", oracle_info.oracle_account, oracle_info.label);
-
-        write
-            .send(Message::Text(account_request_json))
-            .await
-            .context("Failed to send account subscription request")?;
-
-        *subscription_id_counter += 1;
-    }
 
     if !oracle_accounts.is_empty() {
-        log::info!("📤 Subscribed to {} oracle accounts for price feed updates", oracle_accounts.len());
+        const ORACLE_SUB_BATCH_SIZE: usize = 16;
+        const ORACLE_SUB_BATCH_DELAY_MS: u64 = 50;
+
+        log::info!(
+            "📡 Subscribing to {} oracle accounts in batches of {} ({}ms delay between batches)",
+            oracle_accounts.len(),
+            ORACLE_SUB_BATCH_SIZE,
+            ORACLE_SUB_BATCH_DELAY_MS
+        );
+
+        for chunk in oracle_accounts.chunks(ORACLE_SUB_BATCH_SIZE) {
+            for oracle_info in chunk {
+                let account_subscribe_request = SubscribeRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: *subscription_id_counter,
+                    method: "accountSubscribe".to_string(),
+                    params: vec![
+                        json!(oracle_info.oracle_account.to_string()),
+                        json!({
+                            "encoding": "base64",
+                            "commitment": "confirmed"
+                        }),
+                    ],
+                };
+
+                let account_request_json = serde_json::to_string(&account_subscribe_request)
+                    .context("Failed to serialize account subscribe request")?;
+
+                log::info!(
+                    "📤 Sending accountSubscribe request for oracle: {} ({})",
+                    oracle_info.oracle_account,
+                    oracle_info.label
+                );
+
+                write
+                    .send(Message::Text(account_request_json))
+                    .await
+                    .context("Failed to send account subscription request")?;
+
+                *subscription_id_counter += 1;
+            }
+
+            // Small delay between batches to be gentle on the WS server
+            sleep(Duration::from_millis(ORACLE_SUB_BATCH_DELAY_MS)).await;
+        }
+
+        log::info!(
+            "📤 Subscribed to {} oracle accounts for price feed updates",
+            oracle_accounts.len()
+        );
     }
 
     // Wait for subscription confirmation
@@ -757,7 +825,7 @@ async fn connect_and_listen(
                                     if notification.params.subscription == sub_id {
                                         // Extract account pubkey from notification
                                         let account_pubkey_str = &notification.params.result.value.pubkey;
-                                        log::debug!("📨 Received programNotification for account: {}", account_pubkey_str);
+                                        log::info!("📨 WebSocket'ten account update geldi: {}", account_pubkey_str);
                                         match account_pubkey_str.parse::<Pubkey>() {
                                             Ok(account_pubkey) => {
                                                 // Process the notification
@@ -973,6 +1041,7 @@ async fn connect_and_listen(
             _ = sleep(Duration::from_secs(30)) => {
                 // Send ping to keep connection alive
                 if confirmed {
+                    log::info!("💓 WebSocket ping gönderiliyor (bağlantı aktif, notification bekleniyor...)");
                     let ping = json!({
                         "jsonrpc": "2.0",
                         "id": *subscription_id_counter,
@@ -983,6 +1052,8 @@ async fn connect_and_listen(
                         log::warn!("Failed to send ping: {}", e);
                         return Err(anyhow::anyhow!("Failed to send ping"));
                     }
+                } else {
+                    log::warn!("⚠️  WebSocket subscription henüz onaylanmadı, ping gönderilmedi");
                 }
             }
         }
@@ -1026,22 +1097,24 @@ async fn handle_program_notification(
     };
 
     // Parse account position using protocol
+    log::info!("🔍 Account parse ediliyor: {}", account_pubkey);
     match protocol
         .parse_account_position(&account_pubkey, &account, Some(Arc::clone(&rpc_client)))
         .await
     {
         Ok(Some(position)) => {
+            log::info!("✅ Account parse başarılı, event publish ediliyor: {}", account_pubkey);
             bus.publish(Event::AccountUpdated(position))
                 .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))?;
             health_manager.record_successful_poll().await;
-            log::debug!("Published account update: {}", account_pubkey);
+            log::info!("✅ AccountUpdated event publish edildi: {}", account_pubkey);
         }
         Ok(None) => {
             // This account is not a position (e.g., market account, reserve account, etc.)
-            // Ignore it
+            log::debug!("Account {} bir pozisyon değil (market/reserve account vb.), atlanıyor", account_pubkey);
         }
         Err(e) => {
-            log::warn!("Failed to parse account {}: {}", account_pubkey, e);
+            log::warn!("❌ Account parse hatası {}: {}", account_pubkey, e);
             // Continue on parse error
         }
     }

@@ -327,11 +327,8 @@ pub async fn calculate_liquidation_opportunity(
             ) {
                 // Use tokio::runtime::Handle to call async function from sync context
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if let Ok(Some(calibrated)) = handle.block_on(calibrator.get_calibrated_multiplier(seizable_collateral_usd)) {
-                        Some(calibrated)
-                    } else {
-                        None
-                    }
+                    // get_calibrated_multiplier already returns Option<f64>
+                    handle.block_on(calibrator.get_calibrated_multiplier(seizable_collateral_usd))
                 } else {
                     None
                 }

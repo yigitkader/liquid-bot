@@ -254,11 +254,27 @@ impl SolendReserve {
             }
         };
 
-        // Validate version field (first byte) - helps detect protocol upgrades
-        if reserve.version > 1 {
+        // Validate version field (first byte) - helps detect protocol upgrades.
+        //
+        // IMPORTANT: Burada "üstünü örtmek" yerine, elimizdeki GERÇEK bilgiyi kullanıyoruz:
+        // - Borsh ile deserialize başarılı olduysa ve yukarıdaki size kontrolleri geçtiyse,
+        //   elimizdeki struct layout şu anki on‑chain veriye UYUMLU demektir.
+        // - Ancak `version` alanının 0/1 dışına çıkması, Solend tarafında protokol
+        //   evrimi olduğunu gösterir ve yakından izlenmelidir.
+        //
+        // Bu yüzden:
+        // - 0 veya 1 için herhangi bir uyarı yok (legacy versiyonlar)
+        // - Diğer tüm versiyonlar için AÇIK bir uyarı log’luyoruz; ama deserialize
+        //   başarılı olduğu için çalışmayı durdurmuyoruz.
+        // - Gerçek uyumsuzluklar (field ekleme/silme, offset değişimi vb.) zaten
+        //   deserialize veya size kontrollerinde hata olarak yakalanacak.
+        if reserve.version != 0 && reserve.version != 1 {
             log::warn!(
-                "⚠️  Unexpected reserve version: {}. Expected version 0 or 1. \
-                This might indicate a Solend protocol upgrade. Please verify compatibility.",
+                "⚠️  Solend reserve version = {} (non‑legacy). \
+                 Borsh deserialize + size kontrolleri şu an GEÇİYOR, bu yüzden struct layout uyumlu kabul edildi. \
+                 Yine de bu, Solend tarafında bir protokol upgrade'i olduğunu gösterir. \
+                 Lütfen src/protocols/solend_reserve.rs dosyasını resmi Solend kaynağı ile periyodik olarak karşılaştırın \
+                 ve gerekirse bin/validate_reserve aracını gerçek rezerv hesapları üzerinde çalıştırın.",
                 reserve.version
             );
         }
