@@ -5,11 +5,14 @@ use crate::protocol::Protocol;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 
 pub struct Analyzer {
     event_bus: EventBus,
     protocol: Arc<dyn Protocol>,
     config: Config,
+    // Paralel processing için worker pool
+    max_workers: usize,
 }
 
 impl Analyzer {
@@ -22,51 +25,64 @@ impl Analyzer {
             event_bus,
             protocol,
             config,
+            max_workers: 4, // 4 paralel worker
         }
     }
 
     pub async fn run(&self) -> Result<()> {
         let mut receiver = self.event_bus.subscribe();
+        let mut tasks = JoinSet::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_workers));
 
         loop {
             match receiver.recv().await {
                 Ok(Event::AccountUpdated { position, .. })
                 | Ok(Event::AccountDiscovered { position, .. }) => {
-                    log::debug!(
-                        "Analyzer: received position update for {} (hf={})",
-                        position.address,
-                        position.health_factor
-                    );
-                    if self.is_liquidatable(&position) {
-                        if let Some(opportunity) = self.calculate_opportunity(position).await {
-                            log::info!(
-                                "Analyzer: opportunity found for {} (net_profit={:.4}, debt_mint={}, collateral_mint={})",
-                                opportunity.position.address,
-                                opportunity.estimated_profit,
-                                opportunity.debt_mint,
-                                opportunity.collateral_mint
-                            );
-                            self.event_bus.publish(Event::OpportunityFound {
-                                opportunity,
-                            })?;
+                    // Worker pool'dan slot al
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    
+                    // Clone dependencies for task
+                    let event_bus = self.event_bus.clone();
+                    let protocol = Arc::clone(&self.protocol);
+                    let config = self.config.clone();
+                    let position = position.clone();
+                    
+                    // Spawn parallel task
+                    tasks.spawn(async move {
+                        let _permit = permit; // Drop edildiğinde slot serbest kalır
+                        
+                        if Self::is_liquidatable_static(&position, &config) {
+                            if let Some(opportunity) = Self::calculate_opportunity_static(
+                                position,
+                                protocol,
+                                config,
+                            ).await {
+                                log::info!("Analyzer: opportunity found for {}", 
+                                    opportunity.position.address);
+                                let _ = event_bus.publish(Event::OpportunityFound {
+                                    opportunity,
+                                });
+                            }
                         }
-                    } else {
-                        log::debug!(
-                            "Analyzer: position {} is not liquidatable (hf={} >= threshold={})",
-                            position.address,
-                            position.health_factor,
-                            self.config.hf_liquidation_threshold
-                        );
-                    }
+                    });
                 }
-                Ok(_) => {
-                }
+                Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log::warn!("Analyzer lagged, skipped {} events", skipped);
+                    log::error!("⚠️  CRITICAL: Analyzer lagged, skipped {} events", skipped);
+                    log::error!("   Consider: 1) Increase EVENT_BUS_BUFFER_SIZE");
+                    log::error!("            2) Increase max_workers in Analyzer");
+                    log::error!("            3) Optimize calculation logic");
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::error!("Event bus closed, analyzer shutting down");
                     break;
+                }
+            }
+            
+            // Periodically cleanup finished tasks
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(e) = result {
+                    log::error!("Analyzer task failed: {}", e);
                 }
             }
         }
@@ -74,29 +90,29 @@ impl Analyzer {
         Ok(())
     }
 
-    fn is_liquidatable(&self, position: &Position) -> bool {
-        position.health_factor < self.config.hf_liquidation_threshold
+    fn is_liquidatable_static(position: &Position, config: &Config) -> bool {
+        position.health_factor < config.hf_liquidation_threshold
     }
 
-    async fn calculate_opportunity(&self, position: Position) -> Option<Opportunity> {
-        let params = self.protocol.liquidation_params();
+    async fn calculate_opportunity_static(
+        position: Position,
+        protocol: Arc<dyn Protocol>,
+        config: Config,
+    ) -> Option<Opportunity> {
+        let params = protocol.liquidation_params();
 
         let max_liquidatable_usd = position.debt_usd * params.close_factor;
         let seizable_collateral_usd = max_liquidatable_usd * (1.0 + params.bonus);
 
-        log::debug!(
-            "Analyzer: calculating opportunity for {} -> debt_usd={:.4}, collateral_usd={:.4}, max_liquidatable_usd={:.4}, seizable_collateral_usd={:.4}",
-            position.address,
-            position.debt_usd,
-            position.collateral_usd,
+        let (debt_mint, collateral_mint) = Self::select_best_pair_static(
+            &position,
             max_liquidatable_usd,
-            seizable_collateral_usd
-        );
-
-        let (debt_mint, collateral_mint) = self.select_best_pair(&position, max_liquidatable_usd, seizable_collateral_usd).await?;
+            seizable_collateral_usd,
+            &config,
+        ).await?;
 
         use crate::strategy::profit_calculator::ProfitCalculator;
-        let profit_calc = ProfitCalculator::new(self.config.clone());
+        let profit_calc = ProfitCalculator::new(config.clone());
         
         let temp_opp = Opportunity {
             position: position.clone(),
@@ -109,13 +125,7 @@ impl Analyzer {
         
         let net_profit = profit_calc.calculate_net_profit(&temp_opp);
 
-        if net_profit < self.config.min_profit_usd {
-            log::info!(
-                "Analyzer: rejecting opportunity for {} - net_profit={:.4} < min_profit_usd={:.4}",
-                position.address,
-                net_profit,
-                self.config.min_profit_usd
-            );
+        if net_profit < config.min_profit_usd {
             return None;
         }
 
@@ -129,49 +139,37 @@ impl Analyzer {
         })
     }
 
-    async fn select_best_pair(
-        &self,
+    async fn select_best_pair_static(
         position: &Position,
         max_liquidatable_usd: f64,
         seizable_collateral_usd: f64,
+        config: &Config,
     ) -> Option<(solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey)> {
         use crate::strategy::profit_calculator::ProfitCalculator;
         use crate::core::types::Opportunity;
         
         if position.debt_assets.is_empty() || position.collateral_assets.is_empty() {
-            log::warn!(
-                "Analyzer: position {} has empty debt_assets or collateral_assets, skipping",
-                position.address
-            );
             return None;
         }
 
-        let profit_calc = ProfitCalculator::new(self.config.clone());
+        let profit_calc = ProfitCalculator::new(config.clone());
         let mut best_profit = f64::NEG_INFINITY;
         let mut best_pair: Option<(solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey)> = None;
 
-        for debt_asset in &position.debt_assets {
-            if debt_asset.amount_usd < max_liquidatable_usd * 0.1 {
-                log::debug!(
-                    "Analyzer: skipping debt asset {} (amount_usd={:.4} < 10% of max_liquidatable_usd={:.4})",
-                    debt_asset.mint,
-                    debt_asset.amount_usd,
-                    max_liquidatable_usd
-                );
-                continue;
-            }
+        // Optimize: Sadece en büyük debt ve collateral'ı kontrol et
+        // Tüm kombinasyonları denemek yerine
+        let top_debts: Vec<_> = position.debt_assets.iter()
+            .filter(|d| d.amount_usd >= max_liquidatable_usd * 0.1)
+            .take(2) // En fazla 2 debt asset kontrol et
+            .collect();
 
-            for collateral_asset in &position.collateral_assets {
-                if collateral_asset.amount_usd < seizable_collateral_usd * 0.1 {
-                    log::debug!(
-                        "Analyzer: skipping collateral asset {} (amount_usd={:.4} < 10% of seizable_collateral_usd={:.4})",
-                        collateral_asset.mint,
-                        collateral_asset.amount_usd,
-                        seizable_collateral_usd
-                    );
-                    continue;
-                }
+        let top_collaterals: Vec<_> = position.collateral_assets.iter()
+            .filter(|c| c.amount_usd >= seizable_collateral_usd * 0.1)
+            .take(2) // En fazla 2 collateral asset kontrol et
+            .collect();
 
+        for debt_asset in &top_debts {
+            for collateral_asset in &top_collaterals {
                 let temp_opp = Opportunity {
                     position: position.clone(),
                     max_liquidatable: (max_liquidatable_usd * 1_000_000.0) as u64,
@@ -186,22 +184,8 @@ impl Analyzer {
                 if net_profit > best_profit {
                     best_profit = net_profit;
                     best_pair = Some((debt_asset.mint, collateral_asset.mint));
-                    log::debug!(
-                        "Analyzer: new best pair for {} -> debt_mint={}, collateral_mint={}, net_profit={:.4}",
-                        position.address,
-                        debt_asset.mint,
-                        collateral_asset.mint,
-                        net_profit
-                    );
                 }
             }
-        }
-
-        if best_pair.is_none() {
-            log::info!(
-                "Analyzer: no profitable debt/collateral pair found for position {}",
-                position.address
-            );
         }
 
         best_pair

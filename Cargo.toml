@@ -73,3 +73,7 @@ path = "src/bin/validate_instruction_accounts.rs"
 [[bin]]
 name = "test_production_features"
 path = "src/bin/test_production_features.rs"
+
+[[bin]]
+name = "create_atas"
+path = "src/bin/create_atas.rs"

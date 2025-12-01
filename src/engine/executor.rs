@@ -31,7 +31,7 @@ impl TxLock {
 
     /// Start background cleanup task that periodically removes expired locks.
     /// This prevents locks from leaking when no new lock attempts are made.
-    fn start_cleanup_task(self: Arc<Self>) {
+    fn start_cleanup_task(self: &Arc<Self>) {
         let locked = Arc::clone(&self.locked);
         let lock_times = Arc::clone(&self.lock_times);
         let timeout_seconds = self.timeout_seconds;

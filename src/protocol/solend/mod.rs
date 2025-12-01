@@ -49,59 +49,89 @@ impl Protocol for SolendProtocol {
         use log;
 
         let data_len = account.data.len();
+
+        // FAST PATH: Size check önce
+        const EXPECTED_OBLIGATION_SIZE: usize = 1300;
+        const MIN_OBLIGATION_SIZE: usize = 1200; // Biraz tolerans
+        
+        if data_len < MIN_OBLIGATION_SIZE {
+            // Bu çok küçük - muhtemelen closed obligation
+            log::debug!(
+                "SolendProtocol: skipping account (too small): {} bytes (expected: {})",
+                data_len,
+                EXPECTED_OBLIGATION_SIZE
+            );
+            return None;
+        }
+        
+        if data_len > EXPECTED_OBLIGATION_SIZE + 100 {
+            // Bu çok büyük - muhtemelen farklı account tipi
+            log::debug!(
+                "SolendProtocol: skipping account (too large): {} bytes (expected: {})",
+                data_len,
+                EXPECTED_OBLIGATION_SIZE
+            );
+            return None;
+        }
+        
+        // Obligation parse et
         let obligation = match SolendObligation::from_account_data(&account.data) {
             Ok(obl) => obl,
             Err(e) => {
-                log::debug!(
-                    "SolendProtocol: failed to parse obligation account (data_len={}): {}",
-                    data_len,
-                    e
-                );
+                // Parse error - log sadece ilk birkaç kez (spam önlemek için)
+                static PARSE_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+                
+                let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                
+                if count < 10 {
+                    log::debug!(
+                        "SolendProtocol: failed to parse obligation (data_len={}): {}",
+                        data_len,
+                        e
+                    );
+                }
+                
                 return None;
             }
         };
-
-        let deposits_len = obligation.deposits.len();
-        let borrows_len = obligation.borrows.len();
-
-        // Sadece ilk birkaç obligation için derin log (log dosyasını şişirmemek için)
-        let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
-        if logged < 5 {
-            let deposited_usd = obligation.total_deposited_value_usd();
-            let borrowed_usd = obligation.total_borrowed_value_usd();
-            let health_factor = obligation.calculate_health_factor();
-
-            log::info!(
-                "🧩 Solend Obligation Parsed (runtime): data_len={}, health_factor={:.6}, deposited_usd={:.6}, borrowed_usd={:.6}, deposits_len={}, borrows_len={}",
-                data_len,
-                health_factor,
-                deposited_usd,
-                borrowed_usd,
-                deposits_len,
-                borrows_len
+        
+        // Empty obligation check
+        if obligation.deposits.is_empty() && obligation.borrows.is_empty() {
+            log::debug!(
+                "SolendProtocol: skipping empty obligation (owner={})",
+                obligation.owner
             );
+            return None;
+        }
+        
+        // Zero-value obligation check
+        let deposited = obligation.total_deposited_value_usd();
+        let borrowed = obligation.total_borrowed_value_usd();
+        
+        if deposited < 0.01 && borrowed < 0.01 {
+            log::debug!(
+                "SolendProtocol: skipping near-zero obligation (owner={}, deposited=${:.4}, borrowed=${:.4})",
+                obligation.owner,
+                deposited,
+                borrowed
+            );
+            return None;
+        }
 
-            for (i, dep) in obligation.deposits.iter().enumerate() {
-                log::info!(
-                    "   ▸ Deposit[{}]: reserve={}, deposited_amount={}, market_value_raw={}, market_value_usd={:.6}",
-                    i,
-                    dep.deposit_reserve,
-                    dep.deposited_amount,
-                    dep.market_value.value,
-                    dep.market_value.to_f64()
-                );
-            }
-
-            for (i, bor) in obligation.borrows.iter().enumerate() {
-                log::info!(
-                    "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
-                    i,
-                    bor.borrow_reserve,
-                    bor.borrowed_amount_wads.to_f64(),
-                    bor.market_value.value,
-                    bor.market_value.to_f64()
-                );
-            }
+        // Log detaylı info (sadece ilk birkaç kez)
+        let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
+        
+        if logged < 5 {
+            let health_factor = obligation.calculate_health_factor();
+            log::info!(
+                "🧩 Solend Obligation Parsed: owner={}, hf={:.6}, deposited=${:.2}, borrowed=${:.2}, deposits={}, borrows={}",
+                obligation.owner,
+                health_factor,
+                deposited,
+                borrowed,
+                obligation.deposits.len(),
+                obligation.borrows.len()
+            );
         }
 
         let health_factor = obligation.calculate_health_factor();

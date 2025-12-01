@@ -4,7 +4,6 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use crate::core::types::Opportunity;
-use crate::blockchain::rpc_client::RpcClient;
 use crate::protocol::solend::accounts::{
     get_associated_token_address,
     derive_lending_market_authority,
@@ -18,7 +17,6 @@ use spl_token;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use once_cell::sync::Lazy;
-
 use crate::blockchain::rpc_client::RpcClient;
 
 /// Minimal subset of Solend reserve data we need when building liquidation instructions.
