@@ -18,13 +18,17 @@ impl PythOracle {
     pub async fn read_price(
         account: &Pubkey,
         rpc: Arc<RpcClient>,
+        config: Option<&crate::config::Config>,
     ) -> Result<PriceData> {
         let account_data = rpc.get_account(account).await?;
-        Self::parse_pyth_account(&account_data.data)
+        Self::parse_pyth_account(&account_data.data, config)
     }
 
-    pub fn parse_pyth_account(data: &[u8]) -> Result<PriceData> {
-        let pyth_program_id = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH"
+    pub fn parse_pyth_account(data: &[u8], config: Option<&crate::config::Config>) -> Result<PriceData> {
+        let pyth_program_id_str = config
+            .map(|c| c.pyth_program_id.as_str())
+            .unwrap_or("FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH");
+        let pyth_program_id = pyth_program_id_str
             .parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
         

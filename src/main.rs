@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use dotenv::dotenv;
+use fern;
 use log;
 use std::fs;
 use std::path::Path;
@@ -25,14 +26,30 @@ use solana_sdk::signature::{Keypair, Signer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .format_timestamp_secs()
-        .init();
-
     dotenv().ok();
+    
+    std::fs::create_dir_all("logs")
+        .context("Failed to create logs directory")?;
+    
+    let log_file_path = format!("logs/bot-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
+    
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] {}",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .chain(std::io::stdout())
+        .chain(fern::log_file(&log_file_path)?)
+        .apply()
+        .context("Failed to initialize logger")?;
 
     log::info!("🚀 Starting Solana Liquidation Bot");
+    log::info!("📝 Logging to: {}", log_file_path);
 
     let config = Config::from_env()
         .context("Failed to load configuration")?;

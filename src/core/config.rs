@@ -52,9 +52,18 @@ pub struct Config {
     pub event_bus_buffer_size: usize,
     pub health_manager_max_error_age_seconds: u64,
     pub retry_jitter_max_ms: u64,
-    pub use_jupiter_api: bool, // Enable real-time slippage estimation from Jupiter API
-    pub slippage_calibration_file: Option<String>, // Path to slippage calibration JSON file
-    pub slippage_min_measurements_per_category: usize, // Minimum measurements per category for calibration
+    pub use_jupiter_api: bool,
+    pub slippage_calibration_file: Option<String>,
+    pub slippage_min_measurements_per_category: usize,
+    pub main_lending_market_address: Option<String>,
+    pub test_wallet_pubkey: Option<String>,
+    pub usdc_mint: String,
+    pub sol_mint: String,
+    pub usdt_mint: Option<String>,
+    pub eth_mint: Option<String>,
+    pub btc_mint: Option<String>,
+    pub default_pyth_oracle_mappings_json: Option<String>,
+    pub default_switchboard_oracle_mappings_json: Option<String>,
 }
 
 impl Config {
@@ -244,6 +253,27 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
+            main_lending_market_address: env::var("MAIN_LENDING_MARKET_ADDRESS")
+                .ok()
+                .or_else(|| Some("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY".to_string())),
+            test_wallet_pubkey: env::var("TEST_WALLET_PUBKEY")
+                .ok()
+                .or_else(|| Some("11111111111111111111111111111111".to_string())),
+            usdc_mint: env::var("USDC_MINT")
+                .unwrap_or_else(|_| "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+            sol_mint: env::var("SOL_MINT")
+                .unwrap_or_else(|_| "So11111111111111111111111111111111111111112".to_string()),
+            usdt_mint: env::var("USDT_MINT")
+                .ok()
+                .or_else(|| Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string())),
+            eth_mint: env::var("ETH_MINT")
+                .ok()
+                .or_else(|| Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs".to_string())),
+            btc_mint: env::var("BTC_MINT")
+                .ok()
+                .or_else(|| Some("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E".to_string())),
+            default_pyth_oracle_mappings_json: env::var("DEFAULT_PYTH_ORACLE_MAPPINGS_JSON").ok(),
+            default_switchboard_oracle_mappings_json: env::var("DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON").ok(),
         };
 
         config.validate()?;

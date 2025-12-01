@@ -5,6 +5,8 @@
 *.class
 *.log
 *.tmp
+logs/
+logs/*
 .DS_Store
 *.xml
 

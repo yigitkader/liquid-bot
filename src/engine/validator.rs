@@ -74,7 +74,11 @@ impl Validator {
     }
 
     async fn verify_ata_exists(&self, mint: &Pubkey) -> Result<()> {
-        let wallet_pubkey = Pubkey::try_from("11111111111111111111111111111111")
+        let wallet_pubkey_str = self.config.test_wallet_pubkey
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("11111111111111111111111111111111");
+        let wallet_pubkey = wallet_pubkey_str.parse::<Pubkey>()
             .map_err(|_| anyhow::anyhow!("Invalid wallet pubkey"))?;
         let ata = get_associated_token_address(&wallet_pubkey, mint, None)?;
         match self.rpc.get_account(&ata).await {

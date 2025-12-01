@@ -162,7 +162,7 @@ Production'a geçmeden önce **mutlaka** aşağıdaki checklist'i tamamlayın:
 Tüm testleri otomatik olarak çalıştırmak için:
 
 ```bash
-./scripts/production_checklist.sh
+./scripts/prod_check.sh
 ```
 
 ### Manuel Testler

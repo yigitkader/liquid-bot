@@ -1,6 +1,7 @@
-
 use anyhow::{Context, Result};
 use clap::Parser;
+use dotenv::dotenv;
+use fern;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
@@ -74,9 +75,27 @@ impl TestResult {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    dotenv::dotenv().ok();
+    
+    std::fs::create_dir_all("logs")
+        .context("Failed to create logs directory")?;
+    
+    let log_file_path = format!("logs/validate-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
+    
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] {}",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .chain(std::io::stdout())
+        .chain(fern::log_file(&log_file_path)?)
+        .apply()
+        .context("Failed to initialize logger")?;
 
     let args = Args::parse();
 
@@ -107,7 +126,7 @@ async fn main() -> Result<()> {
 
     println!("2️⃣  Validating Addresses...");
     println!("{}", "-".repeat(80));
-    results.extend(validate_addresses().await?);
+    results.extend(validate_addresses(config.as_ref()).await?);
     println!();
 
     println!("3️⃣  Testing RPC Connection...");
@@ -119,12 +138,12 @@ async fn main() -> Result<()> {
         RpcClient::new(rpc_url.to_string())
             .context("Failed to create RPC client")?
     );
-    results.extend(validate_rpc_connection(&rpc_client).await?);
+    results.extend(validate_rpc_connection(&rpc_client, config.as_ref()).await?);
     println!();
 
     println!("4️⃣  Validating Reserve Account Structure...");
     println!("{}", "-".repeat(80));
-    results.extend(validate_reserve_accounts(&rpc_client).await?);
+    results.extend(validate_reserve_accounts(&rpc_client, config.as_ref()).await?);
     println!();
 
     println!("5️⃣  Validating Obligation Account Structure...");
@@ -297,10 +316,12 @@ async fn validate_config(_args: &Args, config: Option<&Config>) -> Result<Vec<Te
     Ok(results)
 }
 
-async fn validate_addresses() -> Result<Vec<TestResult>> {
+async fn validate_addresses(config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    let solend_program_id_str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+    let solend_program_id_str = config
+        .map(|c| c.solend_program_id.as_str())
+        .unwrap_or("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
     match Pubkey::try_from(solend_program_id_str) {
         Ok(pid) => {
             results.push(TestResult::success_with_details(
@@ -317,7 +338,9 @@ async fn validate_addresses() -> Result<Vec<TestResult>> {
         }
     }
 
-    let main_market_str = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY";
+    let main_market_str = config
+        .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
     match main_market_str.parse::<Pubkey>() {
         Ok(market) => {
             results.push(TestResult::success_with_details(
@@ -334,9 +357,16 @@ async fn validate_addresses() -> Result<Vec<TestResult>> {
         }
     }
 
+    let usdc_reserve_str = config
+        .and_then(|c| c.usdc_reserve_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
+    let sol_reserve_str = config
+        .and_then(|c| c.sol_reserve_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36");
+    
     let known_reserves = vec![
-        ("USDC Reserve", "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"),
-        ("SOL Reserve", "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"),
+        ("USDC Reserve", usdc_reserve_str),
+        ("SOL Reserve", sol_reserve_str),
     ];
 
     for (name, addr_str) in known_reserves {
@@ -359,7 +389,7 @@ async fn validate_addresses() -> Result<Vec<TestResult>> {
     Ok(results)
 }
 
-async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>) -> Result<Vec<TestResult>> {
+async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
     match rpc_client.get_slot().await {
@@ -378,7 +408,10 @@ async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>) -> Result<Vec<Test
         }
     }
 
-    let test_pubkey = Pubkey::try_from("So11111111111111111111111111111111111111112")
+    let sol_mint_str = config
+        .map(|c| c.sol_mint.as_str())
+        .unwrap_or("So11111111111111111111111111111111111111112");
+    let test_pubkey = sol_mint_str.parse::<Pubkey>()
         .context("Invalid test pubkey")?;
     match rpc_client.get_account(&test_pubkey).await {
         Ok(account) => {
@@ -399,10 +432,12 @@ async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>) -> Result<Vec<Test
     Ok(results)
 }
 
-async fn validate_reserve_accounts(rpc_client: &Arc<RpcClient>) -> Result<Vec<TestResult>> {
+async fn validate_reserve_accounts(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    let usdc_reserve_str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
+    let usdc_reserve_str = config
+        .and_then(|c| c.usdc_reserve_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
     let usdc_reserve = usdc_reserve_str.parse::<Pubkey>()
         .context("Invalid USDC reserve address")?;
 
@@ -448,11 +483,17 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
         "SolendObligation struct is properly defined with BorshDeserialize"
     ));
 
-    let solend_program_id = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+    let solend_program_id_str = config
+        .map(|c| c.solend_program_id.as_str())
+        .unwrap_or("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
+    let solend_program_id = solend_program_id_str
         .parse::<Pubkey>()
         .context("Invalid Solend program ID")?;
     
-    let main_market = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"
+    let main_market_str = config
+        .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+    let main_market = main_market_str
         .parse::<Pubkey>()
         .context("Invalid main market address")?;
 
@@ -531,11 +572,17 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
 async fn validate_pda_derivations(config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    let program_id = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+    let program_id_str = config
+        .map(|c| c.solend_program_id.as_str())
+        .unwrap_or("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
+    let program_id = program_id_str
         .parse::<Pubkey>()
         .context("Invalid Solend program ID")?;
 
-    let main_market = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"
+    let main_market_str = config
+        .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+    let main_market = main_market_str
         .parse::<Pubkey>()
         .context("Invalid main market address")?;
 
@@ -555,7 +602,10 @@ async fn validate_pda_derivations(config: Option<&Config>) -> Result<Vec<TestRes
         }
     }
 
-    let test_wallet = Pubkey::try_from("11111111111111111111111111111111")
+    let test_wallet_str = config
+        .and_then(|c| c.test_wallet_pubkey.as_ref().map(|s| s.as_str()))
+        .unwrap_or("11111111111111111111111111111111");
+    let test_wallet = test_wallet_str.parse::<Pubkey>()
         .context("Invalid test wallet")?;
     match derive_obligation_address(&test_wallet, &main_market, &program_id) {
         Ok(obligation) => {
@@ -615,7 +665,10 @@ async fn validate_instruction_formats() -> Result<Vec<TestResult>> {
 async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    let usdc_mint = Pubkey::try_from("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+    let usdc_mint_str = config
+        .map(|c| c.usdc_mint.as_str())
+        .unwrap_or("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    let usdc_mint = usdc_mint_str.parse::<Pubkey>()
         .context("Invalid USDC mint")?;
 
     match get_pyth_oracle_account(&usdc_mint, config) {
@@ -661,7 +714,10 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
         }
     }
 
-    let sol_mint = Pubkey::try_from("So11111111111111111111111111111111111111112")
+    let sol_mint_str = config
+        .map(|c| c.sol_mint.as_str())
+        .unwrap_or("So11111111111111111111111111111111111111112");
+    let sol_mint = sol_mint_str.parse::<Pubkey>()
         .context("Invalid SOL mint")?;
 
     match get_pyth_oracle_account(&sol_mint, config) {
@@ -909,14 +965,23 @@ async fn validate_wallet_integration(rpc_client: &Arc<RpcClient>, config: Option
 async fn validate_system_integration(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    let solend_program_id = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+    let solend_program_id_str = config
+        .map(|c| c.solend_program_id.as_str())
+        .unwrap_or("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
+    let solend_program_id = solend_program_id_str
         .parse::<Pubkey>()
         .context("Invalid Solend program ID")?;
-    let main_market = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"
+    
+    let main_market_str = config
+        .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+    let main_market = main_market_str
         .parse::<Pubkey>()
         .context("Invalid main market address")?;
 
-    let usdc_reserve_str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
+    let usdc_reserve_str = config
+        .and_then(|c| c.usdc_reserve_address.as_ref().map(|s| s.as_str()))
+        .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
     let usdc_reserve = usdc_reserve_str.parse::<Pubkey>()
         .context("Invalid USDC reserve address")?;
 
@@ -934,7 +999,8 @@ async fn validate_system_integration(rpc_client: &Arc<RpcClient>, config: Option
                         match SolendProtocol::new(config) {
                             Ok(protocol) => {
                                 let protocol: Arc<dyn Protocol> = Arc::new(protocol);
-                                let usdc_mint = Pubkey::try_from("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                                let usdc_mint_str = config.usdc_mint.as_str();
+                                let usdc_mint = usdc_mint_str.parse::<Pubkey>()
                                     .context("Invalid USDC mint")?;
                                 match get_pyth_oracle_account(&usdc_mint, Some(config)) {
                                     Ok(Some(pyth_oracle)) => {
