@@ -262,12 +262,16 @@ pub async fn ensure_required_atas(
 
     let results = join_all(check_tasks).await;
     
+    log::debug!("ATA check completed, processing {} results...", results.len());
+    
     for result in results {
         match result {
             Ok((name, mint, ata, exists)) => {
                 if !exists {
                     let name_clone = name.clone();
                     missing_atas.push((name, mint, ata));
+                    
+                    log::debug!("Creating ATA instruction for {} (mint: {})...", name_clone, mint);
                     
                     // Create ATA instruction
                     match create_ata_instruction(
@@ -276,7 +280,10 @@ pub async fn ensure_required_atas(
                         &mint,
                         Some(config),
                     ) {
-                        Ok(ix) => instructions.push(ix),
+                        Ok(ix) => {
+                            log::debug!("✅ ATA instruction created for {}", name_clone);
+                            instructions.push(ix);
+                        }
                         Err(e) => {
                             log::warn!("⚠️  Failed to create ATA instruction for {}: {}", name_clone, e);
                         }
@@ -289,6 +296,8 @@ pub async fn ensure_required_atas(
         }
     }
 
+    log::debug!("Processed all results: {} missing ATAs, {} instructions", missing_atas.len(), instructions.len());
+
     if instructions.is_empty() {
         log::info!("🎉 All required ATAs already exist!");
         return Ok(());
@@ -297,12 +306,25 @@ pub async fn ensure_required_atas(
     log::info!("📝 Creating {} missing ATA(s)...", instructions.len());
 
     // Send transaction to create missing ATAs
-    let recent_blockhash = rpc.get_recent_blockhash().await?;
+    log::debug!("Getting recent blockhash...");
+    let recent_blockhash = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        rpc.get_recent_blockhash()
+    ).await
+    .context("Timeout getting recent blockhash")??;
+    
+    log::debug!("Building transaction with {} instructions...", instructions.len());
     let mut tx = Transaction::new_with_payer(&instructions, Some(&wallet_pubkey));
     tx.sign(&[wallet.as_ref()], recent_blockhash);
+    
+    log::debug!("Sending transaction to create ATAs...");
+    let send_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        rpc.send_transaction(&tx)
+    ).await;
 
-    match rpc.send_transaction(&tx).await {
-        Ok(sig) => {
+    match send_result {
+        Ok(Ok(sig)) => {
             log::info!("✅ ATA creation transaction sent: {}", sig);
             
             // Wait a bit for transaction to confirm
@@ -326,10 +348,15 @@ pub async fn ensure_required_atas(
             
             log::info!("🎉 ATA setup completed!");
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("❌ Failed to create ATAs: {}", e);
             log::error!("   You may need to create them manually or ensure wallet has enough SOL");
             // Don't fail - bot can still run, ATAs will be created on-demand during transactions
+            log::warn!("   Bot will continue, but may fail during liquidation if ATAs are missing");
+        }
+        Err(_) => {
+            log::error!("❌ Timeout sending ATA creation transaction (30s)");
+            log::error!("   Transaction may have been sent but not confirmed yet");
             log::warn!("   Bot will continue, but may fail during liquidation if ATAs are missing");
         }
     }
