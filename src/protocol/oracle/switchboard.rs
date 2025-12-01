@@ -37,71 +37,113 @@ impl SwitchboardOracle {
     pub fn parse_switchboard_account(data: &[u8]) -> Result<PriceData> {
         log::debug!("Parsing Switchboard oracle account: {} bytes", data.len());
         
-        if data.len() < 72 {
-            log::error!("Switchboard account data too small: {} bytes (minimum 72 required)", data.len());
+        if data.len() < 24 {
+            log::error!("Switchboard account data too small: {} bytes (minimum 24 required)", data.len());
             return Err(anyhow::anyhow!("Switchboard account data too small: {} bytes", data.len()));
         }
 
         log::debug!("Switchboard account data structure: first 32 bytes = {:02x?}", &data[0..data.len().min(32)]);
 
-        let mut cursor = 0;
-        
-        if data.len() >= 8 {
-            cursor = 8;
-            log::debug!("Skipping first 8 bytes (discriminator/anchor), cursor now at: {}", cursor);
+        // Try multiple parsing strategies in order of preference
+        // Strategy 1: Offset 8 (most common - Anchor discriminator)
+        if let Ok(price_data) = Self::parse_with_offset(data, 8) {
+            if price_data.price > 0.0 && price_data.price.is_finite() && !price_data.price.is_nan() {
+                log::info!("Switchboard oracle parsed successfully with offset 8: price=${:.4}, confidence=${:.4}, timestamp={}", 
+                    price_data.price, price_data.confidence, price_data.timestamp);
+                return Ok(price_data);
+            } else {
+                log::warn!("Switchboard parsing with offset 8 returned invalid price: {}", price_data.price);
+            }
         }
 
-        if data.len() < cursor + 64 {
-            log::error!("Switchboard account data incomplete: need {} bytes, have {} bytes", cursor + 64, data.len());
-            return Err(anyhow::anyhow!("Switchboard account data incomplete: need {} bytes, have {}", cursor + 64, data.len()));
+        // Strategy 2: Offset 0 (no discriminator - direct parsing)
+        if let Ok(price_data) = Self::parse_with_offset(data, 0) {
+            if price_data.price > 0.0 && price_data.price.is_finite() && !price_data.price.is_nan() {
+                log::info!("Switchboard oracle parsed successfully with offset 0: price=${:.4}, confidence=${:.4}, timestamp={}", 
+                    price_data.price, price_data.confidence, price_data.timestamp);
+                return Ok(price_data);
+            } else {
+                log::warn!("Switchboard parsing with offset 0 returned invalid price: {}", price_data.price);
+            }
         }
 
-        let price_bytes: [u8; 8] = data[cursor..cursor + 8]
+        // Strategy 3: Try offset 16 (alternative structure)
+        if data.len() >= 40 {
+            if let Ok(price_data) = Self::parse_with_offset(data, 16) {
+                if price_data.price > 0.0 && price_data.price.is_finite() && !price_data.price.is_nan() {
+                    log::info!("Switchboard oracle parsed successfully with offset 16: price=${:.4}, confidence=${:.4}, timestamp={}", 
+                        price_data.price, price_data.confidence, price_data.timestamp);
+                    return Ok(price_data);
+                }
+            }
+        }
+
+        // All strategies failed
+        log::error!("All Switchboard parsing strategies failed");
+        log::error!("Account data size: {} bytes", data.len());
+        log::error!("First 64 bytes: {:02x?}", &data[0..data.len().min(64)]);
+        Err(anyhow::anyhow!("All Switchboard parsing strategies failed - unable to parse oracle account"))
+    }
+
+    /// Parse Switchboard account data starting from a specific offset
+    fn parse_with_offset(data: &[u8], offset: usize) -> Result<PriceData> {
+        if data.len() < offset + 24 {
+            return Err(anyhow::anyhow!(
+                "Insufficient data for offset {}: need {} bytes, have {} bytes",
+                offset,
+                offset + 24,
+                data.len()
+            ));
+        }
+
+        // Read price (8 bytes)
+        let price_bytes: [u8; 8] = data[offset..offset + 8]
             .try_into()
             .map_err(|e| {
-                log::error!("Failed to read price bytes at offset {}: {:?}", cursor, e);
-                anyhow::anyhow!("Failed to read price bytes")
+                log::debug!("Failed to read price bytes at offset {}: {:?}", offset, e);
+                anyhow::anyhow!("Failed to read price bytes at offset {}", offset)
             })?;
         let price = f64::from_le_bytes(price_bytes);
-        log::debug!("Raw price bytes: {:02x?}, parsed as f64: {}", price_bytes, price);
+        log::debug!("Offset {}: Raw price bytes: {:02x?}, parsed as f64: {}", offset, price_bytes, price);
 
-        let confidence_bytes: [u8; 8] = data[cursor + 8..cursor + 16]
+        // Read confidence (8 bytes)
+        let confidence_bytes: [u8; 8] = data[offset + 8..offset + 16]
             .try_into()
             .map_err(|e| {
-                log::error!("Failed to read confidence bytes at offset {}: {:?}", cursor + 8, e);
-                anyhow::anyhow!("Failed to read confidence bytes")
+                log::debug!("Failed to read confidence bytes at offset {}: {:?}", offset + 8, e);
+                anyhow::anyhow!("Failed to read confidence bytes at offset {}", offset + 8)
             })?;
         let confidence = f64::from_le_bytes(confidence_bytes);
-        log::debug!("Raw confidence bytes: {:02x?}, parsed as f64: {}", confidence_bytes, confidence);
+        log::debug!("Offset {}: Raw confidence bytes: {:02x?}, parsed as f64: {}", offset, confidence_bytes, confidence);
 
-        let timestamp_bytes: [u8; 8] = if data.len() >= cursor + 24 {
-            data[cursor + 16..cursor + 24]
+        // Read timestamp (8 bytes) - optional
+        let timestamp_bytes: [u8; 8] = if data.len() >= offset + 24 {
+            data[offset + 16..offset + 24]
                 .try_into()
                 .map_err(|e| {
-                    log::error!("Failed to read timestamp bytes at offset {}: {:?}", cursor + 16, e);
-                    anyhow::anyhow!("Failed to read timestamp bytes")
+                    log::debug!("Failed to read timestamp bytes at offset {}: {:?}", offset + 16, e);
+                    anyhow::anyhow!("Failed to read timestamp bytes at offset {}", offset + 16)
                 })?
         } else {
-            log::warn!("Timestamp bytes not available (data length: {} < {}), using current time", data.len(), cursor + 24);
+            log::debug!("Timestamp bytes not available at offset {} (data length: {} < {})", 
+                offset, data.len(), offset + 24);
             [0u8; 8]
         };
         let timestamp = i64::from_le_bytes(timestamp_bytes);
-        log::debug!("Raw timestamp bytes: {:02x?}, parsed as i64: {}", timestamp_bytes, timestamp);
+        log::debug!("Offset {}: Raw timestamp bytes: {:02x?}, parsed as i64: {}", offset, timestamp_bytes, timestamp);
 
+        // Validate price
         if price.is_infinite() || price.is_nan() {
-            log::error!("Invalid price value: {} (infinite: {}, nan: {})", price, price.is_infinite(), price.is_nan());
-            return Err(anyhow::anyhow!("Invalid price value: {}", price));
-        }
-        
-        if price == 0.0 {
-            log::warn!("⚠️  Switchboard oracle price is 0.0 - this might indicate:");
-            log::warn!("   1. Parsing issue (wrong offset/structure)");
-            log::warn!("   2. Empty or uninitialized oracle account");
-            log::warn!("   3. Account data structure mismatch");
-            log::warn!("   Account data size: {} bytes, cursor: {}, price bytes: {:02x?}", 
-                data.len(), cursor, price_bytes);
+            return Err(anyhow::anyhow!(
+                "Invalid price value at offset {}: {} (infinite: {}, nan: {})",
+                offset,
+                price,
+                price.is_infinite(),
+                price.is_nan()
+            ));
         }
 
+        // Use current time if timestamp is invalid
         let final_timestamp = if timestamp > 0 { 
             timestamp 
         } else { 
@@ -109,12 +151,9 @@ impl SwitchboardOracle {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
                 .as_secs() as i64;
-            log::warn!("Timestamp was 0, using current time: {}", now);
+            log::debug!("Timestamp was 0 at offset {}, using current time: {}", offset, now);
             now
         };
-
-        log::info!("Switchboard oracle parsed: price=${:.4}, confidence=${:.4}, timestamp={}", 
-            price, confidence, final_timestamp);
 
         Ok(PriceData {
             price,

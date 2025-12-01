@@ -12,6 +12,7 @@ use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_ac
 use crate::core::config::Config;
 use std::sync::Arc;
 use std::str::FromStr;
+use std::time::Duration;
 use sha2::{Sha256, Digest};
 use spl_token;
 use std::collections::HashMap;
@@ -178,9 +179,51 @@ impl ReserveCache {
 
         Ok(())
     }
+
+    /// Start a background task that periodically refreshes the reserve cache.
+    /// This prevents RPC call storms when building liquidation instructions.
+    /// 
+    /// The cache is refreshed every 5 minutes to avoid hitting rate limits
+    /// on free RPC endpoints (typically 1 req/10s for getProgramAccounts).
+    pub fn start_background_refresh(
+        self: Arc<Self>,
+        rpc: Arc<RpcClient>,
+        config: Config,
+    ) {
+        tokio::spawn(async move {
+            // Do an initial refresh immediately on startup
+            log::info!("Performing initial reserve cache refresh...");
+            if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
+                log::warn!("Initial reserve cache refresh failed: {}", e);
+            } else {
+                log::info!("Initial reserve cache refresh completed successfully");
+            }
+
+            // Then refresh every 5 minutes
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
+                
+                log::debug!("Refreshing reserve cache from RPC...");
+                if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
+                    log::warn!("Reserve cache refresh failed: {}", e);
+                } else {
+                    log::debug!("Reserve cache refreshed successfully");
+                }
+            }
+        });
+    }
 }
 
-static RESERVE_CACHE: Lazy<ReserveCache> = Lazy::new(|| ReserveCache::new());
+static RESERVE_CACHE: Lazy<Arc<ReserveCache>> = Lazy::new(|| Arc::new(ReserveCache::new()));
+
+/// Start the background refresh task for the reserve cache.
+/// This should be called once during application startup to prevent RPC call storms.
+pub fn start_reserve_cache_refresh(
+    rpc: Arc<RpcClient>,
+    config: Config,
+) {
+    RESERVE_CACHE.clone().start_background_refresh(rpc, config);
+}
 
 fn get_instruction_discriminator() -> [u8; 8] {
     let mut hasher = Sha256::new();
@@ -222,6 +265,7 @@ async fn get_reserve_address_from_mint(
     
     // Use global cache to avoid calling `get_program_accounts` on every instruction build.
     RESERVE_CACHE
+        .as_ref()
         .get_reserve_for_mint(mint, rpc, config)
         .await
 }
@@ -239,7 +283,7 @@ async fn get_reserve_data(
     reserve: &Pubkey,
     rpc: &Arc<RpcClient>,
 ) -> Result<(Pubkey, Pubkey, Pubkey)> {
-    let data = RESERVE_CACHE.get_reserve_data(reserve, rpc).await?;
+    let data = RESERVE_CACHE.as_ref().get_reserve_data(reserve, rpc).await?;
 
     Ok((data.collateral_mint, data.liquidity_supply, *reserve))
 }

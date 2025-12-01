@@ -50,28 +50,13 @@ impl Protocol for SolendProtocol {
 
         let data_len = account.data.len();
 
-        // FAST PATH: Size check önce
-        const EXPECTED_OBLIGATION_SIZE: usize = 1300;
-        const MIN_OBLIGATION_SIZE: usize = 1200; // Biraz tolerans
+        // FAST PATH 1: Size check (1200-1500 bytes expected for obligation accounts)
+        // This quickly filters out wrong account types before expensive parsing
+        const MIN_OBLIGATION_SIZE: usize = 1200;
+        const MAX_OBLIGATION_SIZE: usize = 1500;
         
-        if data_len < MIN_OBLIGATION_SIZE {
-            // Bu çok küçük - muhtemelen closed obligation
-            log::debug!(
-                "SolendProtocol: skipping account (too small): {} bytes (expected: {})",
-                data_len,
-                EXPECTED_OBLIGATION_SIZE
-            );
-            return None;
-        }
-        
-        if data_len > EXPECTED_OBLIGATION_SIZE + 100 {
-            // Bu çok büyük - muhtemelen farklı account tipi
-            log::debug!(
-                "SolendProtocol: skipping account (too large): {} bytes (expected: {})",
-                data_len,
-                EXPECTED_OBLIGATION_SIZE
-            );
-            return None;
+        if data_len < MIN_OBLIGATION_SIZE || data_len > MAX_OBLIGATION_SIZE {
+            return None; // Wrong account type, skip immediately
         }
         
         // Obligation parse et
@@ -95,26 +80,26 @@ impl Protocol for SolendProtocol {
             }
         };
         
-        // Empty obligation check
+        // FAST PATH 3: Skip empty obligations immediately
         if obligation.deposits.is_empty() && obligation.borrows.is_empty() {
-            log::debug!(
-                "SolendProtocol: skipping empty obligation (owner={})",
-                obligation.owner
-            );
             return None;
         }
         
-        // Zero-value obligation check
-        let deposited = obligation.total_deposited_value_usd();
-        let borrowed = obligation.total_borrowed_value_usd();
+        // FAST PATH 4: Quick health factor check BEFORE expensive USD calculations
+        // This filters out healthy positions (HF > 1.5) early, avoiding unnecessary work
+        let health_factor = obligation.calculate_health_factor();
         
-        if deposited < 0.01 && borrowed < 0.01 {
-            log::debug!(
-                "SolendProtocol: skipping near-zero obligation (owner={}, deposited=${:.4}, borrowed=${:.4})",
-                obligation.owner,
-                deposited,
-                borrowed
-            );
+        // Skip healthy positions (not liquidatable)
+        if health_factor > 1.5 {
+            return None;
+        }
+        
+        // Only now do expensive USD calculations for potentially liquidatable positions
+        let collateral_usd = obligation.total_deposited_value_usd();
+        let debt_usd = obligation.total_borrowed_value_usd();
+        
+        // Zero-value obligation check (after health factor, but still useful)
+        if collateral_usd < 0.01 && debt_usd < 0.01 {
             return None;
         }
 
@@ -122,21 +107,16 @@ impl Protocol for SolendProtocol {
         let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
         
         if logged < 5 {
-            let health_factor = obligation.calculate_health_factor();
             log::info!(
                 "🧩 Solend Obligation Parsed: owner={}, hf={:.6}, deposited=${:.2}, borrowed=${:.2}, deposits={}, borrows={}",
                 obligation.owner,
                 health_factor,
-                deposited,
-                borrowed,
+                collateral_usd,
+                debt_usd,
                 obligation.deposits.len(),
                 obligation.borrows.len()
             );
         }
-
-        let health_factor = obligation.calculate_health_factor();
-        let collateral_usd = obligation.total_deposited_value_usd();
-        let debt_usd = obligation.total_borrowed_value_usd();
 
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {

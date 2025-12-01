@@ -50,6 +50,8 @@ pub struct Config {
     pub close_factor: f64,
     pub max_liquidation_slippage: f64,
     pub event_bus_buffer_size: usize,
+    pub analyzer_max_workers: usize,
+    pub analyzer_max_workers_limit: usize,
     pub health_manager_max_error_age_seconds: u64,
     pub retry_jitter_max_ms: u64,
     pub use_jupiter_api: bool,
@@ -234,6 +236,14 @@ impl Config {
                 .unwrap_or_else(|_| "50000".to_string()) // Increased from 10000 to 50000 to prevent lag
                 .parse()
                 .context("Invalid EVENT_BUS_BUFFER_SIZE value")?,
+            analyzer_max_workers: env::var("ANALYZER_MAX_WORKERS")
+                .unwrap_or_else(|_| "4".to_string())
+                .parse()
+                .context("Invalid ANALYZER_MAX_WORKERS value")?,
+            analyzer_max_workers_limit: env::var("ANALYZER_MAX_WORKERS_LIMIT")
+                .unwrap_or_else(|_| "16".to_string())
+                .parse()
+                .context("Invalid ANALYZER_MAX_WORKERS_LIMIT value")?,
             health_manager_max_error_age_seconds: env::var("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()

@@ -2,6 +2,7 @@ use crate::core::config::Config;
 use solana_sdk::pubkey::Pubkey;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::time::Duration;
 
 pub struct SlippageEstimator {
     config: Config,
@@ -41,6 +42,7 @@ impl SlippageEstimator {
         output_mint: Pubkey,
         amount: u64,
     ) -> Result<u16> {
+        const MAX_RETRIES: u32 = 3;
         let url = format!(
             "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
             input_mint,
@@ -48,38 +50,125 @@ impl SlippageEstimator {
             amount
         );
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to Jupiter API: {}", url))?;
+        // Retry loop with exponential backoff
+        for attempt in 1..=MAX_RETRIES {
+            match self.client.get(&url).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    
+                    if status.is_success() {
+                        // Success - parse and return
+                        let response_text = match response.text().await {
+                            Ok(text) => text,
+                            Err(e) => {
+                                log::warn!(
+                                    "Jupiter API: failed to read response body (attempt {}): {}",
+                                    attempt,
+                                    e
+                                );
+                                if attempt < MAX_RETRIES {
+                                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                    continue;
+                                } else {
+                                    log::warn!(
+                                        "Jupiter API failed after {} attempts, using fallback",
+                                        MAX_RETRIES
+                                    );
+                                    return self.estimate_with_multipliers(amount);
+                                }
+                            }
+                        };
 
-        let status = response.status();
-        let response_text = response.text().await
-            .context("Failed to read Jupiter API response body")?;
-        
-        if !status.is_success() {
-            log::error!("Jupiter API error - Status: {}, Response: {}", status, response_text);
-            return Err(anyhow::anyhow!(
-                "Jupiter API returned error status: {} - {}",
-                status,
-                response_text
-            ));
+                        match serde_json::from_str::<JupiterQuoteResponse>(&response_text) {
+                            Ok(quote) => {
+                                if let Some(price_impact_pct) = quote.price_impact_pct {
+                                    // `priceImpactPct` Jupiter'de 0.0–1.0 arası oran olarak geliyor (ör: 0.005 = 0.5%).
+                                    // Bunu doğru şekilde basis point'e çevirmek için 10_000 ile çarpmalıyız:
+                                    // 0.005 * 10_000 = 50 bps.
+                                    let slippage_bps = (price_impact_pct * 10_000.0) as u16;
+                                    return Ok(slippage_bps.min(self.config.max_slippage_bps));
+                                } else {
+                                    log::warn!(
+                                        "Jupiter API did not return price impact (attempt {}), will retry",
+                                        attempt
+                                    );
+                                    if attempt < MAX_RETRIES {
+                                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                        continue;
+                                    } else {
+                                        log::warn!(
+                                            "Jupiter API failed after {} attempts, using fallback",
+                                            MAX_RETRIES
+                                        );
+                                        return self.estimate_with_multipliers(amount);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Jupiter API: failed to parse response (attempt {}): {}",
+                                    attempt,
+                                    e
+                                );
+                                if attempt < MAX_RETRIES {
+                                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                    continue;
+                                } else {
+                                    log::warn!(
+                                        "Jupiter API failed after {} attempts, using fallback",
+                                        MAX_RETRIES
+                                    );
+                                    return self.estimate_with_multipliers(amount);
+                                }
+                            }
+                        }
+                    } else {
+                        // HTTP error status
+                        let response_text = response.text().await.unwrap_or_default();
+                        log::warn!(
+                            "Jupiter API error (attempt {}): Status {}, Response: {}",
+                            attempt,
+                            status,
+                            response_text
+                        );
+                        
+                        if attempt < MAX_RETRIES {
+                            tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            continue;
+                        } else {
+                            log::warn!(
+                                "Jupiter API failed after {} attempts, using fallback",
+                                MAX_RETRIES
+                            );
+                            return self.estimate_with_multipliers(amount);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Network error
+                    log::warn!(
+                        "Jupiter API network error (attempt {}): {}",
+                        attempt,
+                        e
+                    );
+                    
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                        continue;
+                    } else {
+                        log::warn!(
+                            "Jupiter API failed after {} attempts, using fallback",
+                            MAX_RETRIES
+                        );
+                        return self.estimate_with_multipliers(amount);
+                    }
+                }
+            }
         }
 
-        let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
-            .context("Failed to parse Jupiter API response")?;
-
-        if let Some(price_impact_pct) = quote.price_impact_pct {
-            // `priceImpactPct` Jupiter'de 0.0–1.0 arası oran olarak geliyor (ör: 0.005 = 0.5%).
-            // Bunu doğru şekilde basis point'e çevirmek için 10_000 ile çarpmalıyız:
-            // 0.005 * 10_000 = 50 bps.
-            let slippage_bps = (price_impact_pct * 10_000.0) as u16;
-            Ok(slippage_bps.min(self.config.max_slippage_bps))
-        } else {
-            log::warn!("Jupiter API did not return price impact, using fallback estimation");
-            self.estimate_with_multipliers(amount)
-        }
+        // Should never reach here, but fallback just in case
+        log::warn!("Jupiter API failed after {} attempts, using fallback", MAX_RETRIES);
+        self.estimate_with_multipliers(amount)
     }
 
     fn estimate_with_multipliers(&self, amount: u64) -> Result<u16> {

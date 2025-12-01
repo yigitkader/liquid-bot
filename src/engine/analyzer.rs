@@ -4,6 +4,7 @@ use crate::core::config::Config;
 use crate::protocol::Protocol;
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
@@ -12,7 +13,8 @@ pub struct Analyzer {
     protocol: Arc<dyn Protocol>,
     config: Config,
     // Paralel processing için worker pool
-    max_workers: usize,
+    current_workers: Arc<AtomicUsize>,
+    max_workers_limit: usize,
 }
 
 impl Analyzer {
@@ -21,25 +23,42 @@ impl Analyzer {
         protocol: Arc<dyn Protocol>,
         config: Config,
     ) -> Self {
+        let initial_workers = config.analyzer_max_workers;
+        let max_workers_limit = config.analyzer_max_workers_limit;
         Analyzer {
             event_bus,
             protocol,
             config,
-            max_workers: 4, // 4 paralel worker
+            current_workers: Arc::new(AtomicUsize::new(initial_workers)),
+            max_workers_limit,
         }
     }
 
     pub async fn run(&self) -> Result<()> {
         let mut receiver = self.event_bus.subscribe();
         let mut tasks = JoinSet::new();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_workers));
+        
+        // Dynamic semaphore that can be adjusted based on lag
+        // Use Arc<Mutex<Arc<Semaphore>>> to allow dynamic resizing
+        let semaphore = Arc::new(tokio::sync::Mutex::new(Arc::new(
+            tokio::sync::Semaphore::new(self.current_workers.load(Ordering::Relaxed))
+        )));
 
         loop {
             match receiver.recv().await {
                 Ok(Event::AccountUpdated { position, .. })
                 | Ok(Event::AccountDiscovered { position, .. }) => {
-                    // Worker pool'dan slot al
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    // BACKPRESSURE: Wait for available worker slot before processing
+                    // This prevents buffer overflow by controlling the rate of event processing
+                    let semaphore_guard = semaphore.lock().await;
+                    let permit = match semaphore_guard.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            log::warn!("Semaphore closed, analyzer shutting down");
+                            break;
+                        }
+                    };
+                    drop(semaphore_guard); // Release lock before spawning task
                     
                     // Clone dependencies for task
                     let event_bus = self.event_bus.clone();
@@ -68,10 +87,39 @@ impl Analyzer {
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log::error!("⚠️  CRITICAL: Analyzer lagged, skipped {} events", skipped);
-                    log::error!("   Consider: 1) Increase EVENT_BUS_BUFFER_SIZE");
-                    log::error!("            2) Increase max_workers in Analyzer");
-                    log::error!("            3) Optimize calculation logic");
+                    // ADAPTIVE SCALING: Increase workers when lag detected
+                    let current = self.current_workers.load(Ordering::Relaxed);
+                    if current < self.max_workers_limit {
+                        // Increase workers by 50% or at least 2, up to limit
+                        let increase = std::cmp::max(2, current / 2);
+                        let new_workers = std::cmp::min(
+                            current + increase,
+                            self.max_workers_limit
+                        );
+                        
+                        self.current_workers.store(new_workers, Ordering::Relaxed);
+                        
+                        // Recreate semaphore with new capacity
+                        let mut semaphore_guard = semaphore.lock().await;
+                        *semaphore_guard = Arc::new(tokio::sync::Semaphore::new(new_workers));
+                        drop(semaphore_guard);
+                        
+                        log::warn!(
+                            "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {}",
+                            skipped,
+                            current,
+                            new_workers
+                        );
+                    } else {
+                        log::error!(
+                            "⚠️  CRITICAL: Analyzer lagged {} events, max workers ({}) reached!",
+                            skipped,
+                            self.max_workers_limit
+                        );
+                        log::error!("   Consider: 1) Increase EVENT_BUS_BUFFER_SIZE");
+                        log::error!("            2) Increase ANALYZER_MAX_WORKERS_LIMIT");
+                        log::error!("            3) Optimize calculation logic");
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::error!("Event bus closed, analyzer shutting down");

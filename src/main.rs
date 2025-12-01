@@ -65,6 +65,13 @@ async fn main() -> Result<()> {
     );
     log::info!("✅ RPC client initialized");
 
+    // Start background refresh for reserve cache to prevent RPC call storms
+    liquid_bot::protocol::solend::instructions::start_reserve_cache_refresh(
+        Arc::clone(&rpc),
+        config.clone(),
+    );
+    log::info!("✅ Reserve cache background refresh started (5 min interval)");
+
     let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));
     ws.connect().await
         .context("Failed to connect WebSocket")?;
