@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
 
 struct TxLock {
     locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
@@ -26,6 +27,48 @@ impl TxLock {
             lock_times: Arc::new(std::sync::RwLock::new(HashMap::new())),
             timeout_seconds,
         }
+    }
+
+    /// Start background cleanup task that periodically removes expired locks.
+    /// This prevents locks from leaking when no new lock attempts are made.
+    fn start_cleanup_task(self: Arc<Self>) {
+        let locked = Arc::clone(&self.locked);
+        let lock_times = Arc::clone(&self.lock_times);
+        let timeout_seconds = self.timeout_seconds;
+        
+        tokio::spawn(async move {
+            loop {
+                // Run cleanup every 10 seconds
+                sleep(Duration::from_secs(10)).await;
+                
+                let mut locked_guard = locked.write().unwrap();
+                let mut lock_times_guard = lock_times.write().unwrap();
+                
+                // Remove expired locks
+                let expired_addresses: Vec<Pubkey> = lock_times_guard
+                    .iter()
+                    .filter_map(|(address, time)| {
+                        if time.elapsed().as_secs() >= timeout_seconds {
+                            Some(*address)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                
+                for address in &expired_addresses {
+                    locked_guard.remove(address);
+                    lock_times_guard.remove(address);
+                }
+                
+                if !expired_addresses.is_empty() {
+                    log::debug!(
+                        "TxLock: cleaned up {} expired lock(s)",
+                        expired_addresses.len()
+                    );
+                }
+            }
+        });
     }
 
     fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
@@ -87,6 +130,10 @@ impl Executor {
         config: Config,
     ) -> Self {
         let tx_lock = Arc::new(TxLock::new(config.tx_lock_timeout_seconds));
+        
+        // Start background cleanup task to prevent lock leaks
+        tx_lock.start_cleanup_task();
+        
         Executor {
             event_bus,
             rpc,

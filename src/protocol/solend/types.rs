@@ -265,12 +265,20 @@ impl SolendObligation {
     }
     
     pub fn calculate_health_factor(&self) -> f64 {
-        let borrowed = self.total_borrowed_value_usd();
+        // Solend'de health factor, toplam borcun basit oranı (deposited / borrowed)
+        // yerine, LTV ile ağırlıklandırılmış teminat üzerinden hesaplanır.
+        //
+        // On-chain spl-token-lending mantığına göre:
+        // - `allowed_borrow_value` = weighted collateral (LTV'lerle çarpılmış teminat)
+        // - `borrowed_value` = toplam borç
+        //
+        // Health factor ≈ weighted_collateral / borrowed.
+        let borrowed = self.borrowed_value.to_f64();
         if borrowed == 0.0 {
             return f64::INFINITY;
         }
 
-        let deposited = self.total_deposited_value_usd();
-        deposited / borrowed
+        let weighted_collateral = self.allowed_borrow_value.to_f64();
+        weighted_collateral / borrowed
     }
 }

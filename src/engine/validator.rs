@@ -216,20 +216,35 @@ impl Validator {
         use crate::strategy::slippage_estimator::SlippageEstimator;
         
         let estimator = SlippageEstimator::new(self.config.clone());
-        let slippage = estimator.estimate_dex_slippage(
+        
+        // Get base DEX slippage estimate
+        let base_slippage = estimator.estimate_dex_slippage(
             opp.debt_mint,
             opp.collateral_mint,
             opp.seizable_collateral,
         ).await
             .context("Failed to estimate real-time slippage")?;
 
+        // Read oracle confidence for debt mint and add to slippage
+        let oracle_confidence = estimator.read_oracle_confidence(opp.debt_mint).await
+            .context("Failed to read oracle confidence")?;
+
+        // Add oracle confidence to base slippage
+        // Oracle confidence represents price uncertainty, which should be added to slippage
+        let total_slippage = base_slippage.saturating_add(oracle_confidence);
+        
+        // Cap at max_slippage_bps
+        let final_slippage = total_slippage.min(self.config.max_slippage_bps);
+
         log::debug!(
-            "Validator: real-time slippage for position {} is {} bps (max {} bps)",
+            "Validator: slippage breakdown for position {}: base={} bps, oracle_confidence={} bps, total={} bps (max {} bps)",
             opp.position.address,
-            slippage,
+            base_slippage,
+            oracle_confidence,
+            final_slippage,
             self.config.max_slippage_bps
         );
         
-        Ok(slippage)
+        Ok(final_slippage)
     }
 }

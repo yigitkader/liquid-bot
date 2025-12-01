@@ -178,50 +178,110 @@ impl WsClient {
     }
 
     pub async fn listen(&self) -> Option<AccountUpdate> {
-        let mut conn = self.connection.lock().await;
-        if let Some(ref mut stream) = *conn {
-            if let Some(Ok(msg)) = stream.next().await {
-                match msg {
-                    Message::Text(text) => {
-                        if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if notification.get("method") == Some(&json!("programNotification")) ||
-                               notification.get("method") == Some(&json!("accountNotification")) {
-                                if let Some(params) = notification.get("params") {
-                                        if let Some(result) = params.get("result") {
-                                            if let Some(value) = result.get("value") {
-                                            if let Some(account_data) = value.get("data") {
-                                                if let Some(data_array) = account_data.as_array() {
-                                                    if data_array.len() >= 2 {
-                                                        if let Some(base64_data) = data_array[0].as_str() {
-                                                            use base64::{Engine as _, engine::general_purpose};
-                                                            if let Ok(decoded) = general_purpose::STANDARD.decode(base64_data) {
-                                                                let pubkey_str = value.get("owner")
-                                                                    .and_then(|v| v.as_str())
-                                                                    .unwrap_or("");
-                                                                let pubkey = pubkey_str.parse::<Pubkey>().ok();
-                                                                let slot = value.get("lamports")
-                                                                    .and_then(|v| v.as_u64())
-                                                                    .unwrap_or(0);
-                                                                
-                                                                if let Some(pk) = pubkey {
-                                                                    let account = solana_sdk::account::Account {
-                                                                        lamports: slot,
-                                                                        data: decoded,
-                                                                        owner: pk,
-                                                                        executable: false,
-                                                                        rent_epoch: 0,
-                                                                    };
-                                                                    
-                                                                    return Some(AccountUpdate {
-                                                                        pubkey: pk,
-                                                                        account,
-                                                                        slot,
-                                                                    });
-                                                                }
-                                                            }
+        let msg_opt = {
+            let mut conn = self.connection.lock().await;
+            if let Some(ref mut stream) = *conn {
+                stream.next().await.map(|r| r.ok())
+            } else {
+                None
+            }
+        };
+
+        if let Some(Some(msg)) = msg_opt {
+            match msg {
+                Message::Text(text) => {
+                    if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let method = notification.get("method").and_then(|m| m.as_str());
+                        
+                        if method == Some("programNotification") || method == Some("accountNotification") {
+                            if let Some(params) = notification.get("params") {
+                                // Get subscription ID to identify which account/program this is for
+                                let subscription_id = params.get("subscription")
+                                    .and_then(|v| v.as_u64());
+                                
+                                if let Some(result) = params.get("result") {
+                                    // Extract slot from context (correct location)
+                                    let slot = result.get("context")
+                                        .and_then(|c| c.get("slot"))
+                                        .and_then(|s| s.as_u64())
+                                        .unwrap_or(0);
+                                    
+                                    // Extract account info from value
+                                    let account_info = result.get("value")
+                                        .and_then(|v| v.as_object());
+                                    
+                                    if let Some(value) = account_info {
+                                        // For accountNotification, pubkey is in the subscription mapping
+                                        // For programNotification, pubkey is in value.pubkey
+                                        let pubkey = if method == Some("accountNotification") {
+                                            // Get pubkey from subscription mapping
+                                            if let Some(sub_id) = subscription_id {
+                                                let subscriptions = self.subscriptions.lock().await;
+                                                subscriptions.get(&sub_id)
+                                                    .and_then(|info| {
+                                                        if let SubscriptionType::Account(pk) = &info.subscription_type {
+                                                            Some(*pk)
+                                                        } else {
+                                                            None
                                                         }
-                                                    }
-                                                }
+                                                    })
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            // programNotification: pubkey is in value.pubkey
+                                            value.get("pubkey")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<Pubkey>().ok())
+                                        };
+                                        
+                                        // Extract account data
+                                        let account_data = value.get("data")
+                                            .and_then(|d| d.as_array())
+                                            .filter(|arr| arr.len() >= 2)
+                                            .and_then(|arr| arr[0].as_str());
+                                        
+                                        // Extract owner (program_id) - correct field location
+                                        let owner = value.get("owner")
+                                            .or_else(|| value.get("account").and_then(|a| a.get("owner")))
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<Pubkey>().ok());
+                                        
+                                        // Extract lamports (correct field location)
+                                        let lamports = value.get("lamports")
+                                            .or_else(|| value.get("account").and_then(|a| a.get("lamports")))
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        
+                                        // Extract executable
+                                        let executable = value.get("executable")
+                                            .or_else(|| value.get("account").and_then(|a| a.get("executable")))
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        
+                                        // Extract rent_epoch
+                                        let rent_epoch = value.get("rentEpoch")
+                                            .or_else(|| value.get("rent_epoch"))
+                                            .or_else(|| value.get("account").and_then(|a| a.get("rentEpoch")))
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        
+                                        if let (Some(pk), Some(owner_pk), Some(base64_data)) = (pubkey, owner, account_data) {
+                                            use base64::{Engine as _, engine::general_purpose};
+                                            if let Ok(decoded) = general_purpose::STANDARD.decode(base64_data) {
+                                                let account = solana_sdk::account::Account {
+                                                    lamports,
+                                                    data: decoded,
+                                                    owner: owner_pk,
+                                                    executable,
+                                                    rent_epoch,
+                                                };
+                                                
+                                                return Some(AccountUpdate {
+                                                    pubkey: pk,
+                                                    account,
+                                                    slot,
+                                                });
                                             }
                                         }
                                     }
@@ -229,11 +289,11 @@ impl WsClient {
                             }
                         }
                     }
-                    Message::Close(_) => {
-                        return None;
-                    }
-                    _ => {}
                 }
+                Message::Close(_) => {
+                    return None;
+                }
+                _ => {}
             }
         }
         None

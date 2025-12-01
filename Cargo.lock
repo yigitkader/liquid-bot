@@ -2405,6 +2405,7 @@ dependencies = [
  "fern",
  "futures-util",
  "log",
+ "once_cell",
  "pyth-sdk-solana",
  "rand 0.8.5",
  "reqwest",

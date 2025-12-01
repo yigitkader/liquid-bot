@@ -15,6 +15,174 @@ use std::sync::Arc;
 use std::str::FromStr;
 use sha2::{Sha256, Digest};
 use spl_token;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+use once_cell::sync::Lazy;
+
+use crate::blockchain::rpc_client::RpcClient;
+
+/// Minimal subset of Solend reserve data we need when building liquidation instructions.
+#[derive(Clone, Debug)]
+struct ReserveData {
+    pub collateral_mint: Pubkey,
+    pub liquidity_supply: Pubkey,
+}
+
+struct ReserveCacheInner {
+    mint_to_reserve: HashMap<Pubkey, Pubkey>,
+    reserve_data: HashMap<Pubkey, ReserveData>,
+    initialized: bool,
+}
+
+struct ReserveCache {
+    inner: RwLock<ReserveCacheInner>,
+}
+
+impl ReserveCache {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(ReserveCacheInner {
+                mint_to_reserve: HashMap::new(),
+                reserve_data: HashMap::new(),
+                initialized: false,
+            }),
+        }
+    }
+
+    /// Get reserve address for a given liquidity mint, using cached mapping.
+    ///
+    /// On first miss (or when cache is empty), this performs a single
+    /// `get_program_accounts` call to build a complete mint → reserve index.
+    async fn get_reserve_for_mint(
+        &self,
+        mint: &Pubkey,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+    ) -> Result<Pubkey> {
+        {
+            let inner = self.inner.read().await;
+            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
+                return Ok(*reserve);
+            }
+        }
+
+        // Cache miss: refresh mapping from chain in a single RPC call
+        self.refresh_from_rpc(rpc, config).await?;
+
+        let inner = self.inner.read().await;
+        inner
+            .mint_to_reserve
+            .get(mint)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Reserve not found for mint: {}", mint))
+    }
+
+    /// Get cached reserve data (collateral mint, liquidity supply, etc).
+    async fn get_reserve_data(
+        &self,
+        reserve: &Pubkey,
+        rpc: &Arc<RpcClient>,
+    ) -> Result<ReserveData> {
+        {
+            let inner = self.inner.read().await;
+            if let Some(data) = inner.reserve_data.get(reserve) {
+                return Ok(data.clone());
+            }
+        }
+
+        // Not cached yet: fetch once and store.
+        let account = rpc
+            .get_account(reserve)
+            .await
+            .context("Failed to fetch reserve account")?;
+
+        if account.data.len() < 200 {
+            return Err(anyhow::anyhow!("Reserve account data too small"));
+        }
+
+        let collateral_mint_offset = 8 + 32;
+        let liquidity_supply_offset = 8 + 32 + 32 + 32;
+
+        if account.data.len() < liquidity_supply_offset + 32 {
+            return Err(anyhow::anyhow!("Reserve account data incomplete"));
+        }
+
+        let collateral_mint_bytes: [u8; 32] =
+            account.data[collateral_mint_offset..collateral_mint_offset + 32]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid reserve collateral mint data"))?;
+        let collateral_mint = Pubkey::try_from(collateral_mint_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid collateral mint"))?;
+
+        let liquidity_supply_bytes: [u8; 32] =
+            account.data[liquidity_supply_offset..liquidity_supply_offset + 32]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid reserve liquidity supply data"))?;
+        let liquidity_supply = Pubkey::try_from(liquidity_supply_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid liquidity supply"))?;
+
+        let data = ReserveData {
+            collateral_mint,
+            liquidity_supply,
+        };
+
+        let mut inner = self.inner.write().await;
+        inner.reserve_data.insert(*reserve, data.clone());
+
+        Ok(data)
+    }
+
+    async fn refresh_from_rpc(&self, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+        let program_id = Pubkey::from_str(&config.solend_program_id)
+            .context("Invalid Solend program ID")?;
+
+        let accounts = rpc
+            .get_program_accounts(&program_id)
+            .await
+            .context("Failed to fetch program accounts for reserve lookup")?;
+
+        let mut mint_to_reserve = HashMap::new();
+
+        for (pubkey, account) in accounts {
+            if account.data.len() < 8 {
+                continue;
+            }
+
+            let reserve_discriminator = &account.data[0..8];
+            let expected_discriminator = get_reserve_discriminator();
+
+            if reserve_discriminator != expected_discriminator {
+                continue;
+            }
+
+            if account.data.len() < 200 {
+                continue;
+            }
+
+            let liquidity_mint_offset = 8 + 32 + 32;
+            if account.data.len() <= liquidity_mint_offset + 32 {
+                continue;
+            }
+
+            let liquidity_mint_bytes: [u8; 32] =
+                account.data[liquidity_mint_offset..liquidity_mint_offset + 32]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid reserve data"))?;
+            let liquidity_mint = Pubkey::try_from(liquidity_mint_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid mint in reserve"))?;
+
+            mint_to_reserve.insert(liquidity_mint, pubkey);
+        }
+
+        let mut inner = self.inner.write().await;
+        inner.mint_to_reserve = mint_to_reserve;
+        inner.initialized = true;
+
+        Ok(())
+    }
+}
+
+static RESERVE_CACHE: Lazy<ReserveCache> = Lazy::new(|| ReserveCache::new());
 
 fn get_instruction_discriminator() -> [u8; 8] {
     let mut hasher = Sha256::new();
@@ -50,43 +218,14 @@ async fn get_reserve_address_from_mint(
         }
     }
     
-    let program_id = Pubkey::from_str(&config.solend_program_id)
-        .context("Invalid Solend program ID")?;
-    
     let _market_address = config.main_lending_market_address.as_ref()
         .and_then(|s| Pubkey::from_str(s).ok())
         .ok_or_else(|| anyhow::anyhow!("Main lending market address not configured"))?;
     
-    let accounts = rpc.get_program_accounts(&program_id).await
-        .context("Failed to fetch program accounts for reserve lookup")?;
-    
-    for (pubkey, account) in accounts {
-        if account.data.len() < 8 {
-            continue;
-        }
-        
-        let reserve_discriminator = &account.data[0..8];
-        let expected_discriminator = get_reserve_discriminator();
-        
-        if reserve_discriminator == expected_discriminator {
-            if account.data.len() >= 200 {
-                let liquidity_mint_offset = 8 + 32 + 32;
-                if account.data.len() > liquidity_mint_offset + 32 {
-                    let liquidity_mint_bytes: [u8; 32] = account.data[liquidity_mint_offset..liquidity_mint_offset + 32]
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Invalid reserve data"))?;
-                    let liquidity_mint = Pubkey::try_from(liquidity_mint_bytes)
-                        .map_err(|_| anyhow::anyhow!("Invalid mint in reserve"))?;
-                    
-                    if liquidity_mint == *mint {
-                        return Ok(pubkey);
-                    }
-                }
-            }
-        }
-    }
-    
-    Err(anyhow::anyhow!("Reserve not found for mint: {}", mint))
+    // Use global cache to avoid calling `get_program_accounts` on every instruction build.
+    RESERVE_CACHE
+        .get_reserve_for_mint(mint, rpc, config)
+        .await
 }
 
 fn get_reserve_discriminator() -> [u8; 8] {
@@ -102,33 +241,9 @@ async fn get_reserve_data(
     reserve: &Pubkey,
     rpc: &Arc<RpcClient>,
 ) -> Result<(Pubkey, Pubkey, Pubkey)> {
-    let account = rpc.get_account(reserve).await
-        .context("Failed to fetch reserve account")?;
-    
-    if account.data.len() < 200 {
-        return Err(anyhow::anyhow!("Reserve account data too small"));
-    }
-    
-    let collateral_mint_offset = 8 + 32;
-    let liquidity_supply_offset = 8 + 32 + 32 + 32;
-    
-    if account.data.len() < liquidity_supply_offset + 32 {
-        return Err(anyhow::anyhow!("Reserve account data incomplete"));
-    }
-    
-    let collateral_mint_bytes: [u8; 32] = account.data[collateral_mint_offset..collateral_mint_offset + 32]
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid reserve collateral mint data"))?;
-    let collateral_mint = Pubkey::try_from(collateral_mint_bytes)
-        .map_err(|_| anyhow::anyhow!("Invalid collateral mint"))?;
-    
-    let liquidity_supply_bytes: [u8; 32] = account.data[liquidity_supply_offset..liquidity_supply_offset + 32]
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid reserve liquidity supply data"))?;
-    let liquidity_supply = Pubkey::try_from(liquidity_supply_bytes)
-        .map_err(|_| anyhow::anyhow!("Invalid liquidity supply"))?;
-    
-    Ok((collateral_mint, liquidity_supply, reserve.clone()))
+    let data = RESERVE_CACHE.get_reserve_data(reserve, rpc).await?;
+
+    Ok((data.collateral_mint, data.liquidity_supply, *reserve))
 }
 
 pub async fn build_liquidate_obligation_ix(

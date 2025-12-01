@@ -38,15 +38,53 @@ impl BalanceManager {
         Ok(available)
     }
 
+    /// Get available balance while holding a read lock on reserved map.
+    /// This is used internally to avoid double-locking.
+    async fn get_available_balance_locked(
+        &self,
+        mint: &Pubkey,
+        reserved: &HashMap<Pubkey, u64>,
+    ) -> Result<u64> {
+        use crate::protocol::solend::accounts::get_associated_token_address;
+        let ata = get_associated_token_address(&self.wallet, mint, None)?;
+        let account = self.rpc.get_account(&ata).await?;
+        
+        if account.data.len() < 72 {
+            return Err(anyhow::anyhow!("Invalid token account data"));
+        }
+        
+        let balance_bytes: [u8; 8] = account.data[64..72].try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
+        let actual = u64::from_le_bytes(balance_bytes);
+        
+        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+        let available = actual.saturating_sub(reserved_amount);
+        Ok(available)
+    }
+
+    /// Atomically reserve balance, preventing race conditions.
+    /// This method holds a write lock during both balance check and reservation,
+    /// ensuring no other thread can reserve the same balance concurrently.
     pub async fn reserve(&self, mint: &Pubkey, amount: u64) -> Result<ReservationGuard> {
-        let available = self.get_available_balance(mint).await?;
+        // Acquire write lock FIRST - this prevents race conditions
+        let mut reserved = self.reserved.write().await;
+        
+        // Check available balance while holding the lock
+        let available = self.get_available_balance_locked(mint, &reserved).await?;
 
         if available < amount {
-            return Err(anyhow::anyhow!("Insufficient balance"));
+            return Err(anyhow::anyhow!(
+                "Insufficient balance for mint {}: need {}, available {}",
+                mint,
+                amount,
+                available
+            ));
         }
 
-        self.reserved.write().await.insert(*mint, amount);
-
+        // Reserve the amount atomically (add to existing reserved amount)
+        *reserved.entry(*mint).or_insert(0) += amount;
+        
+        // Lock is released here, but reservation is already committed
         Ok(ReservationGuard {
             reserved: Arc::clone(&self.reserved),
             mint: *mint,

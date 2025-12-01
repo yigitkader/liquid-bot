@@ -71,7 +71,10 @@ impl SlippageEstimator {
             .context("Failed to parse Jupiter API response")?;
 
         if let Some(price_impact_pct) = quote.price_impact_pct {
-            let slippage_bps = (price_impact_pct * 100.0) as u16;
+            // `priceImpactPct` Jupiter'de 0.0–1.0 arası oran olarak geliyor (ör: 0.005 = 0.5%).
+            // Bunu doğru şekilde basis point'e çevirmek için 10_000 ile çarpmalıyız:
+            // 0.005 * 10_000 = 50 bps.
+            let slippage_bps = (price_impact_pct * 10_000.0) as u16;
             Ok(slippage_bps.min(self.config.max_slippage_bps))
         } else {
             log::warn!("Jupiter API did not return price impact, using fallback estimation");
