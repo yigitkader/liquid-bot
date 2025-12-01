@@ -1,4 +1,3 @@
-// Structure.md'ye göre main.rs - Event-driven architecture
 use anyhow::{Context, Result};
 use dotenv::dotenv;
 use log;
@@ -26,7 +25,6 @@ use solana_sdk::signature::{Keypair, Signer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
@@ -36,7 +34,6 @@ async fn main() -> Result<()> {
 
     log::info!("🚀 Starting Solana Liquidation Bot");
 
-    // 1. Load config
     let config = Config::from_env()
         .context("Failed to load configuration")?;
     config.validate()
@@ -44,7 +41,6 @@ async fn main() -> Result<()> {
 
     log::info!("✅ Configuration loaded");
 
-    // 2. Initialize components
     let rpc = Arc::new(
         RpcClient::new(config.rpc_http_url.clone())
             .context("Failed to create RPC client")?
@@ -57,18 +53,15 @@ async fn main() -> Result<()> {
     let ws = Arc::new(ws);
     log::info!("✅ WebSocket client initialized");
 
-    // Load wallet
     let wallet_keypair = load_wallet(&config.wallet_path)
         .context("Failed to load wallet")?;
     let wallet = Arc::new(wallet_keypair);
     let wallet_pubkey = wallet.pubkey();
     log::info!("✅ Wallet loaded: {}", wallet_pubkey);
 
-    // 3. Create event bus
     let event_bus = EventBus::new(config.event_bus_buffer_size);
     log::info!("✅ Event bus initialized");
 
-    // 4. Create managers
     let balance_manager = Arc::new(
         BalanceManager::new(Arc::clone(&rpc), wallet_pubkey)
     );
@@ -80,14 +73,12 @@ async fn main() -> Result<()> {
     let cache = Arc::new(AccountCache::new());
     log::info!("✅ Account cache initialized");
 
-    // 5. Initialize protocol
     let protocol: Arc<dyn Protocol> = Arc::new(
         SolendProtocol::new(&config)
             .context("Failed to initialize Solend protocol")?
     );
     log::info!("✅ Protocol initialized: {} (program: {})", protocol.id(), protocol.program_id());
 
-    // 6. Spawn workers (Structure.md'ye göre)
     let scanner = Scanner::new(
         Arc::clone(&rpc),
         Arc::clone(&ws),
@@ -138,7 +129,6 @@ async fn main() -> Result<()> {
     
     log::info!("✅ All workers started");
 
-    // 6. Metrics logger
     let metrics_clone = Arc::clone(&metrics);
     tokio::spawn(async move {
         loop {
@@ -159,7 +149,6 @@ async fn main() -> Result<()> {
     log::info!("✅ All components initialized");
     log::info!("⏳ Waiting for shutdown signal (Ctrl+C)...");
 
-    // 7. Wait for shutdown signal
     signal::ctrl_c().await
         .context("Failed to listen for shutdown signal")?;
 
@@ -177,7 +166,6 @@ fn load_wallet(path: &str) -> Result<Keypair> {
     let keypair_bytes = fs::read(wallet_path)
         .context("Failed to read wallet file")?;
 
-    // Try to parse as JSON keypair first (Solana CLI format)
     if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
         if keypair.len() == 64 {
             return Keypair::from_bytes(&keypair)
@@ -185,13 +173,11 @@ fn load_wallet(path: &str) -> Result<Keypair> {
         }
     }
 
-    // Try to parse as raw bytes (64 bytes)
     if keypair_bytes.len() == 64 {
         return Keypair::from_bytes(&keypair_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
     }
 
-    // Try to parse as base58 string
     if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
         if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim())
             .into_vec()

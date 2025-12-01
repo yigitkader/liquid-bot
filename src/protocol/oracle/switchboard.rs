@@ -22,9 +22,6 @@ impl SwitchboardOracle {
     }
 
     pub fn parse_switchboard_account(_data: &[u8]) -> Result<PriceData> {
-        // Switchboard oracle parsing requires Switchboard SDK
-        // This must be implemented with real Switchboard account parsing
-        // Cannot use placeholder data - must return error until properly implemented
         Err(anyhow::anyhow!("Switchboard oracle parsing requires Switchboard SDK implementation - not yet implemented"))
     }
 }

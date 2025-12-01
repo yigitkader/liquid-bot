@@ -27,14 +27,10 @@ impl WsClient {
 }
 
     pub async fn subscribe_program(&mut self, _program_id: &Pubkey) -> Result<u64> {
-        // Real WebSocket program subscription required
-        // Cannot use todo! - must implement real subscription
         Err(anyhow::anyhow!("WebSocket program subscription requires full implementation - not yet implemented"))
     }
 
     pub async fn subscribe_account(&mut self, _pubkey: &Pubkey) -> Result<u64> {
-        // Real WebSocket account subscription required
-        // Cannot use todo! - must implement real subscription
         Err(anyhow::anyhow!("WebSocket account subscription requires full implementation - not yet implemented"))
     }
 

@@ -21,21 +21,14 @@ impl BalanceManager {
     }
 
     pub async fn get_available_balance(&self, mint: &Pubkey) -> Result<u64> {
-        // Must get real token balance from RPC - cannot use placeholder
-        // Get associated token account for wallet and mint
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, None)?;
-        
-        // Get token account data from RPC
         let account = self.rpc.get_account(&ata).await?;
         
-        // Parse token account to get balance
-        // Token account structure: mint (32) + owner (32) + amount (8) + ...
         if account.data.len() < 72 {
             return Err(anyhow::anyhow!("Invalid token account data"));
         }
         
-        // Read balance from bytes 64-72 (u64 little-endian)
         let balance_bytes: [u8; 8] = account.data[64..72].try_into()
             .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
         let actual = u64::from_le_bytes(balance_bytes);

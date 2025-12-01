@@ -40,7 +40,6 @@ impl Analyzer {
                     }
                 }
                 Ok(_) => {
-                    // Ignore other events
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     log::warn!("Analyzer lagged, skipped {} events", skipped);
@@ -62,19 +61,15 @@ impl Analyzer {
     async fn calculate_opportunity(&self, position: Position) -> Option<Opportunity> {
         let params = self.protocol.liquidation_params();
 
-        // 1. Calculate liquidatable amount
         let max_liquidatable_usd = position.debt_usd * params.close_factor;
         let seizable_collateral_usd = max_liquidatable_usd * (1.0 + params.bonus);
 
-        // 2. Select best debt/collateral pair (simplified - take first)
         let debt_mint = position.debt_assets.first()?.mint;
         let collateral_mint = position.collateral_assets.first()?.mint;
 
-        // 3. Calculate profit using real profit calculator
         use crate::strategy::profit_calculator::ProfitCalculator;
         let profit_calc = ProfitCalculator::new(self.config.clone());
         
-        // Create temporary opportunity for profit calculation
         let temp_opp = Opportunity {
             position: position.clone(),
             max_liquidatable: (max_liquidatable_usd * 1_000_000.0) as u64,
@@ -84,7 +79,6 @@ impl Analyzer {
             collateral_mint,
         };
         
-        // Calculate real profit (no placeholder values)
         let net_profit = profit_calc.calculate_net_profit(&temp_opp);
 
         if net_profit < self.config.min_profit_usd {

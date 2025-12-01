@@ -2,10 +2,6 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
-/// Get Associated Token Program ID from config or use standard Solana program
-/// 
-/// The Associated Token Program is a standard Solana program that rarely changes.
-/// Default: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL (mainnet)
 pub fn get_associated_token_program_id(config: Option<&crate::config::Config>) -> Result<Pubkey> {
     let program_id_str = config
         .map(|c| c.associated_token_program_id.as_str())
@@ -38,8 +34,6 @@ pub fn derive_lending_market_authority(
     lending_market: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
-    // ✅ DOĞRU: Solend SDK'ya göre sadece lending_market seed olarak kullanılıyor
-    // "lending-market-authority" string'i kullanılmıyor!
     let seeds = &[
         lending_market.as_ref(),
     ];

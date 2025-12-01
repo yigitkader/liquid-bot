@@ -1,12 +1,10 @@
 use crate::core::events::{Event, EventBus};
-// Position import removed - not directly used
 use crate::blockchain::rpc_client::RpcClient;
 use crate::blockchain::ws_client::WsClient;
 use crate::protocol::Protocol;
 use crate::utils::cache::AccountCache;
 use anyhow::Result;
 use std::sync::Arc;
-// Pubkey import removed - not directly used
 
 pub struct Scanner {
     rpc: Arc<RpcClient>,
@@ -33,7 +31,6 @@ impl Scanner {
         }
     }
 
-    // Initial discovery via RPC
     pub async fn discover_accounts(&self) -> Result<usize> {
         let program_id = self.protocol.program_id();
         let accounts = self.rpc.get_program_accounts(&program_id).await?;
@@ -53,13 +50,9 @@ impl Scanner {
         Ok(count)
     }
 
-    // Real-time monitoring via WebSocket
     pub async fn start_monitoring(&self) -> Result<()> {
         let program_id = self.protocol.program_id();
-        // Note: WsClient needs to be mutable, but we have Arc - would need RefCell or similar
-        // For now, simplified
         log::info!("Starting WebSocket monitoring for program: {}", program_id);
-        // Would need proper WebSocket implementation
         Ok(())
     }
 

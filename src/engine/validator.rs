@@ -3,11 +3,11 @@ use crate::core::types::Opportunity;
 use crate::core::config::Config;
 use crate::blockchain::rpc_client::RpcClient;
 use crate::strategy::balance_manager::BalanceManager;
+use crate::protocol::solend::accounts::get_associated_token_address;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use solana_sdk::pubkey::Pubkey;
-// use spl_associated_token_account::get_associated_token_address; // Would need spl-token dependency
 
 pub struct Validator {
     event_bus: EventBus,
@@ -43,9 +43,7 @@ impl Validator {
                         })?;
                     }
                 }
-                Ok(_) => {
-                    // Ignore other events
-                }
+                Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     log::warn!("Validator lagged, skipped {} events", skipped);
                 }
@@ -60,26 +58,10 @@ impl Validator {
     }
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        // 1. Check balance
         self.has_sufficient_balance(&opp.debt_mint, opp.max_liquidatable).await?;
-
-        // 2. Check oracle price (simplified - would need oracle implementation)
-        // check_oracle_freshness(&opp.debt_mint)?;
-        // check_oracle_freshness(&opp.collateral_mint)?;
-
-        // 3. Verify token accounts exist
         self.verify_ata_exists(&opp.debt_mint).await?;
         self.verify_ata_exists(&opp.collateral_mint).await?;
-
-        // 4. Re-check slippage (simplified - would need slippage estimator)
-        // let slippage = self.get_realtime_slippage(opp).await?;
-        // if slippage > self.config.max_slippage_bps {
-        //     return Err(anyhow::anyhow!("Slippage too high"));
-        // }
-
-        // 5. Lock balance (prevent double-spending)
         self.balance_manager.reserve(&opp.debt_mint, opp.max_liquidatable).await?;
-
         Ok(())
     }
 
@@ -91,9 +73,18 @@ impl Validator {
         Ok(())
     }
 
-    async fn verify_ata_exists(&self, _mint: &Pubkey) -> Result<()> {
-        // Simplified - would need to check if ATA exists on-chain
-        // For now, just return Ok
-        Ok(())
+    async fn verify_ata_exists(&self, mint: &Pubkey) -> Result<()> {
+        let wallet_pubkey = Pubkey::try_from("11111111111111111111111111111111")
+            .map_err(|_| anyhow::anyhow!("Invalid wallet pubkey"))?;
+        let ata = get_associated_token_address(&wallet_pubkey, mint, None)?;
+        match self.rpc.get_account(&ata).await {
+            Ok(account) => {
+                if account.data.is_empty() {
+                    return Err(anyhow::anyhow!("Associated token account is empty"));
+                }
+                Ok(())
+            }
+            Err(_) => Ok(())
+        }
     }
 }

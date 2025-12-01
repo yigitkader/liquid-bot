@@ -24,28 +24,24 @@ impl PythOracle {
     }
 
     pub fn parse_pyth_account(data: &[u8]) -> Result<PriceData> {
-        // Use pyth-sdk-solana
-        // Pyth program ID from mainnet
         let pyth_program_id = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH"
             .parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
         
-        // account_to_feed needs Account struct, not just bytes
         let mut account = solana_sdk::account::Account {
             lamports: 0,
             data: data.to_vec(),
-            owner: pyth_program_id, // Real Pyth program ID
+            owner: pyth_program_id,
             executable: false,
             rent_epoch: 0,
         };
         
         let feed = SolanaPriceAccount::account_to_feed(
-            &pyth_program_id, // Real Pyth program ID
+            &pyth_program_id,
             &mut account
         )
         .map_err(|e| anyhow::anyhow!("Failed to parse Pyth account: {}", e))?;
         
-        // Get latest price
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?

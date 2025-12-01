@@ -1,4 +1,3 @@
-// Rate limiter removed - Structure.md doesn't include it
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient as SolanaRpcClient;
 use solana_sdk::{
@@ -15,7 +14,6 @@ pub struct RpcClient {
     rpc_url: String,
     #[allow(dead_code)]
     commitment: CommitmentConfig,
-    // Rate limiter removed per Structure.md
 }
 
 impl RpcClient {
@@ -27,12 +25,10 @@ impl RpcClient {
             )),
             rpc_url,
             commitment: CommitmentConfig::confirmed(),
-            // Rate limiter removed per Structure.md
         })
     }
 
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<solana_sdk::account::Account> {
-        // Rate limiting removed per Structure.md
         let client = Arc::clone(&self.client);
         let pubkey = *pubkey;
         tokio::task::spawn_blocking(move || {
@@ -46,7 +42,6 @@ impl RpcClient {
         &self,
         program_id: &Pubkey,
     ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
-        // Rate limiting removed per Structure.md
         let client = Arc::clone(&self.client);
         let program_id = *program_id;
         tokio::task::spawn_blocking(move || {
@@ -59,7 +54,6 @@ impl RpcClient {
     }
 
     pub async fn send_transaction(&self, tx: &solana_sdk::transaction::Transaction) -> Result<Signature> {
-        // Rate limiting removed per Structure.md
         let client = Arc::clone(&self.client);
         let tx = tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -70,7 +64,6 @@ impl RpcClient {
     }
 
     pub async fn get_recent_blockhash(&self) -> Result<Hash> {
-        // Rate limiting removed per Structure.md
         let client = Arc::clone(&self.client);
         tokio::task::spawn_blocking(move || {
             client
@@ -82,7 +75,6 @@ impl RpcClient {
     }
 
     pub async fn get_slot(&self) -> Result<u64> {
-        // Rate limiting removed per Structure.md
         let client = Arc::clone(&self.client);
         tokio::task::spawn_blocking(move || {
             client

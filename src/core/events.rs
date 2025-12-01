@@ -4,7 +4,6 @@ use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    // Discovery
     AccountDiscovered {
         pubkey: Pubkey,
         position: Position,
@@ -14,17 +13,14 @@ pub enum Event {
         position: Position,
     },
     
-    // Analysis
     OpportunityFound {
         opportunity: Opportunity,
     },
     
-    // Validation
     OpportunityApproved {
         opportunity: Opportunity,
     },
     
-    // Execution
     TransactionSent {
         signature: String,
     },
@@ -34,7 +30,6 @@ pub enum Event {
     },
 }
 
-/// Event Bus - Tüm worker'ların haberleştiği merkezi kanal
 #[derive(Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,

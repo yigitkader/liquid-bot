@@ -81,15 +81,13 @@ pub fn get_oracle_accounts_from_reserve(
         return Ok((pyth_oracle, switchboard_oracle));
     }
     
-    // ⚠️ Warning but not error - some reserves may not have oracle configured
-    // This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin)
     log::warn!(
         "No oracle accounts found for reserve. \
          This is acceptable for certain asset pairs (e.g., stablecoin/stablecoin). \
          Proceeding with estimated pricing."
     );
     
-    Ok((None, None)) // Return None instead of error
+    Ok((None, None))
 }
 
 pub fn get_oracle_accounts_from_mint(

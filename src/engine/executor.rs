@@ -11,7 +11,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-// Simple transaction lock
 struct TxLock {
     locked: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<Pubkey>>>,
     timeout_seconds: u64,
@@ -87,7 +86,6 @@ impl Executor {
         loop {
             match receiver.recv().await {
                 Ok(Event::OpportunityApproved { opportunity }) => {
-                    // Lock to prevent duplicate execution
                     let _guard = match self.tx_lock.try_lock(&opportunity.position.address) {
                         Ok(guard) => guard,
                         Err(_) => {
@@ -106,7 +104,6 @@ impl Executor {
                     }
                 }
                 Ok(_) => {
-                    // Ignore other events
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     log::warn!("Executor lagged, skipped {} events", skipped);
@@ -122,15 +119,12 @@ impl Executor {
     }
 
     async fn execute(&self, opp: Opportunity) -> Result<solana_sdk::signature::Signature> {
-        // 1. Build liquidation instruction
-        // Keypair doesn't have pubkey() method directly, need to derive it
         use solana_sdk::signature::Signer;
         let wallet_pubkey = self.wallet.pubkey();
         let liq_ix = self.protocol
             .build_liquidation_ix(&opp, &wallet_pubkey, Some(Arc::clone(&self.rpc)))
             .await?;
 
-        // 2. Build transaction
         let blockhash = self.rpc.get_recent_blockhash().await?;
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder
@@ -138,23 +132,17 @@ impl Executor {
             .add_instruction(liq_ix);
         let mut tx = tx_builder.build(blockhash);
 
-        // 3. Sign transaction
         sign_transaction(&mut tx, &self.wallet);
 
-        // 4. Send transaction
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
-            // In dry run, we don't send transaction but still need to return
-            // Return error to indicate transaction was not sent
             return Err(anyhow::anyhow!("DRY_RUN mode: Transaction not sent to blockchain"));
         } else {
             send_and_confirm(tx, Arc::clone(&self.rpc)).await?
         };
 
-        // 5. Release balance reservation
         self.balance_manager.release(&opp.debt_mint, opp.max_liquidatable).await;
 
-        // 6. Publish event
         self.event_bus.publish(Event::TransactionSent {
             signature: signature.to_string(),
         })?;

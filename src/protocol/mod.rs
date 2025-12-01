@@ -1,7 +1,6 @@
 pub mod solend;
 pub mod oracle;
 
-// Protocol trait
 use crate::core::types::{Position, Opportunity};
 use solana_sdk::{pubkey::Pubkey, instruction::Instruction};
 use async_trait::async_trait;
@@ -9,7 +8,6 @@ use std::sync::Arc;
 use crate::blockchain::rpc_client::RpcClient;
 use anyhow::Result;
 
-// Re-export Protocol trait
 #[async_trait]
 pub trait Protocol: Send + Sync {
     fn id(&self) -> &str;

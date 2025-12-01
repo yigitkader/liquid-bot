@@ -1,4 +1,3 @@
-// Helper utilities
 use anyhow::Result;
 
 pub fn parse_pubkey(s: &str) -> Result<solana_sdk::pubkey::Pubkey> {

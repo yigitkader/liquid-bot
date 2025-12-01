@@ -40,15 +40,50 @@ impl Protocol for SolendProtocol {
     }
 
     async fn parse_position(&self, account: &Account) -> Option<Position> {
-        // Real implementation required - parse Solend obligation account
-        // For now, return None to indicate parsing not yet implemented
-        // This must be implemented with real Borsh deserialization
-        None
+        use crate::protocol::solend::types::SolendObligation;
+        use crate::core::types::{Position, Asset};
+        
+        let obligation = match SolendObligation::from_account_data(&account.data) {
+            Ok(obl) => obl,
+            Err(_) => return None,
+        };
+
+        let health_factor = obligation.calculate_health_factor();
+        let collateral_usd = obligation.total_deposited_value_usd();
+        let debt_usd = obligation.total_borrowed_value_usd();
+
+        let mut collateral_assets = Vec::new();
+        for deposit in &obligation.deposits {
+            collateral_assets.push(Asset {
+                mint: deposit.deposit_reserve,
+                amount: deposit.deposited_amount,
+                amount_usd: deposit.market_value.to_f64(),
+                ltv: 0.0,
+            });
+        }
+
+        let mut debt_assets = Vec::new();
+        for borrow in &obligation.borrows {
+            let borrowed_amount = (borrow.borrowed_amount_wad as f64 / 1_000_000_000_000_000_000.0) as u64;
+            debt_assets.push(Asset {
+                mint: borrow.borrow_reserve,
+                amount: borrowed_amount,
+                amount_usd: borrow.market_value.to_f64(),
+                ltv: 0.0,
+            });
+        }
+
+        Some(Position {
+            address: obligation.owner,
+            health_factor,
+            collateral_usd,
+            debt_usd,
+            collateral_assets,
+            debt_assets,
+        })
     }
 
     fn calculate_health_factor(&self, position: &Position) -> f64 {
-        // Real implementation required - calculate health factor from position
-        // For now, return position's existing health factor
         position.health_factor
     }
 
@@ -58,7 +93,6 @@ impl Protocol for SolendProtocol {
         liquidator: &Pubkey,
         rpc: Option<Arc<RpcClient>>,
     ) -> Result<Instruction> {
-        // Use the instruction builder from instructions.rs
         instructions::build_liquidate_obligation_ix(opportunity, liquidator, rpc).await
     }
 

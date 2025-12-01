@@ -35,15 +35,7 @@ pub struct Number {
 }
 
 impl Number {
-    /// WAD (Wei-scAlar Decimal) format constant: 1e18
-    /// 
-    /// Solend uses WAD format for all decimal values, consistent with:
-    /// - Solend SDK (src/state/obligation.ts)
-    /// - Solana's decimal representation standard
-    /// - Compound/MakerDAO WAD format (1e18)
-    /// 
-    /// Reference: https://docs.solend.fi/developers/protocol-overview
-    pub const WAD: f64 = 1_000_000_000_000_000_000.0; // 1e18
+    pub const WAD: f64 = 1_000_000_000_000_000_000.0;
     
     pub fn to_f64(&self) -> f64 {
         self.value as f64 / Self::WAD
@@ -60,32 +52,13 @@ impl SolendObligation {
             return Err(anyhow::anyhow!("Empty account data"));
         }
 
-        // ⚠️ IMPORTANT: Solend obligation accounts may or may not have an 8-byte discriminator
-        // According to Solend SDK, obligation accounts use Anchor's discriminator (8 bytes)
-        // But we need to check if the first 8 bytes are actually a discriminator or part of the struct
-        // 
-        // Strategy: Try parsing with discriminator skip first, if that fails, try without skip
-        // This handles both cases: accounts with and without discriminator
-        
-        // First, try with 8-byte discriminator skip (Anchor standard)
         let account_data_with_skip = if data.len() > 8 { &data[8..] } else { data };
-        
-        // Check if this looks like it has a discriminator
-        // Discriminators are typically non-zero bytes in the first 8 bytes
         let has_discriminator = data.len() > 8 && data[0..8].iter().any(|&b| b != 0);
-        
         let account_data = if has_discriminator {
             account_data_with_skip
         } else {
-            // No discriminator, use full data
             data
         };
-        
-        // Calculate expected minimum size for obligation struct
-        // Basic fields: last_update_slot (8) + lending_market (32) + owner (32) + 
-        // deposited_value (16) + borrowed_value (16) + allowed_borrow_value (16) + 
-        // unhealthy_borrow_value (16) + deposits vec (4 + 0*72) + borrows vec (4 + 0*72)
-        // Minimum: ~140 bytes for empty vectors
         let min_expected_size = 140;
         
         if account_data.len() < min_expected_size {
@@ -99,7 +72,6 @@ impl SolendObligation {
         
         SolendObligation::try_from_slice(account_data)
             .map_err(|e| {
-                // Provide more detailed error message
                 let hex_preview: String = data
                     .iter()
                     .take(64)
