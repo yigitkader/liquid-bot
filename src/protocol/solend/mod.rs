@@ -97,7 +97,7 @@ impl Protocol for SolendProtocol {
                     "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
                     i,
                     bor.borrow_reserve,
-                    bor.borrowed_amount_wad,
+                    bor.borrowed_amount_wads.to_f64(),
                     bor.market_value.value,
                     bor.market_value.to_f64()
                 );
@@ -120,7 +120,7 @@ impl Protocol for SolendProtocol {
 
         let mut debt_assets = Vec::new();
         for borrow in &obligation.borrows {
-            let borrowed_amount = (borrow.borrowed_amount_wad as f64 / 1_000_000_000_000_000_000.0) as u64;
+            let borrowed_amount = borrow.borrowed_amount_wads.to_f64() as u64;
             debt_assets.push(Asset {
                 mint: borrow.borrow_reserve,
                 amount: borrowed_amount,
