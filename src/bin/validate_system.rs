@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use dotenv::dotenv;
 use fern;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -673,40 +672,50 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
 
     match get_pyth_oracle_account(&usdc_mint, config) {
         Ok(Some(pyth_oracle)) => {
+            log::info!("Found Pyth oracle account for USDC: {}", pyth_oracle);
             match read_pyth_price(&pyth_oracle, Arc::clone(rpc_client), config).await {
                 Ok(Some(price)) => {
+                    let age_seconds = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64 - price.timestamp;
                     results.push(TestResult::success_with_details(
                         "Pyth Oracle Reading (USDC)",
                         "Successfully read price from Pyth oracle",
                         format!(
-                            "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {}",
+                            "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {} (age: {}s)",
                             price.price,
                             price.confidence,
-                            price.timestamp
+                            price.timestamp,
+                            age_seconds
                         )
                     ));
                 }
                 Ok(None) => {
+                    log::error!("Pyth oracle account {} exists but price data is unavailable or stale", pyth_oracle);
                     results.push(TestResult::failure(
                         "Pyth Oracle Reading (USDC)",
-                        "Oracle account exists but price data is unavailable or stale"
+                        &format!("Oracle account {} exists but price data is unavailable or stale. Check logs for details.", pyth_oracle)
                     ));
                 }
                 Err(e) => {
+                    log::error!("Failed to read Pyth price for USDC: {}", e);
                     results.push(TestResult::failure(
                         "Pyth Oracle Reading (USDC)",
-                        &format!("Failed to read price: {}", e)
+                        &format!("Failed to read price: {}. Check logs for details.", e)
                     ));
                 }
             }
         }
         Ok(None) => {
+            log::warn!("No Pyth oracle account found for USDC mint: {}", usdc_mint);
             results.push(TestResult::failure(
                 "Pyth Oracle Account (USDC)",
-                "No Pyth oracle account found for USDC"
+                &format!("No Pyth oracle account found for USDC mint: {}", usdc_mint)
             ));
         }
         Err(e) => {
+            log::error!("Failed to get Pyth oracle account for USDC: {}", e);
             results.push(TestResult::failure(
                 "Pyth Oracle Account (USDC)",
                 &format!("Failed to get oracle account: {}", e)
@@ -722,40 +731,50 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
 
     match get_pyth_oracle_account(&sol_mint, config) {
         Ok(Some(pyth_oracle)) => {
+            log::info!("Found Pyth oracle account for SOL: {}", pyth_oracle);
             match read_pyth_price(&pyth_oracle, Arc::clone(rpc_client), config).await {
                 Ok(Some(price)) => {
+                    let age_seconds = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64 - price.timestamp;
                     results.push(TestResult::success_with_details(
                         "Pyth Oracle Reading (SOL)",
                         "Successfully read price from Pyth oracle",
                         format!(
-                            "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {}",
+                            "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {} (age: {}s)",
                             price.price,
                             price.confidence,
-                            price.timestamp
+                            price.timestamp,
+                            age_seconds
                         )
                     ));
                 }
                 Ok(None) => {
+                    log::error!("Pyth oracle account {} exists but price data is unavailable or stale", pyth_oracle);
                     results.push(TestResult::failure(
                         "Pyth Oracle Reading (SOL)",
-                        "Oracle account exists but price data is unavailable or stale"
+                        &format!("Oracle account {} exists but price data is unavailable or stale. Check logs for details.", pyth_oracle)
                     ));
                 }
                 Err(e) => {
+                    log::error!("Failed to read Pyth price for SOL: {}", e);
                     results.push(TestResult::failure(
                         "Pyth Oracle Reading (SOL)",
-                        &format!("Failed to read price: {}", e)
+                        &format!("Failed to read price: {}. Check logs for details.", e)
                     ));
                 }
             }
         }
         Ok(None) => {
+            log::warn!("No Pyth oracle account found for SOL mint: {}", sol_mint);
             results.push(TestResult::failure(
                 "Pyth Oracle Account (SOL)",
-                "No Pyth oracle account found for SOL"
+                &format!("No Pyth oracle account found for SOL mint: {}", sol_mint)
             ));
         }
         Err(e) => {
+            log::error!("Failed to get Pyth oracle account for SOL: {}", e);
             results.push(TestResult::failure(
                 "Pyth Oracle Account (SOL)",
                 &format!("Failed to get oracle account: {}", e)

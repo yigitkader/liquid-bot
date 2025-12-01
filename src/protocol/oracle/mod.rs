@@ -224,16 +224,32 @@ pub async fn read_pyth_price(
     rpc_client: Arc<RpcClient>,
     config: Option<&crate::config::Config>,
 ) -> Result<Option<OraclePrice>> {
+    log::debug!("Reading Pyth oracle price from account: {}", oracle_account);
+    
     let account = match rpc_client.get_account(oracle_account).await {
-        Ok(acc) if !acc.data.is_empty() => acc,
-        _ => return Ok(None),
+        Ok(acc) if !acc.data.is_empty() => {
+            log::debug!("Pyth oracle account fetched: {} bytes, owner: {}", acc.data.len(), acc.owner);
+            acc
+        },
+        Ok(acc) => {
+            log::warn!("Pyth oracle account {} is empty ({} bytes)", oracle_account, acc.data.len());
+            return Ok(None);
+        },
+        Err(e) => {
+            log::error!("Failed to fetch Pyth oracle account {}: {}", oracle_account, e);
+            return Ok(None);
+        }
     };
     
     let mut account_mut = account;
     let price_feed = match SolanaPriceAccount::account_to_feed(oracle_account, &mut account_mut) {
-        Ok(feed) => feed,
+        Ok(feed) => {
+            log::debug!("Pyth price feed parsed successfully for account: {}", oracle_account);
+            feed
+        },
         Err(e) => {
-            log::warn!("Failed to parse Pyth price feed: {}", e);
+            log::error!("Failed to parse Pyth price feed for account {}: {}. Account data size: {} bytes, owner: {}", 
+                oracle_account, e, account_mut.data.len(), account_mut.owner);
             return Ok(None);
         }
     };
@@ -244,13 +260,32 @@ pub async fn read_pyth_price(
         .as_secs() as i64;
     
     let max_age_seconds = config.map(|c| c.max_oracle_age_seconds).unwrap_or(60);
+    log::debug!("Checking price data freshness: current_time={}, max_age={}s", current_time, max_age_seconds);
+    
     let price_data = match price_feed.get_price_no_older_than(current_time, max_age_seconds) {
-        Some(data) => data,
-        None => return Ok(None),
+        Some(data) => {
+            log::debug!("Pyth price data found: price={}, expo={}, conf={}, publish_time={}", 
+                data.price, data.expo, data.conf, data.publish_time);
+            data
+        },
+        None => {
+            let latest_price = price_feed.get_price_no_older_than(current_time, u64::MAX);
+            if let Some(latest) = latest_price {
+                let age_seconds = current_time - latest.publish_time;
+                log::warn!("Pyth price data is stale for account {}: age={}s (max={}s), latest_price={}, expo={}, publish_time={}", 
+                    oracle_account, age_seconds, max_age_seconds, latest.price, latest.expo, latest.publish_time);
+            } else {
+                log::error!("No price data found in Pyth feed for account: {}", oracle_account);
+            }
+            return Ok(None);
+        }
     };
     
     let price = price_data.price as f64 * 10_f64.powi(price_data.expo);
     let confidence = price_data.conf as f64 * 10_f64.powi(price_data.expo);
+    
+    log::info!("Pyth oracle price read successfully: account={}, price=${:.4}, confidence=${:.4}, timestamp={}", 
+        oracle_account, price, confidence, price_data.publish_time);
     
     Ok(Some(OraclePrice {
         price,

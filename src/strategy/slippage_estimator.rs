@@ -52,13 +52,14 @@ impl SlippageEstimator {
             .get(&url)
             .send()
             .await
-            .context("Failed to send request to Jupiter API")?;
+            .with_context(|| format!("Failed to send request to Jupiter API: {}", url))?;
 
         let status = response.status();
         let response_text = response.text().await
             .context("Failed to read Jupiter API response body")?;
         
         if !status.is_success() {
+            log::error!("Jupiter API error - Status: {}, Response: {}", status, response_text);
             return Err(anyhow::anyhow!(
                 "Jupiter API returned error status: {} - {}",
                 status,
