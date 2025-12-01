@@ -1,4 +1,5 @@
 use crate::blockchain::rpc_client::RpcClient;
+use crate::core::config::Config;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ pub struct BalanceManager {
     reserved: Arc<RwLock<HashMap<Pubkey, u64>>>,
     rpc: Arc<RpcClient>,
     wallet: Pubkey,
+    config: Option<Config>,
 }
 
 impl BalanceManager {
@@ -17,13 +19,42 @@ impl BalanceManager {
             reserved: Arc::new(RwLock::new(HashMap::new())),
             rpc,
             wallet,
+            config: None,
         }
+    }
+
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = Some(config);
+        self
     }
 
     pub async fn get_available_balance(&self, mint: &Pubkey) -> Result<u64> {
         use crate::protocol::solend::accounts::get_associated_token_address;
-        let ata = get_associated_token_address(&self.wallet, mint, None)?;
-        let account = self.rpc.get_account(&ata).await?;
+        let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
+        
+        // Handle AccountNotFound gracefully - if ATA doesn't exist, balance is 0
+        // This is expected behavior: ATA doesn't exist = no token account = balance is 0
+        let account = match self.rpc.get_account(&ata).await {
+            Ok(acc) => acc,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
+                    // ATA doesn't exist yet - this is normal, balance is 0
+                    // Note: ATA can be created automatically during transaction if needed
+                    log::debug!(
+                        "BalanceManager: ATA not found for mint {} (ata={}), wallet={}. Returning 0 balance (ATA will be auto-created during transaction if needed)",
+                        mint,
+                        ata,
+                        self.wallet
+                    );
+                    let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
+                    // Available = 0 - reserved (which will be 0 if reserved is 0)
+                    return Ok(0u64.saturating_sub(reserved));
+                }
+                // Other errors (network issues, RPC errors, etc.) should be propagated
+                return Err(e);
+            }
+        };
         
         if account.data.len() < 72 {
             return Err(anyhow::anyhow!("Invalid token account data"));
@@ -46,8 +77,31 @@ impl BalanceManager {
         reserved: &HashMap<Pubkey, u64>,
     ) -> Result<u64> {
         use crate::protocol::solend::accounts::get_associated_token_address;
-        let ata = get_associated_token_address(&self.wallet, mint, None)?;
-        let account = self.rpc.get_account(&ata).await?;
+        let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
+        
+        // Handle AccountNotFound gracefully - if ATA doesn't exist, balance is 0
+        // This is expected behavior: ATA doesn't exist = no token account = balance is 0
+        let account = match self.rpc.get_account(&ata).await {
+            Ok(acc) => acc,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
+                    // ATA doesn't exist yet - this is normal, balance is 0
+                    // Note: ATA can be created automatically during transaction if needed
+                    log::debug!(
+                        "BalanceManager: ATA not found for mint {} (ata={}), wallet={}. Returning 0 balance (ATA will be auto-created during transaction if needed)",
+                        mint,
+                        ata,
+                        self.wallet
+                    );
+                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+                    // Available = 0 - reserved (which will be 0 if reserved is 0)
+                    return Ok(0u64.saturating_sub(reserved_amount));
+                }
+                // Other errors (network issues, RPC errors, etc.) should be propagated
+                return Err(e);
+            }
+        };
         
         if account.data.len() < 72 {
             return Err(anyhow::anyhow!("Invalid token account data"));

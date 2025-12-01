@@ -11,6 +11,8 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 use std::str::FromStr;
+use std::path::Path;
+use std::fs;
 
 use liquid_bot::core::config::Config;
 use liquid_bot::blockchain::rpc_client::RpcClient;
@@ -31,16 +33,9 @@ async fn main() -> Result<()> {
             .context("Failed to create RPC client")?
     );
 
-    // Load wallet
-    let wallet_bytes = std::fs::read(&config.wallet_path)
-        .context("Failed to read wallet file")?;
-    let wallet = if let Ok(keypair_vec) = serde_json::from_slice::<Vec<u8>>(&wallet_bytes) {
-        Keypair::from_bytes(&keypair_vec)
-            .context("Failed to parse wallet")?
-    } else {
-        Keypair::from_bytes(&wallet_bytes)
-            .context("Failed to parse wallet")?
-    };
+    // Load wallet using the same method as main.rs
+    let wallet = load_wallet(&config.wallet_path)
+        .context("Failed to load wallet")?;
     let wallet_pubkey = wallet.pubkey();
 
     println!("Wallet: {}\n", wallet_pubkey);
@@ -117,6 +112,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_wallet(path: &str) -> Result<Keypair> {
+    let wallet_path = Path::new(path);
+    
+    if !wallet_path.exists() {
+        return Err(anyhow::anyhow!("Wallet file not found: {}", path));
+    }
+
+    let keypair_bytes = fs::read(wallet_path)
+        .context("Failed to read wallet file")?;
+
+    if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
+        if keypair.len() == 64 {
+            return Keypair::from_bytes(&keypair)
+                .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+        }
+    }
+
+    if keypair_bytes.len() == 64 {
+        return Keypair::from_bytes(&keypair_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+    }
+
+    if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
+        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim())
+            .into_vec()
+        {
+            if keypair_bytes_decoded.len() == 64 {
+                return Keypair::from_bytes(&keypair_bytes_decoded)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Invalid wallet format: expected 64 bytes, JSON array, or base58 string"))
 }
 
 fn create_associated_token_account(

@@ -30,11 +30,12 @@ pub mod utils {
     pub mod cache;
     pub mod metrics;
     pub mod helpers;
+    pub mod ata_manager;
 }
 
 pub use core::{config, events, types, error};
 pub use blockchain::{rpc_client, ws_client, transaction};
 pub use engine::{scanner, analyzer, validator, executor};
 pub use strategy::{profit_calculator, slippage_estimator, balance_manager};
-pub use utils::{cache, metrics, helpers};
+pub use utils::{cache, metrics, helpers, ata_manager};
 pub use protocol::Protocol;
