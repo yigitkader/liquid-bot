@@ -4,7 +4,7 @@ use crate::core::config::Config;
 use crate::blockchain::rpc_client::RpcClient;
 use crate::strategy::balance_manager::BalanceManager;
 use crate::protocol::solend::accounts::get_associated_token_address;
-use anyhow::Result;
+use anyhow::{Result, Context};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use solana_sdk::pubkey::Pubkey;
@@ -59,8 +59,18 @@ impl Validator {
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
         self.has_sufficient_balance(&opp.debt_mint, opp.max_liquidatable).await?;
+        
+        self.check_oracle_freshness(&opp.debt_mint).await?;
+        self.check_oracle_freshness(&opp.collateral_mint).await?;
+        
         self.verify_ata_exists(&opp.debt_mint).await?;
         self.verify_ata_exists(&opp.collateral_mint).await?;
+        
+        let slippage = self.get_realtime_slippage(opp).await?;
+        if slippage > self.config.max_slippage_bps {
+            return Err(anyhow::anyhow!("Slippage too high: {} bps (max: {} bps)", slippage, self.config.max_slippage_bps));
+        }
+        
         self.balance_manager.reserve(&opp.debt_mint, opp.max_liquidatable).await?;
         Ok(())
     }
@@ -90,5 +100,44 @@ impl Validator {
             }
             Err(_) => Ok(())
         }
+    }
+
+    async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
+        use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
+        
+        if let Some(oracle_account) = get_pyth_oracle_account(mint, Some(&self.config))? {
+            let max_age = self.config.max_oracle_age_seconds;
+            if let Some(price_data) = read_pyth_price(&oracle_account, Arc::clone(&self.rpc), Some(&self.config)).await? {
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
+                    .as_secs() as i64;
+                
+                let age_seconds = current_time - price_data.timestamp;
+                if age_seconds > max_age as i64 {
+                    return Err(anyhow::anyhow!("Oracle price data is stale: {} seconds old (max: {} seconds)", age_seconds, max_age));
+                }
+            } else {
+                return Err(anyhow::anyhow!("Failed to read oracle price data for mint: {}", mint));
+            }
+        } else {
+            log::warn!("No Pyth oracle found for mint: {}, skipping freshness check", mint);
+        }
+        
+        Ok(())
+    }
+
+    async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
+        use crate::strategy::slippage_estimator::SlippageEstimator;
+        
+        let estimator = SlippageEstimator::new(self.config.clone());
+        let slippage = estimator.estimate_dex_slippage(
+            opp.debt_mint,
+            opp.collateral_mint,
+            opp.seizable_collateral,
+        ).await
+            .context("Failed to estimate real-time slippage")?;
+        
+        Ok(slippage)
     }
 }

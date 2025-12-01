@@ -84,6 +84,38 @@ impl RpcClient {
         .context("Failed to spawn blocking task")?
     }
 
+    pub async fn get_multiple_accounts(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<solana_sdk::account::Account>>> {
+        let client = Arc::clone(&self.client);
+        let pubkeys = pubkeys.to_vec();
+        let rpc_url = self.rpc_url.clone();
+        tokio::task::spawn_blocking(move || {
+            client
+                .get_multiple_accounts(&pubkeys)
+                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+        })
+        .await
+        .context("Failed to spawn blocking task")?
+    }
+
+    pub async fn simulate_transaction(
+        &self,
+        tx: &solana_sdk::transaction::Transaction,
+    ) -> Result<solana_client::rpc_response::RpcSimulateTransactionResult> {
+        let client = Arc::clone(&self.client);
+        let tx = tx.clone();
+        let rpc_url = self.rpc_url.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.simulate_transaction(&tx)
+        })
+        .await
+        .context("Failed to spawn blocking task")?
+        .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))?;
+        Ok(response.value)
+    }
+
     pub async fn retry<F, Fut, T>(&self, operation: F, max_retries: u32) -> Result<T>
     where
         F: Fn() -> Fut,

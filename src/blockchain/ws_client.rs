@@ -30,6 +30,7 @@ struct SubscriptionInfo {
 enum SubscriptionType {
     Program(Pubkey),
     Account(Pubkey),
+    Slot,
 }
 
 use std::sync::Arc;
@@ -100,13 +101,13 @@ impl WsClient {
                         }
                         Ok(Message::Close(_)) => {
                             return Err(anyhow::anyhow!("WebSocket connection closed"));
-                        }
-                        Err(e) => {
+            }
+            Err(e) => {
                             return Err(anyhow::anyhow!("WebSocket error: {}", e));
                         }
                         _ => {}
                     }
-                } else {
+                    } else {
                     return Err(anyhow::anyhow!("WebSocket stream ended"));
                 }
             }
@@ -154,6 +155,23 @@ impl WsClient {
         let mut subscriptions = self.subscriptions.lock().await;
         subscriptions.insert(subscription_id, SubscriptionInfo {
             subscription_type: SubscriptionType::Account(*pubkey),
+        });
+
+        Ok(subscription_id)
+    }
+
+    pub async fn subscribe_slot(&self) -> Result<u64> {
+        let params = json!([]);
+
+        let request_id = self.send_request("slotSubscribe", params).await?;
+        let result = self.wait_for_response(request_id).await?;
+        
+        let subscription_id = result.as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
+
+        let mut subscriptions = self.subscriptions.lock().await;
+        subscriptions.insert(subscription_id, SubscriptionInfo {
+            subscription_type: SubscriptionType::Slot,
         });
 
         Ok(subscription_id)
@@ -237,6 +255,11 @@ impl WsClient {
                         SubscriptionType::Account(pubkey) => {
                             if let Err(e) = self.subscribe_account(pubkey).await {
                                 log::warn!("Failed to resubscribe to account {}: {}", pubkey, e);
+                            }
+                        }
+                        SubscriptionType::Slot => {
+                            if let Err(e) = self.subscribe_slot().await {
+                                log::warn!("Failed to resubscribe to slot: {}", e);
                             }
                         }
                     }

@@ -62,8 +62,8 @@ impl Scanner {
         loop {
             if let Some(update) = self.ws.listen().await {
                 if let Some(position) = self.protocol.parse_position(&update.account).await {
-                    self.cache.insert(update.pubkey, position.clone()).await;
-                    self.event_bus.publish(Event::AccountDiscovered {
+                    self.cache.update(update.pubkey, position.clone()).await;
+                    self.event_bus.publish(Event::AccountUpdated {
                         pubkey: update.pubkey,
                         position,
                     })?;

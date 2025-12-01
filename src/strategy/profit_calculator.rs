@@ -16,7 +16,7 @@ impl ProfitCalculator {
 
         let tx_fee = self.calculate_tx_fee();
         let slippage_cost = self.calculate_slippage_cost(opportunity);
-        let dex_fee = 0.0; // Simplified - would need swap detection
+        let dex_fee = self.calculate_dex_fee(opportunity);
 
         gross - tx_fee - slippage_cost - dex_fee
     }
@@ -35,5 +35,18 @@ impl ProfitCalculator {
         let slippage_bps = self.config.max_slippage_bps as f64;
         let cost = size_usd * (slippage_bps / 10_000.0);
         cost
+    }
+
+    fn calculate_dex_fee(&self, opp: &Opportunity) -> f64 {
+        let needs_swap = opp.debt_mint != opp.collateral_mint;
+        
+        if !needs_swap {
+            return 0.0;
+        }
+
+        let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
+        let dex_fee_bps = self.config.dex_fee_bps as f64;
+        let fee = size_usd * (dex_fee_bps / 10_000.0);
+        fee
     }
 }
