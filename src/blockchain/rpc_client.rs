@@ -7,40 +7,96 @@ use solana_sdk::{
     hash::Hash,
 };
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
+use tokio::sync::Semaphore;
 
 pub struct RpcClient {
     client: Arc<SolanaRpcClient>,
     rpc_url: String,
+    rate_limiter: Arc<Semaphore>,
+    last_request_time: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 impl RpcClient {
     pub fn new(rpc_url: String) -> Result<Self> {
+        // Rate limiting: Max 10 concurrent requests, min 100ms between requests
         Ok(RpcClient {
             client: Arc::new(SolanaRpcClient::new_with_commitment(
                 rpc_url.clone(),
                 CommitmentConfig::confirmed(),
             )),
             rpc_url,
+            rate_limiter: Arc::new(Semaphore::new(10)), // Max 10 concurrent requests
+            last_request_time: Arc::new(tokio::sync::Mutex::new(Instant::now())),
         })
     }
 
+    async fn rate_limit(&self) {
+        // Minimum 100ms between requests to avoid rate limiting
+        let mut last_time = self.last_request_time.lock().await;
+        let elapsed = last_time.elapsed();
+        if elapsed < Duration::from_millis(100) {
+            sleep(Duration::from_millis(100) - elapsed).await;
+        }
+        *last_time = Instant::now();
+    }
+
+    async fn should_retry_rate_limit(&self, error_str: &str, retry_count: &mut u32) -> bool {
+        if error_str.contains("429") || error_str.contains("Too many requests") || error_str.contains("rate limit") {
+            *retry_count += 1;
+            if *retry_count <= 5 {
+                let backoff = Duration::from_millis(500 * (*retry_count as u64));
+                log::warn!("⚠️  Rate limit hit (429), backing off for {:?} (attempt {}/{})", backoff, *retry_count, 5);
+                sleep(backoff).await;
+                return true; // Retry
+            } else {
+                log::error!("❌ Rate limit exceeded after 5 retries");
+                return false; // Don't retry
+            }
+        }
+        false
+    }
+
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<solana_sdk::account::Account> {
-        let client = Arc::clone(&self.client);
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let pubkey = *pubkey;
-        let rpc_url = self.rpc_url.clone();
-        tokio::task::spawn_blocking(move || {
-            client.get_account(&pubkey)
-                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
-        })
-        .await
-        .context("Failed to spawn blocking task")?
+        let mut retry_count = 0;
+        
+        loop {
+            let client = Arc::clone(&self.client);
+            let rpc_url = self.rpc_url.clone();
+            
+            let result = tokio::task::spawn_blocking(move || {
+                client.get_account(&pubkey)
+                    .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+            })
+            .await
+            .context("Failed to spawn blocking task");
+            
+            match result {
+                Ok(Ok(account)) => return Ok(account),
+                Ok(Err(e)) => {
+                    let error_str = e.to_string();
+                    if !self.should_retry_rate_limit(&error_str, &mut retry_count).await {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn get_program_accounts(
         &self,
         program_id: &Pubkey,
     ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let client = Arc::clone(&self.client);
         let program_id = *program_id;
         tokio::task::spawn_blocking(move || {
@@ -53,6 +109,10 @@ impl RpcClient {
     }
 
     pub async fn send_transaction(&self, tx: &solana_sdk::transaction::Transaction) -> Result<Signature> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let client = Arc::clone(&self.client);
         let tx = tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -63,17 +123,41 @@ impl RpcClient {
     }
 
     pub async fn get_recent_blockhash(&self) -> Result<Hash> {
-        let client = Arc::clone(&self.client);
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_latest_blockhash()
-                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
-        .await
-        .context("Failed to spawn blocking task")?
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
+        let mut retry_count = 0;
+        
+        loop {
+            let client = Arc::clone(&self.client);
+            
+            let result = tokio::task::spawn_blocking(move || {
+                client
+                    .get_latest_blockhash()
+                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            })
+            .await
+            .context("Failed to spawn blocking task");
+            
+            match result {
+                Ok(Ok(hash)) => return Ok(hash),
+                Ok(Err(e)) => {
+                    let error_str = e.to_string();
+                    if !self.should_retry_rate_limit(&error_str, &mut retry_count).await {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn get_slot(&self) -> Result<u64> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let client = Arc::clone(&self.client);
         tokio::task::spawn_blocking(move || {
             client
@@ -88,6 +172,10 @@ impl RpcClient {
         &self,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<solana_sdk::account::Account>>> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let client = Arc::clone(&self.client);
         let pubkeys = pubkeys.to_vec();
         let rpc_url = self.rpc_url.clone();
@@ -104,6 +192,10 @@ impl RpcClient {
         &self,
         tx: &solana_sdk::transaction::Transaction,
     ) -> Result<solana_client::rpc_response::RpcSimulateTransactionResult> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
         let client = Arc::clone(&self.client);
         let tx = tx.clone();
         let rpc_url = self.rpc_url.clone();

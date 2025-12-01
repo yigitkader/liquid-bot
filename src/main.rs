@@ -76,20 +76,12 @@ async fn main() -> Result<()> {
     let wallet_pubkey = wallet.pubkey();
     log::info!("✅ Wallet loaded: {}", wallet_pubkey);
 
-    // Initialize ATA cache and ensure required ATAs exist
+    // Ensure required ATAs exist (simple on-chain check, no cache needed)
     use liquid_bot::utils::ata_manager;
-    let ata_cache = Arc::new(ata_manager::AtaCache::new(wallet_pubkey));
-    
-    // Load persistent cache from file (best effort, non-blocking)
-    if let Err(e) = ata_cache.load_from_file().await {
-        log::debug!("Could not load ATA cache from file (will create new): {}", e);
-    }
-    
     ata_manager::ensure_required_atas(
         Arc::clone(&rpc),
         Arc::clone(&wallet),
         &config,
-        Arc::clone(&ata_cache),
     )
     .await
     .context("Failed to ensure required ATAs exist")?;

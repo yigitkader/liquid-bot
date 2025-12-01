@@ -231,7 +231,7 @@ impl Config {
                 .parse()
                 .context("Invalid MAX_LIQUIDATION_SLIPPAGE value")?,
             event_bus_buffer_size: env::var("EVENT_BUS_BUFFER_SIZE")
-                .unwrap_or_else(|_| "10000".to_string())
+                .unwrap_or_else(|_| "50000".to_string()) // Increased from 10000 to 50000 to prevent lag
                 .parse()
                 .context("Invalid EVENT_BUS_BUFFER_SIZE value")?,
             health_manager_max_error_age_seconds: env::var("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS")

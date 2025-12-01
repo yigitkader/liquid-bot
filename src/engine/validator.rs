@@ -7,6 +7,8 @@ use crate::protocol::solend::accounts::get_associated_token_address;
 use anyhow::{Result, Context};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
+use tokio::sync::Semaphore;
 use solana_sdk::pubkey::Pubkey;
 
 pub struct Validator {
@@ -33,46 +35,76 @@ impl Validator {
 
     pub async fn run(&self) -> Result<()> {
         let mut receiver = self.event_bus.subscribe();
-
+        let mut tasks = JoinSet::new();
+        let semaphore = Arc::new(Semaphore::new(4)); // Max 4 parallel validations
+        
         loop {
-            match receiver.recv().await {
-                Ok(Event::OpportunityFound { opportunity }) => {
-                    log::info!(
-                        "Validator: received OpportunityFound for position {} (debt_mint={}, collateral_mint={}, max_liquidatable={}, est_profit={:.4})",
-                        opportunity.position.address,
-                        opportunity.debt_mint,
-                        opportunity.collateral_mint,
-                        opportunity.max_liquidatable,
-                        opportunity.estimated_profit
-                    );
+            tokio::select! {
+                // Handle new events
+                event_result = receiver.recv() => {
+                    match event_result {
+                        Ok(Event::OpportunityFound { opportunity }) => {
+                            let permit = semaphore.clone().acquire_owned().await
+                                .context("Failed to acquire semaphore permit")?;
+                            
+                            let event_bus = self.event_bus.clone();
+                            let rpc = Arc::clone(&self.rpc);
+                            let config = self.config.clone();
+                            
+                            tasks.spawn(async move {
+                                let _permit = permit;
+                                
+                                log::debug!(
+                                    "Validator: processing opportunity for position {} (est_profit={:.4})",
+                                    opportunity.position.address,
+                                    opportunity.estimated_profit
+                                );
 
-                    match self.validate(&opportunity).await {
-                        Ok(()) => {
-                            log::info!(
-                                "Validator: opportunity approved for position {}",
-                                opportunity.position.address
-                            );
-                            self.event_bus.publish(Event::OpportunityApproved {
-                                opportunity,
-                            })?;
+                                match Self::validate_static(&opportunity, &rpc, &config).await {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "Validator: opportunity approved for position {}",
+                                            opportunity.position.address
+                                        );
+                                        if let Err(e) = event_bus.publish(Event::OpportunityApproved {
+                                            opportunity,
+                                        }) {
+                                            log::error!("Failed to publish OpportunityApproved: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::debug!(
+                                            "Validator: opportunity rejected for position {}: {}",
+                                            opportunity.position.address,
+                                            e
+                                        );
+                                    }
+                                }
+                            });
                         }
-                        Err(e) => {
-                            log::info!(
-                                "Validator: opportunity rejected for position {}: {}",
-                                opportunity.position.address,
-                                e
-                            );
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            log::warn!("Validator lagged, skipped {} events", skipped);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            log::error!("Event bus closed, validator shutting down");
+                            break;
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log::warn!("Validator lagged, skipped {} events", skipped);
+                // Cleanup finished tasks
+                Some(result) = tasks.join_next() => {
+                    if let Err(e) = result {
+                        log::error!("Validator task failed: {}", e);
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => {
-                    log::error!("Event bus closed, validator shutting down");
-                    break;
-                }
+            }
+        }
+
+        // Wait for all tasks to complete
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                log::error!("Validator task failed: {}", e);
             }
         }
 
@@ -80,99 +112,43 @@ impl Validator {
     }
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        log::info!("🔍 VALIDATION DEBUG START for position: {}", opp.position.address);
-        log::info!("   Debt Mint: {}", opp.debt_mint);
-        log::info!("   Collateral Mint: {}", opp.collateral_mint);
-        log::info!("   Max Liquidatable: {}", opp.max_liquidatable);
+        Self::validate_static(opp, &self.rpc, &self.config).await
+    }
 
-        // Step 1: Balance check
-        log::info!("   Step 1/7: Checking balance...");
-        match self.has_sufficient_balance(&opp.debt_mint, opp.max_liquidatable).await {
-            Ok(_) => log::info!("   ✅ Balance OK"),
-            Err(e) => {
-                log::error!("   ❌ Balance FAILED: {}", e);
-                return Err(e);
-            }
+    // Static method for parallel processing
+    async fn validate_static(opp: &Opportunity, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+        log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
+
+        // Step 1: Oracle freshness - debt (parallel with collateral)
+        let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);
+        let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config);
+        
+        let (debt_result, collateral_result) = tokio::join!(debt_oracle_task, collateral_oracle_task);
+        
+        if let Err(e) = debt_result {
+            log::debug!("   ❌ Debt oracle FAILED: {}", e);
+            return Err(e);
         }
         
-        // Step 2: Oracle freshness - debt
-        log::info!("   Step 2/7: Checking debt oracle freshness...");
-        match self.check_oracle_freshness(&opp.debt_mint).await {
-            Ok(_) => log::info!("   ✅ Debt oracle OK"),
-            Err(e) => {
-                log::error!("   ❌ Debt oracle FAILED: {}", e);
-                log::error!("   Trying to fetch oracle account info...");
-                
-                // Debug: Oracle account var mı kontrol et
-                use crate::protocol::oracle::get_pyth_oracle_account;
-                if let Ok(Some(oracle_account)) = get_pyth_oracle_account(&opp.debt_mint, Some(&self.config)) {
-                    log::error!("   Oracle account found: {}", oracle_account);
-                    match self.rpc.get_account(&oracle_account).await {
-                        Ok(acc) => log::error!("   Oracle account EXISTS: {} bytes, owner: {}", 
-                            acc.data.len(), acc.owner),
-                        Err(fetch_err) => log::error!("   ⚠️  ORACLE ACCOUNT FETCH FAILED: {} (THIS IS THE PROBLEM!)", fetch_err),
-                    }
-                } else {
-                    log::error!("   No oracle account configured for mint: {}", opp.debt_mint);
-                }
-                return Err(e);
-            }
+        if let Err(e) = collateral_result {
+            log::debug!("   ❌ Collateral oracle FAILED: {}", e);
+            return Err(e);
         }
         
-        // Step 3: Oracle freshness - collateral
-        log::info!("   Step 3/7: Checking collateral oracle freshness...");
-        match self.check_oracle_freshness(&opp.collateral_mint).await {
-            Ok(_) => log::info!("   ✅ Collateral oracle OK"),
-            Err(e) => {
-                log::error!("   ❌ Collateral oracle FAILED: {}", e);
-                return Err(e);
-            }
-        }
-        
-        // Step 4: ATA verification - debt (NON-BLOCKING - sadece warning)
-        log::info!("   Step 4/7: Verifying debt ATA...");
-        if let Err(e) = self.verify_ata_exists(&opp.debt_mint).await {
-            log::warn!("   ⚠️  Debt ATA verification failed (non-critical): {}", e);
-            // Devam et - ATA eksikse Solana runtime handle eder
-        } else {
-            log::info!("   ✅ Debt ATA OK");
-        }
-        
-        // Step 5: ATA verification - collateral (NON-BLOCKING - sadece warning)
-        log::info!("   Step 5/7: Verifying collateral ATA...");
-        if let Err(e) = self.verify_ata_exists(&opp.collateral_mint).await {
-            log::warn!("   ⚠️  Collateral ATA verification failed (non-critical): {}", e);
-            // Devam et - ATA eksikse Solana runtime handle eder
-        } else {
-            log::info!("   ✅ Collateral ATA OK");
-        }
-        
-        // Step 6: Slippage check
-        log::info!("   Step 6/7: Checking slippage...");
-        let slippage = match self.get_realtime_slippage(opp).await {
+        // Step 2: Slippage check
+        let slippage = match Self::get_realtime_slippage_static(opp, rpc, config).await {
             Ok(s) => s,
             Err(e) => {
-                log::error!("   ❌ Slippage calculation FAILED: {}", e);
+                log::debug!("   ❌ Slippage calculation FAILED: {}", e);
                 return Err(e);
             }
         };
-        if slippage > self.config.max_slippage_bps {
-            log::error!("   ❌ Slippage too high: {} bps (max: {})", slippage, self.config.max_slippage_bps);
+        if slippage > config.max_slippage_bps {
+            log::debug!("   ❌ Slippage too high: {} bps (max: {})", slippage, config.max_slippage_bps);
             return Err(anyhow::anyhow!("Slippage too high: {} bps", slippage));
         }
-        log::info!("   ✅ Slippage OK: {} bps", slippage);
         
-        // Step 7: Reserve balance
-        log::info!("   Step 7/7: Reserving balance...");
-        match self.balance_manager.reserve(&opp.debt_mint, opp.max_liquidatable).await {
-            Ok(_) => log::info!("   ✅ Balance reserved"),
-            Err(e) => {
-                log::error!("   ❌ Balance reservation FAILED: {}", e);
-                return Err(e);
-            }
-        }
-        
-        log::info!("🎉 VALIDATION PASSED!");
+        log::debug!("✅ Validation passed for position: {}", opp.position.address);
         Ok(())
     }
 
@@ -247,9 +223,13 @@ impl Validator {
     }
 
     async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
+        Self::check_oracle_freshness_static(mint, &self.rpc, &self.config).await
+    }
+
+    async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         
-        let oracle_account = match get_pyth_oracle_account(mint, Some(&self.config)) {
+        let oracle_account = match get_pyth_oracle_account(mint, Some(config)) {
             Ok(Some(account)) => account,
             Ok(None) => {
                 log::warn!("No Pyth oracle found for mint: {}, skipping freshness check", mint);
@@ -261,39 +241,9 @@ impl Validator {
             }
         };
         
-        log::debug!(
-            "Validator: checking oracle freshness for mint {} (oracle={})",
-            mint,
-            oracle_account
-        );
-        
-        // Debug: Oracle account'u fetch etmeyi dene
-        match self.rpc.get_account(&oracle_account).await {
-            Ok(acc) => {
-                log::debug!(
-                    "Validator: oracle account exists: {} bytes, owner: {}",
-                    acc.data.len(),
-                    acc.owner
-                );
-            }
-            Err(e) => {
-                log::error!(
-                    "Validator: failed to fetch oracle account {} for mint {}: {}",
-                    oracle_account,
-                    mint,
-                    e
-                );
-                return Err(anyhow::anyhow!(
-                    "Failed to fetch oracle account {} for mint {}: {}",
-                    oracle_account,
-                    mint,
-                    e
-                ));
-            }
-        }
-        
-        let max_age = self.config.max_oracle_age_seconds;
-        let price_data = match read_pyth_price(&oracle_account, Arc::clone(&self.rpc), Some(&self.config)).await {
+        // Skip account existence check - read_pyth_price will handle it
+        let max_age = config.max_oracle_age_seconds;
+        let price_data = match read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config)).await {
             Ok(Some(data)) => data,
             Ok(None) => {
                 return Err(anyhow::anyhow!(
@@ -355,9 +305,13 @@ impl Validator {
     }
 
     async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
+        Self::get_realtime_slippage_static(opp, &self.rpc, &self.config).await
+    }
+
+    async fn get_realtime_slippage_static(opp: &Opportunity, _rpc: &Arc<RpcClient>, config: &Config) -> Result<u16> {
         use crate::strategy::slippage_estimator::SlippageEstimator;
         
-        let estimator = SlippageEstimator::new(self.config.clone());
+        let estimator = SlippageEstimator::new(config.clone());
         
         // Get base DEX slippage estimate
         let base_slippage = estimator.estimate_dex_slippage(
@@ -376,7 +330,7 @@ impl Validator {
         let total_slippage = base_slippage.saturating_add(oracle_confidence);
         
         // Cap at max_slippage_bps
-        let final_slippage = total_slippage.min(self.config.max_slippage_bps);
+        let final_slippage = total_slippage.min(config.max_slippage_bps);
 
         log::debug!(
             "Validator: slippage breakdown for position {}: base={} bps, oracle_confidence={} bps, total={} bps (max {} bps)",
@@ -384,7 +338,7 @@ impl Validator {
             base_slippage,
             oracle_confidence,
             final_slippage,
-            self.config.max_slippage_bps
+            config.max_slippage_bps
         );
         
         Ok(final_slippage)
