@@ -496,6 +496,94 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
         .parse::<Pubkey>()
         .context("Invalid main market address")?;
 
+    // 1) Eğer TEST_OBLIGATION_PUBKEY tanımlıysa, doğrudan o hesabı detaylı incele
+    if let Some(cfg) = config {
+        if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
+            if !test_obligation_str.trim().is_empty() {
+                match Pubkey::try_from(test_obligation_str.trim()) {
+                    Ok(test_obligation) => {
+                        match rpc_client.get_account(&test_obligation).await {
+                            Ok(account) => {
+                                match SolendObligation::from_account_data(&account.data) {
+                                    Ok(obligation) => {
+                                        let health_factor = obligation.calculate_health_factor();
+                                        let deposited = obligation.total_deposited_value_usd();
+                                        let borrowed = obligation.total_borrowed_value_usd();
+
+                                        log::info!(
+                                            "🧩 Solend Obligation Parsed (TEST_OBLIGATION_PUBKEY): pubkey={}, health_factor={:.6}, deposited_usd={:.6}, borrowed_usd={:.6}, deposits_len={}, borrows_len={}",
+                                            test_obligation,
+                                            health_factor,
+                                            deposited,
+                                            borrowed,
+                                            obligation.deposits.len(),
+                                            obligation.borrows.len()
+                                        );
+
+                                        for (i, dep) in obligation.deposits.iter().enumerate() {
+                                            log::info!(
+                                                "   ▸ Deposit[{}]: reserve={}, deposited_amount={}, market_value_raw={}, market_value_usd={:.6}",
+                                                i,
+                                                dep.deposit_reserve,
+                                                dep.deposited_amount,
+                                                dep.market_value.value,
+                                                dep.market_value.to_f64()
+                                            );
+                                        }
+
+                                        for (i, bor) in obligation.borrows.iter().enumerate() {
+                                            log::info!(
+                                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
+                                                i,
+                                                bor.borrow_reserve,
+                                                bor.borrowed_amount_wad,
+                                                bor.market_value.value,
+                                                bor.market_value.to_f64()
+                                            );
+                                        }
+
+                                        results.push(TestResult::success_with_details(
+                                            "Obligation Account Parsing (TEST_OBLIGATION_PUBKEY)",
+                                            "Successfully parsed specified obligation account",
+                                            format!(
+                                                "Obligation: {}, Health Factor: {:.4}, Deposited: ${:.2}, Borrowed: ${:.2}, Deposits: {}, Borrows: {}",
+                                                test_obligation,
+                                                health_factor,
+                                                deposited,
+                                                borrowed,
+                                                obligation.deposits.len(),
+                                                obligation.borrows.len()
+                                            )
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        results.push(TestResult::failure(
+                                            "Obligation Account Parsing (TEST_OBLIGATION_PUBKEY)",
+                                            &format!("Failed to deserialize obligation {}: {}", test_obligation, e),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                results.push(TestResult::failure(
+                                    "Obligation Account Fetch (TEST_OBLIGATION_PUBKEY)",
+                                    &format!("Failed to fetch obligation account {}: {}", test_obligation, e),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        results.push(TestResult::failure(
+                            "Obligation Account Parsing (TEST_OBLIGATION_PUBKEY)",
+                            &format!("Invalid TEST_OBLIGATION_PUBKEY: {}", e),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Genel discovery testi (RPC limitine takılabilir; ortam testi olarak kalıyor)
     match rpc_client.get_program_accounts(&solend_program_id).await {
         Ok(accounts) => {
             let mut found_obligation = false;
@@ -510,6 +598,39 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
                         let health_factor = obligation.calculate_health_factor();
                         let deposited = obligation.total_deposited_value_usd();
                         let borrowed = obligation.total_borrowed_value_usd();
+
+                        // Detaylı obligation log'u (gerçek mainnet verisi ile)
+                        log::info!(
+                            "🧩 Solend Obligation Parsed: pubkey={}, health_factor={:.6}, deposited_usd={:.6}, borrowed_usd={:.6}, deposits_len={}, borrows_len={}",
+                            pubkey,
+                            health_factor,
+                            deposited,
+                            borrowed,
+                            obligation.deposits.len(),
+                            obligation.borrows.len()
+                        );
+
+                        for (i, dep) in obligation.deposits.iter().enumerate() {
+                            log::info!(
+                                "   ▸ Deposit[{}]: reserve={}, deposited_amount={}, market_value_raw={}, market_value_usd={:.6}",
+                                i,
+                                dep.deposit_reserve,
+                                dep.deposited_amount,
+                                dep.market_value.value,
+                                dep.market_value.to_f64()
+                            );
+                        }
+
+                        for (i, bor) in obligation.borrows.iter().enumerate() {
+                            log::info!(
+                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
+                                i,
+                                bor.borrow_reserve,
+                                bor.borrowed_amount_wad,
+                                bor.market_value.value,
+                                bor.market_value.to_f64()
+                            );
+                        }
                         
                         results.push(TestResult::success_with_details(
                             "Obligation Account Parsing",

@@ -37,10 +37,32 @@ impl Validator {
         loop {
             match receiver.recv().await {
                 Ok(Event::OpportunityFound { opportunity }) => {
-                    if self.validate(&opportunity).await.is_ok() {
-                        self.event_bus.publish(Event::OpportunityApproved {
-                            opportunity,
-                        })?;
+                    log::info!(
+                        "Validator: received OpportunityFound for position {} (debt_mint={}, collateral_mint={}, max_liquidatable={}, est_profit={:.4})",
+                        opportunity.position.address,
+                        opportunity.debt_mint,
+                        opportunity.collateral_mint,
+                        opportunity.max_liquidatable,
+                        opportunity.estimated_profit
+                    );
+
+                    match self.validate(&opportunity).await {
+                        Ok(()) => {
+                            log::info!(
+                                "Validator: opportunity approved for position {}",
+                                opportunity.position.address
+                            );
+                            self.event_bus.publish(Event::OpportunityApproved {
+                                opportunity,
+                            })?;
+                        }
+                        Err(e) => {
+                            log::info!(
+                                "Validator: opportunity rejected for position {}: {}",
+                                opportunity.position.address,
+                                e
+                            );
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -58,6 +80,11 @@ impl Validator {
     }
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
+        log::debug!(
+            "Validator: starting validation for position {}",
+            opp.position.address
+        );
+
         self.has_sufficient_balance(&opp.debt_mint, opp.max_liquidatable).await?;
         
         self.check_oracle_freshness(&opp.debt_mint).await?;
@@ -70,6 +97,12 @@ impl Validator {
         if slippage > self.config.max_slippage_bps {
             return Err(anyhow::anyhow!("Slippage too high: {} bps (max: {} bps)", slippage, self.config.max_slippage_bps));
         }
+
+        log::debug!(
+            "Validator: reserving balance for mint {} amount {}",
+            opp.debt_mint,
+            opp.max_liquidatable
+        );
         
         self.balance_manager.reserve(&opp.debt_mint, opp.max_liquidatable).await?;
         Ok(())
@@ -78,8 +111,19 @@ impl Validator {
     async fn has_sufficient_balance(&self, mint: &Pubkey, amount: u64) -> Result<()> {
         let available = self.balance_manager.get_available_balance(mint).await?;
         if available < amount {
-            return Err(anyhow::anyhow!("Insufficient balance: need {}, have {}", amount, available));
+            return Err(anyhow::anyhow!(
+                "Insufficient balance for mint {}: need {}, have {}",
+                mint,
+                amount,
+                available
+            ));
         }
+        log::debug!(
+            "Validator: sufficient balance for mint {}: need {}, available {}",
+            mint,
+            amount,
+            available
+        );
         Ok(())
     }
 
@@ -94,11 +138,30 @@ impl Validator {
         match self.rpc.get_account(&ata).await {
             Ok(account) => {
                 if account.data.is_empty() {
-                    return Err(anyhow::anyhow!("Associated token account is empty"));
+                    return Err(anyhow::anyhow!(
+                        "Associated token account {} for mint {} is empty",
+                        ata,
+                        mint
+                    ));
                 }
+                log::debug!(
+                    "Validator: ATA exists and non-empty: owner_wallet={}, mint={}, ata={}",
+                    wallet_pubkey,
+                    mint,
+                    ata
+                );
                 Ok(())
             }
-            Err(_) => Ok(())
+            Err(e) => {
+                log::warn!(
+                    "Validator: failed to fetch ATA {} for mint {} (wallet {}): {} - treating as non-fatal",
+                    ata,
+                    mint,
+                    wallet_pubkey,
+                    e
+                );
+                Ok(())
+            }
         }
     }
 
@@ -106,6 +169,11 @@ impl Validator {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         
         if let Some(oracle_account) = get_pyth_oracle_account(mint, Some(&self.config))? {
+            log::debug!(
+                "Validator: checking oracle freshness for mint {} (oracle={})",
+                mint,
+                oracle_account
+            );
             let max_age = self.config.max_oracle_age_seconds;
             if let Some(price_data) = read_pyth_price(&oracle_account, Arc::clone(&self.rpc), Some(&self.config)).await? {
                 let current_time = std::time::SystemTime::now()
@@ -115,10 +183,27 @@ impl Validator {
                 
                 let age_seconds = current_time - price_data.timestamp;
                 if age_seconds > max_age as i64 {
-                    return Err(anyhow::anyhow!("Oracle price data is stale: {} seconds old (max: {} seconds)", age_seconds, max_age));
+                    return Err(anyhow::anyhow!(
+                        "Oracle price data is stale for mint {} (oracle {}): {} seconds old (max: {} seconds)",
+                        mint,
+                        oracle_account,
+                        age_seconds,
+                        max_age
+                    ));
                 }
+                log::debug!(
+                    "Validator: oracle price is fresh for mint {} (oracle={}, age={}s, max_age={}s)",
+                    mint,
+                    oracle_account,
+                    age_seconds,
+                    max_age
+                );
             } else {
-                return Err(anyhow::anyhow!("Failed to read oracle price data for mint: {}", mint));
+                return Err(anyhow::anyhow!(
+                    "Failed to read oracle price data for mint {} (oracle={})",
+                    mint,
+                    oracle_account
+                ));
             }
         } else {
             log::warn!("No Pyth oracle found for mint: {}, skipping freshness check", mint);
@@ -137,6 +222,13 @@ impl Validator {
             opp.seizable_collateral,
         ).await
             .context("Failed to estimate real-time slippage")?;
+
+        log::debug!(
+            "Validator: real-time slippage for position {} is {} bps (max {} bps)",
+            opp.position.address,
+            slippage,
+            self.config.max_slippage_bps
+        );
         
         Ok(slippage)
     }

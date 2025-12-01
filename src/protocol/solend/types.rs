@@ -59,37 +59,58 @@ impl SolendObligation {
         } else {
             data
         };
-        let min_expected_size = 140;
-        
-        if account_data.len() < min_expected_size {
+
+        // Hesaplanmış expected size: Mevcut struct'ı Borsh ile serialize ederek uzunluğunu alıyoruz.
+        // Bu, account başındaki Anchor discriminator dahil DEĞİL; sadece struct'ın kendi boyutu.
+        let dummy = SolendObligation {
+            last_update_slot: 0,
+            lending_market: Pubkey::default(),
+            owner: Pubkey::default(),
+            deposited_value: Number { value: 0 },
+            borrowed_value: Number { value: 0 },
+            allowed_borrow_value: Number { value: 0 },
+            unhealthy_borrow_value: Number { value: 0 },
+            deposits: Vec::new(),
+            borrows: Vec::new(),
+        };
+
+        let expected_size = borsh::to_vec(&dummy)
+            .map_err(|e| anyhow::anyhow!("Failed to compute SolendObligation expected size: {}", e))?
+            .len();
+
+        if account_data.len() < expected_size {
             return Err(anyhow::anyhow!(
                 "Account data too small for obligation: {} bytes (expected at least {} bytes). \
                  This might be a reserve, market, or config account (not an obligation).",
                 account_data.len(),
-                min_expected_size
+                expected_size
             ));
         }
-        
-        SolendObligation::try_from_slice(account_data)
-            .map_err(|e| {
-                let hex_preview: String = data
-                    .iter()
-                    .take(64)
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .chunks(32)
-                    .map(|chunk| chunk.join(" "))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                
-                anyhow::anyhow!(
-                    "Failed to deserialize Solend obligation: {}\n   Account data size: {} bytes (after discriminator: {} bytes)\n   First 64 bytes (hex): {}\n   This might indicate:\n   1. Struct layout mismatch (check src/protocols/solend_idl.rs)\n   2. Account is not an obligation (reserve/market/config)\n   3. Protocol version mismatch",
-                    e,
-                    data.len(),
-                    account_data.len(),
-                    hex_preview
-                )
-            })
+
+        // Eğer account_data, struct'tan daha büyükse (örneğin, Solend yeni alanlar eklediyse),
+        // Borsh `Not all bytes read` hatası vermesin diye sadece ilk `expected_size` kadarını deserialize ediyoruz.
+        let slice_to_decode = &account_data[..expected_size];
+
+        SolendObligation::try_from_slice(slice_to_decode).map_err(|e| {
+            let hex_preview: String = data
+                .iter()
+                .take(64)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .chunks(32)
+                .map(|chunk| chunk.join(" "))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            anyhow::anyhow!(
+                "Failed to deserialize Solend obligation: {}\n   Account data size: {} bytes (after discriminator: {} bytes, used {} bytes)\n   First 64 bytes (hex): {}\n   This might indicate:\n   1. Struct layout mismatch\n   2. Account is not an obligation (reserve/market/config)\n   3. Protocol version mismatch",
+                e,
+                data.len(),
+                account_data.len(),
+                expected_size,
+                hex_preview
+            )
+        })
     }
     
     pub fn total_deposited_value_usd(&self) -> f64 {

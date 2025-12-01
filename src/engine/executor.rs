@@ -104,6 +104,14 @@ impl Executor {
         loop {
             match receiver.recv().await {
                 Ok(Event::OpportunityApproved { opportunity }) => {
+                    log::info!(
+                        "Executor: received OpportunityApproved for position {} (debt_mint={}, collateral_mint={}, max_liquidatable={}, est_profit={:.4})",
+                        opportunity.position.address,
+                        opportunity.debt_mint,
+                        opportunity.collateral_mint,
+                        opportunity.max_liquidatable,
+                        opportunity.estimated_profit
+                    );
                     let _guard = match self.tx_lock.try_lock(&opportunity.position.address) {
                         Ok(guard) => guard,
                         Err(_) => {
@@ -114,7 +122,11 @@ impl Executor {
 
                     match self.execute(opportunity).await {
                         Ok(signature) => {
-                            log::info!("Transaction sent: {}", signature);
+                            log::info!(
+                                "Executor: transaction sent for opportunity (position={}): {}",
+                                signature,
+                                "OK"
+                            );
                         }
                         Err(e) => {
                             log::error!("Failed to execute liquidation: {}", e);

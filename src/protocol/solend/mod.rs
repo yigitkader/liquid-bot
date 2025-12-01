@@ -9,6 +9,7 @@ use crate::blockchain::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, instruction::Instruction, account::Account};
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use std::str::FromStr;
 
@@ -16,6 +17,9 @@ pub struct SolendProtocol {
     program_id: Pubkey,
     config: Config,
 }
+
+// Sadece sınırlı sayıda obligation'ı derinlemesine loglamak için
+static LOGGED_OBLIGATIONS: AtomicUsize = AtomicUsize::new(0);
 
 impl SolendProtocol {
     pub fn new(config: &Config) -> Result<Self> {
@@ -42,11 +46,63 @@ impl Protocol for SolendProtocol {
     async fn parse_position(&self, account: &Account) -> Option<Position> {
         use crate::protocol::solend::types::SolendObligation;
         use crate::core::types::{Position, Asset};
-        
+        use log;
+
+        let data_len = account.data.len();
         let obligation = match SolendObligation::from_account_data(&account.data) {
             Ok(obl) => obl,
-            Err(_) => return None,
+            Err(e) => {
+                log::debug!(
+                    "SolendProtocol: failed to parse obligation account (data_len={}): {}",
+                    data_len,
+                    e
+                );
+                return None;
+            }
         };
+
+        let deposits_len = obligation.deposits.len();
+        let borrows_len = obligation.borrows.len();
+
+        // Sadece ilk birkaç obligation için derin log (log dosyasını şişirmemek için)
+        let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
+        if logged < 5 {
+            let deposited_usd = obligation.total_deposited_value_usd();
+            let borrowed_usd = obligation.total_borrowed_value_usd();
+            let health_factor = obligation.calculate_health_factor();
+
+            log::info!(
+                "🧩 Solend Obligation Parsed (runtime): data_len={}, health_factor={:.6}, deposited_usd={:.6}, borrowed_usd={:.6}, deposits_len={}, borrows_len={}",
+                data_len,
+                health_factor,
+                deposited_usd,
+                borrowed_usd,
+                deposits_len,
+                borrows_len
+            );
+
+            for (i, dep) in obligation.deposits.iter().enumerate() {
+                log::info!(
+                    "   ▸ Deposit[{}]: reserve={}, deposited_amount={}, market_value_raw={}, market_value_usd={:.6}",
+                    i,
+                    dep.deposit_reserve,
+                    dep.deposited_amount,
+                    dep.market_value.value,
+                    dep.market_value.to_f64()
+                );
+            }
+
+            for (i, bor) in obligation.borrows.iter().enumerate() {
+                log::info!(
+                    "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
+                    i,
+                    bor.borrow_reserve,
+                    bor.borrowed_amount_wad,
+                    bor.market_value.value,
+                    bor.market_value.to_f64()
+                );
+            }
+        }
 
         let health_factor = obligation.calculate_health_factor();
         let collateral_usd = obligation.total_deposited_value_usd();

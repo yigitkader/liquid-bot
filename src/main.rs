@@ -5,6 +5,7 @@ use log;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::str::FromStr;
 use tokio::signal;
 use tokio::time::{sleep, Duration};
 
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
                 message
             ))
         })
-        .level(log::LevelFilter::Info)
+        .level(log::LevelFilter::Debug)
         .chain(std::io::stdout())
         .chain(fern::log_file(&log_file_path)?)
         .apply()
@@ -146,11 +147,16 @@ async fn main() -> Result<()> {
     log::info!("✅ All workers started");
 
     let metrics_clone = Arc::clone(&metrics);
+    let balance_manager_clone = Arc::clone(&balance_manager);
+    let usdc_mint_str = config.usdc_mint.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
+
+            // Metrics
             let summary = metrics_clone.get_summary().await;
-            log::info!("📊 Metrics: Opportunities: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
+            log::info!(
+                "📊 Metrics: Opportunities: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
                 summary.opportunities,
                 summary.tx_sent,
                 summary.tx_success,
@@ -159,6 +165,31 @@ async fn main() -> Result<()> {
                 summary.avg_latency_ms,
                 summary.p95_latency_ms
             );
+
+            // Wallet USDC balance (available, reserved-aware)
+            if let Ok(usdc_mint) = solana_sdk::pubkey::Pubkey::from_str(&usdc_mint_str) {
+                match balance_manager_clone.get_available_balance(&usdc_mint).await {
+                    Ok(available) => {
+                        let available_usdc = available as f64 / 1_000_000.0; // USDC: 6 decimals
+                        log::info!(
+                            "💰 Wallet available USDC balance: {} ({} USDC)",
+                            available,
+                            available_usdc
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "⚠️ Failed to read available USDC balance for wallet: {}",
+                            e
+                        );
+                    }
+                }
+            } else {
+                log::warn!(
+                    "⚠️ Invalid USDC mint in config, cannot log wallet USDC balance: {}",
+                    usdc_mint_str
+                );
+            }
         }
     });
 

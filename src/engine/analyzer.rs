@@ -30,13 +30,33 @@ impl Analyzer {
 
         loop {
             match receiver.recv().await {
-                Ok(Event::AccountUpdated { position, .. }) => {
+                Ok(Event::AccountUpdated { position, .. })
+                | Ok(Event::AccountDiscovered { position, .. }) => {
+                    log::debug!(
+                        "Analyzer: received position update for {} (hf={})",
+                        position.address,
+                        position.health_factor
+                    );
                     if self.is_liquidatable(&position) {
                         if let Some(opportunity) = self.calculate_opportunity(position).await {
+                            log::info!(
+                                "Analyzer: opportunity found for {} (net_profit={:.4}, debt_mint={}, collateral_mint={})",
+                                opportunity.position.address,
+                                opportunity.estimated_profit,
+                                opportunity.debt_mint,
+                                opportunity.collateral_mint
+                            );
                             self.event_bus.publish(Event::OpportunityFound {
                                 opportunity,
                             })?;
                         }
+                    } else {
+                        log::debug!(
+                            "Analyzer: position {} is not liquidatable (hf={} >= threshold={})",
+                            position.address,
+                            position.health_factor,
+                            self.config.hf_liquidation_threshold
+                        );
                     }
                 }
                 Ok(_) => {
@@ -64,6 +84,15 @@ impl Analyzer {
         let max_liquidatable_usd = position.debt_usd * params.close_factor;
         let seizable_collateral_usd = max_liquidatable_usd * (1.0 + params.bonus);
 
+        log::debug!(
+            "Analyzer: calculating opportunity for {} -> debt_usd={:.4}, collateral_usd={:.4}, max_liquidatable_usd={:.4}, seizable_collateral_usd={:.4}",
+            position.address,
+            position.debt_usd,
+            position.collateral_usd,
+            max_liquidatable_usd,
+            seizable_collateral_usd
+        );
+
         let (debt_mint, collateral_mint) = self.select_best_pair(&position, max_liquidatable_usd, seizable_collateral_usd).await?;
 
         use crate::strategy::profit_calculator::ProfitCalculator;
@@ -81,6 +110,12 @@ impl Analyzer {
         let net_profit = profit_calc.calculate_net_profit(&temp_opp);
 
         if net_profit < self.config.min_profit_usd {
+            log::info!(
+                "Analyzer: rejecting opportunity for {} - net_profit={:.4} < min_profit_usd={:.4}",
+                position.address,
+                net_profit,
+                self.config.min_profit_usd
+            );
             return None;
         }
 
@@ -104,6 +139,10 @@ impl Analyzer {
         use crate::core::types::Opportunity;
         
         if position.debt_assets.is_empty() || position.collateral_assets.is_empty() {
+            log::warn!(
+                "Analyzer: position {} has empty debt_assets or collateral_assets, skipping",
+                position.address
+            );
             return None;
         }
 
@@ -113,11 +152,23 @@ impl Analyzer {
 
         for debt_asset in &position.debt_assets {
             if debt_asset.amount_usd < max_liquidatable_usd * 0.1 {
+                log::debug!(
+                    "Analyzer: skipping debt asset {} (amount_usd={:.4} < 10% of max_liquidatable_usd={:.4})",
+                    debt_asset.mint,
+                    debt_asset.amount_usd,
+                    max_liquidatable_usd
+                );
                 continue;
             }
 
             for collateral_asset in &position.collateral_assets {
                 if collateral_asset.amount_usd < seizable_collateral_usd * 0.1 {
+                    log::debug!(
+                        "Analyzer: skipping collateral asset {} (amount_usd={:.4} < 10% of seizable_collateral_usd={:.4})",
+                        collateral_asset.mint,
+                        collateral_asset.amount_usd,
+                        seizable_collateral_usd
+                    );
                     continue;
                 }
 
@@ -135,8 +186,22 @@ impl Analyzer {
                 if net_profit > best_profit {
                     best_profit = net_profit;
                     best_pair = Some((debt_asset.mint, collateral_asset.mint));
+                    log::debug!(
+                        "Analyzer: new best pair for {} -> debt_mint={}, collateral_mint={}, net_profit={:.4}",
+                        position.address,
+                        debt_asset.mint,
+                        collateral_asset.mint,
+                        net_profit
+                    );
                 }
             }
+        }
+
+        if best_pair.is_none() {
+            log::info!(
+                "Analyzer: no profitable debt/collateral pair found for position {}",
+                position.address
+            );
         }
 
         best_pair
