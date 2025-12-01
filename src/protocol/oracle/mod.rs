@@ -17,12 +17,6 @@ pub fn get_switchboard_program_id(config: Option<&crate::config::Config>) -> &st
     config.map(|c| c.switchboard_program_id.as_str()).unwrap_or("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f")
 }
 
-fn get_oracle_account_from_mapping(mint: &Pubkey, mapping: &[(&str, &str)]) -> Option<Pubkey> {
-    let mint_str = mint.to_string();
-    mapping.iter()
-        .find(|(known_mint, _)| mint_str == *known_mint)
-        .and_then(|(_, oracle_account)| helpers::parse_pubkey_opt(oracle_account))
-}
 
 pub fn get_pyth_oracle_account(mint: &Pubkey, config: Option<&crate::config::Config>) -> Result<Option<Pubkey>> {
     if let Some(cfg) = config {

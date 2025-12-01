@@ -881,7 +881,6 @@ async fn validate_wallet_integration(rpc_client: &Arc<RpcClient>, config: Option
 
     use solana_sdk::signature::{Keypair, Signer};
     use std::fs;
-    use std::path::Path;
 
     match fs::read(&config.wallet_path) {
         Ok(keypair_bytes) => {

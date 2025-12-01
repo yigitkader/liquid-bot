@@ -12,8 +12,6 @@ use tokio::time::{sleep, Duration};
 pub struct RpcClient {
     client: Arc<SolanaRpcClient>,
     rpc_url: String,
-    #[allow(dead_code)]
-    commitment: CommitmentConfig,
 }
 
 impl RpcClient {
@@ -24,15 +22,16 @@ impl RpcClient {
                 CommitmentConfig::confirmed(),
             )),
             rpc_url,
-            commitment: CommitmentConfig::confirmed(),
         })
     }
 
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<solana_sdk::account::Account> {
         let client = Arc::clone(&self.client);
         let pubkey = *pubkey;
+        let rpc_url = self.rpc_url.clone();
         tokio::task::spawn_blocking(move || {
-            client.get_account(&pubkey).map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            client.get_account(&pubkey)
+                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
         })
         .await
         .context("Failed to spawn blocking task")?

@@ -105,7 +105,7 @@ fi
 print_header "2️⃣  Obligation Parsing Test"
 
 print_info "Testing obligation parsing with your wallet..."
-if cargo run --bin find_my_obligation 2>&1 | tee /tmp/obligation_test.log; then
+if cargo run --bin validate_system 2>&1 | tee /tmp/obligation_test.log; then
     if grep -q "✅ OBLIGATION STRUCT VALIDATION SUCCESSFUL" /tmp/obligation_test.log || \
        grep -q "✅ Found.*active obligation" /tmp/obligation_test.log || \
        grep -q "Account exists but is empty" /tmp/obligation_test.log; then
@@ -205,9 +205,29 @@ else
 fi
 
 # ============================================================================
-# 5. CONFIGURATION CHECKLIST
+# 5. PRODUCTION FEATURES TEST (Real Mainnet Data)
 # ============================================================================
-print_header "5️⃣  Configuration Checklist"
+print_header "5️⃣  Production Features Test (Real Mainnet Data)"
+
+print_info "Testing critical production features with real mainnet data..."
+if cargo run --bin test_production_features 2>&1 | tee /tmp/production_features_test.log; then
+    if grep -q "✅ ALL PRODUCTION FEATURE TESTS PASSED" /tmp/production_features_test.log; then
+        print_success "All production feature tests passed"
+    else
+        if grep -q "❌ SOME TESTS FAILED" /tmp/production_features_test.log; then
+            print_error "Some production feature tests failed - check output above"
+        else
+            print_warning "Production feature tests completed with warnings"
+        fi
+    fi
+else
+    print_error "Production feature tests failed to run"
+fi
+
+# ============================================================================
+# 6. CONFIGURATION CHECKLIST
+# ============================================================================
+print_header "6️⃣  Configuration Checklist"
 
 # Check if .env file exists
 if [ ! -f .env ]; then
@@ -351,9 +371,9 @@ else
 fi
 
 # ============================================================================
-# 6. DRY-RUN TEST INSTRUCTIONS
+# 7. DRY-RUN TEST INSTRUCTIONS
 # ============================================================================
-print_header "6️⃣  Dry-Run Test Instructions"
+print_header "7️⃣  Dry-Run Test Instructions"
 
 print_info "To run a 24-hour dry-run test, execute:"
 echo ""
@@ -369,9 +389,9 @@ echo "  - Slippage estimation"
 echo ""
 
 # ============================================================================
-# 7. SMALL CAPITAL TEST INSTRUCTIONS
+# 8. SMALL CAPITAL TEST INSTRUCTIONS
 # ============================================================================
-print_header "7️⃣  Small Capital Test Instructions"
+print_header "8️⃣  Small Capital Test Instructions"
 
 print_info "To test with small capital (\$100), execute:"
 echo ""

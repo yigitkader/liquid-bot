@@ -9,43 +9,61 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::pubkey::Pubkey;
 use anyhow::Result;
 use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use tokio::sync::broadcast;
 
 struct TxLock {
-    locked: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<Pubkey>>>,
+    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
+    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
     timeout_seconds: u64,
 }
 
 impl TxLock {
     fn new(timeout_seconds: u64) -> Self {
         TxLock {
-            locked: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            locked: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            lock_times: Arc::new(std::sync::RwLock::new(HashMap::new())),
             timeout_seconds,
         }
     }
 
     fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
         let mut locked = self.locked.write().unwrap();
-        if locked.contains(address) {
-            return Err(anyhow::anyhow!("Account already locked"));
+        let mut lock_times = self.lock_times.write().unwrap();
+        
+        if let Some(lock_time) = lock_times.get(address) {
+            if lock_time.elapsed().as_secs() >= self.timeout_seconds {
+                locked.remove(address);
+                lock_times.remove(address);
+            } else {
+                return Err(anyhow::anyhow!("Account already locked"));
+            }
         }
+        
         locked.insert(*address);
+        lock_times.insert(*address, std::time::Instant::now());
+        
         Ok(TxLockGuard {
             locked: Arc::clone(&self.locked),
+            lock_times: Arc::clone(&self.lock_times),
             address: *address,
         })
     }
 }
 
 struct TxLockGuard {
-    locked: Arc<std::sync::RwLock<std::collections::HashSet<Pubkey>>>,
+    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
+    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
     address: Pubkey,
 }
 
 impl Drop for TxLockGuard {
     fn drop(&mut self) {
         let mut locked = self.locked.write().unwrap();
+        let mut lock_times = self.lock_times.write().unwrap();
         locked.remove(&self.address);
+        lock_times.remove(&self.address);
     }
 }
 

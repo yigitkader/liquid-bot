@@ -27,7 +27,7 @@ use solana_sdk::signature::{Keypair, Signer};
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    
+
     std::fs::create_dir_all("logs")
         .context("Failed to create logs directory")?;
     
@@ -64,10 +64,9 @@ async fn main() -> Result<()> {
     );
     log::info!("✅ RPC client initialized");
 
-    let mut ws = WsClient::new(config.rpc_ws_url.clone());
+    let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));
     ws.connect().await
         .context("Failed to connect WebSocket")?;
-    let ws = Arc::new(ws);
     log::info!("✅ WebSocket client initialized");
 
     let wallet_keypair = load_wallet(&config.wallet_path)
@@ -143,7 +142,7 @@ async fn main() -> Result<()> {
             log::error!("Executor error: {}", e);
         }
     });
-    
+
     log::info!("✅ All workers started");
 
     let metrics_clone = Arc::clone(&metrics);

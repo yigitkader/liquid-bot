@@ -62,13 +62,13 @@ name = "test_obligation_direct"
 path = "src/bin/test_obligation_direct.rs"
 
 [[bin]]
-name = "find_my_obligation"
-path = "src/bin/find_my_obligation.rs"
-
-[[bin]]
 name = "validate_system"
 path = "src/bin/validate_system.rs"
 
 [[bin]]
 name = "validate_instruction_accounts"
 path = "src/bin/validate_instruction_accounts.rs"
+
+[[bin]]
+name = "test_production_features"
+path = "src/bin/test_production_features.rs"
