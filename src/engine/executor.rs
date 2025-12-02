@@ -424,8 +424,23 @@ impl Executor {
         const MAX_TX_RETRIES: u32 = 3;
         
         for attempt in 1..=MAX_TX_RETRIES {
+            // ✅ CRITICAL: Build FRESH transaction for EACH retry
+            // This prevents stale blockhash issues and ensures each retry uses a new transaction
             match self.send_via_jito(tx_builder, jito_client).await {
                 Ok(sig) => {
+                    // ✅ VERIFY signature is valid before returning
+                    if sig == solana_sdk::signature::Signature::default() {
+                        log::error!("Invalid signature returned (all zeros) on attempt {}", attempt);
+                        if attempt < MAX_TX_RETRIES {
+                            log::warn!("Retrying due to invalid signature...");
+                            sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Invalid signature returned (all zeros) after {} attempts",
+                            MAX_TX_RETRIES
+                        ));
+                    }
                     if attempt > 1 {
                         log::info!("✅ Transaction sent successfully on attempt {}", attempt);
                     }
@@ -470,7 +485,6 @@ impl Executor {
         tx_builder: &TransactionBuilder,
         jito_client: &Arc<JitoClient>,
     ) -> Result<solana_sdk::signature::Signature> {
-        use solana_sdk::signature::Signer;
         
         // Get fresh blockhash for this bundle
         let blockhash = self.rpc.get_recent_blockhash().await?;

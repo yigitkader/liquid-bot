@@ -172,10 +172,15 @@ impl Scanner {
     pub async fn start_monitoring(&self) -> Result<()> {
         use tokio::time::sleep;
         use solana_client::rpc_filter::RpcFilterType;
+        use std::time::Instant;
         
         let program_id = self.protocol.program_id();
         let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
         let mut use_websocket = true;
+        
+        // ✅ CRITICAL: Track last reconnect attempt to prevent reconnect storm
+        let mut last_reconnect_attempt = Instant::now();
+        const RECONNECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
         
         log::info!("Starting monitoring for program: {} (WebSocket mode)", program_id);
         
@@ -311,8 +316,12 @@ impl Scanner {
                         // Reset errors on successful RPC polling
                         self.reset_errors();
                         
-                        // Try to reconnect WebSocket in background
-                        if subscription_id.is_none() {
+                        // ✅ CRITICAL: Try to reconnect WebSocket only if cooldown expired
+                        // This prevents reconnect storm when network is down
+                        if subscription_id.is_none() 
+                            && last_reconnect_attempt.elapsed() >= RECONNECT_COOLDOWN 
+                        {
+                            last_reconnect_attempt = Instant::now();
                             match self.ws.reconnect_with_backoff().await {
                                 Ok(()) => {
                                     match self.ws.subscribe_program(&program_id).await {
@@ -323,15 +332,18 @@ impl Scanner {
                                             self.reset_errors();
                                         }
                                         Err(e) => {
-                                            log::debug!("WebSocket resubscription failed, continuing RPC polling: {}", e);
+                                            log::debug!("WebSocket resubscription failed, will retry in 5min: {}", e);
                                         }
                                     }
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     // WebSocket still unavailable, continue RPC polling
-                                    log::debug!("WebSocket still unavailable, continuing RPC polling mode");
+                                    log::debug!("WebSocket reconnect failed, will retry in 5min: {}", e);
                                 }
                             }
+                        } else if subscription_id.is_none() {
+                            let remaining_cooldown = RECONNECT_COOLDOWN.as_secs() - last_reconnect_attempt.elapsed().as_secs();
+                            log::debug!("WebSocket reconnect cooldown active, {}s remaining", remaining_cooldown);
                         }
                     }
                     Err(e) => {

@@ -446,4 +446,13 @@ impl BalanceManager {
             }
         }
     }
+
+    /// Unsubscribe from ATA monitoring (graceful shutdown).
+    /// Clears all subscriptions to prevent race conditions during shutdown.
+    pub async fn stop_monitoring(&self) -> Result<()> {
+        let mut subscribed_atas = self.subscribed_atas.write().await;
+        subscribed_atas.clear();
+        log::info!("BalanceManager: Stopped monitoring (cleared all subscriptions)");
+        Ok(())
+    }
 }

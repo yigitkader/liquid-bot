@@ -130,21 +130,28 @@ impl ProfitCalculator {
         fee
     }
     
-    /// Check if two mints form a stablecoin pair (e.g., USDC/USDT)
+    /// Check if two mints form a stablecoin pair (e.g., USDC/USDT, DAI/USDC)
     /// Stablecoin pairs typically have much lower DEX fees (~0.01% vs 0.2%)
     fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
-        // Get stablecoin mint addresses from config
-        let usdc_mint = Pubkey::from_str(&self.config.usdc_mint).ok();
-        let usdt_mint = self.config.usdt_mint.as_ref()
-            .and_then(|s| Pubkey::from_str(s).ok());
+        // ✅ CRITICAL FIX: Include all major stablecoins, not just USDC/USDT
+        // This ensures accurate fee calculation for all stablecoin pairs
+        const KNOWN_STABLECOINS: &[&str] = &[
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+            "EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCWNWqxWV4J6o", // DAI
+            "FR87nWEUxVgerFGhZM8Y4AggKGLnaXswr1Pd8wZ4kZcp", // FRAX
+            "9vMJfxuKxXBoEa7rM12mYLMwTacLMLDJqHozw96WQL8i", // UST (TerraUSD)
+            "AZsHEMXd36Bj1EMNXhowJajpUXzrKcK57wW4ZGXVa7yR", // BUSD
+            "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", // TUSD
+            "EchesyfXePKdLbiHRbgTbYq4qP8zF8LzF6S9X5YJ7KzN", // USDP (Pax Dollar)
+        ];
         
-        // Check if both mints are stablecoins
-        let mint1_is_stablecoin = usdc_mint.map(|m| m == *mint1).unwrap_or(false)
-            || usdt_mint.map(|m| m == *mint1).unwrap_or(false);
+        let mint1_is_stable = KNOWN_STABLECOINS.iter()
+            .any(|&s| Pubkey::from_str(s).ok() == Some(*mint1));
         
-        let mint2_is_stablecoin = usdc_mint.map(|m| m == *mint2).unwrap_or(false)
-            || usdt_mint.map(|m| m == *mint2).unwrap_or(false);
+        let mint2_is_stable = KNOWN_STABLECOINS.iter()
+            .any(|&s| Pubkey::from_str(s).ok() == Some(*mint2));
         
-        mint1_is_stablecoin && mint2_is_stablecoin
+        mint1_is_stable && mint2_is_stable
     }
 }

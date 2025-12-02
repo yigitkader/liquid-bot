@@ -1,7 +1,7 @@
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::{Keypair, Signer},
     transaction::Transaction,
 };
 use crate::blockchain::rpc_client::RpcClient;

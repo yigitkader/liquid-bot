@@ -65,12 +65,18 @@ async fn main() -> Result<()> {
     );
     log::info!("✅ RPC client initialized");
 
-    // Start background refresh for reserve cache to prevent RPC call storms
+    // ✅ CRITICAL: Start reserve cache FIRST with longer delay
+    // This prevents RPC storm on startup when both reserve cache and scanner call get_program_accounts
     liquid_bot::protocol::solend::instructions::start_reserve_cache_refresh(
         Arc::clone(&rpc),
         config.clone(),
     );
-    log::info!("✅ Reserve cache background refresh started (5 min interval)");
+    log::info!("✅ Reserve cache background refresh started (30s initial delay)");
+
+    // ✅ CRITICAL: Wait before starting scanner to prevent double RPC call
+    // Scanner will call get_program_accounts() immediately, so we delay to avoid hitting rate limits
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    log::info!("⏳ Starting account discovery...");
 
     let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));
     ws.connect().await
@@ -151,14 +157,17 @@ async fn main() -> Result<()> {
         config.clone(),
         Arc::clone(&rpc),
     );
-    let executor = Executor::new(
+    let executor = Arc::new(Executor::new(
         event_bus.clone(),
         Arc::clone(&rpc),
         Arc::clone(&wallet),
         Arc::clone(&protocol),
         Arc::clone(&balance_manager),
         config.clone(),
-    );
+    ));
+
+    // Keep reference to executor for graceful shutdown
+    let executor_shutdown = Arc::clone(&executor);
 
     tokio::spawn(async move {
         if let Err(e) = scanner.run().await {
@@ -175,8 +184,9 @@ async fn main() -> Result<()> {
             log::error!("Validator error: {}", e);
         }
     });
+    let executor_run = Arc::clone(&executor);
     tokio::spawn(async move {
-        if let Err(e) = executor.run().await {
+        if let Err(e) = executor_run.run().await {
             log::error!("Executor error: {}", e);
         }
     });
@@ -237,6 +247,17 @@ async fn main() -> Result<()> {
         .context("Failed to listen for shutdown signal")?;
 
     log::info!("🛑 Shutting down gracefully...");
+
+    // ✅ CRITICAL: Stop balance monitoring FIRST (clear subscriptions)
+    // This prevents race conditions where account updates arrive after shutdown
+    balance_manager.stop_monitoring().await
+        .context("Failed to stop balance monitoring")?;
+
+    // Then shutdown other components...
+    // Note: Executor has its own shutdown() method that cancels background tasks
+    executor_shutdown.shutdown();
+
+    log::info!("✅ Graceful shutdown completed");
     Ok(())
 }
 

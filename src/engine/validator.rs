@@ -52,26 +52,32 @@ impl Validator {
                             let config = self.config.clone();
                             let balance_manager = Arc::clone(&self.balance_manager);
                             
+                            // Clone opportunity before moving into task
+                            let opportunity_clone = opportunity.clone();
+                            let debt_mint = opportunity.debt_mint;
+                            let max_liquidatable = opportunity.max_liquidatable;
+                            let position_address = opportunity.position.address;
+                            
                             tasks.spawn(async move {
                                 let _permit = permit;
                                 
                                 log::debug!(
                                     "Validator: processing opportunity for position {} (est_profit={:.4})",
-                                    opportunity.position.address,
-                                    opportunity.estimated_profit
+                                    position_address,
+                                    opportunity_clone.estimated_profit
                                 );
 
                                 // ✅ CRITICAL FIX: Reserve balance FIRST (before validation)
                                 // This prevents race conditions where multiple validators try to reserve the same balance
                                 // Reserve is atomic - if it fails, we skip validation (insufficient balance)
-                                match balance_manager.reserve(&opportunity.debt_mint, opportunity.max_liquidatable).await {
+                                match balance_manager.reserve(&debt_mint, max_liquidatable).await {
                                     Ok(()) => {
                                         // Reserved successfully - proceed with validation
                                     }
                                     Err(e) => {
                                         log::debug!(
                                             "Validator: insufficient balance for position {}: {}",
-                                            opportunity.position.address,
+                                            position_address,
                                             e
                                         );
                                         // Don't validate if we can't reserve balance
@@ -80,23 +86,23 @@ impl Validator {
                                 }
                                 
                                 // Validate the opportunity (reservation already done)
-                                match Self::validate_static(&opportunity, &rpc, &config).await {
+                                match Self::validate_static(&opportunity_clone, &rpc, &config).await {
                                     Ok(()) => {
                                         // ✅ SUCCESS: Keep reservation, pass to executor
                                         // Reservation will be released by executor after transaction
                                         log::info!(
                                             "Validator: opportunity approved for position {}",
-                                            opportunity.position.address
+                                            position_address
                                         );
                                         if let Err(e) = event_bus.publish(Event::OpportunityApproved {
-                                            opportunity,
+                                            opportunity: opportunity_clone,
                                         }) {
                                             log::error!("Failed to publish OpportunityApproved: {}", e);
                                             // If publish fails, release reservation (executor won't see it)
                                             balance_manager
                                                 .release(
-                                                    &opportunity.debt_mint,
-                                                    opportunity.max_liquidatable,
+                                                    &debt_mint,
+                                                    max_liquidatable,
                                                 )
                                                 .await;
                                         }
@@ -106,13 +112,13 @@ impl Validator {
                                         // Executor will never see this opportunity, so we must release
                                         log::debug!(
                                             "Validator: opportunity rejected for position {}: {}",
-                                            opportunity.position.address,
+                                            position_address,
                                             e
                                         );
                                         balance_manager
                                             .release(
-                                                &opportunity.debt_mint,
-                                                opportunity.max_liquidatable,
+                                                &debt_mint,
+                                                max_liquidatable,
                                             )
                                             .await;
                                     }

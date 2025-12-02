@@ -5,6 +5,7 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use crate::blockchain::rpc_client::RpcClient;
 use crate::utils::helpers;
 use pyth_sdk_solana::state::SolanaPriceAccount;
@@ -242,10 +243,10 @@ pub async fn read_pyth_price(
     };
     
     let mut account_mut = account;
-    let price_feed = match SolanaPriceAccount::account_to_feed(oracle_account, &mut account_mut) {
-        Ok(feed) => {
+    // Parse price feed to validate account structure (we'll re-parse in blocking thread)
+    match SolanaPriceAccount::account_to_feed(oracle_account, &mut account_mut) {
+        Ok(_feed) => {
             log::debug!("Pyth price feed parsed successfully for account: {}", oracle_account);
-            feed
         },
         Err(e) => {
             log::error!("Failed to parse Pyth price feed for account {}: {}. Account data size: {} bytes, owner: {}", 
@@ -262,38 +263,75 @@ pub async fn read_pyth_price(
     let max_age_seconds = config.map(|c| c.max_oracle_age_seconds).unwrap_or(60);
     log::debug!("Checking price data freshness: current_time={}, max_age={}s", current_time, max_age_seconds);
     
-    // ✅ CRITICAL FIX: Use catch_unwind to prevent Pyth SDK panics from crashing the bot
-    // Pyth SDK's get_price_no_older_than can panic on malformed data or internal bugs
-    // This protection ensures the bot continues operating even if Pyth SDK has issues
+    // ✅ CRITICAL FIX: Wrap Pyth SDK call in spawn_blocking with timeout
+    // Pyth SDK's get_price_no_older_than is SYNC code and can hang or panic
+    // spawn_blocking moves it to a blocking thread pool, and timeout ensures it doesn't hang forever
+    // This prevents the entire async runtime from blocking if Pyth SDK has issues
     use std::panic::catch_unwind;
+    use solana_sdk::account::Account;
     
-    let price_data = match catch_unwind(std::panic::AssertUnwindSafe(|| {
-        price_feed.get_price_no_older_than(current_time, max_age_seconds)
-    })) {
-        Ok(Some(data)) => {
-            log::debug!("Pyth price data found: price={}, expo={}, conf={}, publish_time={}", 
-                data.price, data.expo, data.conf, data.publish_time);
-            data
-        },
-        Ok(None) => {
-            // Try to get latest price (any age) for diagnostic purposes
-            let latest_price = catch_unwind(std::panic::AssertUnwindSafe(|| {
-                price_feed.get_price_no_older_than(current_time, u64::MAX)
-            })).ok().flatten();
+    // Reconstruct Account for blocking thread (need owner, lamports, data)
+    let account_data = account_mut.data.clone();
+    let account_owner = account_mut.owner;
+    let account_lamports = account_mut.lamports;
+    let oracle_account_clone = *oracle_account;
+    let current_time_clone = current_time;
+    let max_age_seconds_clone = max_age_seconds;
+    
+    let price_data_result = tokio::time::timeout(
+        Duration::from_secs(5), // 5s timeout for Pyth SDK call
+        tokio::task::spawn_blocking(move || {
+            // Reconstruct Account in blocking thread
+            let mut account_for_feed = Account {
+                lamports: account_lamports,
+                data: account_data,
+                owner: account_owner,
+                executable: false,
+                rent_epoch: 0,
+            };
             
-            if let Some(latest) = latest_price {
-                let age_seconds = current_time - latest.publish_time;
-                log::warn!("Pyth price data is stale for account {}: age={}s (max={}s), latest_price={}, expo={}, publish_time={}", 
-                    oracle_account, age_seconds, max_age_seconds, latest.price, latest.expo, latest.publish_time);
-            } else {
-                log::error!("No price data found in Pyth feed for account: {}", oracle_account);
+            // Re-parse price feed in blocking thread
+            let price_feed = match SolanaPriceAccount::account_to_feed(&oracle_account_clone, &mut account_for_feed) {
+                Ok(feed) => feed,
+                Err(e) => {
+                    log::error!("Failed to parse Pyth price feed in blocking thread: {}", e);
+                    return Err(anyhow::anyhow!("Failed to parse price feed"));
+                }
+            };
+            
+            Ok(catch_unwind(std::panic::AssertUnwindSafe(|| {
+                price_feed.get_price_no_older_than(current_time_clone, max_age_seconds_clone)
+            })).unwrap_or_else(|_| None))
+        })
+    ).await;
+    
+    let price_data = match price_data_result {
+        Ok(Ok(result)) => match result {
+            Ok(Some(data)) => {
+                log::debug!("Pyth price data found: price={}, expo={}, conf={}, publish_time={}", 
+                    data.price, data.expo, data.conf, data.publish_time);
+                data
+            },
+            Ok(None) => {
+                // Price data is stale or not found
+                log::warn!("Pyth price data is stale or not found for account {} (max_age={}s)", 
+                    oracle_account, max_age_seconds);
+                return Ok(None);
+            },
+            Err(_) => {
+                // Panic occurred in Pyth SDK - log and return None gracefully
+                log::error!("Pyth SDK panic detected when reading price for account {} - this may indicate malformed data or SDK bug", oracle_account);
+                return Ok(None);
             }
+        },
+        Ok(Err(e)) => {
+            log::error!("Pyth SDK blocking task failed for account {}: {}", oracle_account, e);
             return Ok(None);
         },
         Err(_) => {
-            // Panic occurred in Pyth SDK - log and return None gracefully
-            log::error!("Pyth SDK panic detected when reading price for account {} - this may indicate malformed data or SDK bug", oracle_account);
-            return Ok(None);
+            // Timeout occurred
+            log::error!("Pyth SDK call timeout (5s) for account {} - SDK may be hanging", oracle_account);
+            return Err(anyhow::anyhow!("Pyth SDK timeout"));
         }
     };
     

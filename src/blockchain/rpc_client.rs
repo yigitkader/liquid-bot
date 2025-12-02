@@ -362,7 +362,8 @@ impl RpcClient {
             .context("Failed to acquire rate limiter permit")?;
         
         let client = Arc::clone(&self.client);
-        let pubkeys = pubkeys.to_vec();
+        let pubkeys_vec = pubkeys.to_vec();
+        let pubkeys_count = pubkeys_vec.len(); // Save count before moving
         let rpc_url = self.rpc_url.clone();
         let timeout_duration = self.request_timeout;
         
@@ -370,7 +371,7 @@ impl RpcClient {
             timeout_duration,
             tokio::task::spawn_blocking(move || {
                 client
-                    .get_multiple_accounts(&pubkeys)
+                    .get_multiple_accounts(&pubkeys_vec)
                     .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
             })
         )
@@ -378,7 +379,7 @@ impl RpcClient {
         .map_err(|_| anyhow::anyhow!(
             "RPC request timeout after {:?} for get_multiple_accounts ({} accounts)",
             timeout_duration,
-            pubkeys.len()
+            pubkeys_count
         ))?
         .context("Failed to spawn blocking task")?
     }

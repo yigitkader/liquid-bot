@@ -35,6 +35,9 @@ impl Analyzer {
     }
 
     pub async fn run(&self) -> Result<()> {
+        use std::time::Instant;
+        use tokio::time::Duration;
+        
         let mut receiver = self.event_bus.subscribe();
         let mut tasks = JoinSet::new();
         
@@ -43,6 +46,12 @@ impl Analyzer {
         let semaphore = Arc::new(
             tokio::sync::Semaphore::new(self.current_workers.load(Ordering::Relaxed))
         );
+
+        // ✅ CRITICAL: Track lag and scale-down timing for adaptive scaling
+        let mut last_lag = Instant::now();
+        let mut last_scale_down = Instant::now();
+        const SCALE_DOWN_THRESHOLD: Duration = Duration::from_secs(60); // Scale down if no lag for 60s
+        const SCALE_DOWN_INTERVAL: Duration = Duration::from_secs(30); // Minimum 30s between scale downs
 
         loop {
             match receiver.recv().await {
@@ -96,6 +105,9 @@ impl Analyzer {
                     log::warn!("            2) Increase ANALYZER_MAX_WORKERS_LIMIT");
                     log::warn!("            3) Optimize calculation logic");
                     log::warn!("            4) Restart bot to trigger full account re-scan");
+                    
+                    // Update last lag time for scale-down logic
+                    last_lag = Instant::now();
                     
                     // ADAPTIVE SCALING: Increase workers when lag detected
                     let current = self.current_workers.load(Ordering::Relaxed);
@@ -177,6 +189,34 @@ impl Analyzer {
             while let Some(result) = tasks.try_join_next() {
                 if let Err(e) = result {
                     log::error!("Analyzer task failed: {}", e);
+                }
+            }
+            
+            // ✅ CRITICAL: Scale DOWN if no lag for threshold duration
+            // This prevents semaphore from staying at high permit count when system is idle
+            // Note: We can't actually remove permits from semaphore, but we can reduce desired count
+            // and prevent new permits from being acquired (see permit acquisition check above)
+            if last_lag.elapsed() > SCALE_DOWN_THRESHOLD 
+                && last_scale_down.elapsed() > SCALE_DOWN_INTERVAL
+            {
+                let current = self.current_workers.load(Ordering::Relaxed);
+                if current > self.config.analyzer_max_workers {
+                    // Scale down by 25% (or at least 1)
+                    let decrease = std::cmp::max(1, current / 4);
+                    let new_workers = std::cmp::max(
+                        self.config.analyzer_max_workers,
+                        current - decrease
+                    );
+                    
+                    self.current_workers.store(new_workers, Ordering::Relaxed);
+                    last_scale_down = Instant::now();
+                    
+                    log::info!(
+                        "Analyzer: Scaling down workers (no lag for {}s): {} -> {}",
+                        SCALE_DOWN_THRESHOLD.as_secs(),
+                        current,
+                        new_workers
+                    );
                 }
             }
         }

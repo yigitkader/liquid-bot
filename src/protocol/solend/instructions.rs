@@ -232,9 +232,10 @@ impl ReserveCache {
         tokio::spawn(async move {
             // ✅ CRITICAL FIX: Delay initial refresh to prevent RPC storm on startup
             // Free RPC endpoints typically have 1 req/10s limit for getProgramAccounts
-            // Waiting 10 seconds before first refresh prevents hitting rate limits
+            // Waiting 30 seconds before first refresh prevents hitting rate limits
             // This is especially important when multiple components start simultaneously
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Scanner will start after 5s delay, so 30s ensures no overlap
+            tokio::time::sleep(Duration::from_secs(30)).await;
             
             log::info!("Performing initial reserve cache refresh...");
             if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
