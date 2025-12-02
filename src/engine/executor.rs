@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
+use tokio::sync::RwLock;
 
 struct TxLock {
     locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
@@ -140,6 +141,9 @@ pub struct Executor {
     consecutive_errors: Arc<AtomicU32>,
     jito_client: Option<Arc<JitoClient>>,
     use_jito: bool,
+    // Cache of ATAs we've already included create_ata instructions for
+    // This avoids redundant instructions within the same executor instance
+    ata_cache: Arc<RwLock<HashSet<Pubkey>>>,
 }
 
 impl Executor {
@@ -190,6 +194,7 @@ impl Executor {
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             jito_client,
             use_jito,
+            ata_cache: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -316,7 +321,7 @@ impl Executor {
             .build_liquidation_ix(&opp, &wallet_pubkey, Some(Arc::clone(&self.rpc)))
             .await?;
 
-        // Check if destination_collateral ATA exists, create if missing
+        // Derive destination_collateral ATA address
         let destination_collateral = get_associated_token_address(
             &wallet_pubkey,
             &opp.collateral_mint,
@@ -324,37 +329,34 @@ impl Executor {
         )
         .context("Failed to derive destination collateral ATA")?;
         
-        // Check if ATA exists
-        let ata_exists = match self.rpc.get_account(&destination_collateral).await {
-            Ok(_) => true,
-            Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
-                    false
-                } else {
-                    // Other errors (network issues, etc.) - log but continue
-                    log::warn!(
-                        "Executor: Failed to check destination_collateral ATA ({}): {}",
-                        destination_collateral,
-                        e
-                    );
-                    false // Assume missing and try to create
-                }
-            }
-        };
-        
-        let blockhash = self.rpc.get_recent_blockhash().await?;
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
-        // Add create_ata instruction if ATA doesn't exist
-        if !ata_exists {
-            log::info!(
-                "Executor: destination_collateral ATA not found ({}), adding create_ata instruction",
+        // ✅ CRITICAL FIX: Always include create_ata instruction if not in cache
+        // ATA creation is idempotent - if ATA already exists, instruction is a no-op
+        // This eliminates race conditions and unnecessary RPC calls
+        // Cache prevents redundant instructions within the same executor instance
+        let should_add_ata = {
+            let cache = self.ata_cache.read().await;
+            !cache.contains(&destination_collateral)
+        };
+        
+        if should_add_ata {
+            log::debug!(
+                "Executor: Adding create_ata instruction for destination_collateral ATA ({})",
                 destination_collateral
             );
             let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
             tx_builder.add_instruction(create_ata_ix);
+            
+            // Add to cache (even if creation fails, we don't want to retry immediately)
+            let mut cache = self.ata_cache.write().await;
+            cache.insert(destination_collateral);
+        } else {
+            log::debug!(
+                "Executor: Skipping create_ata instruction for {} (already in cache)",
+                destination_collateral
+            );
         }
         
         tx_builder.add_instruction(liq_ix);

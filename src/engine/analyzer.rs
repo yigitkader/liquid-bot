@@ -39,10 +39,10 @@ impl Analyzer {
         let mut tasks = JoinSet::new();
         
         // Dynamic semaphore that can be adjusted based on lag
-        // Use Arc<Mutex<Arc<Semaphore>>> to allow dynamic resizing
-        let semaphore = Arc::new(tokio::sync::Mutex::new(Arc::new(
+        // Use Arc<Semaphore> directly - add_permits() is thread-safe
+        let semaphore = Arc::new(
             tokio::sync::Semaphore::new(self.current_workers.load(Ordering::Relaxed))
-        )));
+        );
 
         loop {
             match receiver.recv().await {
@@ -50,15 +50,13 @@ impl Analyzer {
                 | Ok(Event::AccountDiscovered { position, .. }) => {
                     // BACKPRESSURE: Wait for available worker slot before processing
                     // This prevents buffer overflow by controlling the rate of event processing
-                    let semaphore_guard = semaphore.lock().await;
-                    let permit = match semaphore_guard.clone().acquire_owned().await {
+                    let permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
                             log::warn!("Semaphore closed, analyzer shutting down");
                             break;
                         }
                     };
-                    drop(semaphore_guard); // Release lock before spawning task
                     
                     // Clone dependencies for task
                     let event_bus = self.event_bus.clone();
@@ -97,18 +95,24 @@ impl Analyzer {
                             self.max_workers_limit
                         );
                         
+                        // ✅ CRITICAL FIX: Use add_permits() instead of recreating semaphore
+                        // This preserves existing permits and waiting tasks
+                        // Recreating semaphore would cause waiting tasks to lose their permits
+                        // add_permits() is thread-safe, so we can call it directly on Arc<Semaphore>
+                        let permits_to_add = new_workers.saturating_sub(current);
+                        if permits_to_add > 0 {
+                            // Add permits to existing semaphore (preserves waiting tasks)
+                            semaphore.add_permits(permits_to_add);
+                        }
+                        
                         self.current_workers.store(new_workers, Ordering::Relaxed);
                         
-                        // Recreate semaphore with new capacity
-                        let mut semaphore_guard = semaphore.lock().await;
-                        *semaphore_guard = Arc::new(tokio::sync::Semaphore::new(new_workers));
-                        drop(semaphore_guard);
-                        
                         log::warn!(
-                            "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {}",
+                            "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits)",
                             skipped,
                             current,
-                            new_workers
+                            new_workers,
+                            permits_to_add
                         );
                     } else {
                         log::error!(

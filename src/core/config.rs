@@ -365,33 +365,46 @@ impl Config {
             ));
         }
 
-        // Hard limit for production: MIN_PROFIT_USD must be >= $2.0
-        // This prevents unprofitable transactions due to fees and slippage
-        if !self.dry_run && self.min_profit_usd < 2.0 {
-            return Err(anyhow::anyhow!(
-                "MIN_PROFIT_USD must be >= $2.0 in production (got: ${}). \
-                 Transaction fees + gas typically cost $0.1-0.5, and slippage can add more. \
-                 Lower values may result in negative profit. \
-                 For testing, use DRY_RUN=true with lower MIN_PROFIT_USD values.",
-                self.min_profit_usd
-            ));
-        }
-
-        // Warning for production if below recommended $5.0
-        if !self.dry_run && self.min_profit_usd < 5.0 {
-            log::warn!(
-                "⚠️  MIN_PROFIT_USD={} is below recommended $5.0 for production! \
-                 Transaction fees + gas typically cost $0.1-0.5, \
-                 so you may end up with lower profit margins. \
-                 Recommended: MIN_PROFIT_USD >= 5.0 for production.",
-                self.min_profit_usd
-            );
-        } else if self.dry_run && self.min_profit_usd < 1.0 {
-            log::warn!(
-                "⚠️  MIN_PROFIT_USD={} is very low even for dry-run testing! \
-                 Recommended: MIN_PROFIT_USD >= 1.0 for testing.",
-                self.min_profit_usd
-            );
+        // MIN_PROFIT_USD validation with clear thresholds:
+        // - $2.0: Minimum (error if below in production)
+        // - $5.0: Recommended (warning if below in production)
+        // - $10.0: Safe (info if at or above in production)
+        
+        if !self.dry_run {
+            // Production mode: Strict validation
+            if self.min_profit_usd < 2.0 {
+                return Err(anyhow::anyhow!(
+                    "MIN_PROFIT_USD must be >= $2.0 in production (got: ${}). \
+                     Transaction fees + gas typically cost $0.1-0.5, and slippage can add more. \
+                     Lower values may result in negative profit. \
+                     For testing, use DRY_RUN=true with lower MIN_PROFIT_USD values.",
+                    self.min_profit_usd
+                ));
+            } else if self.min_profit_usd < 5.0 {
+                // Between $2.0 and $5.0: Warning (below recommended)
+                log::warn!(
+                    "⚠️  MIN_PROFIT_USD=${} is below recommended $5.0 for production! \
+                     Transaction fees + gas typically cost $0.1-0.5, \
+                     so you may end up with lower profit margins. \
+                     Recommended: MIN_PROFIT_USD >= 5.0 for production.",
+                    self.min_profit_usd
+                );
+            } else if self.min_profit_usd >= 10.0 {
+                // $10.0 or above: Safe (info message)
+                log::info!(
+                    "✅ MIN_PROFIT_USD=${} is safe for production (>= $10.0 recommended)",
+                    self.min_profit_usd
+                );
+            }
+        } else {
+            // Dry-run mode: More lenient, but still warn if too low
+            if self.min_profit_usd < 1.0 {
+                log::warn!(
+                    "⚠️  MIN_PROFIT_USD=${} is very low even for dry-run testing! \
+                     Recommended: MIN_PROFIT_USD >= 1.0 for testing.",
+                    self.min_profit_usd
+                );
+            }
         }
 
         if self.max_slippage_bps > 10000 {
