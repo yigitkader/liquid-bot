@@ -105,11 +105,11 @@ impl Protocol for SolendProtocol {
             return None;
         }
 
-        // Log detaylı info (sadece ilk birkaç kez)
+        // Log detaylı info (sadece ilk birkaç kez) - debug level to avoid production log spam
         let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
         
         if logged < 5 {
-            log::info!(
+            log::debug!(
                 "🧩 Solend Obligation Parsed: owner={}, hf={:.6}, deposited=${:.2}, borrowed=${:.2}, deposits={}, borrows={}",
                 obligation.owner,
                 health_factor,

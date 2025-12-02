@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["sync"] }
 solana-client = "1.18"
 solana-sdk = "1.18"
 solana-program = "1.18"

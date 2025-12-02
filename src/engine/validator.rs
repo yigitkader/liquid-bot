@@ -343,13 +343,20 @@ impl Validator {
         ).await
             .context("Failed to estimate real-time slippage")?;
 
-        // Read oracle confidence for debt mint and add to slippage
+        // Read oracle confidence for debt mint
         let oracle_confidence = estimator.read_oracle_confidence(opp.debt_mint).await
             .context("Failed to read oracle confidence")?;
 
-        // Add oracle confidence to base slippage
-        // Oracle confidence represents price uncertainty, which should be added to slippage
-        let total_slippage = base_slippage.saturating_add(oracle_confidence);
+        // Combine base slippage and oracle confidence using quadratic sum
+        // This is statistically more accurate for combining independent uncertainties
+        // than simple addition, which can lead to overly conservative estimates
+        // Formula: sqrt(base_slippage^2 + oracle_confidence^2)
+        let total_slippage = {
+            let base_f64 = base_slippage as f64;
+            let oracle_f64 = oracle_confidence as f64;
+            let sum_squares = base_f64 * base_f64 + oracle_f64 * oracle_f64;
+            (sum_squares.sqrt()) as u16
+        };
         
         // Cap at max_slippage_bps
         let final_slippage = total_slippage.min(config.max_slippage_bps);

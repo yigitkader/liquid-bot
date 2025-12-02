@@ -16,11 +16,13 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 
 struct TxLock {
     locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
     lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
     timeout_seconds: u64,
+    cancel_token: CancellationToken,
 }
 
 impl TxLock {
@@ -29,49 +31,63 @@ impl TxLock {
             locked: Arc::new(std::sync::RwLock::new(HashSet::new())),
             lock_times: Arc::new(std::sync::RwLock::new(HashMap::new())),
             timeout_seconds,
+            cancel_token: CancellationToken::new(),
         }
     }
 
     /// Start background cleanup task that periodically removes expired locks.
     /// This prevents locks from leaking when no new lock attempts are made.
+    /// The task can be gracefully shut down using the cancellation token.
     fn start_cleanup_task(self: &Arc<Self>) {
         let locked = Arc::clone(&self.locked);
         let lock_times = Arc::clone(&self.lock_times);
         let timeout_seconds = self.timeout_seconds;
+        let cancel = self.cancel_token.clone();
         
         tokio::spawn(async move {
             loop {
-                // Run cleanup every 10 seconds
-                sleep(Duration::from_secs(10)).await;
-                
-                let mut locked_guard = locked.write().unwrap();
-                let mut lock_times_guard = lock_times.write().unwrap();
-                
-                // Remove expired locks
-                let expired_addresses: Vec<Pubkey> = lock_times_guard
-                    .iter()
-                    .filter_map(|(address, time)| {
-                        if time.elapsed().as_secs() >= timeout_seconds {
-                            Some(*address)
-                        } else {
-                            None
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(10)) => {
+                        // Run cleanup every 10 seconds
+                        let mut locked_guard = locked.write().unwrap();
+                        let mut lock_times_guard = lock_times.write().unwrap();
+                        
+                        // Remove expired locks
+                        let expired_addresses: Vec<Pubkey> = lock_times_guard
+                            .iter()
+                            .filter_map(|(address, time)| {
+                                if time.elapsed().as_secs() >= timeout_seconds {
+                                    Some(*address)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        
+                        for address in &expired_addresses {
+                            locked_guard.remove(address);
+                            lock_times_guard.remove(address);
                         }
-                    })
-                    .collect();
-                
-                for address in &expired_addresses {
-                    locked_guard.remove(address);
-                    lock_times_guard.remove(address);
-                }
-                
-                if !expired_addresses.is_empty() {
-                    log::debug!(
-                        "TxLock: cleaned up {} expired lock(s)",
-                        expired_addresses.len()
-                    );
+                        
+                        if !expired_addresses.is_empty() {
+                            log::debug!(
+                                "TxLock: cleaned up {} expired lock(s)",
+                                expired_addresses.len()
+                            );
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        log::info!("TxLock cleanup task shutting down gracefully");
+                        break;
+                    }
                 }
             }
         });
+    }
+
+    /// Cancel the cleanup task (for graceful shutdown)
+    pub fn cancel_cleanup(&self) {
+        self.cancel_token.cancel();
     }
 
     fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
@@ -212,6 +228,28 @@ impl Executor {
         self.consecutive_errors.store(0, Ordering::Relaxed);
     }
 
+    /// Gracefully shutdown the executor, cancelling background tasks
+    pub fn shutdown(&self) {
+        log::info!("Executor: shutting down gracefully, cancelling background tasks");
+        self.tx_lock.cancel_cleanup();
+    }
+
+    /// Check if an error is retryable (network errors, timeouts, etc.)
+    fn is_retryable_error(&self, error: &anyhow::Error) -> bool {
+        let error_str = error.to_string().to_lowercase();
+        
+        // Retryable errors: network issues, timeouts, RPC errors
+        error_str.contains("timeout") ||
+        error_str.contains("network") ||
+        error_str.contains("connection") ||
+        error_str.contains("rpc") ||
+        error_str.contains("failed to send") ||
+        error_str.contains("request failed") ||
+        error_str.contains("temporarily unavailable") ||
+        error_str.contains("rate limit") ||
+        error_str.contains("too many requests")
+    }
+
     pub async fn run(&self) -> Result<()> {
         let mut receiver = self.event_bus.subscribe();
 
@@ -320,19 +358,16 @@ impl Executor {
         }
         
         tx_builder.add_instruction(liq_ix);
-        let mut tx = tx_builder.build(blockhash);
-
-        sign_transaction(&mut tx, &self.wallet);
 
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
             return Err(anyhow::anyhow!("DRY_RUN mode: Transaction not sent to blockchain"));
         } else if let Some(ref jito) = self.jito_client {
-            // Send via Jito bundle for MEV protection
-            self.send_via_jito(tx, jito).await?
+            // Send via Jito bundle for MEV protection with retries
+            self.send_via_jito_with_retry(&tx_builder, jito).await?
         } else {
-            // Fallback to standard RPC (vulnerable to front-running)
-            send_and_confirm(tx, Arc::clone(&self.rpc)).await?
+            // Fallback to standard RPC (vulnerable to front-running) with retries
+            self.send_with_retry(&tx_builder).await?
         };
 
         self.balance_manager.release(&opp.debt_mint, opp.max_liquidatable).await;
@@ -384,6 +419,56 @@ impl Executor {
         })
     }
 
+    /// Send transaction via Jito bundle for MEV protection with retry logic
+    async fn send_via_jito_with_retry(
+        &self,
+        tx_builder: &TransactionBuilder,
+        jito_client: &Arc<JitoClient>,
+    ) -> Result<solana_sdk::signature::Signature> {
+        const MAX_TX_RETRIES: u32 = 3;
+        
+        for attempt in 1..=MAX_TX_RETRIES {
+            // Rebuild transaction with fresh blockhash for each retry
+            let blockhash = self.rpc.get_recent_blockhash().await?;
+            let tx = tx_builder.build(blockhash);
+            
+            match self.send_via_jito(tx, jito_client).await {
+                Ok(sig) => {
+                    if attempt > 1 {
+                        log::info!("✅ Transaction sent successfully on attempt {}", attempt);
+                    }
+                    return Ok(sig);
+                }
+                Err(e) => {
+                    let is_retryable = self.is_retryable_error(&e);
+                    
+                    if is_retryable && attempt < MAX_TX_RETRIES {
+                        log::warn!(
+                            "Jito TX failed (attempt {}/{}), retrying: {}",
+                            attempt,
+                            MAX_TX_RETRIES,
+                            e
+                        );
+                        // Exponential backoff: 500ms, 1000ms, 2000ms
+                        sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    } else {
+                        if attempt >= MAX_TX_RETRIES {
+                            log::error!(
+                                "Jito TX failed after {} attempts: {}",
+                                MAX_TX_RETRIES,
+                                e
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Should never reach here, but return error just in case
+        Err(anyhow::anyhow!("Failed to send transaction after {} attempts", MAX_TX_RETRIES))
+    }
+
     /// Send transaction via Jito bundle for MEV protection
     async fn send_via_jito(
         &self,
@@ -429,10 +514,64 @@ impl Executor {
         
         // Return the signature of the main transaction (first non-tip transaction)
         // Note: In production, you might want to track bundle status separately
-        if let Some(main_tx) = bundle.transactions().get(1) {
-            Ok(main_tx.signatures[0])
-        } else {
-            Err(anyhow::anyhow!("Bundle missing main transaction"))
+        let main_tx = bundle.transactions().get(1)
+            .ok_or_else(|| anyhow::anyhow!("Bundle missing main transaction"))?;
+
+        // Transaction henüz sign edilmemiş olabilir
+        if main_tx.signatures.is_empty() {
+            return Err(anyhow::anyhow!("Main transaction not signed"));
         }
+
+        Ok(main_tx.signatures[0])
+    }
+
+    /// Send transaction via standard RPC with retry logic
+    async fn send_with_retry(
+        &self,
+        tx_builder: &TransactionBuilder,
+    ) -> Result<solana_sdk::signature::Signature> {
+        const MAX_TX_RETRIES: u32 = 3;
+        
+        for attempt in 1..=MAX_TX_RETRIES {
+            // Rebuild transaction with fresh blockhash for each retry attempt
+            let blockhash = self.rpc.get_recent_blockhash().await?;
+            let mut tx = tx_builder.build(blockhash);
+            sign_transaction(&mut tx, &self.wallet);
+            
+            match send_and_confirm(tx, Arc::clone(&self.rpc)).await {
+                Ok(sig) => {
+                    if attempt > 1 {
+                        log::info!("✅ Transaction sent successfully on attempt {}", attempt);
+                    }
+                    return Ok(sig);
+                }
+                Err(e) => {
+                    let is_retryable = self.is_retryable_error(&e);
+                    
+                    if is_retryable && attempt < MAX_TX_RETRIES {
+                        log::warn!(
+                            "RPC TX failed (attempt {}/{}), retrying: {}",
+                            attempt,
+                            MAX_TX_RETRIES,
+                            e
+                        );
+                        // Exponential backoff: 500ms, 1000ms, 2000ms
+                        sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    } else {
+                        if attempt >= MAX_TX_RETRIES {
+                            log::error!(
+                                "RPC TX failed after {} attempts: {}",
+                                MAX_TX_RETRIES,
+                                e
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Should never reach here, but return error just in case
+        Err(anyhow::anyhow!("Failed to send transaction after {} attempts", MAX_TX_RETRIES))
     }
 }

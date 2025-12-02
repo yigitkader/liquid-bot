@@ -58,6 +58,7 @@ impl ReserveCache {
         rpc: &Arc<RpcClient>,
         config: &Config,
     ) -> Result<Pubkey> {
+        // Önce read lock
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -65,14 +66,23 @@ impl ReserveCache {
             }
         }
 
-        // Cache miss: refresh mapping from chain in a single RPC call
-        self.refresh_from_rpc(rpc, config).await?;
+        // Write lock ile refresh
+        {
+            let mut inner = self.inner.write().await;
+            
+            // Double-check (başka thread refresh yapmış olabilir)
+            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
+                return Ok(*reserve);
+            }
+            
+            // Refresh yap (write lock içinde)
+            drop(inner); // Lock'u drop et
+            self.refresh_from_rpc(rpc, config).await?;
+        }
 
+        // Final check
         let inner = self.inner.read().await;
-        inner
-            .mint_to_reserve
-            .get(mint)
-            .copied()
+        inner.mint_to_reserve.get(mint).copied()
             .ok_or_else(|| anyhow::anyhow!("Reserve not found for mint: {}", mint))
     }
 

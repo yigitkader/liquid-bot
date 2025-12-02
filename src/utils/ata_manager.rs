@@ -12,7 +12,10 @@ use solana_sdk::{
 use std::sync::Arc;
 use std::str::FromStr;
 
-const MAX_ATAS_PER_TX: usize = 5; // Max 5 ATAs per transaction (~50k CU, still safe within ~200k CU limit)
+// Max ATAs per transaction - optimized for compute unit usage
+// Each ATA creation uses ~10k CU, so 7 ATAs = ~70k CU (well within 200k CU limit)
+// Note: This should be tested in production to ensure it doesn't exceed compute limits
+const MAX_ATAS_PER_TX: usize = 7;
 
 /// Ensure all required ATAs exist for the bot wallet
 /// Simple approach: Check on-chain, create if missing
@@ -116,7 +119,7 @@ pub async fn ensure_required_atas(
 
     log::info!("📝 Creating {} missing ATA(s)...", missing_atas.len());
 
-    // ⚠️ KEY FIX: Send ATAs in batches (max 5 per transaction to stay within compute limits)
+    // ⚠️ KEY FIX: Send ATAs in batches (max 7 per transaction to optimize compute unit usage)
     for chunk in missing_atas.chunks(MAX_ATAS_PER_TX) {
         log::info!("📤 Sending batch of {} ATA(s)...", chunk.len());
         

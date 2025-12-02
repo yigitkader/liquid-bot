@@ -2,6 +2,25 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+/// Expected Solend program ID on mainnet
+const EXPECTED_SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+
+/// Validate that the provided program ID matches the expected Solend program ID
+fn validate_solend_program_id(program_id: &Pubkey) -> Result<()> {
+    let expected_program_id = Pubkey::from_str(EXPECTED_SOLEND_PROGRAM_ID)
+        .map_err(|_| anyhow::anyhow!("Failed to parse expected Solend program ID"))?;
+    
+    if program_id != &expected_program_id {
+        return Err(anyhow::anyhow!(
+            "Invalid Solend program ID: expected {}, got {}",
+            EXPECTED_SOLEND_PROGRAM_ID,
+            program_id
+        ));
+    }
+    
+    Ok(())
+}
+
 pub fn get_associated_token_program_id(config: Option<&crate::config::Config>) -> Result<Pubkey> {
     let program_id_str = config
         .map(|c| c.associated_token_program_id.as_str())
@@ -34,6 +53,9 @@ pub fn derive_lending_market_authority(
     lending_market: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
+    // Program ID validate et
+    validate_solend_program_id(program_id)?;
+    
     let seeds = &[
         lending_market.as_ref(),
     ];
@@ -48,6 +70,9 @@ pub fn derive_obligation_address(
     lending_market: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
+    // Program ID validate et
+    validate_solend_program_id(program_id)?;
+    
     let seeds = &[
         b"obligation".as_ref(),
         wallet_pubkey.as_ref(),

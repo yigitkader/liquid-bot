@@ -139,7 +139,12 @@ impl Analyzer {
     }
 
     fn is_liquidatable_static(position: &Position, config: &Config) -> bool {
-        position.health_factor < config.hf_liquidation_threshold
+        // Safety margin to avoid race conditions at exact threshold
+        // With 0.95 margin, we only liquidate when HF < 0.95 * threshold
+        // This gives us a 5% buffer to avoid competing with other bots at the exact threshold
+        const SAFETY_MARGIN: f64 = 0.95; // %5 margin
+        
+        position.health_factor < (config.hf_liquidation_threshold * SAFETY_MARGIN)
     }
 
     async fn calculate_opportunity_static(

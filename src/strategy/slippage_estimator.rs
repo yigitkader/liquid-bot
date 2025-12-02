@@ -82,10 +82,17 @@ impl SlippageEstimator {
                         match serde_json::from_str::<JupiterQuoteResponse>(&response_text) {
                             Ok(quote) => {
                                 if let Some(price_impact_pct) = quote.price_impact_pct {
-                                    // `priceImpactPct` Jupiter'de 0.0–1.0 arası oran olarak geliyor (ör: 0.005 = 0.5%).
-                                    // Bunu doğru şekilde basis point'e çevirmek için 10_000 ile çarpmalıyız:
-                                    // 0.005 * 10_000 = 50 bps.
-                                    let slippage_bps = (price_impact_pct * 10_000.0) as u16;
+                                    // Önce Jupiter API'nin döndürdüğü değeri logla
+                                    log::info!("Jupiter raw price_impact_pct: {}", price_impact_pct);
+
+                                    // Ardından doğru çarpanı belirle
+                                    let slippage_bps = if price_impact_pct < 1.0 {
+                                        // 0.005 formatı (0-1 arası)
+                                        (price_impact_pct * 10_000.0) as u16
+                                    } else {
+                                        // 0.5 formatı (0-100 arası)
+                                        (price_impact_pct * 100.0) as u16
+                                    };
                                     return Ok(slippage_bps.min(self.config.max_slippage_bps));
                                 } else {
                                     log::warn!(

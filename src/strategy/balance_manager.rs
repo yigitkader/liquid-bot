@@ -4,12 +4,23 @@ use crate::core::config::Config;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast};
 use anyhow::Result;
 
+/// Cached balance with timestamp for freshness checking
+#[derive(Clone, Debug)]
+struct CachedBalance {
+    amount: u64,
+    timestamp: Instant,
+}
+
+/// Cache time-to-live: balances older than this will be considered stale
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
 pub struct BalanceManager {
     reserved: Arc<RwLock<HashMap<Pubkey, u64>>>, // mint -> reserved amount
-    balances: Arc<RwLock<HashMap<Pubkey, u64>>>, // ATA pubkey -> balance (cached)
+    balances: Arc<RwLock<HashMap<Pubkey, CachedBalance>>>, // ATA pubkey -> cached balance with timestamp
     rpc: Arc<RpcClient>,
     ws: Option<Arc<WsClient>>,
     wallet: Pubkey,
@@ -49,14 +60,23 @@ impl BalanceManager {
         // Try to read from cache first
         {
             let balances = self.balances.read().await;
-            if let Some(&cached_balance) = balances.get(&ata) {
-                let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
-                let available = cached_balance.saturating_sub(reserved);
-                log::debug!(
-                    "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}",
-                    mint, ata, cached_balance, reserved, available
-                );
-                return Ok(available);
+            if let Some(cached) = balances.get(&ata) {
+                // Check cache freshness
+                if cached.timestamp.elapsed() < CACHE_TTL {
+                    let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
+                    let available = cached.amount.saturating_sub(reserved);
+                    log::debug!(
+                        "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}, age={:.2}s",
+                        mint, ata, cached.amount, reserved, available, cached.timestamp.elapsed().as_secs_f64()
+                    );
+                    return Ok(available);
+                } else {
+                    // Stale cache, fall through to RPC
+                    log::debug!(
+                        "BalanceManager: Cache stale for mint {} (ata={}): age={:.2}s (TTL={}s), falling back to RPC",
+                        mint, ata, cached.timestamp.elapsed().as_secs_f64(), CACHE_TTL.as_secs()
+                    );
+                }
             }
         }
         
@@ -83,7 +103,10 @@ impl BalanceManager {
                     );
                     // Cache the zero balance to avoid repeated RPC calls
                     let mut balances = self.balances.write().await;
-                    balances.insert(ata, 0);
+                    balances.insert(ata, CachedBalance {
+                        amount: 0,
+                        timestamp: Instant::now(),
+                    });
                     let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
                     return Ok(0u64.saturating_sub(reserved));
                 }
@@ -103,7 +126,10 @@ impl BalanceManager {
         // Update cache with RPC result
         {
             let mut balances = self.balances.write().await;
-            balances.insert(ata, actual);
+            balances.insert(ata, CachedBalance {
+                amount: actual,
+                timestamp: Instant::now(),
+            });
         }
         
         let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
@@ -125,9 +151,13 @@ impl BalanceManager {
         // Try cache first
         {
             let balances = self.balances.read().await;
-            if let Some(&cached_balance) = balances.get(&ata) {
-                let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                return Ok(cached_balance.saturating_sub(reserved_amount));
+            if let Some(cached) = balances.get(&ata) {
+                // Check cache freshness
+                if cached.timestamp.elapsed() < CACHE_TTL {
+                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+                    return Ok(cached.amount.saturating_sub(reserved_amount));
+                }
+                // Stale cache, fall through to RPC
             }
         }
         
@@ -139,7 +169,10 @@ impl BalanceManager {
                 if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
                     // Cache zero balance
                     let mut balances = self.balances.write().await;
-                    balances.insert(ata, 0);
+                    balances.insert(ata, CachedBalance {
+                        amount: 0,
+                        timestamp: Instant::now(),
+                    });
                     let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
                     return Ok(0u64.saturating_sub(reserved_amount));
                 }
@@ -158,7 +191,10 @@ impl BalanceManager {
         // Update cache
         {
             let mut balances = self.balances.write().await;
-            balances.insert(ata, actual);
+            balances.insert(ata, CachedBalance {
+                amount: actual,
+                timestamp: Instant::now(),
+            });
         }
         
         let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
@@ -220,7 +256,10 @@ impl BalanceManager {
                                 .map_err(|_| anyhow::anyhow!("Failed to read balance"))?;
                             let balance = u64::from_le_bytes(balance_bytes);
                             let mut balances = self.balances.write().await;
-                            balances.insert(ata, balance);
+                            balances.insert(ata, CachedBalance {
+                                amount: balance,
+                                timestamp: Instant::now(),
+                            });
                             log::debug!(
                                 "BalanceManager: Initial {} balance cached: {}",
                                 name, balance
@@ -278,10 +317,13 @@ impl BalanceManager {
         
         let balance = u64::from_le_bytes(balance_bytes);
         
-        // Update cache
+        // Update cache with fresh timestamp
         {
             let mut balances = self.balances.write().await;
-            balances.insert(update.pubkey, balance);
+            balances.insert(update.pubkey, CachedBalance {
+                amount: balance,
+                timestamp: Instant::now(),
+            });
         }
         
         log::debug!(

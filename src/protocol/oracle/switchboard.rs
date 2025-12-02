@@ -37,45 +37,65 @@ impl SwitchboardOracle {
     /// Parse Switchboard account data using the correct offset for AggregatorAccount.
     /// 
     /// Switchboard V2 AggregatorAccount structure:
-    /// - LatestConfirmedRound.Result.Value is at offset 361 (i128, 16 bytes)
+    /// - LatestConfirmedRound.Result.Value is at offset 361 (i128, 16 bytes) - but this can vary
     /// - Price mantissa needs to be scaled by 10^9 (standard Switchboard scale)
+    /// 
+    /// This function tries multiple possible offsets to handle different Switchboard versions.
     pub fn parse_switchboard_account(data: &[u8], owner: &Pubkey) -> Result<PriceData> {
         log::debug!("Parsing Switchboard oracle account: {} bytes, owner: {}", data.len(), owner);
         
-        const LATEST_RESULT_OFFSET: usize = 361; // Correct offset for LatestConfirmedRound.Result.Value
+        // Possible offsets for LatestConfirmedRound.Result.Value across different Switchboard versions
+        const POSSIBLE_OFFSETS: &[usize] = &[361, 200, 216, 232];
         const SCALE: u32 = 9; // Switchboard standard scale (10^9)
         
-        if data.len() < LATEST_RESULT_OFFSET + 16 {
-            log::error!("Switchboard account data too small: {} bytes (need at least {} bytes)", 
-                data.len(), LATEST_RESULT_OFFSET + 16);
+        // Try each possible offset
+        for &offset in POSSIBLE_OFFSETS {
+            if let Ok(price_data) = Self::try_parse_at_offset(data, offset, SCALE) {
+                if Self::is_valid_price(&price_data) {
+                    log::info!(
+                        "Switchboard oracle parsed successfully at offset {}: price=${:.4}, confidence=${:.4}, timestamp={}",
+                        offset, price_data.price, price_data.confidence, price_data.timestamp
+                    );
+                    return Ok(price_data);
+                }
+            }
+        }
+        
+        // All offsets failed
+        log::error!(
+            "Failed to parse Switchboard account at any offset. Account size: {} bytes, owner: {}",
+            data.len(),
+            owner
+        );
+        Err(anyhow::anyhow!(
+            "Failed to parse Switchboard account: tried offsets {:?}, account size: {} bytes",
+            POSSIBLE_OFFSETS,
+            data.len()
+        ))
+    }
+
+    /// Try to parse Switchboard account data at a specific offset
+    fn try_parse_at_offset(data: &[u8], offset: usize, scale: u32) -> Result<PriceData> {
+        if data.len() < offset + 16 {
             return Err(anyhow::anyhow!(
-                "Switchboard account data too small: {} bytes (need at least {} bytes)",
-                data.len(),
-                LATEST_RESULT_OFFSET + 16
+                "Insufficient data for offset {}: need {} bytes, have {} bytes",
+                offset,
+                offset + 16,
+                data.len()
             ));
         }
 
         // Read mantissa (i128, 16 bytes, little-endian)
-        let mantissa_bytes: [u8; 16] = data[LATEST_RESULT_OFFSET..LATEST_RESULT_OFFSET + 16]
+        let mantissa_bytes: [u8; 16] = data[offset..offset + 16]
             .try_into()
-            .map_err(|e| anyhow::anyhow!("Failed to read mantissa bytes at offset {}: {:?}", LATEST_RESULT_OFFSET, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read mantissa bytes at offset {}: {:?}", offset, e))?;
         
         let mantissa = i128::from_le_bytes(mantissa_bytes);
-        log::debug!("Switchboard mantissa at offset {}: {}", LATEST_RESULT_OFFSET, mantissa);
+        log::debug!("Switchboard mantissa at offset {}: {}", offset, mantissa);
         
         // Convert mantissa to price using scale
-        let price = mantissa as f64 / 10_f64.powi(SCALE as i32);
-        log::debug!("Switchboard price (mantissa={}, scale={}): {}", mantissa, SCALE, price);
-        
-        // Validation
-        if price <= 0.0 || price.is_infinite() || price.is_nan() {
-            return Err(anyhow::anyhow!(
-                "Invalid price value: {} (mantissa: {}, scale: {})",
-                price,
-                mantissa,
-                SCALE
-            ));
-        }
+        let price = mantissa as f64 / 10_f64.powi(scale as i32);
+        log::debug!("Switchboard price at offset {} (mantissa={}, scale={}): {}", offset, mantissa, scale, price);
         
         // Estimate confidence as 0.1% of price (standard Switchboard confidence estimate)
         let confidence = price * 0.001;
@@ -85,15 +105,20 @@ impl SwitchboardOracle {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
             .as_secs() as i64;
-
-        log::info!("Switchboard oracle parsed successfully: price=${:.4}, confidence=${:.4}, timestamp={}", 
-            price, confidence, timestamp);
         
         Ok(PriceData {
             price,
             confidence,
             timestamp,
         })
+    }
+
+    /// Check if parsed price data is valid
+    fn is_valid_price(price_data: &PriceData) -> bool {
+        price_data.price > 0.0 
+            && price_data.price.is_finite() 
+            && !price_data.price.is_nan()
+            && price_data.price < 1e15 // Reasonable upper bound for prices
     }
 
     /// Determine the correct offset for price data based on account structure.
