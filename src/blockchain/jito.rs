@@ -89,7 +89,7 @@ impl JitoClient {
                     .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
                 Ok(base64::encode(&bytes))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
         // Prepare bundle payload
         let payload = json!({

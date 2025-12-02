@@ -70,6 +70,10 @@ cp .env.example .env
    - `POLL_INTERVAL_MS`: RPC polling fallback aralığı (milisaniye, **ücretsiz RPC için önerilen: 10000**, premium RPC için: 2000-5000)
      - **Not**: WebSocket varsayılan olarak kullanılır. Bu değer sadece WebSocket başarısız olursa fallback için kullanılır.
    - `DRY_RUN`: Test modu (true/false, **ilk kullanımda mutlaka true!**)
+   - `USE_JITO`: Jito MEV protection (true/false, **mainnet için önerilen: true**)
+   - `TEST_OBLIGATION_PUBKEY`: Test için bir Solend obligation hesabı (opsiyonel)
+     - Bulmak için: `./scripts/find_obligation.sh` çalıştırın
+     - Veya Solana Explorer'da Solend program hesabına bakın: https://explorer.solana.com/address/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
 
    Detaylı açıklamalar için aşağıdaki bölümlere bakın.
 
@@ -86,6 +90,26 @@ cargo run --release
 ## ⚙️ Konfigürasyon
 
 Tüm konfigürasyon değerleri environment variable'lar üzerinden yönetilir.
+
+### TEST_OBLIGATION_PUBKEY Nasıl Bulunur?
+
+`TEST_OBLIGATION_PUBKEY` test ve validasyon için kullanılan gerçek bir Solend obligation hesabıdır. Bulmak için:
+
+**Yöntem 1: Script Kullanma**
+```bash
+./scripts/find_obligation.sh
+```
+
+**Yöntem 2: Solana Explorer**
+1. https://explorer.solana.com/address/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo adresine gidin
+2. "Program Accounts" sekmesine tıklayın
+3. Account size'a göre filtreleyin (~1300 bytes = obligation accounts)
+4. Bir obligation pubkey'i kopyalayın ve `.env` dosyasına ekleyin
+
+**Yöntem 3: Bot Çalıştırma**
+Bot çalıştığında otomatik olarak obligation hesaplarını bulur. Log'larda obligation adreslerini görebilirsiniz.
+
+**Not:** `TEST_OBLIGATION_PUBKEY` opsiyoneldir. Boş bırakabilirsiniz, bot yine de çalışır.
 
 ### Önemli Parametreler
 
