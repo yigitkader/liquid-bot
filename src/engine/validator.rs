@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 
 pub struct Validator {
@@ -267,23 +267,40 @@ impl Validator {
         // Skip account existence check - read_pyth_price will handle it
         let max_age = config.max_oracle_age_seconds;
         
-        // CRITICAL FIX: Add timeout to prevent oracle read from blocking validation
-        // RPC timeout yoksa oracle read 30s+ bekleyebilir, bu validation'ı bloklar
-        const ORACLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-        
-        let price_data = match timeout(
-            ORACLE_READ_TIMEOUT,
-            read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config))
-        ).await {
-            Ok(Ok(Some(data))) => data,
-            Ok(Ok(None)) => {
+        // ✅ CRITICAL FIX: Remove redundant timeout wrapper
+        // RPC client already has timeout handling (via SolanaRpcClient's internal HTTP client)
+        // Double timeout is unnecessary and can cause confusion
+        // If RPC is slow, it will timeout at the HTTP client level, not here
+        // 
+        // Note: If RPC client timeout is too long (30s+), it should be configured at RPC client level,
+        // not here. This keeps timeout logic in one place and avoids race conditions.
+        let price_data = match read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config)).await {
+            Ok(Some(data)) => data,
+            Ok(None) => {
                 return Err(anyhow::anyhow!(
                     "Failed to read oracle price data for mint {} (oracle={}) - price data is None",
                     mint,
                     oracle_account
                 ));
             }
-            Ok(Err(e)) => {
+            Err(e) => {
+                // Check if error is timeout-related
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("timeout") || error_str.contains("timed out") {
+                    log::error!(
+                        "Validator: oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}",
+                        mint,
+                        oracle_account,
+                        e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}",
+                        mint,
+                        oracle_account,
+                        e
+                    ));
+                }
+                
                 log::error!(
                     "Validator: failed to read Pyth price for mint {} (oracle={}): {}",
                     mint,
@@ -295,20 +312,6 @@ impl Validator {
                     mint,
                     oracle_account,
                     e
-                ));
-            }
-            Err(_) => {
-                // Timeout occurred
-                log::error!(
-                    "Validator: oracle read timeout for mint {} (oracle={}) after {:?}",
-                    mint,
-                    oracle_account,
-                    ORACLE_READ_TIMEOUT
-                );
-                return Err(anyhow::anyhow!(
-                    "Oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive",
-                    mint,
-                    oracle_account
                 ));
             }
         };

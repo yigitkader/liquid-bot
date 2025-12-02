@@ -493,10 +493,13 @@ impl Executor {
         )
         .context("Failed to add Jito tip transaction")?;
         
-        // CRITICAL FIX: Build a NEW transaction from scratch with the fresh blockhash
-        // DO NOT copy and re-sign an existing transaction (causes double signing error)
-        // This ensures the transaction is created fresh and signed only once
+        // ✅ CRITICAL FIX: Build a FRESH, UNSIGNED transaction from scratch with the fresh blockhash
+        // TransactionBuilder::build() creates an UNSIGNED transaction - this is correct!
+        // We sign it ONCE here, and sign_transaction() will prevent double-signing if called again
+        // DO NOT pass an already-signed transaction here - always build fresh!
         let mut main_tx = tx_builder.build(blockhash);
+        
+        // Sign the transaction ONCE - sign_transaction() has guards to prevent double-signing
         sign_transaction(&mut main_tx, &self.wallet);
         
         // Add main liquidation transaction

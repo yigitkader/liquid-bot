@@ -9,7 +9,7 @@ use solana_sdk::{
     hash::Hash,
 };
 use std::sync::Arc;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration, Instant, timeout};
 use tokio::sync::Semaphore;
 
 /// Token bucket for rate limiting with burst support
@@ -68,10 +68,36 @@ pub struct RpcClient {
     rate_limiter: Arc<Semaphore>,
     token_bucket: Arc<TokenBucket>,
     last_request_time: Arc<tokio::sync::Mutex<Instant>>,
+    /// RPC request timeout - prevents requests from hanging indefinitely
+    /// Default: 10 seconds (reasonable for most RPC calls)
+    /// Can be configured via RPC_TIMEOUT_SECONDS env var
+    request_timeout: Duration,
 }
 
 impl RpcClient {
     pub fn new(rpc_url: String) -> Result<Self> {
+        // ✅ CRITICAL: Configure RPC timeout to prevent requests from hanging
+        // Default: 10 seconds (reasonable for most RPC calls)
+        // Can be overridden via RPC_TIMEOUT_SECONDS env var
+        let request_timeout_seconds: u64 = std::env::var("RPC_TIMEOUT_SECONDS")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse()
+            .unwrap_or(10); // Fallback to 10s if parse fails
+        
+        let request_timeout = Duration::from_secs(request_timeout_seconds);
+        
+        if request_timeout_seconds > 30 {
+            log::warn!(
+                "⚠️  RPC_TIMEOUT_SECONDS={} is very high (>30s) - this may cause validation to block for too long",
+                request_timeout_seconds
+            );
+        }
+        
+        log::info!(
+            "RpcClient: Initialized with request_timeout={:?} (configure via RPC_TIMEOUT_SECONDS env var)",
+            request_timeout
+        );
+        
         // Rate limiting configuration:
         // - Semaphore: Max 10 concurrent requests
         // - Token bucket: Capacity 10 tokens, refill rate 10 tokens/second (allows 10 req/s sustained, burst up to 10)
@@ -85,6 +111,7 @@ impl RpcClient {
             rate_limiter: Arc::new(Semaphore::new(10)), // Max 10 concurrent requests
             token_bucket: Arc::new(TokenBucket::new(10.0, 10.0)), // 10 tokens capacity, 10 tokens/second refill
             last_request_time: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            request_timeout,
         })
     }
 
@@ -125,12 +152,29 @@ impl RpcClient {
             let client = Arc::clone(&self.client);
             let rpc_url = self.rpc_url.clone();
             
-            let result = tokio::task::spawn_blocking(move || {
-                client.get_account(&pubkey)
-                    .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
-            })
-            .await
-            .context("Failed to spawn blocking task");
+            // ✅ CRITICAL: Add timeout to prevent RPC calls from hanging indefinitely
+            // This ensures validation doesn't block for too long
+            let timeout_duration = self.request_timeout;
+            let result = timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || {
+                    client.get_account(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+                })
+            )
+            .await;
+            
+            let result = match result {
+                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
+                Err(_) => {
+                    // Timeout occurred
+                    return Err(anyhow::anyhow!(
+                        "RPC request timeout after {:?} for get_account({})",
+                        timeout_duration,
+                        pubkey
+                    ));
+                }
+            };
             
             match result {
                 Ok(Ok(account)) => return Ok(account),
@@ -155,12 +199,22 @@ impl RpcClient {
         
         let client = Arc::clone(&self.client);
         let program_id = *program_id;
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_program_accounts(&program_id)
-                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
+        let timeout_duration = self.request_timeout;
+        
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client
+                    .get_program_accounts(&program_id)
+                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for get_program_accounts({})",
+            timeout_duration,
+            program_id
+        ))?
         .context("Failed to spawn blocking task")?
     }
 
@@ -188,12 +242,22 @@ impl RpcClient {
             ..Default::default()
         };
         
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_program_accounts_with_config(&program_id, config)
-                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
+        let timeout_duration = self.request_timeout;
+        
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client
+                    .get_program_accounts_with_config(&program_id, config)
+                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for get_program_accounts_with_config({})",
+            timeout_duration,
+            program_id
+        ))?
         .context("Failed to spawn blocking task")?
     }
 
@@ -204,10 +268,19 @@ impl RpcClient {
         
         let client = Arc::clone(&self.client);
         let tx = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            client.send_transaction(&tx).map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
+        let timeout_duration = self.request_timeout;
+        
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client.send_transaction(&tx).map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for send_transaction",
+            timeout_duration
+        ))?
         .context("Failed to spawn blocking task")?
     }
 
@@ -221,13 +294,27 @@ impl RpcClient {
         loop {
             let client = Arc::clone(&self.client);
             
-            let result = tokio::task::spawn_blocking(move || {
-                client
-                    .get_latest_blockhash()
-                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-            })
-            .await
-            .context("Failed to spawn blocking task");
+            let timeout_duration = self.request_timeout;
+            let result = timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || {
+                    client
+                        .get_latest_blockhash()
+                        .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+                })
+            )
+            .await;
+            
+            let result = match result {
+                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
+                Err(_) => {
+                    // Timeout occurred
+                    return Err(anyhow::anyhow!(
+                        "RPC request timeout after {:?} for get_latest_blockhash",
+                        timeout_duration
+                    ));
+                }
+            };
             
             match result {
                 Ok(Ok(hash)) => return Ok(hash),
@@ -248,12 +335,21 @@ impl RpcClient {
             .context("Failed to acquire rate limiter permit")?;
         
         let client = Arc::clone(&self.client);
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_slot()
-                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-        })
+        let timeout_duration = self.request_timeout;
+        
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client
+                    .get_slot()
+                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for get_slot",
+            timeout_duration
+        ))?
         .context("Failed to spawn blocking task")?
     }
 
@@ -268,12 +364,22 @@ impl RpcClient {
         let client = Arc::clone(&self.client);
         let pubkeys = pubkeys.to_vec();
         let rpc_url = self.rpc_url.clone();
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_multiple_accounts(&pubkeys)
-                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
-        })
+        let timeout_duration = self.request_timeout;
+        
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client
+                    .get_multiple_accounts(&pubkeys)
+                    .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for get_multiple_accounts ({} accounts)",
+            timeout_duration,
+            pubkeys.len()
+        ))?
         .context("Failed to spawn blocking task")?
     }
 
@@ -288,10 +394,19 @@ impl RpcClient {
         let client = Arc::clone(&self.client);
         let tx = tx.clone();
         let rpc_url = self.rpc_url.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            client.simulate_transaction(&tx)
-        })
+        let timeout_duration = self.request_timeout;
+        
+        let response = timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                client.simulate_transaction(&tx)
+            })
+        )
         .await
+        .map_err(|_| anyhow::anyhow!(
+            "RPC request timeout after {:?} for simulate_transaction",
+            timeout_duration
+        ))?
         .context("Failed to spawn blocking task")?
         .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))?;
         Ok(response.value)

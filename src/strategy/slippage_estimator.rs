@@ -10,9 +10,35 @@ pub struct SlippageEstimator {
 }
 
 #[derive(Debug, Deserialize)]
+struct SwapInfo {
+    #[serde(rename = "ammKey")]
+    amm_key: Option<String>,
+    label: Option<String>,
+    #[serde(rename = "inputMint")]
+    input_mint: Option<String>,
+    #[serde(rename = "outputMint")]
+    output_mint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutePlan {
+    #[serde(rename = "swapInfo")]
+    swap_info: Option<SwapInfo>,
+    percent: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
 struct JupiterQuoteResponse {
+    /// Jupiter API v6 returns priceImpactPct as a STRING in percentage format (0-100)
+    /// Examples: "0" = 0%, "0.5" = 0.5%, "1.25" = 1.25%
+    /// This must be parsed to f64 and converted to basis points (multiply by 100)
     #[serde(rename = "priceImpactPct")]
-    price_impact_pct: Option<f64>,
+    price_impact_pct: Option<String>,
+    /// Route plan contains the swap path information
+    /// Each element in routePlan represents one hop in the swap
+    /// Example: USDC -> SOL -> ETH would have 2 hops (routePlan.length = 2)
+    #[serde(rename = "routePlan")]
+    route_plan: Option<Vec<RoutePlan>>,
 }
 
 impl SlippageEstimator {
@@ -23,6 +49,24 @@ impl SlippageEstimator {
         }
     }
 
+    /// Estimate DEX slippage and return both slippage (in bps) and hop count
+    /// Hop count is important for multi-hop swaps (e.g., USDC -> SOL -> ETH = 2 hops)
+    /// Each hop incurs a DEX fee, so total fee = base_fee * hop_count
+    pub async fn estimate_dex_slippage_with_route(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+    ) -> Result<(u16, u8)> {
+        if self.config.use_jupiter_api {
+            self.estimate_with_jupiter_route(input_mint, output_mint, amount).await
+        } else {
+            // Fallback: assume 1 hop (direct swap)
+            let slippage = self.estimate_with_multipliers(amount)?;
+            Ok((slippage, 1))
+        }
+    }
+
     pub async fn estimate_dex_slippage(
         &self,
         input_mint: Pubkey,
@@ -30,18 +74,20 @@ impl SlippageEstimator {
         amount: u64,
     ) -> Result<u16> {
         if self.config.use_jupiter_api {
-            self.estimate_with_jupiter(input_mint, output_mint, amount).await
+            let (slippage, _) = self.estimate_with_jupiter_route(input_mint, output_mint, amount).await?;
+            Ok(slippage)
         } else {
             self.estimate_with_multipliers(amount)
         }
     }
 
-    async fn estimate_with_jupiter(
+    /// Estimate slippage with Jupiter API and return both slippage and hop count
+    async fn estimate_with_jupiter_route(
         &self,
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
-    ) -> Result<u16> {
+    ) -> Result<(u16, u8)> {
         const MAX_RETRIES: u32 = 3;
         let url = format!(
             "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
@@ -86,26 +132,91 @@ impl SlippageEstimator {
                                         "Jupiter API failed after {} attempts, using fallback",
                                         MAX_RETRIES
                                     );
-                                    return self.estimate_with_multipliers(amount);
+                                    let slippage = self.estimate_with_multipliers(amount)?;
+                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
                                 }
                             }
                         };
 
                         match serde_json::from_str::<JupiterQuoteResponse>(&response_text) {
                             Ok(quote) => {
-                                if let Some(price_impact_pct) = quote.price_impact_pct {
-                                    // Önce Jupiter API'nin döndürdüğü değeri logla
-                                    log::info!("Jupiter raw price_impact_pct: {}", price_impact_pct);
-
-                                    // Ardından doğru çarpanı belirle
-                                    let slippage_bps = if price_impact_pct < 1.0 {
-                                        // 0.005 formatı (0-1 arası)
-                                        (price_impact_pct * 10_000.0) as u16
-                                    } else {
-                                        // 0.5 formatı (0-100 arası)
-                                        (price_impact_pct * 100.0) as u16
+                                if let Some(price_impact_str) = quote.price_impact_pct {
+                                    // ✅ CRITICAL: Jupiter API v6 returns priceImpactPct as STRING in percentage format
+                                    // Official docs: https://docs.jup.ag/apis/quote-api
+                                    // Format: String representing percentage (0-100)
+                                    // Examples: "0" = 0%, "0.5" = 0.5% = 50 bps, "1.25" = 1.25% = 125 bps
+                                    // Note: "0" is normal for very liquid pairs (SOL/USDC)
+                                    
+                                    // Parse string to f64
+                                    let price_impact_pct = match price_impact_str.parse::<f64>() {
+                                        Ok(val) => {
+                                            if val < 0.0 {
+                                                log::warn!(
+                                                    "⚠️  Jupiter API returned negative price impact: '{}' - using fallback",
+                                                    price_impact_str
+                                                );
+                                                if attempt < MAX_RETRIES {
+                                                    let backoff = get_backoff(attempt);
+                                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                                                    tokio::time::sleep(backoff).await;
+                                                    continue;
+                                                } else {
+                                                    let slippage = self.estimate_with_multipliers(amount)?;
+                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
+                                                }
+                                            }
+                                            val
+                                        },
+                                        Err(e) => {
+                                            log::warn!(
+                                                "⚠️  Jupiter API: failed to parse priceImpactPct '{}': {} - using fallback",
+                                                price_impact_str,
+                                                e
+                                            );
+                                            if attempt < MAX_RETRIES {
+                                                let backoff = get_backoff(attempt);
+                                                log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                                                tokio::time::sleep(backoff).await;
+                                                continue;
+                                            } else {
+                                                let slippage = self.estimate_with_multipliers(amount)?;
+                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
+                                            }
+                                        }
                                     };
-                                    return Ok(slippage_bps.min(self.config.max_slippage_bps));
+                                    
+                                    // ✅ Convert percentage to basis points
+                                    // "0.5" (0.5%) → 50 bps
+                                    // "1.25" (1.25%) → 125 bps
+                                    let slippage_bps = (price_impact_pct * 100.0) as u16;
+                                    
+                                    // ✅ Calculate hop count from route plan
+                                    // Each element in routePlan represents one hop
+                                    // Example: USDC -> SOL -> ETH has 2 hops (routePlan.length = 2)
+                                    let hop_count = quote.route_plan.as_ref()
+                                        .map(|route| route.len() as u8)
+                                        .unwrap_or(1); // Default to 1 hop if route plan is missing
+                                    
+                                    // Validate result is reasonable (should be < 10,000 bps = < 100%)
+                                    if slippage_bps > 10_000 {
+                                        log::warn!(
+                                            "⚠️  Jupiter API returned suspiciously high price impact: '{}' ({}% = {} bps > 100%) - capping at max_slippage_bps",
+                                            price_impact_str,
+                                            price_impact_pct,
+                                            slippage_bps
+                                        );
+                                        return Ok((self.config.max_slippage_bps, hop_count));
+                                    }
+                                    
+                                    log::info!(
+                                        "✅ Jupiter API: priceImpactPct='{}' ({}%) → {} bps, hop_count={}",
+                                        price_impact_str,
+                                        price_impact_pct,
+                                        slippage_bps,
+                                        hop_count
+                                    );
+                                    
+                                    return Ok((slippage_bps.min(self.config.max_slippage_bps), hop_count));
                                 } else {
                                     log::warn!(
                                         "Jupiter API did not return price impact (attempt {}), will retry",
@@ -121,7 +232,8 @@ impl SlippageEstimator {
                                             "Jupiter API failed after {} attempts, using fallback",
                                             MAX_RETRIES
                                         );
-                                        return self.estimate_with_multipliers(amount);
+                                        let slippage = self.estimate_with_multipliers(amount)?;
+                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
                                     }
                                 }
                             }
@@ -141,7 +253,8 @@ impl SlippageEstimator {
                                         "Jupiter API failed after {} attempts, using fallback",
                                         MAX_RETRIES
                                     );
-                                    return self.estimate_with_multipliers(amount);
+                                    let slippage = self.estimate_with_multipliers(amount)?;
+                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
                                 }
                             }
                         }

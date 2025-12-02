@@ -41,7 +41,43 @@ impl TransactionBuilder {
     }
 }
 
+/// Sign a transaction with the given keypair.
+/// 
+/// CRITICAL: This function should only be called on UNSIGNED transactions.
+/// The TransactionBuilder::build() method creates unsigned transactions, so this is safe to call
+/// immediately after build(). However, if a transaction is already signed, calling this again
+/// can cause double-signing errors in Solana.
+/// 
+/// To prevent double-signing:
+/// 1. Always build a fresh transaction using TransactionBuilder::build()
+/// 2. Sign it once using this function
+/// 3. Never re-sign an already-signed transaction
 pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) {
+    // CRITICAL: Ensure transaction is unsigned before signing
+    // Transaction::new_with_payer() creates transactions with empty signatures,
+    // but we check here to be safe and prevent accidental double-signing
+    let signer_pubkey = keypair.pubkey();
+    let signer_index = tx.message.account_keys.iter()
+        .position(|&pk| pk == signer_pubkey);
+    
+    if let Some(index) = signer_index {
+        // Check if this signer already has a non-zero signature
+        if index < tx.signatures.len() {
+            let existing_sig = &tx.signatures[index];
+            // A default (all zeros) signature means not signed yet
+            let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
+            
+            if is_signed {
+                log::warn!(
+                    "⚠️  Transaction already signed by keypair {} at index {} - skipping duplicate sign to prevent double-signing error",
+                    signer_pubkey, index
+                );
+                return; // Skip signing to prevent double-signing error
+            }
+        }
+    }
+    
+    // Transaction is unsigned or signer not found in account_keys - safe to sign
     tx.sign(&[keypair], tx.message.recent_blockhash);
 }
 

@@ -175,7 +175,36 @@ impl Analyzer {
             collateral_mint,
         };
         
-        let net_profit = profit_calc.calculate_net_profit(&temp_opp);
+        // ✅ Get hop count from Jupiter API if swap is needed
+        // This ensures accurate multi-hop fee calculation
+        let hop_count = if debt_mint != collateral_mint && config.use_jupiter_api {
+            use crate::strategy::slippage_estimator::SlippageEstimator;
+            let estimator = SlippageEstimator::new(config.clone());
+            // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
+            let amount = 1_000_000u64;
+            match estimator.estimate_dex_slippage_with_route(debt_mint, collateral_mint, amount).await {
+                Ok((_slippage, hop_count)) => {
+                    log::debug!(
+                        "Analyzer: Got hop_count={} from Jupiter API for swap {} -> {}",
+                        hop_count,
+                        debt_mint,
+                        collateral_mint
+                    );
+                    Some(hop_count)
+                },
+                Err(e) => {
+                    log::warn!(
+                        "Analyzer: Failed to get hop count from Jupiter API: {} - using default (1 hop)",
+                        e
+                    );
+                    None // Fallback to 1 hop
+                }
+            }
+        } else {
+            None // No swap needed or Jupiter API disabled - will default to 1 hop
+        };
+        
+        let net_profit = profit_calc.calculate_net_profit(&temp_opp, hop_count);
 
         if net_profit < config.min_profit_usd {
             return None;
@@ -231,7 +260,10 @@ impl Analyzer {
                     collateral_mint: collateral_asset.mint,
                 };
 
-                let net_profit = profit_calc.calculate_net_profit(&temp_opp);
+                // ✅ Get hop count for accurate fee calculation
+                // For pair selection, we can use a quick estimate (default to 1 hop)
+                // Full hop count will be calculated in calculate_opportunity_static
+                let net_profit = profit_calc.calculate_net_profit(&temp_opp, None);
 
                 if net_profit > best_profit {
                     best_profit = net_profit;

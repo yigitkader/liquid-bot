@@ -63,6 +63,7 @@ cp .env.example .env
 4. `.env` dosyasını düzenleyin ve gerekli değerleri ayarlayın:
    - `RPC_HTTP_URL`: Solana RPC HTTP endpoint (Helius, Triton, QuickNode vb.)
    - `RPC_WS_URL`: Solana RPC WebSocket endpoint (opsiyonel)
+   - `RPC_TIMEOUT_SECONDS`: RPC request timeout (saniye, **default: 10**, validation için 5, ağır işlemler için 30)
    - `WALLET_PATH`: Wallet dosyası yolu (örn: `./wallet.json`)
    - `HF_LIQUIDATION_THRESHOLD`: Health Factor eşiği (varsayılan: 1.0)
    - `MIN_PROFIT_USD`: Minimum kâr eşiği (USD, **production için önerilen: 5.0-10.0**, test için: 1.0)
@@ -113,6 +114,11 @@ Bot çalıştığında otomatik olarak obligation hesaplarını bulur. Log'larda
 
 ### Önemli Parametreler
 
+- **RPC_TIMEOUT_SECONDS**: RPC request timeout (saniye)
+  - **Default: 10 saniye** (çoğu RPC çağrısı için yeterli)
+  - **Validation için: 5 saniye** (daha hızlı timeout)
+  - **Ağır işlemler için: 30 saniye** (get_program_accounts gibi)
+  - Bu timeout tüm RPC çağrılarını etkiler ve validation'ın bloklanmasını önler
 - **HF_LIQUIDATION_THRESHOLD**: Health Factor bu değerin altındaysa pozisyon riskli kabul edilir
 - **MIN_PROFIT_USD**: Bu değerin altındaki fırsatlar işleme alınmaz
   - **Production için önerilen: $5-10** (transaction fee + gas maliyetleri için yeterli margin)

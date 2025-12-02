@@ -52,13 +52,16 @@ impl ReserveCache {
     ///
     /// On first miss (or when cache is empty), this performs a single
     /// `get_program_accounts` call to build a complete mint → reserve index.
+    ///
+    /// ✅ IMPROVED: Uses clean double-check locking pattern without nested lock risk.
+    /// RPC call is made outside the lock, then lock is acquired once to update cache.
     async fn get_reserve_for_mint(
         &self,
         mint: &Pubkey,
         rpc: &Arc<RpcClient>,
         config: &Config,
     ) -> Result<Pubkey> {
-        // Önce read lock
+        // Fast path: Try read lock first (most common case)
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -66,29 +69,29 @@ impl ReserveCache {
             }
         }
 
-        // Write lock ile double-check
+        // Slow path: Cache miss - need to refresh
+        // ✅ CRITICAL: RPC call is made OUTSIDE the lock to prevent blocking
+        // This is safe because we'll double-check after acquiring write lock
+        let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
+
+        // ✅ CRITICAL: Acquire write lock ONCE to update cache
+        // No nested lock risk - we only acquire lock here, not inside fetch function
         {
             let mut inner = self.inner.write().await;
             
-            // Double-check (başka thread refresh yapmış olabilir)
+            // Double-check: Another thread might have refreshed while we were fetching
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
                 return Ok(*reserve);
             }
             
-            // Lock'u drop et - refresh_from_rpc içinde tekrar write lock alınacak
-            // Nested lock riskini önlemek için lock'u burada bırakıyoruz
-            drop(inner);
+            // Update cache with fresh data
+            inner.mint_to_reserve = mint_to_reserve;
+            inner.initialized = true;
+            
+            // Now get the reserve we just cached
+            inner.mint_to_reserve.get(mint).copied()
+                .ok_or_else(|| anyhow::anyhow!("Reserve not found for mint: {}", mint))
         }
-
-        // CRITICAL FIX: Lock dışında refresh yap
-        // refresh_from_rpc içinde kendi write lock'unu alacak
-        // Bu nested lock riskini önler
-        self.refresh_from_rpc(rpc, config).await?;
-
-        // Final check
-        let inner = self.inner.read().await;
-        inner.mint_to_reserve.get(mint).copied()
-            .ok_or_else(|| anyhow::anyhow!("Reserve not found for mint: {}", mint))
     }
 
     /// Get cached reserve data (collateral mint, liquidity supply, etc).
@@ -146,7 +149,16 @@ impl ReserveCache {
         Ok(data)
     }
 
-    async fn refresh_from_rpc(&self, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+    /// Fetch reserve mapping from RPC without acquiring any locks.
+    /// This is safe to call from anywhere because it doesn't touch shared state.
+    /// Returns the mint_to_reserve mapping that can be used to update the cache.
+    ///
+    /// ✅ IMPROVED: Separated RPC fetch from lock acquisition to prevent nested lock risk.
+    async fn fetch_reserve_mapping_from_rpc(
+        &self,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+    ) -> Result<HashMap<Pubkey, Pubkey>> {
         let program_id = Pubkey::from_str(&config.solend_program_id)
             .context("Invalid Solend program ID")?;
 
@@ -188,6 +200,18 @@ impl ReserveCache {
             mint_to_reserve.insert(liquidity_mint, pubkey);
         }
 
+        Ok(mint_to_reserve)
+    }
+
+    /// Refresh the cache from RPC.
+    /// 
+    /// ✅ IMPROVED: This method acquires its own write lock, so it's safe to call
+    /// from anywhere (including background tasks). No nested lock risk.
+    async fn refresh_from_rpc(&self, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+        // Fetch data outside lock (no nested lock risk)
+        let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
+
+        // Acquire lock ONCE to update cache
         let mut inner = self.inner.write().await;
         inner.mint_to_reserve = mint_to_reserve;
         inner.initialized = true;
