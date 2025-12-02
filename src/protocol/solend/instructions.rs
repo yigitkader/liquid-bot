@@ -77,7 +77,7 @@ impl ReserveCache {
             
             // Refresh yap (write lock içinde)
             drop(inner); // Lock'u drop et
-            self.refresh_from_rpc(rpc, config).await?;
+        self.refresh_from_rpc(rpc, config).await?;
         }
 
         // Final check

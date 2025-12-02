@@ -149,11 +149,14 @@ impl WsClient {
     }
 
     pub async fn subscribe_account(&self, pubkey: &Pubkey) -> Result<u64> {
-        let params = json!({
-            "account": pubkey.to_string(),
+        // Solana WebSocket API requires params as an array, not an object
+        let params = json!([
+            pubkey.to_string(),
+            {
             "encoding": "base64",
             "commitment": "confirmed"
-        });
+            }
+        ]);
 
         let request_id = self.send_request("accountSubscribe", params).await?;
         let result = self.wait_for_response(request_id).await?;

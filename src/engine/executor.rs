@@ -48,32 +48,32 @@ impl TxLock {
             loop {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(10)) => {
-                        // Run cleanup every 10 seconds
-                        let mut locked_guard = locked.write().unwrap();
-                        let mut lock_times_guard = lock_times.write().unwrap();
-                        
-                        // Remove expired locks
-                        let expired_addresses: Vec<Pubkey> = lock_times_guard
-                            .iter()
-                            .filter_map(|(address, time)| {
-                                if time.elapsed().as_secs() >= timeout_seconds {
-                                    Some(*address)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        
-                        for address in &expired_addresses {
-                            locked_guard.remove(address);
-                            lock_times_guard.remove(address);
+                // Run cleanup every 10 seconds
+                let mut locked_guard = locked.write().unwrap();
+                let mut lock_times_guard = lock_times.write().unwrap();
+                
+                // Remove expired locks
+                let expired_addresses: Vec<Pubkey> = lock_times_guard
+                    .iter()
+                    .filter_map(|(address, time)| {
+                        if time.elapsed().as_secs() >= timeout_seconds {
+                            Some(*address)
+                        } else {
+                            None
                         }
-                        
-                        if !expired_addresses.is_empty() {
-                            log::debug!(
-                                "TxLock: cleaned up {} expired lock(s)",
-                                expired_addresses.len()
-                            );
+                    })
+                    .collect();
+                
+                for address in &expired_addresses {
+                    locked_guard.remove(address);
+                    lock_times_guard.remove(address);
+                }
+                
+                if !expired_addresses.is_empty() {
+                    log::debug!(
+                        "TxLock: cleaned up {} expired lock(s)",
+                        expired_addresses.len()
+                    );
                         }
                     }
                     _ = cancel.cancelled() => {
@@ -522,7 +522,7 @@ impl Executor {
             return Err(anyhow::anyhow!("Main transaction not signed"));
         }
 
-        Ok(main_tx.signatures[0])
+            Ok(main_tx.signatures[0])
     }
 
     /// Send transaction via standard RPC with retry logic
@@ -557,7 +557,7 @@ impl Executor {
                         );
                         // Exponential backoff: 500ms, 1000ms, 2000ms
                         sleep(Duration::from_millis(500 * attempt as u64)).await;
-                    } else {
+        } else {
                         if attempt >= MAX_TX_RETRIES {
                             log::error!(
                                 "RPC TX failed after {} attempts: {}",

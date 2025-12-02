@@ -63,13 +63,13 @@ impl BalanceManager {
             if let Some(cached) = balances.get(&ata) {
                 // Check cache freshness
                 if cached.timestamp.elapsed() < CACHE_TTL {
-                    let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
+                let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
                     let available = cached.amount.saturating_sub(reserved);
-                    log::debug!(
+                log::debug!(
                         "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}, age={:.2}s",
                         mint, ata, cached.amount, reserved, available, cached.timestamp.elapsed().as_secs_f64()
-                    );
-                    return Ok(available);
+                );
+                return Ok(available);
                 } else {
                     // Stale cache, fall through to RPC
                     log::debug!(
@@ -154,7 +154,7 @@ impl BalanceManager {
             if let Some(cached) = balances.get(&ata) {
                 // Check cache freshness
                 if cached.timestamp.elapsed() < CACHE_TTL {
-                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+                let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
                     return Ok(cached.amount.saturating_sub(reserved_amount));
                 }
                 // Stale cache, fall through to RPC
