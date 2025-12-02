@@ -55,12 +55,7 @@ mkdir -p solanakey
 solana-keygen new -o ./solanakey/bot-wallet.json
 ```
 
-4. `.env` dosyası oluşturun:
-```bash
-cp .env.example .env
-```
-
-4. `.env` dosyasını düzenleyin ve gerekli değerleri ayarlayın:
+4. `.env` dosyası oluşturun ve gerekli değerleri ayarlayın:
    - `RPC_HTTP_URL`: Solana RPC HTTP endpoint (Helius, Triton, QuickNode vb.)
    - `RPC_WS_URL`: Solana RPC WebSocket endpoint (opsiyonel)
    - `RPC_TIMEOUT_SECONDS`: RPC request timeout (saniye, **default: 10**, validation için 5, ağır işlemler için 30)
