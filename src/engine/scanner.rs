@@ -144,55 +144,178 @@ impl Scanner {
 
     pub async fn start_monitoring(&self) -> Result<()> {
         use anyhow::Context;
+        use tokio::time::sleep;
+        use solana_client::rpc_filter::RpcFilterType;
+        
         let program_id = self.protocol.program_id();
-        log::info!("Starting WebSocket monitoring for program: {}", program_id);
+        let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
+        let mut use_websocket = true;
         
-        let subscription_id = self
-            .ws
-            .subscribe_program(&program_id)
-            .await
-            .context("Failed to subscribe to program")?;
-        log::info!("Subscribed to program {} with subscription ID: {}", program_id, subscription_id);
+        log::info!("Starting monitoring for program: {} (WebSocket mode)", program_id);
         
-        // Reset errors on successful subscription
-        self.reset_errors();
+        // Try to start with WebSocket first
+        let mut subscription_id = match self.ws.subscribe_program(&program_id).await {
+            Ok(id) => {
+                log::info!("✅ WebSocket subscribed to program {} with subscription ID: {}", program_id, id);
+                self.reset_errors();
+                Some(id)
+            }
+            Err(e) => {
+                log::warn!("⚠️  WebSocket subscription failed: {}. Falling back to RPC polling mode.", e);
+                use_websocket = false;
+                None
+            }
+        };
         
         loop {
-            if let Some(update) = self.ws.listen().await {
-                log::debug!(
-                    "Scanner: WS update received for pubkey={} slot={}",
-                    update.pubkey,
-                    update.slot
-                );
+            if use_websocket {
+                // WebSocket mode: Real-time updates
+                if let Some(update) = self.ws.listen().await {
+                    log::debug!(
+                        "Scanner: WS update received for pubkey={} slot={}",
+                        update.pubkey,
+                        update.slot
+                    );
 
-                match self.protocol.parse_position(&update.account).await {
-                    Some(position) => {
-                        self.cache
-                            .update(update.pubkey, position.clone())
-                            .await;
-                        if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
-                            pubkey: update.pubkey,
-                            position,
-                        }) {
-                            log::error!("Scanner: Failed to publish AccountUpdated: {}", e);
-                            self.record_error()?;
-                            continue;
+                    match self.protocol.parse_position(&update.account).await {
+                        Some(position) => {
+                            self.cache
+                                .update(update.pubkey, position.clone())
+                                .await;
+                            if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
+                                pubkey: update.pubkey,
+                                position,
+                            }) {
+                                log::error!("Scanner: Failed to publish AccountUpdated: {}", e);
+                                self.record_error()?;
+                                continue;
+                            }
+                            // Reset errors on successful processing
+                            self.reset_errors();
                         }
-                        // Reset errors on successful processing
-                        self.reset_errors();
+                        None => {
+                            log::debug!(
+                                "Scanner: WS account {} could not be parsed into a Position",
+                                update.pubkey
+                            );
+                            // Parse failure is not a critical error, don't count it
+                        }
                     }
-                    None => {
-                        log::debug!(
-                            "Scanner: WS account {} could not be parsed into a Position",
-                            update.pubkey
-                        );
-                        // Parse failure is not a critical error, don't count it
+                } else {
+                    // WebSocket connection lost
+                    log::warn!("WebSocket connection lost, attempting reconnect...");
+                    self.record_error()?; // Critical error - connection lost
+                    
+                    // Try to reconnect
+                    match self.ws.reconnect_with_backoff().await {
+                        Ok(()) => {
+                            log::info!("✅ WebSocket reconnected, resubscribing...");
+                            // Resubscribe
+                            match self.ws.subscribe_program(&program_id).await {
+                                Ok(id) => {
+                                    subscription_id = Some(id);
+                                    log::info!("✅ WebSocket resubscribed successfully");
+                                    self.reset_errors();
+                                    // Continue with WebSocket mode
+                                }
+                                Err(e) => {
+                                    log::warn!("⚠️  WebSocket resubscription failed: {}. Falling back to RPC polling.", e);
+                                    use_websocket = false;
+                                    subscription_id = None;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("❌ WebSocket reconnection failed: {}", e);
+                            log::warn!("⚠️  Falling back to RPC polling mode to continue operation...");
+                            use_websocket = false;
+                            subscription_id = None;
+                            // Continue to RPC polling mode below
+                        }
                     }
                 }
-            } else {
-                log::warn!("WebSocket connection lost, attempting reconnect...");
-                self.record_error()?; // Critical error - connection lost
-                self.ws.reconnect_with_backoff().await;
+            }
+            
+            if !use_websocket {
+                // RPC Polling mode: Fallback when WebSocket fails
+                // This ensures bot continues operating even if WebSocket is unavailable
+                log::debug!("Scanner: RPC polling mode - fetching program accounts...");
+                
+                match self.rpc
+                    .get_program_accounts_with_filters(
+                        &program_id,
+                        vec![RpcFilterType::DataSize(1300)], // Obligation accounts
+                    )
+                    .await
+                {
+                    Ok(accounts) => {
+                        log::debug!("Scanner: RPC polling fetched {} accounts", accounts.len());
+                        
+                        for (pubkey, account) in accounts {
+                            match self.protocol.parse_position(&account).await {
+                                Some(position) => {
+                                    // Check if position changed (avoid duplicate events)
+                                    let cached = self.cache.get(&pubkey).await;
+                                    let should_publish = if let Some(cached_pos) = cached {
+                                        // Only publish if position changed significantly
+                                        cached_pos.health_factor != position.health_factor
+                                    } else {
+                                        // New position
+                                        true
+                                    };
+                                    
+                                    if should_publish {
+                                        self.cache.update(pubkey, position.clone()).await;
+                                        if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
+                                            pubkey,
+                                            position,
+                                        }) {
+                                            log::error!("Scanner: Failed to publish AccountUpdated: {}", e);
+                                            self.record_error()?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Parse failure is not a critical error
+                                }
+                            }
+                        }
+                        
+                        // Reset errors on successful RPC polling
+                        self.reset_errors();
+                        
+                        // Try to reconnect WebSocket in background
+                        if subscription_id.is_none() {
+                            match self.ws.reconnect_with_backoff().await {
+                                Ok(()) => {
+                                    match self.ws.subscribe_program(&program_id).await {
+                                        Ok(id) => {
+                                            log::info!("✅ WebSocket reconnected! Switching back to WebSocket mode.");
+                                            subscription_id = Some(id);
+                                            use_websocket = true;
+                                            self.reset_errors();
+                                        }
+                                        Err(e) => {
+                                            log::debug!("WebSocket resubscription failed, continuing RPC polling: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // WebSocket still unavailable, continue RPC polling
+                                    log::debug!("WebSocket still unavailable, continuing RPC polling mode");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Scanner: RPC polling failed: {}", e);
+                        self.record_error()?;
+                    }
+                }
+                
+                // Wait before next RPC poll
+                sleep(poll_interval).await;
             }
         }
     }

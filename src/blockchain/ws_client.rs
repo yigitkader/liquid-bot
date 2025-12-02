@@ -316,7 +316,15 @@ impl WsClient {
         None
     }
 
-    pub async fn reconnect_with_backoff(&self) {
+    /// Attempt to reconnect WebSocket with exponential backoff.
+    /// 
+    /// ✅ CRITICAL FIX: Returns Result instead of panicking to allow graceful degradation.
+    /// If WebSocket cannot be reconnected, caller can fall back to RPC polling mode.
+    /// This prevents bot from crashing and losing all profit opportunities.
+    /// 
+    /// Returns Ok(()) if reconnected successfully, Err if all attempts failed.
+    pub async fn reconnect_with_backoff(&self) -> Result<()> {
+        use anyhow::Context;
         const MAX_RECONNECT_ATTEMPTS: usize = 10;
         let mut backoff = Duration::from_secs(1);
         
@@ -349,7 +357,7 @@ impl WsClient {
                         }
                     }
                 }
-                return; // Successfully reconnected
+                return Ok(()); // Successfully reconnected
             }
             
             // Exponential backoff with max cap
@@ -366,12 +374,16 @@ impl WsClient {
             );
         }
         
-        // Max reconnect attempts reached - this is a critical failure
+        // Max reconnect attempts reached - return error instead of panicking
+        // This allows caller to fall back to RPC polling mode
         log::error!(
             "❌ WebSocket connection permanently lost after {} attempts. Network may be down or RPC endpoint unreachable.",
             MAX_RECONNECT_ATTEMPTS
         );
-        log::error!("Bot cannot continue without WebSocket connection. Shutting down...");
-        panic!("WebSocket connection permanently lost after {} reconnect attempts", MAX_RECONNECT_ATTEMPTS);
+        log::warn!("⚠️  Falling back to RPC polling mode to continue operation...");
+        Err(anyhow::anyhow!(
+            "WebSocket connection permanently lost after {} reconnect attempts",
+            MAX_RECONNECT_ATTEMPTS
+        ))
     }
 }
