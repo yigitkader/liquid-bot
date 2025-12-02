@@ -1,5 +1,7 @@
 use crate::core::types::Opportunity;
 use crate::core::config::Config;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 
 pub struct ProfitCalculator {
     config: Config,
@@ -74,14 +76,51 @@ impl ProfitCalculator {
         }
 
         let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
-        let dex_fee_bps = self.config.dex_fee_bps as f64;
+        
+        // CRITICAL FIX: Detect stablecoin pairs and apply lower fee
+        // Stablecoin pairs (USDC/USDT) typically have much lower DEX fees (~0.01% vs 0.2%)
+        let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
+        
+        let dex_fee_bps = if is_stablecoin_pair {
+            // Stablecoin pairs: Use much lower fee (0.01% = 1 bps)
+            // This is typical for stablecoin swaps on most DEXes
+            const STABLECOIN_DEX_FEE_BPS: u16 = 1; // 0.01%
+            log::debug!(
+                "ProfitCalculator: dex_fee -> stablecoin pair detected, using lower fee ({} bps)",
+                STABLECOIN_DEX_FEE_BPS
+            );
+            STABLECOIN_DEX_FEE_BPS as f64
+        } else {
+            // Regular pairs: Use configured fee
+            self.config.dex_fee_bps as f64
+        };
+        
         let fee = size_usd * (dex_fee_bps / 10_000.0);
         log::debug!(
-            "ProfitCalculator: dex_fee -> size_usd={:.6}, dex_fee_bps={}, fee={:.6}",
+            "ProfitCalculator: dex_fee -> size_usd={:.6}, dex_fee_bps={}, fee={:.6}, stablecoin_pair={}",
             size_usd,
             dex_fee_bps,
-            fee
+            fee,
+            is_stablecoin_pair
         );
         fee
+    }
+    
+    /// Check if two mints form a stablecoin pair (e.g., USDC/USDT)
+    /// Stablecoin pairs typically have much lower DEX fees (~0.01% vs 0.2%)
+    fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
+        // Get stablecoin mint addresses from config
+        let usdc_mint = Pubkey::from_str(&self.config.usdc_mint).ok();
+        let usdt_mint = self.config.usdt_mint.as_ref()
+            .and_then(|s| Pubkey::from_str(s).ok());
+        
+        // Check if both mints are stablecoins
+        let mint1_is_stablecoin = usdc_mint.map(|m| m == *mint1).unwrap_or(false)
+            || usdt_mint.map(|m| m == *mint1).unwrap_or(false);
+        
+        let mint2_is_stablecoin = usdc_mint.map(|m| m == *mint2).unwrap_or(false)
+            || usdt_mint.map(|m| m == *mint2).unwrap_or(false);
+        
+        mint1_is_stablecoin && mint2_is_stablecoin
     }
 }

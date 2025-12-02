@@ -59,6 +59,18 @@ impl Protocol for SolendProtocol {
             return None; // Wrong account type, skip immediately
         }
         
+        // FAST PATH 2: Discriminator check (before expensive parse)
+        // This filters out wrong account types by checking the account discriminator
+        // Solend uses Anchor framework which prefixes accounts with discriminator
+        if data_len >= 8 {
+            let account_discriminator = &account.data[0..8];
+            let expected_discriminator = get_obligation_discriminator();
+            
+            if account_discriminator != expected_discriminator {
+                return None; // Wrong account type, skip immediately
+            }
+        }
+        
         // Obligation parse et
         let obligation = match SolendObligation::from_account_data(&account.data) {
             Ok(obl) => obl,
@@ -87,11 +99,14 @@ impl Protocol for SolendProtocol {
         
         // FAST PATH 4: Quick health factor check BEFORE expensive USD calculations
         // This filters out healthy positions early, avoiding unnecessary work
-        // Uses config threshold with 50% safety margin (e.g., 1.0 * 1.5 = 1.5)
+        // CRITICAL FIX: Use unified liquidation_safety_margin from config
+        // Skip healthy positions (not liquidatable) - use config threshold with safety margin
         let health_factor = obligation.calculate_health_factor();
         
-        // Skip healthy positions (not liquidatable) - use config threshold with safety margin
-        let skip_threshold = self.config.hf_liquidation_threshold * 1.5;
+        // Use the same safety margin as analyzer for consistency
+        // If HF > threshold * (1 / safety_margin), it's definitely not liquidatable
+        // For safety_margin = 0.95, this means HF > threshold * 1.05 (5% above threshold)
+        let skip_threshold = self.config.hf_liquidation_threshold / self.config.liquidation_safety_margin;
         if health_factor > skip_threshold {
             return None;
         }
@@ -171,4 +186,17 @@ impl Protocol for SolendProtocol {
             max_slippage: self.config.max_liquidation_slippage,
         }
     }
+}
+
+/// Get the obligation account discriminator
+/// Solend uses Anchor framework which prefixes accounts with discriminator
+/// Discriminator is the first 8 bytes of SHA256("account:Obligation")
+fn get_obligation_discriminator() -> [u8; 8] {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(b"account:Obligation");
+    let hash = hasher.finalize();
+    let mut discriminator = [0u8; 8];
+    discriminator.copy_from_slice(&hash[..8]);
+    discriminator
 }

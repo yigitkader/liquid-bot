@@ -317,10 +317,18 @@ impl WsClient {
     }
 
     pub async fn reconnect_with_backoff(&self) {
+        const MAX_RECONNECT_ATTEMPTS: usize = 10;
         let mut backoff = Duration::from_secs(1);
-        loop {
+        
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
             sleep(backoff).await;
+            
+            log::info!("WebSocket reconnect attempt {}/{}", attempt, MAX_RECONNECT_ATTEMPTS);
+            
             if self.connect().await.is_ok() {
+                log::info!("✅ WebSocket reconnected successfully on attempt {}", attempt);
+                
+                // Resubscribe to all previous subscriptions
                 let subscriptions = self.subscriptions.lock().await;
                 for (_, info) in subscriptions.iter() {
                     match &info.subscription_type {
@@ -341,12 +349,29 @@ impl WsClient {
                         }
                     }
                 }
-                break;
+                return; // Successfully reconnected
             }
+            
+            // Exponential backoff with max cap
             backoff = backoff.saturating_mul(2);
             if backoff > Duration::from_secs(60) {
                 backoff = Duration::from_secs(60);
             }
+            
+            log::warn!(
+                "WebSocket reconnect attempt {}/{} failed, retrying in {:.1}s...",
+                attempt,
+                MAX_RECONNECT_ATTEMPTS,
+                backoff.as_secs_f64()
+            );
         }
+        
+        // Max reconnect attempts reached - this is a critical failure
+        log::error!(
+            "❌ WebSocket connection permanently lost after {} attempts. Network may be down or RPC endpoint unreachable.",
+            MAX_RECONNECT_ATTEMPTS
+        );
+        log::error!("Bot cannot continue without WebSocket connection. Shutting down...");
+        panic!("WebSocket connection permanently lost after {} reconnect attempts", MAX_RECONNECT_ATTEMPTS);
     }
 }

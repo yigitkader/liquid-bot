@@ -8,6 +8,7 @@ pub struct Config {
     pub rpc_ws_url: String,
     pub wallet_path: String,
     pub hf_liquidation_threshold: f64,
+    pub liquidation_safety_margin: f64, // Safety margin for liquidation threshold (default: 0.95)
     pub min_profit_usd: f64,
     pub max_slippage_bps: u16,
     pub poll_interval_ms: u64,
@@ -81,6 +82,10 @@ impl Config {
                 .unwrap_or_else(|_| "1.0".to_string())
                 .parse()
                 .context("Invalid HF_LIQUIDATION_THRESHOLD value")?,
+            liquidation_safety_margin: env::var("LIQUIDATION_SAFETY_MARGIN")
+                .unwrap_or_else(|_| "0.95".to_string()) // Default: 0.95 (5% safety margin)
+                .parse()
+                .context("Invalid LIQUIDATION_SAFETY_MARGIN value (must be between 0.0 and 1.0)")?,
             min_profit_usd: env::var("MIN_PROFIT_USD")
                 .unwrap_or_else(|_| "5.0".to_string()) // Default: $5 (production-safe)
                 .parse()
@@ -334,6 +339,13 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "HF_LIQUIDATION_THRESHOLD must be between 0.0 and 10.0, got: {}",
                 self.hf_liquidation_threshold
+            ));
+        }
+        
+        if self.liquidation_safety_margin <= 0.0 || self.liquidation_safety_margin > 1.0 {
+            return Err(anyhow::anyhow!(
+                "LIQUIDATION_SAFETY_MARGIN must be between 0.0 and 1.0, got: {}",
+                self.liquidation_safety_margin
             ));
         }
 

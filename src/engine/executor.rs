@@ -428,11 +428,7 @@ impl Executor {
         const MAX_TX_RETRIES: u32 = 3;
         
         for attempt in 1..=MAX_TX_RETRIES {
-            // Rebuild transaction with fresh blockhash for each retry
-            let blockhash = self.rpc.get_recent_blockhash().await?;
-            let tx = tx_builder.build(blockhash);
-            
-            match self.send_via_jito(tx, jito_client).await {
+            match self.send_via_jito(tx_builder, jito_client).await {
                 Ok(sig) => {
                     if attempt > 1 {
                         log::info!("✅ Transaction sent successfully on attempt {}", attempt);
@@ -470,13 +466,17 @@ impl Executor {
     }
 
     /// Send transaction via Jito bundle for MEV protection
+    /// 
+    /// CRITICAL: This function creates a NEW transaction from the builder with a fresh blockhash.
+    /// DO NOT pass an already-signed transaction, as changing blockhash and re-signing causes double signing.
     async fn send_via_jito(
         &self,
-        tx: Transaction,
+        tx_builder: &TransactionBuilder,
         jito_client: &Arc<JitoClient>,
     ) -> Result<solana_sdk::signature::Signature> {
         use solana_sdk::signature::Signer;
         
+        // Get fresh blockhash for this bundle
         let blockhash = self.rpc.get_recent_blockhash().await?;
         
         // Create bundle
@@ -493,13 +493,14 @@ impl Executor {
         )
         .context("Failed to add Jito tip transaction")?;
         
-        // Re-sign main transaction with new blockhash
-        let mut tx_with_new_blockhash = tx;
-        tx_with_new_blockhash.message.recent_blockhash = blockhash;
-        sign_transaction(&mut tx_with_new_blockhash, &self.wallet);
+        // CRITICAL FIX: Build a NEW transaction from scratch with the fresh blockhash
+        // DO NOT copy and re-sign an existing transaction (causes double signing error)
+        // This ensures the transaction is created fresh and signed only once
+        let mut main_tx = tx_builder.build(blockhash);
+        sign_transaction(&mut main_tx, &self.wallet);
         
         // Add main liquidation transaction
-        bundle.add_transaction(tx_with_new_blockhash);
+        bundle.add_transaction(main_tx);
         
         // Send bundle to Jito
         let bundle_id = jito_client.send_bundle(&bundle).await

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use solana_sdk::pubkey::Pubkey;
 
 pub struct Validator {
@@ -265,16 +266,24 @@ impl Validator {
         
         // Skip account existence check - read_pyth_price will handle it
         let max_age = config.max_oracle_age_seconds;
-        let price_data = match read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config)).await {
-            Ok(Some(data)) => data,
-            Ok(None) => {
+        
+        // CRITICAL FIX: Add timeout to prevent oracle read from blocking validation
+        // RPC timeout yoksa oracle read 30s+ bekleyebilir, bu validation'ı bloklar
+        const ORACLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+        
+        let price_data = match timeout(
+            ORACLE_READ_TIMEOUT,
+            read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config))
+        ).await {
+            Ok(Ok(Some(data))) => data,
+            Ok(Ok(None)) => {
                 return Err(anyhow::anyhow!(
                     "Failed to read oracle price data for mint {} (oracle={}) - price data is None",
                     mint,
                     oracle_account
                 ));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::error!(
                     "Validator: failed to read Pyth price for mint {} (oracle={}): {}",
                     mint,
@@ -286,6 +295,20 @@ impl Validator {
                     mint,
                     oracle_account,
                     e
+                ));
+            }
+            Err(_) => {
+                // Timeout occurred
+                log::error!(
+                    "Validator: oracle read timeout for mint {} (oracle={}) after {:?}",
+                    mint,
+                    oracle_account,
+                    ORACLE_READ_TIMEOUT
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive",
+                    mint,
+                    oracle_account
                 ));
             }
         };

@@ -12,16 +12,70 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Token bucket for rate limiting with burst support
+/// Allows burst requests up to capacity, then refills at refill_rate tokens/second
+struct TokenBucket {
+    tokens: Arc<tokio::sync::Mutex<f64>>,
+    capacity: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: Arc<tokio::sync::Mutex<Instant>>,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_rate: f64) -> Self {
+        TokenBucket {
+            tokens: Arc::new(tokio::sync::Mutex::new(capacity)),
+            capacity,
+            refill_rate,
+            last_refill: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+        }
+    }
+
+    /// Acquire a token, waiting if necessary
+    async fn acquire(&self) {
+        loop {
+            let mut tokens = self.tokens.lock().await;
+            let mut last_refill = self.last_refill.lock().await;
+            
+            // Refill tokens based on elapsed time
+            let elapsed = last_refill.elapsed();
+            let tokens_to_add = elapsed.as_secs_f64() * self.refill_rate;
+            *tokens = (*tokens + tokens_to_add).min(self.capacity);
+            *last_refill = Instant::now();
+            
+            // If we have at least 1 token, consume it and return
+            if *tokens >= 1.0 {
+                *tokens -= 1.0;
+                return;
+            }
+            
+            // Otherwise, calculate how long to wait
+            let tokens_needed = 1.0 - *tokens;
+            let wait_time = Duration::from_secs_f64(tokens_needed / self.refill_rate);
+            
+            // Drop locks before sleeping
+            drop(tokens);
+            drop(last_refill);
+            
+            sleep(wait_time).await;
+        }
+    }
+}
+
 pub struct RpcClient {
     client: Arc<SolanaRpcClient>,
     rpc_url: String,
     rate_limiter: Arc<Semaphore>,
+    token_bucket: Arc<TokenBucket>,
     last_request_time: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 impl RpcClient {
     pub fn new(rpc_url: String) -> Result<Self> {
-        // Rate limiting: Max 10 concurrent requests, min 100ms between requests
+        // Rate limiting configuration:
+        // - Semaphore: Max 10 concurrent requests
+        // - Token bucket: Capacity 10 tokens, refill rate 10 tokens/second (allows 10 req/s sustained, burst up to 10)
+        // - Last request time: Legacy fixed delay (kept for backward compatibility)
         Ok(RpcClient {
             client: Arc::new(SolanaRpcClient::new_with_commitment(
                 rpc_url.clone(),
@@ -29,17 +83,17 @@ impl RpcClient {
             )),
             rpc_url,
             rate_limiter: Arc::new(Semaphore::new(10)), // Max 10 concurrent requests
+            token_bucket: Arc::new(TokenBucket::new(10.0, 10.0)), // 10 tokens capacity, 10 tokens/second refill
             last_request_time: Arc::new(tokio::sync::Mutex::new(Instant::now())),
         })
     }
 
     async fn rate_limit(&self) {
-        // Minimum 100ms between requests to avoid rate limiting
+        // Use token bucket for rate limiting (handles burst requests better)
+        self.token_bucket.acquire().await;
+        
+        // Legacy: Update last request time (kept for compatibility, but token bucket is primary)
         let mut last_time = self.last_request_time.lock().await;
-        let elapsed = last_time.elapsed();
-        if elapsed < Duration::from_millis(100) {
-            sleep(Duration::from_millis(100) - elapsed).await;
-        }
         *last_time = Instant::now();
     }
 

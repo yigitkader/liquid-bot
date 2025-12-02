@@ -50,6 +50,16 @@ impl SlippageEstimator {
             amount
         );
 
+        // Helper function for exponential backoff
+        // Exponential backoff: 1s, 2s, 4s (better for rate limit handling)
+        let get_backoff = |attempt: u32| -> Duration {
+            // attempt 1: 1000 * 2^0 = 1000ms = 1s
+            // attempt 2: 1000 * 2^1 = 2000ms = 2s
+            // attempt 3: 1000 * 2^2 = 4000ms = 4s
+            let backoff_ms = 1000 * 2_u64.pow(attempt.saturating_sub(1));
+            Duration::from_millis(backoff_ms)
+        };
+
         // Retry loop with exponential backoff
         for attempt in 1..=MAX_RETRIES {
             match self.client.get(&url).send().await {
@@ -67,7 +77,9 @@ impl SlippageEstimator {
                                     e
                                 );
                                 if attempt < MAX_RETRIES {
-                                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                    let backoff = get_backoff(attempt);
+                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                                    tokio::time::sleep(backoff).await;
                                     continue;
                                 } else {
                                     log::warn!(
@@ -100,7 +112,9 @@ impl SlippageEstimator {
                                         attempt
                                     );
                                     if attempt < MAX_RETRIES {
-                                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                        let backoff = get_backoff(attempt);
+                                        log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                                        tokio::time::sleep(backoff).await;
                                         continue;
                                     } else {
                                         log::warn!(
@@ -118,7 +132,9 @@ impl SlippageEstimator {
                                     e
                                 );
                                 if attempt < MAX_RETRIES {
-                                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                                    let backoff = get_backoff(attempt);
+                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                                    tokio::time::sleep(backoff).await;
                                     continue;
                                 } else {
                                     log::warn!(
@@ -140,7 +156,9 @@ impl SlippageEstimator {
                         );
                         
                         if attempt < MAX_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            let backoff = get_backoff(attempt);
+                            log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                            tokio::time::sleep(backoff).await;
                             continue;
                         } else {
                             log::warn!(
@@ -160,7 +178,9 @@ impl SlippageEstimator {
                     );
                     
                     if attempt < MAX_RETRIES {
-                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                        let backoff = get_backoff(attempt);
+                        log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
+                        tokio::time::sleep(backoff).await;
                         continue;
                     } else {
                         log::warn!(

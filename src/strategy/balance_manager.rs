@@ -57,19 +57,23 @@ impl BalanceManager {
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
         
+        // CRITICAL FIX: Read reserved FIRST to avoid race condition
+        // Reserved value can change between cache check and reserved read
+        // By reading it first, we ensure we always use the latest reserved value
+        let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
+        
         // Try to read from cache first
         {
             let balances = self.balances.read().await;
             if let Some(cached) = balances.get(&ata) {
                 // Check cache freshness
                 if cached.timestamp.elapsed() < CACHE_TTL {
-                let reserved = self.reserved.read().await.get(mint).copied().unwrap_or(0);
                     let available = cached.amount.saturating_sub(reserved);
-                log::debug!(
+                    log::debug!(
                         "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}, age={:.2}s",
                         mint, ata, cached.amount, reserved, available, cached.timestamp.elapsed().as_secs_f64()
-                );
-                return Ok(available);
+                    );
+                    return Ok(available);
                 } else {
                     // Stale cache, fall through to RPC
                     log::debug!(

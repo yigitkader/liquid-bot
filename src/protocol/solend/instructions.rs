@@ -66,7 +66,7 @@ impl ReserveCache {
             }
         }
 
-        // Write lock ile refresh
+        // Write lock ile double-check
         {
             let mut inner = self.inner.write().await;
             
@@ -75,10 +75,15 @@ impl ReserveCache {
                 return Ok(*reserve);
             }
             
-            // Refresh yap (write lock içinde)
-            drop(inner); // Lock'u drop et
-        self.refresh_from_rpc(rpc, config).await?;
+            // Lock'u drop et - refresh_from_rpc içinde tekrar write lock alınacak
+            // Nested lock riskini önlemek için lock'u burada bırakıyoruz
+            drop(inner);
         }
+
+        // CRITICAL FIX: Lock dışında refresh yap
+        // refresh_from_rpc içinde kendi write lock'unu alacak
+        // Bu nested lock riskini önler
+        self.refresh_from_rpc(rpc, config).await?;
 
         // Final check
         let inner = self.inner.read().await;
