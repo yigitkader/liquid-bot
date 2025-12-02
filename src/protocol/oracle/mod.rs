@@ -296,10 +296,32 @@ pub async fn read_pyth_price(
 }
 
 pub async fn read_switchboard_price(
-    _oracle_account: &Pubkey,
-    _rpc_client: Arc<RpcClient>,
+    oracle_account: &Pubkey,
+    rpc_client: Arc<RpcClient>,
 ) -> Result<Option<OraclePrice>> {
-    Ok(None)
+    use crate::protocol::oracle::switchboard::SwitchboardOracle;
+    
+    log::debug!("Reading Switchboard oracle price from account: {}", oracle_account);
+    
+    match SwitchboardOracle::read_price(oracle_account, rpc_client).await {
+        Ok(price_data) => {
+            log::info!("Switchboard oracle price read successfully: account={}, price=${:.4}, confidence=${:.4}, timestamp={}", 
+                oracle_account, price_data.price, price_data.confidence, price_data.timestamp);
+            
+            // Switchboard prices are typically already in USD, so exponent is 0
+            // Confidence is also typically in USD units
+            Ok(Some(OraclePrice {
+                price: price_data.price,
+                confidence: price_data.confidence,
+                exponent: 0,
+                timestamp: price_data.timestamp,
+            }))
+        }
+        Err(e) => {
+            log::error!("Failed to read Switchboard oracle price from account {}: {}", oracle_account, e);
+            Ok(None)
+        }
+    }
 }
 
 pub async fn read_oracle_price(

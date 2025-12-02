@@ -50,6 +50,7 @@ impl Validator {
                             let event_bus = self.event_bus.clone();
                             let rpc = Arc::clone(&self.rpc);
                             let config = self.config.clone();
+                            let balance_manager = Arc::clone(&self.balance_manager);
                             
                             tasks.spawn(async move {
                                 let _permit = permit;
@@ -60,7 +61,7 @@ impl Validator {
                                     opportunity.estimated_profit
                                 );
 
-                                match Self::validate_static(&opportunity, &rpc, &config).await {
+                                match Self::validate_static(&opportunity, &rpc, &config, &balance_manager).await {
                                     Ok(()) => {
                                         log::info!(
                                             "Validator: opportunity approved for position {}",
@@ -78,6 +79,15 @@ impl Validator {
                                             opportunity.position.address,
                                             e
                                         );
+
+                                        // Release the reserved balance for rejected opportunities,
+                                        // since the executor will never see them.
+                                        balance_manager
+                                            .release(
+                                                &opportunity.debt_mint,
+                                                opportunity.max_liquidatable,
+                                            )
+                                            .await;
                                     }
                                 }
                             });
@@ -112,12 +122,24 @@ impl Validator {
     }
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        Self::validate_static(opp, &self.rpc, &self.config).await
+        Self::validate_static(opp, &self.rpc, &self.config, &self.balance_manager).await
     }
 
     // Static method for parallel processing
-    async fn validate_static(opp: &Opportunity, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+    async fn validate_static(
+        opp: &Opportunity,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+        balance_manager: &Arc<BalanceManager>,
+    ) -> Result<()> {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
+
+        // Step 0: Reserve balance FIRST (atomic check-and-lock)
+        // This prevents race conditions between parallel validations for the same mint
+        balance_manager
+            .reserve(&opp.debt_mint, opp.max_liquidatable)
+            .await
+            .context("Insufficient balance - reservation failed")?;
 
         // Step 1: Oracle freshness - debt (parallel with collateral)
         let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);

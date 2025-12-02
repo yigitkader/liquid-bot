@@ -117,9 +117,14 @@ impl BalanceManager {
     }
 
     /// Atomically reserve balance, preventing race conditions.
+    ///
     /// This method holds a write lock during both balance check and reservation,
     /// ensuring no other thread can reserve the same balance concurrently.
-    pub async fn reserve(&self, mint: &Pubkey, amount: u64) -> Result<ReservationGuard> {
+    ///
+    /// The reservation stays in effect until `release` is called for the same
+    /// `mint`/`amount` pair (typically by the `Executor` after a transaction
+    /// has been sent or definitively failed).
+    pub async fn reserve(&self, mint: &Pubkey, amount: u64) -> Result<()> {
         // Acquire write lock FIRST - this prevents race conditions
         let mut reserved = self.reserved.write().await;
         
@@ -137,15 +142,15 @@ impl BalanceManager {
 
         // Reserve the amount atomically (add to existing reserved amount)
         *reserved.entry(*mint).or_insert(0) += amount;
-        
-        // Lock is released here, but reservation is already committed
-        Ok(ReservationGuard {
-            reserved: Arc::clone(&self.reserved),
-            mint: *mint,
-            amount,
-        })
+
+        // Lock is released here, but reservation is already committed.
+        Ok(())
     }
 
+    /// Release a previously reserved balance.
+    ///
+    /// This should be called exactly once for each successful `reserve` call
+    /// for a given `(mint, amount)` pair.
     pub async fn release(&self, mint: &Pubkey, amount: u64) {
         let mut reserved = self.reserved.write().await;
         if let Some(reserved_amount) = reserved.get_mut(mint) {
@@ -154,28 +159,5 @@ impl BalanceManager {
                 reserved.remove(mint);
             }
         }
-    }
-}
-
-pub struct ReservationGuard {
-    reserved: Arc<RwLock<HashMap<Pubkey, u64>>>,
-    mint: Pubkey,
-    amount: u64,
-}
-
-impl Drop for ReservationGuard {
-    fn drop(&mut self) {
-        let reserved = Arc::clone(&self.reserved);
-        let mint = self.mint;
-        let amount = self.amount;
-        tokio::spawn(async move {
-            let mut reserved = reserved.write().await;
-            if let Some(reserved_amount) = reserved.get_mut(&mint) {
-                *reserved_amount = reserved_amount.saturating_sub(amount);
-                if *reserved_amount == 0 {
-                    reserved.remove(&mint);
-                }
-            }
-        });
     }
 }

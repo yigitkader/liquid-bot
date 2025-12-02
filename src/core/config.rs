@@ -337,6 +337,15 @@ impl Config {
             ));
         }
 
+        // RPC Rate Limit Check: Free RPC endpoints require longer polling intervals
+        if self.is_free_rpc_endpoint() && self.poll_interval_ms < 10000 {
+            return Err(anyhow::anyhow!(
+                "FATAL: Free RPC endpoint requires POLL_INTERVAL_MS >= 10000ms (got: {}). \
+                 Either use premium RPC or increase polling interval.",
+                self.poll_interval_ms
+            ));
+        }
+
         if self.min_profit_usd < 0.0 {
             return Err(anyhow::anyhow!(
                 "MIN_PROFIT_USD must be >= 0.0, got: {}",
@@ -379,41 +388,25 @@ impl Config {
         let is_free_rpc = self.is_free_rpc_endpoint();
         let is_premium_rpc = self.is_premium_rpc_endpoint();
         
-        if is_free_rpc && self.poll_interval_ms < 10000 {
-            log::error!(
-                "🚨 OPERASYONEL RİSK: Free RPC endpoint + kısa polling interval!"
-            );
-            log::error!(
-                "   RPC: {} (ücretsiz endpoint tespit edildi)",
-                self.rpc_http_url
-            );
-            log::error!(
-                "   POLL_INTERVAL_MS: {}ms (önerilen: 10000ms minimum)",
-                self.poll_interval_ms
-            );
-            log::error!(
-                "   Free RPC'ler getProgramAccounts için 1 req/10s limit koyar!"
-            );
-            log::error!("");
-            log::error!("   ÇÖZÜM SEÇENEKLERİ:");
-            log::error!("   1. Polling interval'ı artır: POLL_INTERVAL_MS=10000");
-            log::error!("   2. WebSocket kullanılacak (varsayılan, önerilen)");
-            log::error!("   3. Premium RPC kullan: Helius, Triton, QuickNode");
-            log::error!("");
+        // Note: Free RPC + short polling check is now done earlier in validate() as a hard error
+        if is_free_rpc && self.poll_interval_ms >= 10000 {
+            log::info!("✅ Free RPC endpoint with safe polling interval: {}ms", self.poll_interval_ms);
+        } else if is_premium_rpc {
+            log::info!("✅ Premium RPC endpoint detected");
+            if self.poll_interval_ms < 10000 {
+                log::warn!(
+                    "⚠️  POLL_INTERVAL_MS={}ms is short (OK for premium RPC, but >= 10000ms recommended)",
+                    self.poll_interval_ms
+                );
+            }
         } else if self.poll_interval_ms < 10000 {
             log::warn!(
                 "⚠️  POLL_INTERVAL_MS={}ms is very short for getProgramAccounts!",
                 self.poll_interval_ms
             );
-            if !is_premium_rpc {
-                log::warn!(
-                    "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) minimum for RPC polling fallback"
-                );
-            } else {
-                log::warn!(
-                    "⚠️  Premium RPC detected, but still recommend POLL_INTERVAL_MS>=5000ms for getProgramAccounts"
-                );
-            }
+            log::warn!(
+                "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) minimum for RPC polling fallback"
+            );
         }
         
         if is_free_rpc {

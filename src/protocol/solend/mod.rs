@@ -86,11 +86,13 @@ impl Protocol for SolendProtocol {
         }
         
         // FAST PATH 4: Quick health factor check BEFORE expensive USD calculations
-        // This filters out healthy positions (HF > 1.5) early, avoiding unnecessary work
+        // This filters out healthy positions early, avoiding unnecessary work
+        // Uses config threshold with 50% safety margin (e.g., 1.0 * 1.5 = 1.5)
         let health_factor = obligation.calculate_health_factor();
         
-        // Skip healthy positions (not liquidatable)
-        if health_factor > 1.5 {
+        // Skip healthy positions (not liquidatable) - use config threshold with safety margin
+        let skip_threshold = self.config.hf_liquidation_threshold * 1.5;
+        if health_factor > skip_threshold {
             return None;
         }
         
