@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -19,6 +19,7 @@ pub struct WsClient {
     connection: Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>,
     subscriptions: Arc<Mutex<HashMap<u64, SubscriptionInfo>>>,
     next_request_id: Arc<Mutex<u64>>,
+    account_update_tx: broadcast::Sender<AccountUpdate>, // Broadcast channel for account updates
 }
 
 #[derive(Debug, Clone)]
@@ -37,12 +38,20 @@ use std::sync::Arc;
 
 impl WsClient {
     pub fn new(url: String) -> Self {
+        let (tx, _) = broadcast::channel(1000); // Buffer up to 1000 account updates
         WsClient {
             url,
             connection: Arc::new(Mutex::new(None)),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: Arc::new(Mutex::new(1)),
+            account_update_tx: tx,
         }
+    }
+
+    /// Subscribe to account updates via broadcast channel.
+    /// This allows multiple listeners (e.g., Scanner and BalanceManager) to receive updates.
+    pub fn subscribe_account_updates(&self) -> broadcast::Receiver<AccountUpdate> {
+        self.account_update_tx.subscribe()
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -277,11 +286,16 @@ impl WsClient {
                                                     rent_epoch,
                                                 };
                                                 
-                                                return Some(AccountUpdate {
+                                                let update = AccountUpdate {
                                                     pubkey: pk,
                                                     account,
                                                     slot,
-                                                });
+                                                };
+                                                
+                                                // Broadcast to all subscribers (non-blocking)
+                                                let _ = self.account_update_tx.send(update.clone());
+                                                
+                                                return Some(update);
                                             }
                                         }
                                     }

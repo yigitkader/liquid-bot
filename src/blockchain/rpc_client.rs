@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient as SolanaRpcClient;
+use solana_client::rpc_config::RpcProgramAccountsConfig;
+use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     pubkey::Pubkey,
@@ -102,6 +104,39 @@ impl RpcClient {
         tokio::task::spawn_blocking(move || {
             client
                 .get_program_accounts(&program_id)
+                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+        })
+        .await
+        .context("Failed to spawn blocking task")?
+    }
+
+    /// Get program accounts with filters to reduce data transfer and processing.
+    /// This is much more efficient than fetching all accounts and filtering client-side.
+    pub async fn get_program_accounts_with_filters(
+        &self,
+        program_id: &Pubkey,
+        filters: Vec<RpcFilterType>,
+    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>> {
+        self.rate_limit().await;
+        let _permit = self.rate_limiter.acquire().await
+            .context("Failed to acquire rate limiter permit")?;
+        
+        let client = Arc::clone(&self.client);
+        let program_id = *program_id;
+        
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            account_config: solana_client::rpc_config::RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        
+        tokio::task::spawn_blocking(move || {
+            client
+                .get_program_accounts_with_config(&program_id, config)
                 .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
         })
         .await

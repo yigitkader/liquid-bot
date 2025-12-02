@@ -100,8 +100,25 @@ async fn main() -> Result<()> {
     let balance_manager = Arc::new(
         BalanceManager::new(Arc::clone(&rpc), wallet_pubkey)
             .with_config(config.clone())
+            .with_websocket(Arc::clone(&ws))
     );
     log::info!("✅ Balance manager initialized");
+    
+    // Start balance monitoring via WebSocket
+    let balance_manager_monitor = Arc::clone(&balance_manager);
+    tokio::spawn(async move {
+        // Subscribe to ATA accounts
+        if let Err(e) = balance_manager_monitor.start_monitoring().await {
+            log::error!("BalanceManager: Failed to start monitoring: {}", e);
+            log::warn!("BalanceManager: Will fall back to RPC-only mode");
+        } else {
+            // Start listening for account updates
+            if let Err(e) = balance_manager_monitor.listen_account_updates().await {
+                log::error!("BalanceManager: Account update listener error: {}", e);
+            }
+        }
+    });
+    log::info!("✅ Balance manager monitoring started");
 
     let metrics = Arc::new(Metrics::new());
     log::info!("✅ Metrics initialized");
@@ -121,6 +138,7 @@ async fn main() -> Result<()> {
         Arc::clone(&protocol),
         event_bus.clone(),
         Arc::clone(&cache),
+        config.clone(),
     );
     let analyzer = Analyzer::new(
         event_bus.clone(),

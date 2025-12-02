@@ -9,6 +9,7 @@ pub mod blockchain {
     pub mod rpc_client;
     pub mod ws_client;
     pub mod transaction;
+    pub mod jito;
 }
 
 pub mod protocol;
@@ -34,7 +35,7 @@ pub mod utils {
 }
 
 pub use core::{config, events, types, error};
-pub use blockchain::{rpc_client, ws_client, transaction};
+pub use blockchain::{rpc_client, ws_client, transaction, jito};
 pub use engine::{scanner, analyzer, validator, executor};
 pub use strategy::{profit_calculator, slippage_estimator, balance_manager};
 pub use utils::{cache, metrics, helpers, ata_manager};
