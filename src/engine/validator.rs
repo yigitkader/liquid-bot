@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
-use tokio::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 
 pub struct Validator {
@@ -62,8 +61,29 @@ impl Validator {
                                     opportunity.estimated_profit
                                 );
 
-                                match Self::validate_static(&opportunity, &rpc, &config, &balance_manager).await {
+                                // ✅ CRITICAL FIX: Reserve balance FIRST (before validation)
+                                // This prevents race conditions where multiple validators try to reserve the same balance
+                                // Reserve is atomic - if it fails, we skip validation (insufficient balance)
+                                match balance_manager.reserve(&opportunity.debt_mint, opportunity.max_liquidatable).await {
                                     Ok(()) => {
+                                        // Reserved successfully - proceed with validation
+                                    }
+                                    Err(e) => {
+                                        log::debug!(
+                                            "Validator: insufficient balance for position {}: {}",
+                                            opportunity.position.address,
+                                            e
+                                        );
+                                        // Don't validate if we can't reserve balance
+                                        return;
+                                    }
+                                }
+                                
+                                // Validate the opportunity (reservation already done)
+                                match Self::validate_static(&opportunity, &rpc, &config).await {
+                                    Ok(()) => {
+                                        // ✅ SUCCESS: Keep reservation, pass to executor
+                                        // Reservation will be released by executor after transaction
                                         log::info!(
                                             "Validator: opportunity approved for position {}",
                                             opportunity.position.address
@@ -72,17 +92,23 @@ impl Validator {
                                             opportunity,
                                         }) {
                                             log::error!("Failed to publish OpportunityApproved: {}", e);
+                                            // If publish fails, release reservation (executor won't see it)
+                                            balance_manager
+                                                .release(
+                                                    &opportunity.debt_mint,
+                                                    opportunity.max_liquidatable,
+                                                )
+                                                .await;
                                         }
                                     }
                                     Err(e) => {
+                                        // ❌ VALIDATION FAILED: Release reservation
+                                        // Executor will never see this opportunity, so we must release
                                         log::debug!(
                                             "Validator: opportunity rejected for position {}: {}",
                                             opportunity.position.address,
                                             e
                                         );
-
-                                        // Release the reserved balance for rejected opportunities,
-                                        // since the executor will never see them.
                                         balance_manager
                                             .release(
                                                 &opportunity.debt_mint,
@@ -123,24 +149,35 @@ impl Validator {
     }
 
     async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        Self::validate_static(opp, &self.rpc, &self.config, &self.balance_manager).await
+        // Reserve balance first
+        self.balance_manager
+            .reserve(&opp.debt_mint, opp.max_liquidatable)
+            .await
+            .context("Insufficient balance - reservation failed")?;
+        
+        // Validate (reservation already done)
+        match Self::validate_static(opp, &self.rpc, &self.config).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Release reservation on validation failure
+                self.balance_manager
+                    .release(&opp.debt_mint, opp.max_liquidatable)
+                    .await;
+                Err(e)
+            }
+        }
     }
 
     // Static method for parallel processing
+    // ✅ CRITICAL FIX: Reserve is now done BEFORE calling this function
+    // This ensures reservation happens atomically before validation starts
+    // If validation fails, caller must release the reservation
     async fn validate_static(
         opp: &Opportunity,
         rpc: &Arc<RpcClient>,
         config: &Config,
-        balance_manager: &Arc<BalanceManager>,
     ) -> Result<()> {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
-
-        // Step 0: Reserve balance FIRST (atomic check-and-lock)
-        // This prevents race conditions between parallel validations for the same mint
-        balance_manager
-            .reserve(&opp.debt_mint, opp.max_liquidatable)
-            .await
-            .context("Insufficient balance - reservation failed")?;
 
         // Step 1: Oracle freshness - debt (parallel with collateral)
         let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);

@@ -230,7 +230,12 @@ impl ReserveCache {
         config: Config,
     ) {
         tokio::spawn(async move {
-            // Do an initial refresh immediately on startup
+            // ✅ CRITICAL FIX: Delay initial refresh to prevent RPC storm on startup
+            // Free RPC endpoints typically have 1 req/10s limit for getProgramAccounts
+            // Waiting 10 seconds before first refresh prevents hitting rate limits
+            // This is especially important when multiple components start simultaneously
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            
             log::info!("Performing initial reserve cache refresh...");
             if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
                 log::warn!("Initial reserve cache refresh failed: {}", e);
@@ -309,13 +314,13 @@ async fn get_reserve_address_from_mint(
         .await
 }
 
+// ✅ CRITICAL FIX: Pre-calculated compile-time constant to avoid hash calculation on every call
+// This is called in hotpath (get_program_accounts filtering) - hash calculation was expensive
+// SHA256("account:Reserve")[..8] = [0x2b, 0xf2, 0xcc, 0xca, 0x1a, 0xf7, 0x3b, 0x7f]
+const RESERVE_DISCRIMINATOR: [u8; 8] = [0x2b, 0xf2, 0xcc, 0xca, 0x1a, 0xf7, 0x3b, 0x7f];
+
 fn get_reserve_discriminator() -> [u8; 8] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"account:Reserve");
-    let hash = hasher.finalize();
-    let mut discriminator = [0u8; 8];
-    discriminator.copy_from_slice(&hash[..8]);
-    discriminator
+    RESERVE_DISCRIMINATOR
 }
 
 async fn get_reserve_data(

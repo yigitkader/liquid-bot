@@ -7,6 +7,8 @@ use crate::utils::cache::AccountCache;
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use futures_util::future::join_all;
+use tokio::time::Duration;
 
 pub struct Scanner {
     rpc: Arc<RpcClient>,
@@ -114,21 +116,46 @@ impl Scanner {
             program_id
         );
 
+        // ✅ CRITICAL FIX: Batch processing with parallel tasks to prevent CPU bottleneck
+        // Processing 10,000+ accounts sequentially is too slow
+        // Process in batches of 100 accounts in parallel to utilize CPU efficiently
+        const BATCH_SIZE: usize = 100;
         let mut parsed = 0usize;
         let mut failed = 0usize;
 
-        for (pubkey, account) in accounts {
-            match self.protocol.parse_position(&account).await {
-                Some(position) => {
-                    parsed += 1;
-                    self.cache.insert(pubkey, position.clone()).await;
-                    self.event_bus.publish(Event::AccountDiscovered {
-                        pubkey,
-                        position,
-                    })?;
-                }
-                None => {
-                    failed += 1;
+        // Process accounts in batches
+        for chunk in accounts.chunks(BATCH_SIZE) {
+            // Create parallel tasks for this batch
+            let parse_tasks: Vec<_> = chunk.iter()
+                .map(|(pubkey, account)| {
+                    let protocol = Arc::clone(&self.protocol);
+                    let pubkey = *pubkey;
+                    let account = account.clone();
+                    async move {
+                        protocol.parse_position(&account).await.map(|pos| (pubkey, pos))
+                    }
+                })
+                .collect();
+
+            // Execute all tasks in parallel for this batch
+            let results = join_all(parse_tasks).await;
+            
+            // Process results
+            for result in results {
+                match result {
+                    Some((pubkey, position)) => {
+                        parsed += 1;
+                        self.cache.insert(pubkey, position.clone()).await;
+                        if let Err(e) = self.event_bus.publish(Event::AccountDiscovered {
+                            pubkey,
+                            position,
+                        }) {
+                            log::error!("Scanner: Failed to publish AccountDiscovered: {}", e);
+                        }
+                    }
+                    None => {
+                        failed += 1;
+                    }
                 }
             }
         }
@@ -143,7 +170,6 @@ impl Scanner {
     }
 
     pub async fn start_monitoring(&self) -> Result<()> {
-        use anyhow::Context;
         use tokio::time::sleep;
         use solana_client::rpc_filter::RpcFilterType;
         

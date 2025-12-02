@@ -311,7 +311,8 @@ impl BalanceManager {
     /// Process account update from WebSocket and update cache.
     /// This should be called from a background task that listens to WebSocket updates.
     pub async fn handle_account_update(&self, update: &AccountUpdate) {
-        // Check if this is one of our subscribed ATAs
+        // ✅ CRITICAL FIX: Atomic check-and-set to prevent TOCTOU race condition
+        // Check if this is one of our subscribed ATAs (first check with read lock)
         let subscribed_atas = self.subscribed_atas.read().await;
         let is_subscribed = subscribed_atas.values().any(|&ata| ata == update.pubkey);
         
@@ -342,20 +343,33 @@ impl BalanceManager {
         
         let balance = u64::from_le_bytes(balance_bytes);
         
-        // Update cache with fresh timestamp
-        {
-            let mut balances = self.balances.write().await;
+        // ✅ CRITICAL FIX: Double-check subscription while holding write lock
+        // This prevents TOCTOU: between first check and insert, ATA could be unsubscribed
+        // By checking again while holding write lock, we ensure atomicity
+        let mut balances = self.balances.write().await;
+        
+        // Double-check: ATA might have been unsubscribed between first check and now
+        // We need to check again while holding write lock to ensure atomicity
+        let subscribed_atas_check = self.subscribed_atas.read().await;
+        if subscribed_atas_check.values().any(|&ata| ata == update.pubkey) {
+            // Still subscribed - safe to update cache
             balances.insert(update.pubkey, CachedBalance {
                 amount: balance,
                 timestamp: Instant::now(),
             });
+            
+            log::debug!(
+                "BalanceManager: Updated balance cache for ATA {}: {}",
+                update.pubkey,
+                balance
+            );
+        } else {
+            // ATA was unsubscribed between check and insert - skip update
+            log::debug!(
+                "BalanceManager: Skipping update for ATA {} (unsubscribed during processing)",
+                update.pubkey
+            );
         }
-        
-        log::debug!(
-            "BalanceManager: Updated balance cache for ATA {}: {}",
-            update.pubkey,
-            balance
-        );
     }
 
     /// Start background task to listen for account updates from WebSocket broadcast channel.

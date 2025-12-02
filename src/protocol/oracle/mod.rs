@@ -262,14 +262,25 @@ pub async fn read_pyth_price(
     let max_age_seconds = config.map(|c| c.max_oracle_age_seconds).unwrap_or(60);
     log::debug!("Checking price data freshness: current_time={}, max_age={}s", current_time, max_age_seconds);
     
-    let price_data = match price_feed.get_price_no_older_than(current_time, max_age_seconds) {
-        Some(data) => {
+    // ✅ CRITICAL FIX: Use catch_unwind to prevent Pyth SDK panics from crashing the bot
+    // Pyth SDK's get_price_no_older_than can panic on malformed data or internal bugs
+    // This protection ensures the bot continues operating even if Pyth SDK has issues
+    use std::panic::catch_unwind;
+    
+    let price_data = match catch_unwind(std::panic::AssertUnwindSafe(|| {
+        price_feed.get_price_no_older_than(current_time, max_age_seconds)
+    })) {
+        Ok(Some(data)) => {
             log::debug!("Pyth price data found: price={}, expo={}, conf={}, publish_time={}", 
                 data.price, data.expo, data.conf, data.publish_time);
             data
         },
-        None => {
-            let latest_price = price_feed.get_price_no_older_than(current_time, u64::MAX);
+        Ok(None) => {
+            // Try to get latest price (any age) for diagnostic purposes
+            let latest_price = catch_unwind(std::panic::AssertUnwindSafe(|| {
+                price_feed.get_price_no_older_than(current_time, u64::MAX)
+            })).ok().flatten();
+            
             if let Some(latest) = latest_price {
                 let age_seconds = current_time - latest.publish_time;
                 log::warn!("Pyth price data is stale for account {}: age={}s (max={}s), latest_price={}, expo={}, publish_time={}", 
@@ -277,6 +288,11 @@ pub async fn read_pyth_price(
             } else {
                 log::error!("No price data found in Pyth feed for account: {}", oracle_account);
             }
+            return Ok(None);
+        },
+        Err(_) => {
+            // Panic occurred in Pyth SDK - log and return None gracefully
+            log::error!("Pyth SDK panic detected when reading price for account {} - this may indicate malformed data or SDK bug", oracle_account);
             return Ok(None);
         }
     };

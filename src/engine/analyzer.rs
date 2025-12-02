@@ -85,8 +85,26 @@ impl Analyzer {
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // ✅ CRITICAL FIX: Log lagged events - these are lost forever!
+                    // Buffer had too many events, some were dropped
+                    // This indicates system is overloaded or buffer is too small
+                    log::warn!(
+                        "⚠️  CRITICAL: Analyzer lagged {} events - these events are LOST FOREVER!",
+                        skipped
+                    );
+                    log::warn!("   Consider: 1) Increase EVENT_BUS_BUFFER_SIZE");
+                    log::warn!("            2) Increase ANALYZER_MAX_WORKERS_LIMIT");
+                    log::warn!("            3) Optimize calculation logic");
+                    log::warn!("            4) Restart bot to trigger full account re-scan");
+                    
                     // ADAPTIVE SCALING: Increase workers when lag detected
                     let current = self.current_workers.load(Ordering::Relaxed);
+                    
+                    // ✅ CRITICAL FIX: Hard limit to prevent semaphore from growing indefinitely
+                    // This prevents memory leaks when tasks don't complete quickly
+                    // Even if max_workers_limit is high, we cap at a reasonable concurrent limit
+                    const MAX_CONCURRENT_VALIDATIONS: usize = 100;
+                    
                     if current < self.max_workers_limit {
                         // Increase workers by 50% or at least 2, up to limit
                         let increase = std::cmp::max(2, current / 2);
@@ -95,25 +113,49 @@ impl Analyzer {
                             self.max_workers_limit
                         );
                         
-                        // ✅ CRITICAL FIX: Use add_permits() instead of recreating semaphore
-                        // This preserves existing permits and waiting tasks
-                        // Recreating semaphore would cause waiting tasks to lose their permits
-                        // add_permits() is thread-safe, so we can call it directly on Arc<Semaphore>
-                        let permits_to_add = new_workers.saturating_sub(current);
+                        // ✅ CRITICAL FIX: Check semaphore available permits before adding
+                        // This prevents semaphore from growing beyond reasonable limits
+                        // If semaphore already has too many permits, don't add more
+                        let available_permits = semaphore.available_permits();
+                        let permits_to_add = if available_permits + (new_workers.saturating_sub(current)) <= MAX_CONCURRENT_VALIDATIONS {
+                            new_workers.saturating_sub(current)
+                        } else {
+                            // Would exceed max concurrent limit - cap at max
+                            let max_to_add = MAX_CONCURRENT_VALIDATIONS.saturating_sub(available_permits);
+                            if max_to_add > 0 {
+                                max_to_add
+                            } else {
+                                // Already at max, can't add more
+                                log::error!(
+                                    "⚠️  CRITICAL: Cannot add more permits - max concurrent limit ({}) reached! Available: {}",
+                                    MAX_CONCURRENT_VALIDATIONS,
+                                    available_permits
+                                );
+                                0
+                            }
+                        };
+                        
                         if permits_to_add > 0 {
                             // Add permits to existing semaphore (preserves waiting tasks)
                             semaphore.add_permits(permits_to_add);
+                            let actual_new_workers = current + permits_to_add;
+                            self.current_workers.store(actual_new_workers, Ordering::Relaxed);
+                            
+                            log::warn!(
+                                "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits, available: {})",
+                                skipped,
+                                current,
+                                actual_new_workers,
+                                permits_to_add,
+                                semaphore.available_permits()
+                            );
+                        } else {
+                            log::error!(
+                                "⚠️  CRITICAL: Analyzer lagged {} events, but cannot add more permits (max concurrent: {})",
+                                skipped,
+                                MAX_CONCURRENT_VALIDATIONS
+                            );
                         }
-                        
-                        self.current_workers.store(new_workers, Ordering::Relaxed);
-                        
-                        log::warn!(
-                            "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits)",
-                            skipped,
-                            current,
-                            new_workers,
-                            permits_to_add
-                        );
                     } else {
                         log::error!(
                             "⚠️  CRITICAL: Analyzer lagged {} events, max workers ({}) reached!",

@@ -324,7 +324,6 @@ impl WsClient {
     /// 
     /// Returns Ok(()) if reconnected successfully, Err if all attempts failed.
     pub async fn reconnect_with_backoff(&self) -> Result<()> {
-        use anyhow::Context;
         const MAX_RECONNECT_ATTEMPTS: usize = 10;
         let mut backoff = Duration::from_secs(1);
         
@@ -336,23 +335,47 @@ impl WsClient {
             if self.connect().await.is_ok() {
                 log::info!("✅ WebSocket reconnected successfully on attempt {}", attempt);
                 
-                // Resubscribe to all previous subscriptions
-                let subscriptions = self.subscriptions.lock().await;
-                for (_, info) in subscriptions.iter() {
+                // ✅ CRITICAL FIX: Clear old subscriptions before resubscribing
+                // Old subscription IDs are invalid after reconnection - they must be cleaned up
+                // This prevents memory leak where HashMap grows indefinitely with stale IDs
+                let old_subscriptions = {
+                    let mut subscriptions = self.subscriptions.lock().await;
+                    let old = subscriptions.clone(); // Clone before clearing
+                    subscriptions.clear(); // Clear old subscription IDs
+                    old
+                };
+                
+                // Resubscribe to all previous subscriptions with new IDs
+                for (_, info) in old_subscriptions.iter() {
                     match &info.subscription_type {
                         SubscriptionType::Program(program_id) => {
-                            if let Err(e) = self.subscribe_program(program_id).await {
-                                log::warn!("Failed to resubscribe to program {}: {}", program_id, e);
+                            match self.subscribe_program(program_id).await {
+                                Ok(new_id) => {
+                                    log::info!("Resubscribed to program {} with new subscription ID: {}", program_id, new_id);
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to resubscribe to program {}: {}", program_id, e);
+                                }
                             }
                         }
                         SubscriptionType::Account(pubkey) => {
-                            if let Err(e) = self.subscribe_account(pubkey).await {
-                                log::warn!("Failed to resubscribe to account {}: {}", pubkey, e);
+                            match self.subscribe_account(pubkey).await {
+                                Ok(new_id) => {
+                                    log::info!("Resubscribed to account {} with new subscription ID: {}", pubkey, new_id);
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to resubscribe to account {}: {}", pubkey, e);
+                                }
                             }
                         }
                         SubscriptionType::Slot => {
-                            if let Err(e) = self.subscribe_slot().await {
-                                log::warn!("Failed to resubscribe to slot: {}", e);
+                            match self.subscribe_slot().await {
+                                Ok(new_id) => {
+                                    log::info!("Resubscribed to slot with new subscription ID: {}", new_id);
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to resubscribe to slot: {}", e);
+                                }
                             }
                         }
                     }

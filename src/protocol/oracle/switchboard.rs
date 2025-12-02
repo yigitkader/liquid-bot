@@ -48,17 +48,35 @@ impl SwitchboardOracle {
         const POSSIBLE_OFFSETS: &[usize] = &[361, 200, 216, 232];
         const SCALE: u32 = 9; // Switchboard standard scale (10^9)
         
-        // Try each possible offset
+        // ✅ CRITICAL FIX: Try all offsets and select the one with the most recent timestamp
+        // This prevents using stale data from an older offset when newer data exists at a different offset
+        // Example: Offset 200 has stale data (valid), offset 361 has fresh data (valid)
+        // Old code would return stale data from offset 200 - now we return fresh data from offset 361
+        let mut best_price: Option<(PriceData, usize)> = None;
+        
         for &offset in POSSIBLE_OFFSETS {
             if let Ok(price_data) = Self::try_parse_at_offset(data, offset, SCALE) {
                 if Self::is_valid_price(&price_data) {
-                    log::info!(
-                        "Switchboard oracle parsed successfully at offset {}: price=${:.4}, confidence=${:.4}, timestamp={}",
-                        offset, price_data.price, price_data.confidence, price_data.timestamp
-                    );
-                    return Ok(price_data);
+                    // Check if this is better (more recent) than the current best
+                    if let Some((best, _)) = &best_price {
+                        if price_data.timestamp > best.timestamp {
+                            best_price = Some((price_data, offset));
+                        }
+                    } else {
+                        // First valid price found
+                        best_price = Some((price_data, offset));
+                    }
                 }
             }
+        }
+        
+        // Return the best (most recent) price data found
+        if let Some((price_data, offset)) = best_price {
+            log::info!(
+                "Switchboard oracle parsed successfully at offset {} (best timestamp): price=${:.4}, confidence=${:.4}, timestamp={}",
+                offset, price_data.price, price_data.confidence, price_data.timestamp
+            );
+            return Ok(price_data);
         }
         
         // All offsets failed

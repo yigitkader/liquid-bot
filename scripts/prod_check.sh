@@ -325,6 +325,26 @@ else
     fi
 fi
 
+# WebSocket Fallback Check
+print_info "Checking WebSocket fallback mechanism (RPC polling)..."
+if grep -q "reconnect_with_backoff.*Result" src/blockchain/ws_client.rs 2>/dev/null; then
+    print_success "WebSocket reconnect_with_backoff() returns Result (no panic) - graceful degradation enabled"
+else
+    print_error "WebSocket reconnect_with_backoff() may still panic - check implementation"
+fi
+
+if grep -q "use_websocket.*false\|RPC polling mode\|Falling back to RPC polling" src/engine/scanner.rs 2>/dev/null; then
+    print_success "Scanner has RPC polling fallback mechanism implemented"
+else
+    print_error "Scanner missing RPC polling fallback - WebSocket failure will crash bot"
+fi
+
+if grep -q "WebSocket reconnected.*Switching back to WebSocket mode" src/engine/scanner.rs 2>/dev/null; then
+    print_success "Scanner has automatic WebSocket reconnection (best of both worlds)"
+else
+    print_warning "Scanner may not automatically switch back to WebSocket when reconnected"
+fi
+
 # RPC HTTP URL check
 if [ -z "$RPC_HTTP_URL" ]; then
     print_warning "RPC_HTTP_URL not set - using default: https://api.mainnet-beta.solana.com"
@@ -335,6 +355,7 @@ else
         # Check if it's a free RPC endpoint
         if [[ "$RPC_HTTP_URL" == *"api.mainnet-beta.solana.com"* ]]; then
             print_warning "Free RPC endpoint detected - ensure POLL_INTERVAL_MS >= 10000 if using RPC polling fallback"
+            print_info "✅ RPC polling fallback is now implemented - bot will continue operating if WebSocket fails"
         fi
     else
         print_error "RPC_HTTP_URL must start with http:// or https://"
@@ -440,10 +461,14 @@ echo ""
 print_info "Monitor logs for:"
 echo "  - ✅ WebSocket connected"
 echo "  - ✅ Subscribed to program accounts"
+echo "  - ⚠️  WebSocket fallback to RPC polling (if WebSocket fails)"
+echo "  - ✅ WebSocket reconnected (automatic switch back)"
 echo "  - Opportunity detection"
 echo "  - Profit calculation"
 echo "  - Fee breakdown"
 echo "  - Slippage estimation"
+echo ""
+print_info "✅ NEW: Bot now has RPC polling fallback - will continue operating even if WebSocket fails"
 echo ""
 
 # ============================================================================

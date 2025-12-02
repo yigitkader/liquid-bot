@@ -8,7 +8,6 @@ use crate::strategy::balance_manager::BalanceManager;
 use crate::core::config::Config;
 use solana_sdk::signature::Keypair;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::transaction::Transaction;
 use anyhow::{Result, Context};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
@@ -332,27 +331,22 @@ impl Executor {
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
-        // ✅ CRITICAL FIX: Always include create_ata instruction if not in cache
+        // ✅ CRITICAL FIX: Atomic check-and-set to prevent TOCTOU race condition
+        // HashSet::insert() returns true if the value was newly inserted (not already present)
+        // This makes the check and insert atomic - no other thread can insert between check and insert
         // ATA creation is idempotent - if ATA already exists, instruction is a no-op
         // This eliminates race conditions and unnecessary RPC calls
-        // Cache prevents redundant instructions within the same executor instance
-        let should_add_ata = {
-            let cache = self.ata_cache.read().await;
-            !cache.contains(&destination_collateral)
-        };
-        
-        if should_add_ata {
+        let mut cache = self.ata_cache.write().await;
+        if cache.insert(destination_collateral) {
+            // insert() returned true = value was newly inserted, so we need to add instruction
             log::debug!(
                 "Executor: Adding create_ata instruction for destination_collateral ATA ({})",
                 destination_collateral
             );
             let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
             tx_builder.add_instruction(create_ata_ix);
-            
-            // Add to cache (even if creation fails, we don't want to retry immediately)
-            let mut cache = self.ata_cache.write().await;
-            cache.insert(destination_collateral);
         } else {
+            // insert() returned false = value was already present, skip instruction
             log::debug!(
                 "Executor: Skipping create_ata instruction for {} (already in cache)",
                 destination_collateral
@@ -502,7 +496,8 @@ impl Executor {
         let mut main_tx = tx_builder.build(blockhash);
         
         // Sign the transaction ONCE - sign_transaction() has guards to prevent double-signing
-        sign_transaction(&mut main_tx, &self.wallet);
+        sign_transaction(&mut main_tx, &self.wallet)
+            .context("Failed to sign main transaction - double signing detected")?;
         
         // Add main liquidation transaction
         bundle.add_transaction(main_tx);
@@ -523,12 +518,19 @@ impl Executor {
         let main_tx = bundle.transactions().get(1)
             .ok_or_else(|| anyhow::anyhow!("Bundle missing main transaction"))?;
 
-        // Transaction henüz sign edilmemiş olabilir
+        // ✅ CRITICAL FIX: Check that transaction is properly signed
+        // Empty signatures array means transaction is unsigned
+        // Default signature (all zeros) means transaction is not properly signed
         if main_tx.signatures.is_empty() {
-            return Err(anyhow::anyhow!("Main transaction not signed"));
+            return Err(anyhow::anyhow!("Main transaction not signed - signatures array is empty"));
+        }
+        
+        let sig = main_tx.signatures[0];
+        if sig == solana_sdk::signature::Signature::default() {
+            return Err(anyhow::anyhow!("Main transaction not properly signed - signature is default (all zeros)"));
         }
 
-            Ok(main_tx.signatures[0])
+        Ok(sig)
     }
 
     /// Send transaction via standard RPC with retry logic
@@ -542,7 +544,8 @@ impl Executor {
             // Rebuild transaction with fresh blockhash for each retry attempt
             let blockhash = self.rpc.get_recent_blockhash().await?;
             let mut tx = tx_builder.build(blockhash);
-            sign_transaction(&mut tx, &self.wallet);
+            sign_transaction(&mut tx, &self.wallet)
+                .context("Failed to sign transaction - double signing detected")?;
             
             match send_and_confirm(tx, Arc::clone(&self.rpc)).await {
                 Ok(sig) => {

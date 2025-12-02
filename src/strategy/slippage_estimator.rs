@@ -278,7 +278,9 @@ impl SlippageEstimator {
                                 "Jupiter API failed after {} attempts, using fallback",
                                 MAX_RETRIES
                             );
-                            return self.estimate_with_multipliers(amount);
+                            // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
+                            let slippage = self.estimate_with_multipliers(amount)?;
+                            return Ok((slippage, 1)); // Default to 1 hop on fallback
                         }
                     }
                 }
@@ -300,7 +302,9 @@ impl SlippageEstimator {
                             "Jupiter API failed after {} attempts, using fallback",
                             MAX_RETRIES
                         );
-                        return self.estimate_with_multipliers(amount);
+                        // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
+                        let slippage = self.estimate_with_multipliers(amount)?;
+                        return Ok((slippage, 1)); // Default to 1 hop on fallback
                     }
                 }
             }
@@ -308,7 +312,9 @@ impl SlippageEstimator {
 
         // Should never reach here, but fallback just in case
         log::warn!("Jupiter API failed after {} attempts, using fallback", MAX_RETRIES);
-        self.estimate_with_multipliers(amount)
+        // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
+        let slippage = self.estimate_with_multipliers(amount)?;
+        Ok((slippage, 1)) // Default to 1 hop on fallback
     }
 
     fn estimate_with_multipliers(&self, amount: u64) -> Result<u16> {

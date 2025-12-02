@@ -52,7 +52,10 @@ impl TransactionBuilder {
 /// 1. Always build a fresh transaction using TransactionBuilder::build()
 /// 2. Sign it once using this function
 /// 3. Never re-sign an already-signed transaction
-pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) {
+/// 
+/// ✅ CRITICAL FIX: Returns Result to prevent silent failures
+/// Caller must handle the error - silent return was dangerous for Jito bundles
+pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
     // CRITICAL: Ensure transaction is unsigned before signing
     // Transaction::new_with_payer() creates transactions with empty signatures,
     // but we check here to be safe and prevent accidental double-signing
@@ -68,17 +71,20 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) {
             let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
             
             if is_signed {
-                log::warn!(
-                    "⚠️  Transaction already signed by keypair {} at index {} - skipping duplicate sign to prevent double-signing error",
+                // ✅ CRITICAL FIX: Return error instead of silent return
+                // Silent return was dangerous - caller didn't know transaction wasn't signed
+                // This is especially critical for Jito bundles where unsigned transactions fail
+                return Err(anyhow::anyhow!(
+                    "Transaction already signed by keypair {} at index {} - double signing prevented",
                     signer_pubkey, index
-                );
-                return; // Skip signing to prevent double-signing error
+                ));
             }
         }
     }
     
     // Transaction is unsigned or signer not found in account_keys - safe to sign
     tx.sign(&[keypair], tx.message.recent_blockhash);
+    Ok(())
 }
 
 pub async fn send_and_confirm(

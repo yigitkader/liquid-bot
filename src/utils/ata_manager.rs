@@ -154,6 +154,12 @@ pub async fn ensure_required_atas(
 
         // Send transaction for this batch
         log::info!("🚀 Sending batch transaction with {} instruction(s)...", instructions.len());
+        
+        // ✅ CRITICAL FIX: Check if any critical ATAs are in this batch
+        // Critical ATAs (USDC, SOL) are required for liquidation - failure is fatal
+        const CRITICAL_ATAS: &[&str] = &["USDC", "SOL"];
+        let has_critical_ata = batch_atas.iter().any(|(name, _, _)| CRITICAL_ATAS.contains(&name.as_str()));
+        
         match send_ata_batch(
             Arc::clone(&rpc),
             Arc::clone(&wallet),
@@ -165,7 +171,19 @@ pub async fn ensure_required_atas(
             }
             Err(e) => {
                 log::error!("❌ Batch transaction failed: {}", e);
-                log::warn!("   Bot will continue, ATAs can be created on-demand during liquidation");
+                
+                if has_critical_ata {
+                    // ✅ CRITICAL: Critical ATA creation failed - this is fatal
+                    // Bot cannot operate without USDC or SOL ATAs
+                    log::error!("🚨 CRITICAL: Critical ATA creation failed (USDC or SOL) - bot cannot operate!");
+                    return Err(anyhow::anyhow!(
+                        "Critical ATA creation failed: {}. Bot requires USDC and SOL ATAs to operate.",
+                        e
+                    ));
+                } else {
+                    // Non-critical ATA failure - bot can continue, ATAs can be created on-demand
+                    log::warn!("   Bot will continue, ATAs can be created on-demand during liquidation");
+                }
             }
         }
 
