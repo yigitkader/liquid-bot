@@ -219,6 +219,28 @@ impl ReserveCache {
         Ok(())
     }
 
+    /// Check if cache is initialized (has been populated at least once)
+    pub async fn is_initialized(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.initialized
+    }
+
+    /// Wait for cache to be initialized (with timeout)
+    /// Returns true if initialized, false if timeout
+    pub async fn wait_for_initialization(&self, timeout: Duration) -> bool {
+        use tokio::time::{sleep, Instant};
+        let start = Instant::now();
+        
+        while start.elapsed() < timeout {
+            if self.is_initialized().await {
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await; // Check every 100ms
+        }
+        
+        false
+    }
+
     /// Start a background task that periodically refreshes the reserve cache.
     /// This prevents RPC call storms when building liquidation instructions.
     /// 
@@ -268,6 +290,13 @@ pub fn start_reserve_cache_refresh(
     config: Config,
 ) {
     RESERVE_CACHE.clone().start_background_refresh(rpc, config);
+}
+
+/// Wait for reserve cache to be initialized (populated at least once).
+/// This should be called before starting Executor to prevent RPC rate limit violations.
+/// Returns true if cache is initialized, false if timeout exceeded.
+pub async fn wait_for_reserve_cache_initialization(timeout: Duration) -> bool {
+    RESERVE_CACHE.as_ref().wait_for_initialization(timeout).await
 }
 
 fn get_instruction_discriminator() -> [u8; 8] {

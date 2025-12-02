@@ -331,22 +331,63 @@ impl Executor {
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
-        // ✅ CRITICAL FIX: Atomic check-and-set to prevent TOCTOU race condition
-        // HashSet::insert() returns true if the value was newly inserted (not already present)
-        // This makes the check and insert atomic - no other thread can insert between check and insert
-        // ATA creation is idempotent - if ATA already exists, instruction is a no-op
-        // This eliminates race conditions and unnecessary RPC calls
+        // ✅ CRITICAL FIX: Double-check lock pattern with RPC verification
+        // Problem: Cache miss durumunda ATA gerçekten var mı kontrol edilmiyor
+        // Senaryo: Bot restart → cache boş → ATA zaten var ama cache boş → instruction eklenir → HATA
+        // 
+        // Çözüm: Cache miss durumunda RPC call yapıp ATA'nın gerçekten var olup olmadığını kontrol et
+        // - ATA varsa: Cache'e ekle, instruction skip et
+        // - ATA yoksa: Instruction ekle, cache'e ekle
+        // 
+        // Note: ATA create instruction is idempotent (no-op if exists), but checking prevents unnecessary instructions
         let mut cache = self.ata_cache.write().await;
-        if cache.insert(destination_collateral) {
-            // insert() returned true = value was newly inserted, so we need to add instruction
+        
+        if !cache.contains(&destination_collateral) {
+            // Cache miss - check RPC to see if ATA actually exists
             log::debug!(
-                "Executor: Adding create_ata instruction for destination_collateral ATA ({})",
+                "Executor: Cache miss for ATA {}, checking on-chain existence...",
                 destination_collateral
             );
-            let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
-            tx_builder.add_instruction(create_ata_ix);
+            
+            match self.rpc.get_account(&destination_collateral).await {
+                Ok(_) => {
+                    // ✅ ATA exists on-chain - add to cache, skip instruction
+                    cache.insert(destination_collateral);
+                    log::debug!(
+                        "Executor: ATA {} exists on-chain, added to cache, skipping create_ata instruction",
+                        destination_collateral
+                    );
+                }
+                Err(e) => {
+                    // ATA doesn't exist - need to create it
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("accountnotfound") || error_str.contains("account not found") {
+                        // ✅ ATA doesn't exist - add instruction
+                        log::debug!(
+                            "Executor: ATA {} doesn't exist, adding create_ata instruction",
+                            destination_collateral
+                        );
+                        let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
+                        tx_builder.add_instruction(create_ata_ix);
+                        
+                        // Add to cache after adding instruction
+                        cache.insert(destination_collateral);
+                    } else {
+                        // Other RPC errors (network, timeout, etc.) - log and continue
+                        // We'll add instruction anyway (idempotent, so safe)
+                        log::warn!(
+                            "Executor: Failed to check ATA existence for {}: {}. Adding create_ata instruction anyway (idempotent)",
+                            destination_collateral,
+                            e
+                        );
+                        let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
+                        tx_builder.add_instruction(create_ata_ix);
+                        cache.insert(destination_collateral);
+                    }
+                }
+            }
         } else {
-            // insert() returned false = value was already present, skip instruction
+            // Cache hit - ATA already processed, skip instruction
             log::debug!(
                 "Executor: Skipping create_ata instruction for {} (already in cache)",
                 destination_collateral
@@ -355,14 +396,23 @@ impl Executor {
         
         tx_builder.add_instruction(liq_ix);
 
+        // ✅ CRITICAL: Do NOT sign transaction here - let send_via_jito/send_with_retry handle signing
+        // TransactionBuilder is just a builder - it doesn't create signed transactions
+        // Each send method will:
+        //   1. Build a FRESH transaction with fresh blockhash (tx_builder.build())
+        //   2. Sign it ONCE (sign_transaction())
+        //   3. Send it
+        // This prevents double-signing risks and ensures each transaction has a fresh blockhash
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
             return Err(anyhow::anyhow!("DRY_RUN mode: Transaction not sent to blockchain"));
         } else if let Some(ref jito) = self.jito_client {
             // Send via Jito bundle for MEV protection with retries
+            // ✅ send_via_jito_with_retry will build FRESH tx + sign ONCE
             self.send_via_jito_with_retry(&tx_builder, jito).await?
         } else {
             // Fallback to standard RPC (vulnerable to front-running) with retries
+            // ✅ send_with_retry will build FRESH tx + sign ONCE for each retry
             self.send_with_retry(&tx_builder).await?
         };
 

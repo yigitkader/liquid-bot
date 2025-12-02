@@ -115,6 +115,12 @@ impl RpcClient {
         })
     }
 
+    /// Get the RPC request timeout duration
+    /// This is useful for coordinating timeouts in other components (e.g., oracle reads)
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     async fn rate_limit(&self) {
         // Use token bucket for rate limiting (handles burst requests better)
         self.token_bucket.acquire().await;

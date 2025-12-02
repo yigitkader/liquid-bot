@@ -34,9 +34,19 @@ impl TransactionBuilder {
         self
     }
 
+    /// Build an UNSIGNED transaction from the builder.
+    /// 
+    /// ✅ CRITICAL: This always creates an UNSIGNED transaction.
+    /// The returned transaction has empty signatures (all zeros).
+    /// You MUST call sign_transaction() after build() to sign it.
+    /// 
+    /// This method is safe to call multiple times - each call creates a fresh transaction.
+    /// However, you should use a fresh blockhash for each transaction to avoid replay attacks.
     pub fn build(&self, blockhash: solana_sdk::hash::Hash) -> Transaction {
         let mut tx = Transaction::new_with_payer(&self.instructions, Some(&self.payer));
         tx.message.recent_blockhash = blockhash;
+        // ✅ Transaction::new_with_payer() creates transactions with empty signatures
+        // This is safe - transaction is unsigned and ready to be signed
         tx
     }
 }

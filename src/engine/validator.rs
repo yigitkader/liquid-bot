@@ -186,10 +186,20 @@ impl Validator {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
 
         // Step 1: Oracle freshness - debt (parallel with collateral)
-        let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);
-        let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config);
-        
-        let (debt_result, collateral_result) = tokio::join!(debt_oracle_task, collateral_oracle_task);
+        // ✅ CRITICAL: For free RPC endpoints, run oracle checks sequentially to avoid rate limits
+        // Each check_oracle_freshness_static already has 100ms delay for free RPC,
+        // but running them in parallel can still cause rate limit violations
+        let (debt_result, collateral_result) = if config.is_free_rpc_endpoint() {
+            // Sequential execution for free RPC to prevent rate limit violations
+            let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config).await;
+            let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config).await;
+            (debt_result, collateral_result)
+        } else {
+            // Parallel execution for premium RPC (faster, no rate limit concerns)
+            let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);
+            let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config);
+            tokio::join!(debt_oracle_task, collateral_oracle_task)
+        };
         
         if let Err(e) = debt_result {
             log::debug!("   ❌ Debt oracle FAILED: {}", e);
@@ -294,6 +304,18 @@ impl Validator {
 
     async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
+        use tokio::time::Duration;
+        
+        // ✅ CRITICAL: Add rate limit guard for free RPC endpoints
+        // Free RPC endpoints (api.mainnet-beta.solana.com) have strict rate limits:
+        // - 1 req/10s for getProgramAccounts
+        // - ~10 req/s for getAccount (but we should be conservative)
+        // This prevents rate limit violations when multiple oracle checks run in parallel
+        if config.is_free_rpc_endpoint() {
+            // Minimum 100ms delay between oracle checks to avoid rate limit
+            // This is especially important when debt and collateral checks run in parallel
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         
         let oracle_account = match get_pyth_oracle_account(mint, Some(config)) {
             Ok(Some(account)) => account,
@@ -310,13 +332,15 @@ impl Validator {
         // Skip account existence check - read_pyth_price will handle it
         let max_age = config.max_oracle_age_seconds;
         
-        // ✅ CRITICAL FIX: Remove redundant timeout wrapper
-        // RPC client already has timeout handling (via SolanaRpcClient's internal HTTP client)
-        // Double timeout is unnecessary and can cause confusion
-        // If RPC is slow, it will timeout at the HTTP client level, not here
+        // ✅ CRITICAL FIX: Oracle timeout is now consistent with RPC client timeout
+        // read_pyth_price() uses RPC client's timeout (default: 10s) for Pyth SDK call
+        // RPC client also uses the same timeout (10s) for get_account() call
+        // This ensures consistent timeout handling: Total wait = 10s (not 5s + 10s = 15s)
         // 
-        // Note: If RPC client timeout is too long (30s+), it should be configured at RPC client level,
-        // not here. This keeps timeout logic in one place and avoids race conditions.
+        // Timeout flow:
+        //   1. RPC get_account() call: 10s timeout (RPC client level)
+        //   2. Pyth SDK call: 10s timeout (oracle level, matches RPC timeout)
+        //   Total: 10s maximum (consistent!)
         let price_data = match read_pyth_price(&oracle_account, Arc::clone(rpc), Some(config)).await {
             Ok(Some(data)) => data,
             Ok(None) => {

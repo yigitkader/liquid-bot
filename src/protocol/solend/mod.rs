@@ -99,14 +99,20 @@ impl Protocol for SolendProtocol {
         
         // FAST PATH 4: Quick health factor check BEFORE expensive USD calculations
         // This filters out healthy positions early, avoiding unnecessary work
-        // CRITICAL FIX: Use unified liquidation_safety_margin from config
-        // Skip healthy positions (not liquidatable) - use config threshold with safety margin
+        // ✅ CRITICAL FIX: Use the SAME threshold calculation as analyzer for consistency
+        // Analyzer uses: HF < (threshold * safety_margin) to liquidate
+        // Parser should use: HF > (threshold * safety_margin) to skip (inverse logic)
+        // This ensures parser and analyzer agree on which positions are liquidatable
         let health_factor = obligation.calculate_health_factor();
         
-        // Use the same safety margin as analyzer for consistency
-        // If HF > threshold * (1 / safety_margin), it's definitely not liquidatable
-        // For safety_margin = 0.95, this means HF > threshold * 1.05 (5% above threshold)
-        let skip_threshold = self.config.hf_liquidation_threshold / self.config.liquidation_safety_margin;
+        // ✅ CRITICAL FIX: Use threshold * safety_margin (NOT threshold / safety_margin)
+        // This matches analyzer's logic: analyzer liquidates when HF < threshold * safety_margin
+        // So parser should skip when HF > threshold * safety_margin (same threshold value)
+        // Example: threshold=1.0, safety_margin=0.95
+        //   - Analyzer: liquidate if HF < 0.95
+        //   - Parser: skip if HF > 0.95 (consistent!)
+        // Previous bug: skip_threshold = 1.0 / 0.95 = 1.05 (inconsistent!)
+        let skip_threshold = self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
         if health_factor > skip_threshold {
             return None;
         }

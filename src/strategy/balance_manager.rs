@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast};
-use anyhow::Result;
+use anyhow::{Result, Context};
 
 /// Cached balance with timestamp for freshness checking
 #[derive(Clone, Debug)]
@@ -414,7 +414,31 @@ impl BalanceManager {
         // Acquire write lock FIRST - this prevents race conditions
         let mut reserved = self.reserved.write().await;
         
+        // ✅ CRITICAL FIX: Invalidate cache BEFORE checking balance to prevent TOCTOU race condition
+        // Scenario:
+        //   Thread A: get_available_balance() → cache hit, returns 1000 (stale)
+        //   [100ms delay - network/CPU]
+        //   Thread B: reserve(500) → succeeds, reserved=500
+        //   Thread A: reserve(1000) → cache still shows 1000, reserved=500 → available=500 → WRONG!
+        // 
+        // Solution: Invalidate cache in reserve() to force fresh RPC call
+        // This ensures we always use the most up-to-date balance when reserving
+        {
+            use crate::protocol::solend::accounts::get_associated_token_address;
+            let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
+                .with_context(|| format!("Failed to derive ATA for mint {} (cache invalidation)", mint))?;
+            
+            let mut balances = self.balances.write().await;
+            balances.remove(&ata); // Force cache invalidation - next read will use RPC
+            log::debug!(
+                "BalanceManager: Cache invalidated for mint {} (ata={}) before reserve check",
+                mint,
+                ata
+            );
+        }
+        
         // Check available balance while holding the lock
+        // ✅ Now get_available_balance_locked() will use fresh RPC call (cache was invalidated)
         let available = self.get_available_balance_locked(mint, &reserved).await?;
 
         if available < amount {

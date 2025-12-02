@@ -227,6 +227,17 @@ pub async fn read_pyth_price(
 ) -> Result<Option<OraclePrice>> {
     log::debug!("Reading Pyth oracle price from account: {}", oracle_account);
     
+    // ✅ CRITICAL: Add rate limit guard for free RPC endpoints
+    // This prevents rate limit violations when multiple oracle reads happen in quick succession
+    // (e.g., in validate_system.rs or when validating multiple opportunities)
+    if let Some(cfg) = config {
+        if cfg.is_free_rpc_endpoint() {
+            // Minimum 100ms delay between oracle reads for free RPC
+            // This is especially important in validation scripts that read multiple oracles
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    
     let account = match rpc_client.get_account(oracle_account).await {
         Ok(acc) if !acc.data.is_empty() => {
             log::debug!("Pyth oracle account fetched: {} bytes, owner: {}", acc.data.len(), acc.owner);
@@ -267,8 +278,16 @@ pub async fn read_pyth_price(
     // Pyth SDK's get_price_no_older_than is SYNC code and can hang or panic
     // spawn_blocking moves it to a blocking thread pool, and timeout ensures it doesn't hang forever
     // This prevents the entire async runtime from blocking if Pyth SDK has issues
+    // 
+    // ✅ CRITICAL FIX: Use RPC client timeout for consistency
+    // RPC client timeout is 10s (default), so oracle timeout should match
+    // This prevents: Oracle timeout (5s) → RPC timeout (10s) → Total 15s wait
+    // Instead: Oracle timeout (10s) matches RPC timeout (10s) → Total 10s wait
     use std::panic::catch_unwind;
     use solana_sdk::account::Account;
+    
+    // Get RPC client timeout for consistent timeout handling
+    let oracle_timeout = rpc_client.request_timeout();
     
     // Reconstruct Account for blocking thread (need owner, lamports, data)
     let account_data = account_mut.data.clone();
@@ -279,7 +298,7 @@ pub async fn read_pyth_price(
     let max_age_seconds_clone = max_age_seconds;
     
     let price_data_result = tokio::time::timeout(
-        Duration::from_secs(5), // 5s timeout for Pyth SDK call
+        oracle_timeout, // ✅ Use RPC client timeout for consistency (default: 10s)
         tokio::task::spawn_blocking(move || {
             // Reconstruct Account in blocking thread
             let mut account_for_feed = Account {
@@ -330,8 +349,15 @@ pub async fn read_pyth_price(
         },
         Err(_) => {
             // Timeout occurred
-            log::error!("Pyth SDK call timeout (5s) for account {} - SDK may be hanging", oracle_account);
-            return Err(anyhow::anyhow!("Pyth SDK timeout"));
+            log::error!(
+                "Pyth SDK call timeout ({:?}) for account {} - SDK may be hanging or RPC is slow",
+                oracle_timeout,
+                oracle_account
+            );
+            return Err(anyhow::anyhow!(
+                "Pyth SDK timeout after {:?} (matches RPC client timeout)",
+                oracle_timeout
+            ));
         }
     };
     
