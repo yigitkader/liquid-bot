@@ -94,6 +94,39 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
     
     // Transaction is unsigned or signer not found in account_keys - safe to sign
     tx.sign(&[keypair], tx.message.recent_blockhash);
+    
+    // ✅ FIX: Verify transaction was actually signed
+    // This prevents silent failures where tx.sign() doesn't set the signature correctly
+    let signer_pubkey = keypair.pubkey();
+    let signer_index = tx.message.account_keys.iter()
+        .position(|&pk| pk == signer_pubkey);
+    
+    if let Some(index) = signer_index {
+        if index >= tx.signatures.len() {
+            return Err(anyhow::anyhow!(
+                "Transaction signing failed: signature not found at index {} (signatures.len()={})",
+                index,
+                tx.signatures.len()
+            ));
+        }
+        
+        let sig = &tx.signatures[index];
+        if *sig == solana_sdk::signature::Signature::default() {
+            return Err(anyhow::anyhow!(
+                "Transaction signing failed: signature is default (all zeros) for signer {} at index {}",
+                signer_pubkey,
+                index
+            ));
+        }
+        
+        log::debug!("Transaction signed successfully: {} -> {} (index: {})", signer_pubkey, sig, index);
+    } else {
+        return Err(anyhow::anyhow!(
+            "Transaction signing failed: signer {} not found in account_keys",
+            signer_pubkey
+        ));
+    }
+    
     Ok(())
 }
 

@@ -304,20 +304,27 @@ impl Validator {
 
     async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
-        use tokio::time::Duration;
+        use tokio::time::{Duration, timeout};
         
-        // ✅ CRITICAL: Add rate limit guard for free RPC endpoints
-        // Free RPC endpoints (api.mainnet-beta.solana.com) have strict rate limits:
-        // - 1 req/10s for getProgramAccounts
-        // - ~10 req/s for getAccount (but we should be conservative)
-        // This prevents rate limit violations when multiple oracle checks run in parallel
-        if config.is_free_rpc_endpoint() {
-            // Minimum 100ms delay between oracle checks to avoid rate limit
-            // This is especially important when debt and collateral checks run in parallel
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // ✅ FIX: Wrap entire oracle check in timeout to prevent cumulative timeouts
+        // Free RPC: Sequential checks can take 20s+ (10s per oracle × 2)
+        // Premium RPC: Parallel checks can take 10s+ (10s per oracle, but parallel)
+        // Solution: Cap each oracle check at 5s to prevent validation from taking too long
+        const ORACLE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
         
-        let oracle_account = match get_pyth_oracle_account(mint, Some(config)) {
+        timeout(ORACLE_CHECK_TIMEOUT, async {
+            // ✅ CRITICAL: Add rate limit guard for free RPC endpoints
+            // Free RPC endpoints (api.mainnet-beta.solana.com) have strict rate limits:
+            // - 1 req/10s for getProgramAccounts
+            // - ~10 req/s for getAccount (but we should be conservative)
+            // This prevents rate limit violations when multiple oracle checks run in parallel
+            if config.is_free_rpc_endpoint() {
+                // Minimum 100ms delay between oracle checks to avoid rate limit
+                // This is especially important when debt and collateral checks run in parallel
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            
+            let oracle_account = match get_pyth_oracle_account(mint, Some(config)) {
             Ok(Some(account)) => account,
             Ok(None) => {
                 log::warn!("No Pyth oracle found for mint: {}, skipping freshness check", mint);
@@ -406,15 +413,24 @@ impl Validator {
             ));
         }
         
-        log::debug!(
-            "Validator: oracle price is fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4})",
-            mint,
-            oracle_account,
-            age_seconds,
-            max_age,
-            price_data.price,
-            price_data.confidence
-        );
+            log::debug!(
+                "Validator: oracle price is fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4})",
+                mint,
+                oracle_account,
+                age_seconds,
+                max_age,
+                price_data.price,
+                price_data.confidence
+            );
+            
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!(
+            "Oracle check timeout after {:?} for mint {}",
+            ORACLE_CHECK_TIMEOUT,
+            mint
+        ))?;
         
         Ok(())
     }

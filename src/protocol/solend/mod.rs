@@ -107,13 +107,14 @@ impl Protocol for SolendProtocol {
         
         // ✅ CRITICAL FIX: Use threshold * safety_margin (NOT threshold / safety_margin)
         // This matches analyzer's logic: analyzer liquidates when HF < threshold * safety_margin
-        // So parser should skip when HF > threshold * safety_margin (same threshold value)
+        // So parser should skip when HF >= threshold * safety_margin (same threshold value)
         // Example: threshold=1.0, safety_margin=0.95
         //   - Analyzer: liquidate if HF < 0.95
-        //   - Parser: skip if HF > 0.95 (consistent!)
-        // Previous bug: skip_threshold = 1.0 / 0.95 = 1.05 (inconsistent!)
+        //   - Parser: skip if HF >= 0.95 (consistent!)
+        // ✅ FIX: Use >= instead of > to handle boundary case (HF = 0.95 exactly)
+        // Without this, positions at exactly the threshold are parsed but never liquidated
         let skip_threshold = self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
-        if health_factor > skip_threshold {
+        if health_factor >= skip_threshold {
             return None;
         }
         

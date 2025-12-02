@@ -76,18 +76,41 @@ async fn main() -> Result<()> {
     // ✅ CRITICAL: Wait before starting scanner to prevent double RPC call
     // Scanner will call get_program_accounts() immediately, so we delay to avoid hitting rate limits
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    
+    // ✅ FIX: For free RPC endpoints, delay scanner's first scan until reserve cache completes
+    // This prevents RPC rate limit violation:
+    // - T=0s: Reserve cache refresh starts (30s delay)
+    // - T=5s: Scanner would start and call get_program_accounts() → RATE LIMIT!
+    // - T=30s: Reserve cache also calls get_program_accounts() → RATE LIMIT!
+    // Solution: Wait for reserve cache to complete before starting scanner
+    if config.is_free_rpc_endpoint() {
+        log::info!("⏳ Free RPC endpoint detected - waiting for reserve cache initialization to avoid rate limits...");
+        let cache_timeout = tokio::time::Duration::from_secs(40); // 30s delay + 10s buffer for RPC call
+        if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(cache_timeout).await {
+            log::info!("✅ Reserve cache populated, starting scanner safely");
+        } else {
+            log::warn!("⚠️  Reserve cache initialization timeout - scanner will start anyway (may hit rate limits)");
+        }
+    }
+    
     log::info!("⏳ Starting account discovery...");
     
     // ✅ CRITICAL: Wait for reserve cache initial population before starting Executor
     // Executor needs reserve cache to build liquidation instructions without hitting RPC rate limits
     // If cache is not ready, Executor would call get_program_accounts() on first opportunity → rate limit violation
-    log::info!("⏳ Waiting for reserve cache initial population...");
-    let cache_timeout = tokio::time::Duration::from_secs(40); // 30s delay + 10s buffer for RPC call
-    if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(cache_timeout).await {
-        log::info!("✅ Reserve cache populated, ready for liquidation execution");
+    // Note: For free RPC, we already waited above, but we still need to ensure cache is ready for Executor
+    if !config.is_free_rpc_endpoint() {
+        log::info!("⏳ Waiting for reserve cache initial population...");
+        let cache_timeout = tokio::time::Duration::from_secs(40); // 30s delay + 10s buffer for RPC call
+        if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(cache_timeout).await {
+            log::info!("✅ Reserve cache populated, ready for liquidation execution");
+        } else {
+            log::warn!("⚠️  Reserve cache initialization timeout - Executor may hit RPC rate limits on first opportunity");
+            log::warn!("   This is OK if cache populates shortly, but monitor for rate limit errors");
+        }
     } else {
-        log::warn!("⚠️  Reserve cache initialization timeout - Executor may hit RPC rate limits on first opportunity");
-        log::warn!("   This is OK if cache populates shortly, but monitor for rate limit errors");
+        // For free RPC, we already waited above, so cache should be ready
+        log::info!("✅ Reserve cache should be ready (waited during scanner startup)");
     }
 
     let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));

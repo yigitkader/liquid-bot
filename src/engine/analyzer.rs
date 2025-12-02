@@ -194,8 +194,7 @@ impl Analyzer {
             
             // ✅ CRITICAL: Scale DOWN if no lag for threshold duration
             // This prevents semaphore from staying at high permit count when system is idle
-            // Note: We can't actually remove permits from semaphore, but we can reduce desired count
-            // and prevent new permits from being acquired (see permit acquisition check above)
+            // ✅ FIX: Remove permits from semaphore when scaling down to prevent memory leak
             if last_lag.elapsed() > SCALE_DOWN_THRESHOLD 
                 && last_scale_down.elapsed() > SCALE_DOWN_INTERVAL
             {
@@ -208,14 +207,32 @@ impl Analyzer {
                         current - decrease
                     );
                     
+                    // ✅ FIX: Remove permits from semaphore by acquiring and forgetting them
+                    // This prevents semaphore permit leak when scaling down
+                    let permits_to_remove = current - new_workers;
+                    let mut removed = 0;
+                    for _ in 0..permits_to_remove {
+                        // Try to acquire permit non-blockingly
+                        if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                            // Forget the permit = remove it from the pool
+                            std::mem::forget(permit);
+                            removed += 1;
+                        } else {
+                            // Permit is in use - can't remove it now
+                            // This is OK - the permit will be released when the task completes
+                            break;
+                        }
+                    }
+                    
                     self.current_workers.store(new_workers, Ordering::Relaxed);
                     last_scale_down = Instant::now();
                     
                     log::info!(
-                        "Analyzer: Scaling down workers (no lag for {}s): {} -> {}",
+                        "Analyzer: Scaling down workers (no lag for {}s): {} -> {} (removed {} permits from semaphore)",
                         SCALE_DOWN_THRESHOLD.as_secs(),
                         current,
-                        new_workers
+                        new_workers,
+                        removed
                     );
                 }
             }

@@ -82,6 +82,7 @@ impl SlippageEstimator {
     }
 
     /// Estimate slippage with Jupiter API and return both slippage and hop count
+    /// ✅ FIX: Refactored to use cleaner error handling pattern
     async fn estimate_with_jupiter_route(
         &self,
         input_mint: Pubkey,
@@ -106,215 +107,87 @@ impl SlippageEstimator {
             Duration::from_millis(backoff_ms)
         };
 
-        // Retry loop with exponential backoff
+        let mut last_error = None;
+        
+        // ✅ FIX: Cleaner retry loop - try Jupiter API, fallback on all errors
         for attempt in 1..=MAX_RETRIES {
-            match self.client.get(&url).send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    
-                    if status.is_success() {
-                        // Success - parse and return
-                        let response_text = match response.text().await {
-                            Ok(text) => text,
-                            Err(e) => {
-                                log::warn!(
-                                    "Jupiter API: failed to read response body (attempt {}): {}",
-                                    attempt,
-                                    e
-                                );
-                                if attempt < MAX_RETRIES {
-                                    let backoff = get_backoff(attempt);
-                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                                    tokio::time::sleep(backoff).await;
-                                    continue;
-                                } else {
-                                    log::warn!(
-                                        "Jupiter API failed after {} attempts, using fallback",
-                                        MAX_RETRIES
-                                    );
-                                    let slippage = self.estimate_with_multipliers(amount)?;
-                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
-                                }
-                            }
-                        };
-
-                        match serde_json::from_str::<JupiterQuoteResponse>(&response_text) {
-                            Ok(quote) => {
-                                if let Some(price_impact_str) = quote.price_impact_pct {
-                                    // ✅ CRITICAL: Jupiter API v6 returns priceImpactPct as STRING in percentage format
-                                    // Official docs: https://docs.jup.ag/apis/quote-api
-                                    // Format: String representing percentage (0-100)
-                                    // Examples: "0" = 0%, "0.5" = 0.5% = 50 bps, "1.25" = 1.25% = 125 bps
-                                    // Note: "0" is normal for very liquid pairs (SOL/USDC)
-                                    
-                                    // Parse string to f64
-                                    let price_impact_pct = match price_impact_str.parse::<f64>() {
-                                        Ok(val) => {
-                                            if val < 0.0 {
-                                                log::warn!(
-                                                    "⚠️  Jupiter API returned negative price impact: '{}' - using fallback",
-                                                    price_impact_str
-                                                );
-                                                if attempt < MAX_RETRIES {
-                                                    let backoff = get_backoff(attempt);
-                                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                                                    tokio::time::sleep(backoff).await;
-                                                    continue;
-                                                } else {
-                                                    let slippage = self.estimate_with_multipliers(amount)?;
-                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
-                                                }
-                                            }
-                                            val
-                                        },
-                                        Err(e) => {
-                                            log::warn!(
-                                                "⚠️  Jupiter API: failed to parse priceImpactPct '{}': {} - using fallback",
-                                                price_impact_str,
-                                                e
-                                            );
-                                            if attempt < MAX_RETRIES {
-                                                let backoff = get_backoff(attempt);
-                                                log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                                                tokio::time::sleep(backoff).await;
-                                                continue;
-                                            } else {
-                                                let slippage = self.estimate_with_multipliers(amount)?;
-                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
-                                            }
-                                        }
-                                    };
-                                    
-                                    // ✅ Convert percentage to basis points
-                                    // "0.5" (0.5%) → 50 bps
-                                    // "1.25" (1.25%) → 125 bps
-                                    let slippage_bps = (price_impact_pct * 100.0) as u16;
-                                    
-                                    // ✅ Calculate hop count from route plan
-                                    // Each element in routePlan represents one hop
-                                    // Example: USDC -> SOL -> ETH has 2 hops (routePlan.length = 2)
-                                    let hop_count = quote.route_plan.as_ref()
-                                        .map(|route| route.len() as u8)
-                                        .unwrap_or(1); // Default to 1 hop if route plan is missing
-                                    
-                                    // Validate result is reasonable (should be < 10,000 bps = < 100%)
-                                    if slippage_bps > 10_000 {
-                                        log::warn!(
-                                            "⚠️  Jupiter API returned suspiciously high price impact: '{}' ({}% = {} bps > 100%) - capping at max_slippage_bps",
-                                            price_impact_str,
-                                            price_impact_pct,
-                                            slippage_bps
-                                        );
-                                        return Ok((self.config.max_slippage_bps, hop_count));
-                                    }
-                                    
-                                    log::info!(
-                                        "✅ Jupiter API: priceImpactPct='{}' ({}%) → {} bps, hop_count={}",
-                                        price_impact_str,
-                                        price_impact_pct,
-                                        slippage_bps,
-                                        hop_count
-                                    );
-                                    
-                                    return Ok((slippage_bps.min(self.config.max_slippage_bps), hop_count));
-                                } else {
-                                    log::warn!(
-                                        "Jupiter API did not return price impact (attempt {}), will retry",
-                                        attempt
-                                    );
-                                    if attempt < MAX_RETRIES {
-                                        let backoff = get_backoff(attempt);
-                                        log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                                        tokio::time::sleep(backoff).await;
-                                        continue;
-                                    } else {
-                                        log::warn!(
-                                            "Jupiter API failed after {} attempts, using fallback",
-                                            MAX_RETRIES
-                                        );
-                                        let slippage = self.estimate_with_multipliers(amount)?;
-                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Jupiter API: failed to parse response (attempt {}): {}",
-                                    attempt,
-                                    e
-                                );
-                                if attempt < MAX_RETRIES {
-                                    let backoff = get_backoff(attempt);
-                                    log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                                    tokio::time::sleep(backoff).await;
-                                    continue;
-                                } else {
-                                    log::warn!(
-                                        "Jupiter API failed after {} attempts, using fallback",
-                                        MAX_RETRIES
-                                    );
-                                    let slippage = self.estimate_with_multipliers(amount)?;
-                                    return Ok((slippage, 1)); // Default to 1 hop on fallback
-                                }
-                            }
-                        }
-                    } else {
-                        // HTTP error status
-                        let response_text = response.text().await.unwrap_or_default();
-                        log::warn!(
-                            "Jupiter API error (attempt {}): Status {}, Response: {}",
-                            attempt,
-                            status,
-                            response_text
-                        );
-                        
-                        if attempt < MAX_RETRIES {
-                            let backoff = get_backoff(attempt);
-                            log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
-                            tokio::time::sleep(backoff).await;
-                            continue;
-                        } else {
-                            log::warn!(
-                                "Jupiter API failed after {} attempts, using fallback",
-                                MAX_RETRIES
-                            );
-                            // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
-                            let slippage = self.estimate_with_multipliers(amount)?;
-                            return Ok((slippage, 1)); // Default to 1 hop on fallback
-                        }
-                    }
+            match self.try_jupiter_quote(&url).await {
+                Ok((slippage, hop_count)) => {
+                    // ✅ Success - return immediately
+                    return Ok((slippage, hop_count));
                 }
                 Err(e) => {
-                    // Network error
-                    log::warn!(
-                        "Jupiter API network error (attempt {}): {}",
-                        attempt,
-                        e
-                    );
+                    log::warn!("Jupiter API attempt {}/{} failed: {}", attempt, MAX_RETRIES, e);
+                    last_error = Some(e);
                     
                     if attempt < MAX_RETRIES {
                         let backoff = get_backoff(attempt);
-                        log::debug!("Jupiter API: waiting {:?} before retry (attempt {})", backoff, attempt);
                         tokio::time::sleep(backoff).await;
-                        continue;
-                    } else {
-                        log::warn!(
-                            "Jupiter API failed after {} attempts, using fallback",
-                            MAX_RETRIES
-                        );
-                        // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
-                        let slippage = self.estimate_with_multipliers(amount)?;
-                        return Ok((slippage, 1)); // Default to 1 hop on fallback
+                        // continue to next attempt
                     }
                 }
             }
         }
-
-        // Should never reach here, but fallback just in case
-        log::warn!("Jupiter API failed after {} attempts, using fallback", MAX_RETRIES);
-        // ✅ CRITICAL FIX: Return consistent tuple type (u16, u8)
+        
+        // ✅ All retries exhausted - use fallback
+        log::warn!(
+            "Jupiter API failed after {} attempts (last error: {:?}), using fallback",
+            MAX_RETRIES,
+            last_error
+        );
+        
         let slippage = self.estimate_with_multipliers(amount)?;
-        Ok((slippage, 1)) // Default to 1 hop on fallback
+        Ok((slippage, 1))
+    }
+    
+    /// Try to get a quote from Jupiter API (single attempt, no retries)
+    /// ✅ FIX: Separated into its own function for cleaner error handling
+    async fn try_jupiter_quote(&self, url: &str) -> Result<(u16, u8)> {
+        use anyhow::Context;
+        
+        // Make HTTP request
+        let response = self.client.get(url).send().await
+            .context("Network error")?;
+        
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+        }
+        
+        // Read response body
+        let response_text = response.text().await
+            .context("Failed to read response body")?;
+        
+        // Parse JSON response
+        let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
+            .context("Failed to parse JSON")?;
+        
+        // Extract price impact
+        let price_impact_str = quote.price_impact_pct
+            .ok_or_else(|| anyhow::anyhow!("No price impact in response"))?;
+        
+        // Parse price impact percentage
+        let price_impact_pct = price_impact_str.parse::<f64>()
+            .context("Failed to parse price impact")?;
+        
+        // ✅ Validate BEFORE using
+        if price_impact_pct < 0.0 {
+            return Err(anyhow::anyhow!("Negative price impact: {}", price_impact_pct));
+        }
+        
+        if price_impact_pct > 100.0 {
+            return Err(anyhow::anyhow!("Suspiciously high price impact: {}%", price_impact_pct));
+        }
+        
+        // Convert percentage to basis points
+        let slippage_bps = (price_impact_pct * 100.0) as u16;
+        
+        // Calculate hop count from route plan
+        let hop_count = quote.route_plan
+            .as_ref()
+            .map(|route| route.len() as u8)
+            .unwrap_or(1);
+        
+        Ok((slippage_bps.min(self.config.max_slippage_bps), hop_count))
     }
 
     fn estimate_with_multipliers(&self, amount: u64) -> Result<u16> {
@@ -334,6 +207,7 @@ impl SlippageEstimator {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use crate::blockchain::rpc_client::RpcClient;
         use std::sync::Arc;
+        use anyhow::Context;
         
         let rpc = Arc::new(
             RpcClient::new(self.config.rpc_http_url.clone())

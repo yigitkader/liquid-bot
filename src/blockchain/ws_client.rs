@@ -345,41 +345,74 @@ impl WsClient {
                     old
                 };
                 
-                // Resubscribe to all previous subscriptions with new IDs
-                for (_, info) in old_subscriptions.iter() {
-                    match &info.subscription_type {
+                // ✅ FIX: Resubscribe with error tracking to handle failed subscriptions
+                // Track failed subscriptions and retry them once to improve reliability
+                let mut failed_subscriptions = Vec::new();
+                
+                for (old_id, info) in old_subscriptions.iter() {
+                    let resubscribe_result = match &info.subscription_type {
                         SubscriptionType::Program(program_id) => {
-                            match self.subscribe_program(program_id).await {
-                                Ok(new_id) => {
-                                    log::info!("Resubscribed to program {} with new subscription ID: {}", program_id, new_id);
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to resubscribe to program {}: {}", program_id, e);
-                                }
-                            }
+                            self.subscribe_program(program_id).await
+                                .map(|new_id| {
+                                    log::info!("Resubscribed: {} -> {} (program: {})", old_id, new_id, program_id);
+                                    new_id
+                                })
                         }
                         SubscriptionType::Account(pubkey) => {
-                            match self.subscribe_account(pubkey).await {
-                                Ok(new_id) => {
-                                    log::info!("Resubscribed to account {} with new subscription ID: {}", pubkey, new_id);
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to resubscribe to account {}: {}", pubkey, e);
-                                }
-                            }
+                            self.subscribe_account(pubkey).await
+                                .map(|new_id| {
+                                    log::info!("Resubscribed: {} -> {} (account: {})", old_id, new_id, pubkey);
+                                    new_id
+                                })
                         }
                         SubscriptionType::Slot => {
-                            match self.subscribe_slot().await {
-                                Ok(new_id) => {
-                                    log::info!("Resubscribed to slot with new subscription ID: {}", new_id);
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to resubscribe to slot: {}", e);
-                                }
+                            self.subscribe_slot().await
+                                .map(|new_id| {
+                                    log::info!("Resubscribed: {} -> {} (slot)", old_id, new_id);
+                                    new_id
+                                })
+                        }
+                    };
+                    
+                    match resubscribe_result {
+                        Ok(_) => {
+                            // Successfully resubscribed
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to resubscribe {}: {}", old_id, e);
+                            failed_subscriptions.push((*old_id, info.clone()));
+                        }
+                    }
+                }
+                
+                // Retry failed subscriptions once
+                if !failed_subscriptions.is_empty() {
+                    log::info!("Retrying {} failed subscriptions...", failed_subscriptions.len());
+                    for (old_id, info) in failed_subscriptions {
+                        let retry_result = match &info.subscription_type {
+                            SubscriptionType::Program(program_id) => {
+                                self.subscribe_program(program_id).await
+                            }
+                            SubscriptionType::Account(pubkey) => {
+                                self.subscribe_account(pubkey).await
+                            }
+                            SubscriptionType::Slot => {
+                                self.subscribe_slot().await
+                            }
+                        };
+                        
+                        match retry_result {
+                            Ok(new_id) => {
+                                log::info!("Retry successful: {} -> {}", old_id, new_id);
+                            }
+                            Err(e) => {
+                                log::error!("Retry failed for {}: {} (subscription will be lost)", old_id, e);
                             }
                         }
                     }
                 }
+                
+                // ✅ old_subscriptions is dropped here (no memory leak)
                 return Ok(()); // Successfully reconnected
             }
             

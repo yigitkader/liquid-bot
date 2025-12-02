@@ -64,16 +64,16 @@ impl BalanceManager {
         // This prevents TOCTOU race condition where reserved value changes between read and use
         // Lock order: reserved first, then balances (consistent ordering prevents deadlock)
         let reserved = self.reserved.read().await;
-        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
         
-        // Try to read from cache while holding reserved lock
+        // Try to read from cache while holding BOTH locks
         {
             let balances = self.balances.read().await;
             if let Some(cached) = balances.get(&ata) {
                 // Check cache freshness
                 if cached.timestamp.elapsed() < CACHE_TTL {
-                    // ✅ ATOMIC: Both reserved and cached values are read while locks are held
+                    // ✅ ATOMIC: Read reserved WHILE holding both locks
                     // This ensures reserved value cannot change between read and calculation
+                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
                     let available = cached.amount.saturating_sub(reserved_amount);
                     log::debug!(
                         "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}, age={:.2}s",
@@ -89,7 +89,7 @@ impl BalanceManager {
                 }
             }
         }
-        // Reserved lock is dropped here (after cache check)
+        // Both locks are dropped here (after cache check)
         
         // Cache miss - fallback to RPC (this should be rare after initial subscription)
         log::debug!(
@@ -473,10 +473,26 @@ impl BalanceManager {
 
     /// Unsubscribe from ATA monitoring (graceful shutdown).
     /// Clears all subscriptions to prevent race conditions during shutdown.
+    /// ✅ FIX: Clear cache AND subscriptions together to prevent race conditions
     pub async fn stop_monitoring(&self) -> Result<()> {
+        // ✅ FIX: Hold both locks simultaneously to clear subscriptions and cache atomically
+        // This prevents race condition where handle_account_update() checks subscription
+        // while we're clearing it, causing update loss
         let mut subscribed_atas = self.subscribed_atas.write().await;
+        let mut balances = self.balances.write().await; // Hold both locks!
+        
+        let subscription_count = subscribed_atas.len();
+        
+        // Clear subscriptions
         subscribed_atas.clear();
-        log::info!("BalanceManager: Stopped monitoring (cleared all subscriptions)");
+        
+        // Clear cache for safety (prevents stale data after shutdown)
+        balances.clear();
+        
+        log::info!(
+            "BalanceManager: Stopped monitoring (cleared {} subscriptions and cache)",
+            subscription_count
+        );
         Ok(())
     }
 }

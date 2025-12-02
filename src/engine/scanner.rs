@@ -285,9 +285,11 @@ impl Scanner {
                         for (pubkey, account) in accounts {
                             match self.protocol.parse_position(&account).await {
                                 Some(position) => {
-                                    // Check if position changed (avoid duplicate events)
+                                    // ✅ FIX: ALWAYS update cache in RPC polling mode
+                                    // This ensures cache is fresh for next comparison, even if we don't publish
+                                    // Get old cached value BEFORE updating (for comparison)
                                     let cached = self.cache.get(&pubkey).await;
-                                    let should_publish = if let Some(cached_pos) = cached {
+                                    let should_publish = if let Some(cached_pos) = &cached {
                                         // Only publish if position changed significantly
                                         cached_pos.health_factor != position.health_factor
                                     } else {
@@ -295,8 +297,11 @@ impl Scanner {
                                         true
                                     };
                                     
+                                    // Always update cache (even if not publishing)
+                                    self.cache.update(pubkey, position.clone()).await;
+                                    
+                                    // Only publish if position changed
                                     if should_publish {
-                                        self.cache.update(pubkey, position.clone()).await;
                                         if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
                                             pubkey,
                                             position,

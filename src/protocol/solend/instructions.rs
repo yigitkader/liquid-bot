@@ -74,12 +74,22 @@ impl ReserveCache {
         // This is safe because we'll double-check after acquiring write lock
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
 
+        // ✅ FIX: Check BEFORE acquiring write lock to prevent deadlock
+        // If another thread already updated the cache while we were fetching, we can return early
+        // This prevents two threads from both acquiring write locks simultaneously
+        {
+            let inner = self.inner.read().await;
+            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
+                return Ok(*reserve); // Another thread already updated
+            }
+        }
+
         // ✅ CRITICAL: Acquire write lock ONCE to update cache
         // No nested lock risk - we only acquire lock here, not inside fetch function
         {
             let mut inner = self.inner.write().await;
             
-            // Double-check: Another thread might have refreshed while we were fetching
+            // Double-check: Another thread might have refreshed while we were waiting for write lock
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
                 return Ok(*reserve);
             }
