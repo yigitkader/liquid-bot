@@ -373,27 +373,38 @@ impl Executor {
                         // Add to cache after adding instruction
                         cache.insert(destination_collateral);
                     } else {
-                        // Other RPC errors (network, timeout, etc.) - log and continue
-                        // We'll add instruction anyway (idempotent, so safe)
+                        // Other RPC errors (network, timeout, etc.) - handle carefully
                         let error_str = e.to_string().to_lowercase();
                         let is_timeout = error_str.contains("timeout") || error_str.contains("timed out");
                         
                         if is_timeout {
-                            // ✅ FIX: Cache pessimistically on timeout - assume ATA missing
-                            // Prevents repeated RPC calls on consecutive timeouts
-                            // Without this, repeated timeouts = repeated double instructions = transaction failures
+                            // ✅ CRITICAL FIX: Timeout durumunda cache'e EKLEME
+                            // Problem: Timeout → cache'e "missing" ekleniyor → sonraki opportunity'de
+                            // cache hit → duplicate instruction → TX fail
+                            //
+                            // Senaryo:
+                            // 1. Opportunity 1: ATA timeout → cache'e "missing" ekleniyor
+                            // 2. Opportunity 2: Cache'den "missing" okuyor → instruction ekliyor
+                            // 3. Her ikisi de create_ata instruction gönderiyor
+                            // 4. İlk TX: ATA create ediyor ✅
+                            // 5. İkinci TX: Duplicate create → TX FAIL ❌
+                            //
+                            // Çözüm: Timeout durumunda cache'e eklememek, her seferinde RPC check yapmak
+                            // Timeout geçici bir durum, bir sonraki opportunity'de timeout geçmiş olabilir
+                            // ve ATA gerçekten var olabilir. Cache'e eklememek duplicate instruction'ı önler.
                             log::warn!(
-                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction and caching pessimistically (assuming ATA missing)",
+                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction but NOT caching (will retry RPC check on next opportunity)",
                                 destination_collateral
                             );
                             let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
                             tx_builder.add_instruction(create_ata_ix);
-                            // Cache pessimistically: assume ATA missing to prevent repeated RPC calls
-                            cache.insert(destination_collateral);
-                            log::warn!("Cached ATA as missing due to timeout (pessimistic caching)");
+                            // ✅ CRITICAL: Cache'e EKLEME - timeout geçici, sonraki opportunity'de
+                            // timeout geçmiş olabilir ve ATA gerçekten var olabilir
+                            // Cache'e eklememek duplicate instruction'ı önler
                         } else {
                             // Other errors (network, etc.) - add instruction, cache pessimistically
-                            // This assumes ATA doesn't exist (safe assumption for non-timeout errors)
+                            // Non-timeout errors are usually permanent (network issues, etc.)
+                            // so it's safe to cache pessimistically
                             log::warn!(
                                 "Executor: Failed to check ATA existence for {}: {}. Adding create_ata instruction anyway (idempotent)",
                                 destination_collateral,

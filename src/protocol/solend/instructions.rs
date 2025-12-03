@@ -71,25 +71,33 @@ impl ReserveCache {
 
         // Slow path: Cache miss - need to refresh
         // ✅ CRITICAL: RPC call is made OUTSIDE the lock to prevent blocking
-        // This is safe because we'll double-check after acquiring write lock
+        // This is safe because we'll double-check after the RPC call completes
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
 
-        // ✅ FIX: Check BEFORE acquiring write lock to prevent deadlock
-        // If another thread already updated the cache while we were fetching, we can return early
-        // This prevents two threads from both acquiring write locks simultaneously
+        // ✅ CRITICAL FIX: Double-check BEFORE acquiring write lock
+        // This prevents race condition where multiple threads make redundant RPC calls:
+        // - Thread 1: RPC call yapıyor (5 saniye)
+        // - Thread 2: RPC call yapıyor (5 saniye, aynı veri!)
+        // - Thread 1: Write lock alıp cache güncelliyor
+        // - Thread 2: Write lock alıp AYNI veriyi TEKRAR yazıyor (gereksiz!)
+        // 
+        // Çözüm: RPC call'dan SONRA, write lock almadan ÖNCE tekrar kontrol et.
+        // Eğer başka thread güncellediyse, gereksiz write işlemini skip et.
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
-                return Ok(*reserve); // Another thread already updated
+                // Başka thread cache'i güncellemiş, gereksiz write işlemini atla
+                return Ok(*reserve);
             }
         }
 
-        // ✅ CRITICAL: Acquire write lock ONCE to update cache
+        // ✅ CRITICAL: Şimdi güvenli: Eğer buraya geldiyse, gerçekten güncelleme gerekiyor
+        // Acquire write lock ONCE to update cache
         // No nested lock risk - we only acquire lock here, not inside fetch function
         {
             let mut inner = self.inner.write().await;
             
-            // Double-check: Another thread might have refreshed while we were waiting for write lock
+            // Final double-check: Another thread might have refreshed while we were waiting for write lock
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
                 return Ok(*reserve);
             }

@@ -335,13 +335,33 @@ impl WsClient {
             if self.connect().await.is_ok() {
                 log::info!("✅ WebSocket reconnected successfully on attempt {}", attempt);
                 
-                // ✅ CRITICAL FIX: Clear old subscriptions before resubscribing
-                // Old subscription IDs are invalid after reconnection - they must be cleaned up
-                // This prevents memory leak where HashMap grows indefinitely with stale IDs
+                // ✅ CRITICAL FIX: Clear old subscriptions BEFORE resubscribing
+                // Problem: Old subscription IDs are invalid after reconnection but remain in HashMap
+                // This causes memory leak where HashMap grows indefinitely with stale IDs
+                //
+                // Senaryo:
+                // 1. Initial connect: Subscription ID 123 (programSubscribe)
+                // 2. Connection lost → reconnect
+                // 3. Resubscribe: Yeni subscription ID 456
+                // 4. HashMap'te: {123: Info, 456: Info} ← 123 STALE!
+                // 5. Her reconnect'te +1 entry → memory leak!
+                //
+                // Çözüm: ÖNCE old subscriptions'ı temizle, SONRA resubscribe
                 let old_subscriptions = {
                     let mut subscriptions = self.subscriptions.lock().await;
+                    let old_count = subscriptions.len();
                     let old = subscriptions.clone(); // Clone before clearing
-                    subscriptions.clear(); // Clear old subscription IDs
+                    
+                    // ✅ CRITICAL: Clear old subscription IDs to prevent memory leak
+                    subscriptions.clear();
+                    
+                    if old_count > 0 {
+                        log::info!(
+                            "Cleared {} stale subscription(s) before resubscribing (preventing memory leak)",
+                            old_count
+                        );
+                    }
+                    
                     old
                 };
                 

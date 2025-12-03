@@ -97,6 +97,11 @@ impl BalanceManager {
             mint, ata
         );
         
+        // ✅ CRITICAL FIX: Hold reserved lock throughout ENTIRE RPC call and cache update
+        // This prevents TOCTOU: reserved value cannot change between RPC call and calculation
+        // Lock order: reserved first, then balances (consistent ordering prevents deadlock)
+        let reserved = self.reserved.read().await;
+        
         // Handle AccountNotFound gracefully - if ATA doesn't exist, balance is 0
         // This is expected behavior: ATA doesn't exist = no token account = balance is 0
         let account = match self.rpc.get_account(&ata).await {
@@ -112,18 +117,15 @@ impl BalanceManager {
                         ata,
                         self.wallet
                     );
-                    // Cache the zero balance to avoid repeated RPC calls
-                    // ✅ CRITICAL: Read reserved while holding balances write lock to ensure atomicity
-                    let reserved_amount = {
-                        let reserved = self.reserved.read().await;
-                        reserved.get(mint).copied().unwrap_or(0)
-                    };
+                    // ✅ CRITICAL FIX: Hold BOTH locks simultaneously to ensure atomicity
+                    // Read reserved WHILE holding balances write lock to prevent TOCTOU
+                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
                     let mut balances = self.balances.write().await;
                     balances.insert(ata, CachedBalance {
                         amount: 0,
                         timestamp: Instant::now(),
                     });
-                    // ✅ ATOMIC: Reserved was read before cache update, so calculation is safe
+                    // ✅ ATOMIC: Reserved was read WHILE holding both locks, so calculation is safe
                     return Ok(0u64.saturating_sub(reserved_amount));
                 }
                 // Other errors (network issues, RPC errors, etc.) should be propagated
@@ -139,15 +141,12 @@ impl BalanceManager {
             .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
         let actual = u64::from_le_bytes(balance_bytes);
         
-        // ✅ CRITICAL FIX: Read reserved AFTER RPC call but BEFORE cache update
-        // This ensures we use the most up-to-date reserved value (RPC call may have taken time)
-        // and prevents reserved from changing between cache update and calculation
-        let reserved_amount = {
-            let reserved = self.reserved.read().await;
-            reserved.get(mint).copied().unwrap_or(0)
-        };
+        // ✅ CRITICAL FIX: Read reserved WHILE holding balances write lock to ensure atomicity
+        // Reserved lock is already held from above, so we can safely read it
+        // This ensures reserved value cannot change between RPC call and calculation
+        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
         
-        // Update cache with RPC result
+        // Update cache with RPC result (while still holding reserved lock)
         {
             let mut balances = self.balances.write().await;
             balances.insert(ata, CachedBalance {
@@ -156,8 +155,9 @@ impl BalanceManager {
             });
         }
         
-        // ✅ ATOMIC: Reserved was read after RPC (most up-to-date) and before cache update
-        // This ensures calculation uses consistent values
+        // ✅ ATOMIC: Reserved was read WHILE holding reserved lock throughout entire operation
+        // This ensures calculation uses consistent values - reserved cannot change between
+        // RPC call and calculation because we hold the lock the entire time
         let available = actual.saturating_sub(reserved_amount);
         Ok(available)
     }

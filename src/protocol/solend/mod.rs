@@ -50,25 +50,41 @@ impl Protocol for SolendProtocol {
 
         let data_len = account.data.len();
 
-        // FAST PATH 1: Size check (1200-1500 bytes expected for obligation accounts)
+        // ✅ CRITICAL FIX: Discriminator check BEFORE size check
+        // Problem: Discriminator check sadece 8 byte gerektirirken, size check 1200 byte gerektiriyor
+        // Bu gereksiz parse attempt'lerine yol açıyor - yanlış account type'ları 1200 byte okunana kadar
+        // bekliyor, sonra discriminator check yapılıyor.
+        //
+        // Çözüm: Discriminator check'i size check'ten ÖNCE yap
+        // 1. Önce 8 byte check (discriminator okunabilir mi?)
+        // 2. Sonra discriminator check (doğru account type mı?)
+        // 3. Sonra size check (tam obligation size mı?)
+        //
+        // Bu sıralama gereksiz parse attempt'lerini önler ve performansı artırır
+        
+        // FAST PATH 1: Discriminator check (ONLY 8 bytes needed - fastest check!)
+        // This filters out wrong account types immediately by checking the account discriminator
+        // Solend uses Anchor framework which prefixes accounts with discriminator
+        const DISCRIMINATOR_SIZE: usize = 8;
+        if data_len < DISCRIMINATOR_SIZE {
+            return None; // Can't even read discriminator, skip immediately
+        }
+        
+        let account_discriminator = &account.data[0..DISCRIMINATOR_SIZE];
+        let expected_discriminator = get_obligation_discriminator();
+        
+        if account_discriminator != expected_discriminator {
+            return None; // Wrong account type, skip immediately (before expensive size check)
+        }
+        
+        // FAST PATH 2: Size check (1200-1500 bytes expected for obligation accounts)
         // This quickly filters out wrong account types before expensive parsing
+        // Only check size AFTER discriminator matches (optimization)
         const MIN_OBLIGATION_SIZE: usize = 1200;
         const MAX_OBLIGATION_SIZE: usize = 1500;
         
         if data_len < MIN_OBLIGATION_SIZE || data_len > MAX_OBLIGATION_SIZE {
             return None; // Wrong account type, skip immediately
-        }
-        
-        // FAST PATH 2: Discriminator check (before expensive parse)
-        // This filters out wrong account types by checking the account discriminator
-        // Solend uses Anchor framework which prefixes accounts with discriminator
-        if data_len >= 8 {
-            let account_discriminator = &account.data[0..8];
-            let expected_discriminator = get_obligation_discriminator();
-            
-            if account_discriminator != expected_discriminator {
-                return None; // Wrong account type, skip immediately
-            }
         }
         
         // Obligation parse et

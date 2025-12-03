@@ -110,64 +110,109 @@ impl Analyzer {
                     last_lag = Instant::now();
                     
                     // ADAPTIVE SCALING: Increase workers when lag detected
-                    let current = self.current_workers.load(Ordering::Relaxed);
+                    let current_target = self.current_workers.load(Ordering::Relaxed);
                     
                     // ✅ CRITICAL FIX: Hard limit to prevent semaphore from growing indefinitely
                     // This prevents memory leaks when tasks don't complete quickly
                     // Even if max_workers_limit is high, we cap at a reasonable concurrent limit
                     const MAX_CONCURRENT_VALIDATIONS: usize = 100;
                     
-                    if current < self.max_workers_limit {
+                    if current_target < self.max_workers_limit {
                         // Increase workers by 50% or at least 2, up to limit
-                        let increase = std::cmp::max(2, current / 2);
-                        let new_workers = std::cmp::min(
-                            current + increase,
+                        let increase = std::cmp::max(2, current_target / 2);
+                        let new_target = std::cmp::min(
+                            current_target + increase,
                             self.max_workers_limit
                         );
                         
-                        // ✅ CRITICAL FIX: Add permits based on target, but respect limits
-                        // Since scale down doesn't remove permits (just updates target),
-                        // we need to be careful not to add too many permits
-                        // Strategy: Add permits to reach new_workers target, but respect MAX_CONCURRENT_VALIDATIONS
-                        let permits_to_add = new_workers.saturating_sub(current);
+                        // ✅ CRITICAL FIX: Check ACTUAL semaphore permit count to prevent leak
+                        // Problem: Scale down doesn't remove permits, so semaphore may have more
+                        // permits than current_target. We need to check actual available permits
+                        // and only add permits to reach new_target, not add on top of existing excess.
+                        //
+                        // Strategy:
+                        // 1. Get current available permits (doesn't include permits in use by tasks)
+                        // 2. If available >= new_target: Already have enough (or too many) - don't add
+                        // 3. If available < new_target: Add only (new_target - available) permits
+                        //
+                        // Note: We can't know exact total permits (available + used), but we can
+                        // prevent leak by only adding permits when available < new_target.
+                        // If scale down happened and permits weren't removed, available will be
+                        // high, so we won't add more permits unnecessarily.
+                        let current_available = semaphore.available_permits();
+                        
+                        // ✅ CRITICAL FIX: Only add permits if we're below target
+                        // If available permits >= new_target, we already have enough (or too many)
+                        // Don't add more permits in that case - just update target
+                        // This prevents permit leak when scale down didn't remove permits
+                        let permits_to_add = if current_available < new_target {
+                            new_target - current_available
+                        } else {
+                            // Already have enough or too many permits (leak scenario)
+                            // Just update target, don't add more permits
+                            0
+                        };
                         
                         // Respect MAX_CONCURRENT_VALIDATIONS limit
-                        // Estimate total permits: current (best guess, may be higher if scale down didn't remove permits)
-                        let estimated_total = current;
-                        let max_allowed = MAX_CONCURRENT_VALIDATIONS.saturating_sub(estimated_total);
-                        let permits_to_add = permits_to_add.min(max_allowed);
-                        
-                        if permits_to_add > 0 {
-                            // Add permits to existing semaphore (preserves waiting tasks)
-                            semaphore.add_permits(permits_to_add);
-                            let actual_new_workers = current + permits_to_add;
-                            self.current_workers.store(actual_new_workers, Ordering::Relaxed);
-                            
-                            log::warn!(
-                                "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits, available: {})",
-                                skipped,
-                                current,
-                                actual_new_workers,
-                                permits_to_add,
-                                semaphore.available_permits()
-                            );
-                        } else if permits_to_add == 0 && new_workers <= current {
-                            // Target is already reached or exceeded (due to scale down not removing permits)
-                            // Just update target to match current
-                            self.current_workers.store(new_workers, Ordering::Relaxed);
-                            log::warn!(
-                                "⚠️  Analyzer lagged, skipped {} events. Target updated: {} -> {} (permits already sufficient, available: {})",
-                                skipped,
-                                current,
-                                new_workers,
-                                semaphore.available_permits()
-                            );
+                        // Note: current_available is only available permits, not total
+                        // We estimate total by assuming some permits are in use
+                        // This is conservative - we cap at MAX_CONCURRENT_VALIDATIONS
+                        let estimated_total_after = current_available + permits_to_add;
+                        let final_permits_to_add = if estimated_total_after > MAX_CONCURRENT_VALIDATIONS {
+                            // Cap at MAX_CONCURRENT_VALIDATIONS
+                            MAX_CONCURRENT_VALIDATIONS.saturating_sub(current_available)
                         } else {
+                            permits_to_add
+                        };
+                        
+                        if final_permits_to_add > 0 {
+                            // Add permits to reach target (or max limit)
+                            semaphore.add_permits(final_permits_to_add);
+                            let actual_new_target = current_target + final_permits_to_add;
+                            self.current_workers.store(actual_new_target, Ordering::Relaxed);
+                            
+                            if estimated_total_after > MAX_CONCURRENT_VALIDATIONS {
+                                log::warn!(
+                                    "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits, available: {}, capped at max {})",
+                                    skipped,
+                                    current_target,
+                                    actual_new_target,
+                                    final_permits_to_add,
+                                    semaphore.available_permits(),
+                                    MAX_CONCURRENT_VALIDATIONS
+                                );
+                            } else {
+                                log::warn!(
+                                    "⚠️  Analyzer lagged, skipped {} events. Increasing workers: {} -> {} (added {} permits, available: {})",
+                                    skipped,
+                                    current_target,
+                                    actual_new_target,
+                                    final_permits_to_add,
+                                    semaphore.available_permits()
+                                );
+                            }
+                        } else if permits_to_add > 0 {
+                            // Wanted to add permits but hit MAX_CONCURRENT_VALIDATIONS limit
                             log::error!(
-                                "⚠️  CRITICAL: Analyzer lagged {} events, but cannot add more permits (max concurrent: {}, current: {})",
+                                "⚠️  CRITICAL: Analyzer lagged {} events, but cannot add more permits (max concurrent: {}, available: {})",
                                 skipped,
                                 MAX_CONCURRENT_VALIDATIONS,
-                                current
+                                current_available
+                            );
+                        } else {
+                            // Already have enough permits (available >= new_target)
+                            // This can happen if scale down didn't remove permits (leak scenario)
+                            // Just update target to match, don't add more permits
+                            // This prevents permit leak from growing
+                            self.current_workers.store(new_target, Ordering::Relaxed);
+                            
+                            log::warn!(
+                                "⚠️  Analyzer lagged, skipped {} events. Target updated: {} -> {} (permits already sufficient: available={}, target={})",
+                                skipped,
+                                current_target,
+                                new_target,
+                                current_available,
+                                new_target
                             );
                         }
                     } else {

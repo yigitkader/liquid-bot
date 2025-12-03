@@ -193,18 +193,33 @@ impl Validator {
         // ✅ FIX: Add 100ms delay ONCE before sequential checks, not per-check
         // Problem: Each check added 100ms delay → 200ms total delay + 2 RPC calls = ~20s per opportunity
         // Solution: Add delay once, then run checks sequentially WITHOUT extra delays
-        let (debt_result, collateral_result) = if config.is_free_rpc_endpoint() {
-            // Add 100ms delay ONCE, then run checks sequentially WITHOUT extra delays
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
-            let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
-            (debt_result, collateral_result)
-        } else {
-            // Parallel execution for premium RPC (faster, no rate limit concerns)
-            let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false);
-            let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false);
-            tokio::join!(debt_oracle_task, collateral_oracle_task)
-        };
+        //
+        // ✅ CRITICAL FIX: Total timeout cap for both oracle checks
+        // Problem: Sequential oracle checks için timeout kümülatif olabilir:
+        //   - Debt oracle: 5s timeout (per-check timeout)
+        //   - Collateral oracle: 5s timeout (per-check timeout)
+        //   - Toplam: 10s (çok uzun!)
+        // Solution: Total timeout cap ekle (12s max for both checks combined)
+        use tokio::time::{Duration, timeout};
+        const TOTAL_ORACLE_TIMEOUT: Duration = Duration::from_secs(12); // Max 12s for both checks
+        
+        let (debt_result, collateral_result) = timeout(TOTAL_ORACLE_TIMEOUT, async {
+            if config.is_free_rpc_endpoint() {
+                // Add 100ms delay ONCE, then run checks sequentially WITHOUT extra delays
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
+                let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
+                (debt_result, collateral_result)
+            } else {
+                // Parallel execution for premium RPC (faster, no rate limit concerns)
+                let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false);
+                let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false);
+                tokio::join!(debt_oracle_task, collateral_oracle_task)
+            }
+        }).await.map_err(|_| anyhow::anyhow!(
+            "Total oracle check timeout after {:?} (debt + collateral checks exceeded time limit)",
+            TOTAL_ORACLE_TIMEOUT
+        ))?;
         
         if let Err(e) = debt_result {
             log::debug!("   ❌ Debt oracle FAILED: {}", e);
