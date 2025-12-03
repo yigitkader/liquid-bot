@@ -209,6 +209,11 @@ impl ReserveCache {
                 true // Keep: reserve still exists on-chain
             } else {
                 removed_count += 1;
+                log::debug!(
+                    "SolendProtocol: Removing stale mint_to_reserve entry: mint {} -> reserve {} (reserve no longer exists on-chain)",
+                    mint,
+                    reserve
+                );
                 false // Remove: reserve no longer exists on-chain
             }
         });

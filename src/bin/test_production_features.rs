@@ -146,6 +146,10 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
                     println!("   ✅ Instruction built successfully with {} accounts", instruction.accounts.len());
                     println!("   ✅ Program ID: {}", instruction.program_id);
                     println!("   ✅ Data length: {} bytes", instruction.data.len());
+                    // Use found_liquidatable variable to provide informative message
+                    if found_liquidatable {
+                        println!("   ✅ Found liquidatable position and successfully built instruction");
+                    }
                     return Ok(());
                 } else {
                     return Err(anyhow::anyhow!("Instruction has incorrect number of accounts: {}", instruction.accounts.len()));
@@ -154,7 +158,10 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
         }
     }
 
-    if !found_liquidatable {
+    // Use found_liquidatable to provide informative test result
+    if found_liquidatable {
+        println!("   ✅ Found liquidatable obligations and tested instruction building");
+    } else {
         println!("   ⚠️  No liquidatable obligations found in first 10 accounts (this is OK)");
         println!("   ✅ Instruction building logic is correct (tested with mock data)");
     }

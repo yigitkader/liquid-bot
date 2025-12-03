@@ -411,13 +411,37 @@ impl Executor {
         tx_builder.add_compute_budget(200_000, 1_000);
         let mut cache = self.ata_cache.write().await;
 
-        if !cache.contains_key(&destination_collateral) {
-            // Cache miss - check RPC to see if ATA actually exists
-            log::debug!(
-                "Executor: Cache miss for ATA {}, checking on-chain existence...",
-                destination_collateral
-            );
+        // Check cache: if entry exists and is verified, skip RPC check
+        let needs_rpc_check = match cache.get(&destination_collateral) {
+            Some(entry) => {
+                // Entry exists - check if it's verified
+                if entry.verified {
+                    // ✅ Verified entry: ATA exists on-chain, skip create_ata instruction
+                    log::debug!(
+                        "Executor: ATA {} found in cache (verified: true), skipping create_ata instruction",
+                        destination_collateral
+                    );
+                    false // No RPC check needed
+                } else {
+                    // ✅ Unverified entry: previous check failed (timeout/error), retry RPC check
+                    log::debug!(
+                        "Executor: ATA {} found in cache but not verified (verified: false), re-checking on-chain existence...",
+                        destination_collateral
+                    );
+                    true // Need RPC check to verify
+                }
+            }
+            None => {
+                // Cache miss - check RPC to see if ATA actually exists
+                log::debug!(
+                    "Executor: Cache miss for ATA {}, checking on-chain existence...",
+                    destination_collateral
+                );
+                true // Need RPC check
+            }
+        };
 
+        if needs_rpc_check {
             match self.rpc.get_account(&destination_collateral).await {
                 Ok(_) => {
                     cache.insert(destination_collateral, AtaCacheEntry {
@@ -425,7 +449,7 @@ impl Executor {
                         verified: true,
                     });
                     log::debug!(
-                        "Executor: ATA {} exists on-chain, added to cache, skipping create_ata instruction",
+                        "Executor: ATA {} exists on-chain, added to cache (verified: true), skipping create_ata instruction",
                         destination_collateral
                     );
                 }
@@ -484,11 +508,6 @@ impl Executor {
                     }
                 }
             }
-        } else {
-            log::debug!(
-                "Executor: Skipping create_ata instruction for {} (already in cache)",
-                destination_collateral
-            );
         }
 
         tx_builder.add_instruction(liq_ix);

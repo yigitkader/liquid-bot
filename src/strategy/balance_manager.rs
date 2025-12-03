@@ -442,8 +442,8 @@ impl BalanceManager {
                 let rpc_account_result = self.rpc.get_account(&ata).await;
                 
                 // Re-acquire locks (SAME ORDER: balances -> reserved to prevent deadlock)
-                let mut balances = self.balances.write().await;
-                let mut reserved = self.reserved.write().await;
+                balances = self.balances.write().await;
+                reserved = self.reserved.write().await;
                 
                 match rpc_account_result {
                     Ok(account) => {
@@ -495,8 +495,8 @@ impl BalanceManager {
             let rpc_account_result = self.rpc.get_account(&ata).await;
             
             // Re-acquire locks (SAME ORDER: balances -> reserved to prevent deadlock)
-            let mut balances = self.balances.write().await;
-            let mut reserved = self.reserved.write().await;
+            balances = self.balances.write().await;
+            reserved = self.reserved.write().await;
             
             match rpc_account_result {
                 Ok(account) => {

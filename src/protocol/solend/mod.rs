@@ -94,7 +94,10 @@ impl Protocol for SolendProtocol {
         let health_factor = obligation.calculate_health_factor();
         let skip_threshold =
             self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
-        if health_factor > skip_threshold {
+        // ✅ FIX: Use >= to match analyzer's < logic exactly
+        // Analyzer liquidates if HF < threshold, so parser should skip if HF >= threshold
+        // This prevents wasting CPU parsing positions that analyzer won't liquidate
+        if health_factor >= skip_threshold {
             return None;
         }
 

@@ -205,32 +205,36 @@ impl Analyzer {
                 // ✅ FIX: Periodic cleanup - remove completed tasks even when no events arrive
                 // This prevents task queue from staying full when tasks complete slowly
                 _ = tokio::time::sleep(CLEANUP_INTERVAL) => {
-                    // Cleanup completed tasks
-                    let mut cleaned_count = 0;
-                    while let Some(result) = tasks.try_join_next() {
-                        cleaned_count += 1;
-                        if let Err(e) = result {
-                            log::error!("Analyzer task failed: {}", e);
+                    // Only cleanup if enough time has passed since last cleanup
+                    if last_cleanup.elapsed() >= CLEANUP_INTERVAL {
+                        // Cleanup completed tasks
+                        let mut cleaned_count = 0;
+                        while let Some(result) = tasks.try_join_next() {
+                            cleaned_count += 1;
+                            if let Err(e) = result {
+                                log::error!("Analyzer task failed: {}", e);
+                            }
                         }
+                        
+                        if cleaned_count > 0 {
+                            log::debug!(
+                                "Analyzer: Cleaned up {} completed task(s), {} remaining (last cleanup: {}ms ago)",
+                                cleaned_count,
+                                tasks.len(),
+                                last_cleanup.elapsed().as_millis()
+                            );
+                        }
+                        
+                        // If task queue is still full after cleanup, log warning
+                        if tasks.len() >= MAX_CONCURRENT_TASKS {
+                            log::warn!(
+                                "Analyzer: Task queue still full after cleanup ({} tasks). Tasks may be completing slowly.",
+                                tasks.len()
+                            );
+                        }
+                        
+                        last_cleanup = Instant::now();
                     }
-                    
-                    if cleaned_count > 0 {
-                        log::debug!(
-                            "Analyzer: Cleaned up {} completed task(s), {} remaining",
-                            cleaned_count,
-                            tasks.len()
-                        );
-                    }
-                    
-                    // If task queue is still full after cleanup, log warning
-                    if tasks.len() >= MAX_CONCURRENT_TASKS {
-                        log::warn!(
-                            "Analyzer: Task queue still full after cleanup ({} tasks). Tasks may be completing slowly.",
-                            tasks.len()
-                        );
-                    }
-                    
-                    last_cleanup = Instant::now();
                 }
             }
 
