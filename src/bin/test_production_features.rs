@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use dotenv::dotenv;
+use log;
 use liquid_bot::core::config::Config;
 use liquid_bot::blockchain::rpc_client::RpcClient;
 use liquid_bot::blockchain::ws_client::WsClient;
@@ -100,12 +101,54 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
     let solend_program_id = Pubkey::from_str(&config.solend_program_id)
         .context("Invalid Solend program ID")?;
 
-    let accounts = rpc.get_program_accounts(&solend_program_id).await
-        .context("Failed to fetch program accounts")?;
+    // ✅ FIX: Use filter to avoid RPC limit error
+    use solana_client::rpc_filter::RpcFilterType;
+    const OBLIGATION_DATA_SIZE: u64 = 1300;
+    let accounts_result = rpc.get_program_accounts_with_filters(
+        &solend_program_id,
+        vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
+    ).await;
 
-    if accounts.is_empty() {
-        return Err(anyhow::anyhow!("No program accounts found - cannot test with real data"));
-    }
+    let accounts = match accounts_result {
+        Ok(accounts) => {
+            if accounts.is_empty() {
+                return Err(anyhow::anyhow!("No program accounts found - cannot test with real data"));
+            }
+            accounts
+        }
+        Err(e) => {
+            let error_str = e.to_string();
+            // ✅ FIX: RPC limit/timeout errors are expected for large programs - use wallet's obligation if available
+            if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
+                log::warn!("RPC limit hit (expected for large programs). Attempting to use TEST_OBLIGATION_PUBKEY if available...");
+                
+                // Try to use TEST_OBLIGATION_PUBKEY if configured
+                if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
+                    if !test_obligation_str.trim().is_empty() {
+                        if let Ok(test_obligation) = test_obligation_str.trim().parse::<Pubkey>() {
+                            match rpc.get_account(&test_obligation).await {
+                                Ok(account) => {
+                                    log::info!("Using TEST_OBLIGATION_PUBKEY for instruction building test: {}", test_obligation);
+                                    return Ok(vec![(test_obligation, account)]);
+                                }
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!("RPC limit/timeout hit and TEST_OBLIGATION_PUBKEY account not found: {}. Please configure a valid TEST_OBLIGATION_PUBKEY or use a premium RPC with higher limits.", e));
+                                }
+                            }
+                        } else {
+                            return Err(anyhow::anyhow!("RPC limit/timeout hit and TEST_OBLIGATION_PUBKEY is invalid. Please configure a valid TEST_OBLIGATION_PUBKEY or use a premium RPC with higher limits."));
+                        }
+                    } else {
+                        return Err(anyhow::anyhow!("RPC limit/timeout hit (expected for large programs). Please configure TEST_OBLIGATION_PUBKEY in .env to test instruction building, or use a premium RPC with higher limits."));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("RPC limit/timeout hit (expected for large programs). Please configure TEST_OBLIGATION_PUBKEY in .env to test instruction building, or use a premium RPC with higher limits."));
+                }
+            } else {
+                return Err(e).context("Failed to fetch program accounts");
+            }
+        }
+    };
 
     let protocol: Arc<dyn Protocol> = Arc::new(
         SolendProtocol::new(config)
