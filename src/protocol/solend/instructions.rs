@@ -197,7 +197,45 @@ impl ReserveCache {
     async fn refresh_from_rpc(&self, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         let mut inner = self.inner.write().await;
-        inner.mint_to_reserve = mint_to_reserve;
+        
+        // ✅ CLEANUP: Remove cache entries for reserves that no longer exist on-chain
+        // This prevents stale cache entries from accumulating when reserves are removed
+        let rpc_reserve_set: std::collections::HashSet<Pubkey> = mint_to_reserve.values().copied().collect();
+        let mut removed_count = 0;
+        
+        // Remove mint_to_reserve entries for reserves that no longer exist
+        inner.mint_to_reserve.retain(|mint, reserve| {
+            if rpc_reserve_set.contains(reserve) {
+                true // Keep: reserve still exists on-chain
+            } else {
+                removed_count += 1;
+                false // Remove: reserve no longer exists on-chain
+            }
+        });
+        
+        // Also clean up reserve_data cache for removed reserves
+        let mut removed_data_count = 0;
+        inner.reserve_data.retain(|reserve, _| {
+            if rpc_reserve_set.contains(reserve) {
+                true // Keep: reserve still exists
+            } else {
+                removed_data_count += 1;
+                false // Remove: reserve no longer exists
+            }
+        });
+        
+        if removed_count > 0 || removed_data_count > 0 {
+            log::debug!(
+                "Reserve cache cleanup: removed {} mint mappings and {} reserve data entries (reserves no longer exist on-chain)",
+                removed_count,
+                removed_data_count
+            );
+        }
+        
+        // ✅ FIX: Use extend instead of override to prevent losing entries added by other threads
+        // Problem: If another thread adds a mapping during refresh, override would lose it
+        // Solution: Extend preserves existing entries while updating with fresh RPC data
+        inner.mint_to_reserve.extend(mint_to_reserve);
         inner.initialized = true;
 
         Ok(())

@@ -80,7 +80,30 @@ impl ProfitCalculator {
         }
 
         let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
-        let hop_count = hop_count.unwrap_or(1);
+        
+        // ✅ CRITICAL FIX: Use conservative estimate when hop_count is None
+        // Problem: unwrap_or(1) assumes 1 hop, but multi-hop swaps (e.g., USDC -> SOL -> ETH = 2 hops)
+        //   would have DEX fee underestimated → profit overestimated → negative profit liquidation risk
+        // Solution: Use conservative estimate based on pair type when hop_count is unknown
+        let hop_count = if let Some(count) = hop_count {
+            count
+        } else {
+            // Conservative estimate: stablecoin pairs typically 1 hop, others may need 2-3 hops
+            let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
+            let conservative_estimate = if is_stablecoin_pair {
+                1 // Stablecoin pairs usually direct swap
+            } else {
+                3 // Regular pairs may need multiple hops (conservative to avoid underestimating fee)
+            };
+            log::warn!(
+                "ProfitCalculator: hop_count is None for {} -> {}, using conservative estimate: {} hops (stablecoin_pair: {})",
+                opp.debt_mint,
+                opp.collateral_mint,
+                conservative_estimate,
+                is_stablecoin_pair
+            );
+            conservative_estimate
+        };
 
         // CRITICAL FIX: Detect stablecoin pairs and apply lower fee
         // Stablecoin pairs (USDC/USDT) typically have much lower DEX fees (~0.01% vs 0.2%)

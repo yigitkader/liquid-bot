@@ -188,29 +188,59 @@ impl Executor {
         let ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
         let ata_cache_cleanup_token = CancellationToken::new();
         
-        // ✅ FIX: Start background cleanup task for ATA cache
+        // ✅ CRITICAL FIX: Start background cleanup task for ATA cache with aggressive cleanup
+        // Problem: 24-hour TTL is too long - thousands of ATAs can accumulate in high-volume scenarios
+        // Solution: Use 4-hour TTL + cache size limit to prevent memory leak
+        const ATA_CACHE_TTL_SECONDS: u64 = 4 * 3600; // 4 hours (was 24 hours)
+        const ATA_CACHE_MAX_SIZE: usize = 1000; // Maximum cache entries before aggressive cleanup
+        const CLEANUP_INTERVAL_SECONDS: u64 = 1800; // Run cleanup every 30 minutes (was 1 hour)
+        
         let cache_for_cleanup = Arc::clone(&ata_cache);
         let cleanup_token = ata_cache_cleanup_token.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(3600)) => {
-                        // Run cleanup every hour
+                    _ = sleep(Duration::from_secs(CLEANUP_INTERVAL_SECONDS)) => {
                         let mut cache = cache_for_cleanup.write().await;
                         let now = Instant::now();
                         
-                        // Remove entries older than 24 hours
                         let before_len = cache.len();
+                        
+                        // Strategy 1: Remove entries older than TTL (4 hours)
                         cache.retain(|_, entry| {
-                            now.duration_since(entry.timestamp) < Duration::from_secs(86400)
+                            now.duration_since(entry.timestamp) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
                         });
+                        
+                        // Strategy 2: If cache is still too large, remove oldest entries (LRU-like)
+                        if cache.len() > ATA_CACHE_MAX_SIZE {
+                            let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
+                            // Sort by timestamp (oldest first)
+                            entries.sort_by(|a, b| a.1.timestamp.cmp(&b.1.timestamp));
+                            // Keep only the newest ATA_CACHE_MAX_SIZE entries (skip oldest ones)
+                            let to_remove = entries.len().saturating_sub(ATA_CACHE_MAX_SIZE);
+                            let removed_count = to_remove;
+                            // Insert back only the newest entries
+                            for (pubkey, entry) in entries.into_iter().skip(to_remove) {
+                                cache.insert(pubkey, entry);
+                            }
+                            
+                            log::warn!(
+                                "Executor: ATA cache exceeded max size ({}), removed {} oldest entries (now: {})",
+                                ATA_CACHE_MAX_SIZE,
+                                removed_count,
+                                cache.len()
+                            );
+                        }
+                        
                         let after_len = cache.len();
                         
                         if before_len != after_len {
                             log::debug!(
-                                "Executor: ATA cache cleanup: removed {} entries ({} remaining)",
+                                "Executor: ATA cache cleanup: removed {} entries ({} remaining, TTL: {}h, max_size: {})",
                                 before_len - after_len,
-                                after_len
+                                after_len,
+                                ATA_CACHE_TTL_SECONDS / 3600,
+                                ATA_CACHE_MAX_SIZE
                             );
                         }
                     }
@@ -422,14 +452,21 @@ impl Executor {
                             error_str.contains("timeout") || error_str.contains("timed out");
 
                         if is_timeout {
+                            // ✅ FIX: Cache pessimistically on timeout to prevent repeated timeouts
+                            // Problem: Without caching, next opportunity will retry RPC → same timeout → double instruction → transaction failure
+                            // Solution: Cache as missing (verified: false) to prevent repeated RPC calls
                             log::warn!(
-                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction but NOT caching (will retry RPC check on next opportunity)",
+                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction and caching pessimistically (assuming ATA missing to prevent repeated timeouts)",
                                 destination_collateral
                             );
                             let create_ata_ix =
                                 self.create_ata_instruction(&opp.collateral_mint)?;
                             tx_builder.add_instruction(create_ata_ix);
-                            // Don't cache on timeout - will retry next time
+                            // Cache pessimistically: assume ATA missing to prevent repeated RPC calls on consecutive timeouts
+                            cache.insert(destination_collateral, AtaCacheEntry {
+                                timestamp: Instant::now(),
+                                verified: false, // Not verified (timeout), but cached to prevent retry
+                            });
                         } else {
                             log::warn!(
                                 "Executor: Failed to check ATA existence for {}: {}. Adding create_ata instruction anyway (idempotent)",

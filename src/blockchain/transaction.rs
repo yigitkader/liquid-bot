@@ -64,64 +64,60 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
         ));
     }
 
-    // ✅ FIX: Check if already signed - if valid signature exists, skip signing
+    // ✅ CRITICAL FIX: Check if already signed - if valid signature exists, skip signing
+    // This prevents double-signing which can cause signature mismatch errors
+    // Early return guarantees that code after this block will NOT execute if already signed
     if signer_index < tx.signatures.len() {
         let existing_sig = &tx.signatures[signer_index];
         let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
 
         if is_signed {
-            // ✅ Transaction already signed with valid signature - verify it's correct
+            // ✅ Transaction already signed with valid signature - skip re-signing
             // Note: We can't fully verify without re-signing, but if signature is non-default
             // and matches the expected signer, we assume it's valid
             log::debug!(
-                "Transaction already signed by {} at index {} - skipping re-signing",
+                "Transaction already signed by {} at index {} - skipping re-signing to prevent double-signing",
                 signer_pubkey,
                 signer_index
             );
-            return Ok(()); // ✅ Don't error - just return success
+            // ✅ EARLY RETURN: Code after this point will NOT execute
+            // This guarantees that tx.sign() will NOT be called if transaction is already signed
+            return Ok(());
         }
     }
 
-    // Transaction is unsigned or signature is default - sign it
+    // ✅ Transaction is unsigned or signature is default - sign it
+    // This code path is ONLY reached if:
+    //   1. Transaction is not signed (signature is default)
+    //   2. Signer index is valid and within bounds
+    //   3. Signature array size matches account_keys size
     tx.sign(&[keypair], tx.message.recent_blockhash);
 
-    let signer_pubkey = keypair.pubkey();
-    let signer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|&pk| pk == signer_pubkey);
-
-    if let Some(index) = signer_index {
-        if index >= tx.signatures.len() {
-            return Err(anyhow::anyhow!(
-                "Transaction signing failed: signature not found at index {} (signatures.len()={})",
-                index,
-                tx.signatures.len()
-            ));
-        }
-
-        let sig = &tx.signatures[index];
-        if *sig == solana_sdk::signature::Signature::default() {
-            return Err(anyhow::anyhow!(
-                "Transaction signing failed: signature is default (all zeros) for signer {} at index {}",
-                signer_pubkey,
-                index
-            ));
-        }
-
-        log::debug!(
-            "Transaction signed successfully: {} -> {} (index: {})",
-            signer_pubkey,
-            sig,
-            index
-        );
-    } else {
+    // Verify signing succeeded
+    // Note: signer_index is already known from above, no need to recalculate
+    if signer_index >= tx.signatures.len() {
         return Err(anyhow::anyhow!(
-            "Transaction signing failed: signer {} not found in account_keys",
-            signer_pubkey
+            "Transaction signing failed: signature not found at index {} (signatures.len()={})",
+            signer_index,
+            tx.signatures.len()
         ));
     }
+
+    let sig = &tx.signatures[signer_index];
+    if *sig == solana_sdk::signature::Signature::default() {
+        return Err(anyhow::anyhow!(
+            "Transaction signing failed: signature is default (all zeros) for signer {} at index {}",
+            signer_pubkey,
+            signer_index
+        ));
+    }
+
+    log::debug!(
+        "Transaction signed successfully: {} -> {} (index: {})",
+        signer_pubkey,
+        sig,
+        signer_index
+    );
 
     Ok(())
 }

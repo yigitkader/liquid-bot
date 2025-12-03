@@ -180,9 +180,14 @@ impl Validator {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
 
         use tokio::time::{Duration, timeout};
-        const TOTAL_ORACLE_TIMEOUT: Duration = Duration::from_secs(12); // Max 12s for both checks
+        // ✅ FIX: Total timeout = RPC timeout + buffer for parallel checks
+        // Each oracle check uses RPC timeout, and they run in parallel (premium RPC) or sequential (free RPC)
+        // For parallel: max(RPC timeout) = RPC timeout, so total = RPC timeout + small buffer
+        // For sequential: RPC timeout + RPC timeout = 2 * RPC timeout, but we use single timeout for both
+        let rpc_timeout = rpc.request_timeout();
+        let total_oracle_timeout = rpc_timeout + Duration::from_secs(2); // RPC timeout + 2s buffer
 
-        let (debt_result, collateral_result) = timeout(TOTAL_ORACLE_TIMEOUT, async {
+        let (debt_result, collateral_result) = timeout(total_oracle_timeout, async {
             if config.is_free_rpc_endpoint() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
@@ -194,8 +199,9 @@ impl Validator {
                 tokio::join!(debt_oracle_task, collateral_oracle_task)
             }
         }).await.map_err(|_| anyhow::anyhow!(
-            "Total oracle check timeout after {:?} (debt + collateral checks exceeded time limit)",
-            TOTAL_ORACLE_TIMEOUT
+            "Total oracle check timeout after {:?} (debt + collateral checks exceeded time limit, RPC timeout: {:?})",
+            total_oracle_timeout,
+            rpc_timeout
         ))?;
 
         if let Err(e) = debt_result {
@@ -316,10 +322,13 @@ impl Validator {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use tokio::time::{Duration, timeout};
 
-        // ✅ FIX: Use shorter timeout than RPC timeout to prevent double-waiting
-        // read_pyth_price uses rpc.request_timeout() (default 10s), but we want to fail faster
-        // Set timeout to 5s to prevent total wait time of 10s (RPC) + 10s (outer timeout) = 20s
-        let oracle_check_timeout = Duration::from_secs(5);
+        // ✅ CRITICAL FIX: Oracle timeout MUST equal RPC timeout to prevent double-waiting
+        // Problem: If oracle timeout < RPC timeout, we wait for oracle timeout, then RPC timeout triggers
+        //   Example: oracle timeout (5s) → RPC timeout (10s) → Total wait: 15s ❌
+        // Solution: Set oracle timeout = RPC timeout so we only wait once
+        //   Example: oracle timeout (10s) = RPC timeout (10s) → Total wait: 10s ✅
+        // This prevents cascading timeouts and reduces validation latency
+        let oracle_check_timeout = rpc.request_timeout();
 
         let timeout_result = timeout(oracle_check_timeout, async {
             if config.is_free_rpc_endpoint() && !skip_delay {

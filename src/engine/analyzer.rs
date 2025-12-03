@@ -41,13 +41,20 @@ impl Analyzer {
 
         let mut last_lag = Instant::now();
         let mut last_scale_down = Instant::now();
+        let mut last_cleanup = Instant::now();
         const SCALE_DOWN_THRESHOLD: Duration = Duration::from_secs(60);
         const SCALE_DOWN_INTERVAL: Duration = Duration::from_secs(30);
         // ✅ FIX: Task limit to prevent unlimited task spawning
         const MAX_CONCURRENT_TASKS: usize = 1000;
+        // ✅ FIX: Periodic cleanup interval to prevent task queue from staying full
+        const CLEANUP_INTERVAL: Duration = Duration::from_millis(100);
 
-        loop {
-            match receiver.recv().await {
+        'main_loop: loop {
+            // ✅ FIX: Use tokio::select! to handle multiple events concurrently
+            // This allows periodic cleanup even when events are arriving slowly
+            tokio::select! {
+                event_result = receiver.recv() => {
+                    match event_result {
                 Ok(Event::AccountUpdated { position, .. })
                 | Ok(Event::AccountDiscovered { position, .. }) => {
                     // ✅ FIX: Check task limit before spawning
@@ -57,14 +64,15 @@ impl Analyzer {
                             tasks.len(),
                             position.address
                         );
-                        continue;
-                    }
+                        // Skip spawning task - continue to next loop iteration
+                        // Note: This is inside tokio::select!, so we just skip the rest of this branch
+                    } else {
 
                     let permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
                             log::warn!("Semaphore closed, analyzer shutting down");
-                            break;
+                            break 'main_loop;
                         }
                     };
 
@@ -91,6 +99,7 @@ impl Analyzer {
                             }
                         }
                     });
+                    }
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -187,12 +196,54 @@ impl Analyzer {
                         log::error!("            3) Optimize calculation logic");
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => {
-                    log::error!("Event bus closed, analyzer shutting down");
-                    break;
+                        Err(broadcast::error::RecvError::Closed) => {
+                            log::error!("Event bus closed, analyzer shutting down");
+                            break 'main_loop;
+                        }
+                    }
+                }
+                // ✅ FIX: Periodic cleanup - remove completed tasks even when no events arrive
+                // This prevents task queue from staying full when tasks complete slowly
+                _ = tokio::time::sleep(CLEANUP_INTERVAL) => {
+                    // Cleanup completed tasks
+                    let mut cleaned_count = 0;
+                    while let Some(result) = tasks.try_join_next() {
+                        cleaned_count += 1;
+                        if let Err(e) = result {
+                            log::error!("Analyzer task failed: {}", e);
+                        }
+                    }
+                    
+                    if cleaned_count > 0 {
+                        log::debug!(
+                            "Analyzer: Cleaned up {} completed task(s), {} remaining",
+                            cleaned_count,
+                            tasks.len()
+                        );
+                    }
+                    
+                    // If task queue is still full after cleanup, log warning
+                    if tasks.len() >= MAX_CONCURRENT_TASKS {
+                        log::warn!(
+                            "Analyzer: Task queue still full after cleanup ({} tasks). Tasks may be completing slowly.",
+                            tasks.len()
+                        );
+                    }
+                    
+                    last_cleanup = Instant::now();
                 }
             }
 
+            // ✅ FIX: Also cleanup after processing each event (non-blocking)
+            // This ensures tasks are cleaned up as soon as they complete
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(e) = result {
+                    log::error!("Analyzer task failed: {}", e);
+                }
+            }
+
+            // ✅ FIX: Also cleanup after processing each event (non-blocking)
+            // This ensures tasks are cleaned up as soon as they complete
             while let Some(result) = tasks.try_join_next() {
                 if let Err(e) = result {
                     log::error!("Analyzer task failed: {}", e);

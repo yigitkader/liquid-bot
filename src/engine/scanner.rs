@@ -61,19 +61,24 @@ impl Scanner {
 
     fn record_error(&self) -> Result<()> {
         // ✅ FIX: Check for overflow BEFORE incrementing to prevent wraparound
-        // If we're near u32::MAX, reset to max_consecutive_errors to keep threshold check working
+        // If we're near u32::MAX, reset to a safe value below threshold to prevent immediate panic
         let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
         
         if previous_value >= u32::MAX - 10 {
             // Safety margin: reset before overflow to prevent wraparound
+            // ✅ CRITICAL FIX: Reset to threshold - 5 instead of threshold to prevent immediate panic
+            // This gives buffer for temporary network issues without causing bot restart
+            let reset_value = self.config.max_consecutive_errors.saturating_sub(5);
             log::error!(
-                "🚨 CRITICAL: Scanner error counter near overflow ({}), resetting to max_consecutive_errors ({})",
+                "🚨 CRITICAL: Scanner error counter near overflow ({}), resetting to {} (threshold: {}, buffer: 5 errors)",
                 previous_value,
+                reset_value,
                 self.config.max_consecutive_errors
             );
-            self.consecutive_errors.store(self.config.max_consecutive_errors, Ordering::Relaxed);
-            // Still check threshold after reset
-            return self.check_error_threshold();
+            self.consecutive_errors.store(reset_value, Ordering::Relaxed);
+            // Don't check threshold after reset - we're below threshold now
+            // This prevents immediate panic on overflow protection
+            return Ok(());
         }
 
         // Now safely increment

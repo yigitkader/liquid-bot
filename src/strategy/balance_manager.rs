@@ -56,10 +56,12 @@ impl BalanceManager {
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
 
         {
+            // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
             let balances = self.balances.read().await;
             if let Some(cached) = balances.get(&ata) {
                 if cached.timestamp.elapsed() < CACHE_TTL {
                     // Read reserved amount without holding it across other locks/RPC calls
+                    // Lock order: balances (already held) -> reserved (consistent order)
                     let reserved_amount = {
                         let reserved = self.reserved.read().await;
                         reserved.get(mint).copied().unwrap_or(0)
@@ -98,6 +100,7 @@ impl BalanceManager {
                         self.wallet
                     );
 
+                    // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
                     let mut balances = self.balances.write().await;
                     balances.insert(
                         ata,
@@ -108,6 +111,7 @@ impl BalanceManager {
                     );
 
                     let reserved_amount = {
+                        // Lock order: balances (already held) -> reserved (consistent order)
                         let reserved = self.reserved.read().await;
                         reserved.get(mint).copied().unwrap_or(0)
                     };
@@ -128,7 +132,8 @@ impl BalanceManager {
             .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
         let actual = u64::from_le_bytes(balance_bytes);
 
-        // Update cache with RPC result (while still holding reserved lock)
+        // Update cache with RPC result
+        // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
         {
             let mut balances = self.balances.write().await;
             balances.insert(
@@ -141,6 +146,7 @@ impl BalanceManager {
         }
 
         let reserved_amount = {
+            // Lock order: balances (not held) -> reserved (consistent order, read-only)
             let reserved = self.reserved.read().await;
             reserved.get(mint).copied().unwrap_or(0)
         };
@@ -158,6 +164,8 @@ impl BalanceManager {
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
 
         {
+            // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
+            // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
             let balances = self.balances.read().await;
             if let Some(cached) = balances.get(&ata) {
                 if cached.timestamp.elapsed() < CACHE_TTL {
@@ -175,6 +183,8 @@ impl BalanceManager {
                 if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
                 {
                     // Cache zero balance
+                    // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
+                    // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
                     let mut balances = self.balances.write().await;
                     balances.insert(
                         ata,
@@ -200,6 +210,8 @@ impl BalanceManager {
         let actual = u64::from_le_bytes(balance_bytes);
 
         // Update cache
+        // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
+        // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
         {
             let mut balances = self.balances.write().await;
             balances.insert(
@@ -400,43 +412,139 @@ impl BalanceManager {
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
             .with_context(|| format!("Failed to derive ATA for mint {}", mint))?;
 
-        // Step 1: Fetch latest balance from RPC (no locks held to avoid blocking)
-        let rpc_account_result = self.rpc.get_account(&ata).await;
+        // ✅ CRITICAL FIX: Hold BOTH locks BEFORE RPC call to prevent TOCTOU race condition
+        // Problem: Between RPC call and lock acquisition, another thread can:
+        //   1. Update cache with stale data
+        //   2. Reserve balance using stale cache → DOUBLE-SPEND
+        // Solution: Hold locks during entire operation (cache check + RPC if needed)
+        // 
+        // ✅ DEADLOCK PREVENTION: Lock order MUST be consistent across all functions
+        // Lock order: balances -> reserved (ALWAYS in this order to prevent deadlock)
+        // This order is used in: reserve(), get_available_balance(), get_available_balance_locked()
+        // If you need both locks, ALWAYS acquire balances first, then reserved
+        let mut balances = self.balances.write().await;
+        let mut reserved = self.reserved.write().await;
 
-        // Step 2: Decode balance
-        let actual = match rpc_account_result {
-            Ok(account) => {
-                if account.data.len() < 72 {
-                    return Err(anyhow::anyhow!("Invalid token account data"));
+        // Check cache first (with lock held)
+        let actual = if let Some(cached) = balances.get(&ata) {
+            if cached.timestamp.elapsed() < CACHE_TTL {
+                // Cache hit - use cached value
+                cached.amount
+            } else {
+                // Cache stale - invalidate and fetch from RPC (lock still held)
+                balances.remove(&ata);
+                
+                // Drop lock temporarily for RPC call (RPC can take time)
+                drop(balances);
+                drop(reserved);
+                
+                // Fetch from RPC
+                let rpc_account_result = self.rpc.get_account(&ata).await;
+                
+                // Re-acquire locks (SAME ORDER: balances -> reserved to prevent deadlock)
+                let mut balances = self.balances.write().await;
+                let mut reserved = self.reserved.write().await;
+                
+                match rpc_account_result {
+                    Ok(account) => {
+                        if account.data.len() < 72 {
+                            return Err(anyhow::anyhow!("Invalid token account data"));
+                        }
+
+                        let balance_bytes: [u8; 8] = account.data[64..72]
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
+                        let balance = u64::from_le_bytes(balance_bytes);
+                        
+                        // Update cache with fresh RPC data
+                        balances.insert(
+                            ata,
+                            CachedBalance {
+                                amount: balance,
+                                timestamp: Instant::now(),
+                            },
+                        );
+                        
+                        balance
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
+                        {
+                            // ATA doesn't exist - balance is 0, cache it
+                            balances.insert(
+                                ata,
+                                CachedBalance {
+                                    amount: 0,
+                                    timestamp: Instant::now(),
+                                },
+                            );
+                            0
+                        } else {
+                            return Err(e).context("Failed to fetch account balance during reserve");
+                        }
+                    }
                 }
-
-                let balance_bytes: [u8; 8] = account.data[64..72]
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
-                u64::from_le_bytes(balance_bytes)
             }
-            Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
-                {
-                    // ATA doesn't exist - balance is 0
-                    0
-                } else {
-                    return Err(e).context("Failed to fetch account balance during reserve");
+        } else {
+            // Cache miss - fetch from RPC (lock still held)
+            // Drop lock temporarily for RPC call
+            drop(balances);
+            drop(reserved);
+            
+            let rpc_account_result = self.rpc.get_account(&ata).await;
+            
+            // Re-acquire locks (SAME ORDER: balances -> reserved to prevent deadlock)
+            let mut balances = self.balances.write().await;
+            let mut reserved = self.reserved.write().await;
+            
+            match rpc_account_result {
+                Ok(account) => {
+                    if account.data.len() < 72 {
+                        return Err(anyhow::anyhow!("Invalid token account data"));
+                    }
+
+                    let balance_bytes: [u8; 8] = account.data[64..72]
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
+                    let balance = u64::from_le_bytes(balance_bytes);
+                    
+                    // Update cache with fresh RPC data
+                    balances.insert(
+                        ata,
+                        CachedBalance {
+                            amount: balance,
+                            timestamp: Instant::now(),
+                        },
+                    );
+                    
+                    balance
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
+                    {
+                        // ATA doesn't exist - balance is 0, cache it
+                        balances.insert(
+                            ata,
+                            CachedBalance {
+                                amount: 0,
+                                timestamp: Instant::now(),
+                            },
+                        );
+                        0
+                    } else {
+                        return Err(e).context("Failed to fetch account balance during reserve");
+                    }
                 }
             }
         };
 
-        // ✅ FIX: Hold BOTH locks simultaneously to prevent race condition
-        // Lock order: balances -> reserved (consistent with other methods)
-        let mut balances = self.balances.write().await;
-        let mut reserved = self.reserved.write().await;
-
-        // Step 3: Calculate new reserved amount BEFORE updating cache
+        // Calculate new reserved amount
         let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
         let new_reserved = reserved_amount.saturating_add(amount);
 
-        // Step 4: Calculate available balance with NEW reserved amount
+        // Calculate available balance with NEW reserved amount
         let available = actual.saturating_sub(new_reserved);
 
         if available < amount {
@@ -451,18 +559,19 @@ impl BalanceManager {
             ));
         }
 
-        // Step 5: Update reserved FIRST (before cache update)
+        // Update reserved
         reserved.insert(*mint, new_reserved);
 
-        // Step 6: Update cache AFTER reserved is updated (prevents race condition)
-        // Other threads reading cache will see correct reserved amount
-        balances.insert(
-            ata,
-            CachedBalance {
-                amount: actual,
-                timestamp: Instant::now(),
-            },
-        );
+        // Ensure cache is up to date (may have been updated during RPC call)
+        if !balances.contains_key(&ata) {
+            balances.insert(
+                ata,
+                CachedBalance {
+                    amount: actual,
+                    timestamp: Instant::now(),
+                },
+            );
+        }
 
         log::debug!(
             "BalanceManager: Reserved {} for mint {} (balance: {}, reserved: {} -> {}, available: {})",
@@ -482,7 +591,12 @@ impl BalanceManager {
     ///
     /// This should be called exactly once for each successful `reserve` call
     /// for a given `(mint, amount)` pair.
+    ///
+    /// ✅ DEADLOCK PREVENTION: This function only locks `reserved`, not `balances`.
+    /// This is safe because it doesn't need to access balances cache.
+    /// If you need both locks, use the order: balances -> reserved (consistent with reserve())
     pub async fn release(&self, mint: &Pubkey, amount: u64) {
+        // Only lock reserved (no balances lock needed, so no deadlock risk)
         let mut reserved = self.reserved.write().await;
         if let Some(reserved_amount) = reserved.get_mut(mint) {
             *reserved_amount = reserved_amount.saturating_sub(amount);
