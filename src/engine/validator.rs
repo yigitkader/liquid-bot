@@ -154,7 +154,10 @@ impl Validator {
         Ok(())
     }
 
-    async fn validate(&self, opp: &Opportunity) -> Result<()> {
+    /// Validate an opportunity using instance methods
+    /// This is the public API for validation - can be used by external code
+    /// Note: For parallel processing in run(), validate_static is used instead
+    pub async fn validate(&self, opp: &Opportunity) -> Result<()> {
         // Reserve balance first
         self.balance_manager
             .reserve(&opp.debt_mint, opp.max_liquidatable)
@@ -213,7 +216,16 @@ impl Validator {
             return Err(e);
         }
         
-        // Step 2: Slippage check
+        // Step 2: ATA verification - check that ATAs exist or can be created
+        // Note: ATA verification is non-blocking (warns but continues) since ATAs can be auto-created
+        if let Err(e) = Self::verify_ata_exists_static(&opp.debt_mint, rpc, config).await {
+            log::debug!("   ⚠️  Debt ATA verification warning: {} (continuing - ATA can be auto-created)", e);
+        }
+        if let Err(e) = Self::verify_ata_exists_static(&opp.collateral_mint, rpc, config).await {
+            log::debug!("   ⚠️  Collateral ATA verification warning: {} (continuing - ATA can be auto-created)", e);
+        }
+        
+        // Step 3: Slippage check
         let slippage = match Self::get_realtime_slippage_static(opp, rpc, config).await {
             Ok(s) => s,
             Err(e) => {
@@ -230,7 +242,9 @@ impl Validator {
         Ok(())
     }
 
-    async fn has_sufficient_balance(&self, mint: &Pubkey, amount: u64) -> Result<()> {
+    /// Check if there is sufficient balance for a given mint and amount
+    /// This is a public API method that can be used by external code
+    pub async fn has_sufficient_balance(&self, mint: &Pubkey, amount: u64) -> Result<()> {
         let available = self.balance_manager.get_available_balance(mint).await?;
         if available < amount {
             return Err(anyhow::anyhow!(
@@ -249,8 +263,19 @@ impl Validator {
         Ok(())
     }
 
-    async fn verify_ata_exists(&self, mint: &Pubkey) -> Result<()> {
-        let wallet_pubkey_str = self.config.test_wallet_pubkey
+    /// Verify that an ATA exists for a given mint
+    /// This is a public API method that can be used by external code
+    pub async fn verify_ata_exists(&self, mint: &Pubkey) -> Result<()> {
+        Self::verify_ata_exists_static(mint, &self.rpc, &self.config).await
+    }
+
+    /// Static version of verify_ata_exists for parallel processing
+    async fn verify_ata_exists_static(
+        mint: &Pubkey,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+    ) -> Result<()> {
+        let wallet_pubkey_str = config.test_wallet_pubkey
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or("11111111111111111111111111111111");
@@ -258,7 +283,7 @@ impl Validator {
             .map_err(|_| anyhow::anyhow!("Invalid wallet pubkey"))?;
         
         // FIX: Config parametresini doğru geçiyoruz
-        let ata = get_associated_token_address(&wallet_pubkey, mint, Some(&self.config))
+        let ata = get_associated_token_address(&wallet_pubkey, mint, Some(config))
             .context("Failed to derive ATA address")?;
         
         log::debug!(
@@ -268,7 +293,7 @@ impl Validator {
             ata
         );
         
-        match self.rpc.get_account(&ata).await {
+        match rpc.get_account(&ata).await {
             Ok(account) => {
                 if account.data.is_empty() {
                     log::warn!("⚠️  ATA exists but is empty: {}", ata);
@@ -300,7 +325,9 @@ impl Validator {
         }
     }
 
-    async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
+    /// Check if oracle price data is fresh for a given mint
+    /// This is a public API method that can be used by external code
+    pub async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
         Self::check_oracle_freshness_static(mint, &self.rpc, &self.config, false).await
     }
 
@@ -314,7 +341,7 @@ impl Validator {
         // Solution: Cap each oracle check at 5s to prevent validation from taking too long
         const ORACLE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
         
-        timeout(ORACLE_CHECK_TIMEOUT, async {
+        let timeout_result = timeout(ORACLE_CHECK_TIMEOUT, async {
             // ✅ CRITICAL: Add rate limit guard for free RPC endpoints
             // Free RPC endpoints (api.mainnet-beta.solana.com) have strict rate limits:
             // - 1 req/10s for getProgramAccounts
@@ -429,17 +456,20 @@ impl Validator {
             
             Ok(())
         })
-        .await
-        .map_err(|_| anyhow::anyhow!(
+        .await;
+        
+        timeout_result.map_err(|_| anyhow::anyhow!(
             "Oracle check timeout after {:?} for mint {}",
             ORACLE_CHECK_TIMEOUT,
             mint
-        ))?;
+        ))??;
         
         Ok(())
     }
 
-    async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
+    /// Get real-time slippage estimate for an opportunity
+    /// This is a public API method that can be used by external code
+    pub async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
         Self::get_realtime_slippage_static(opp, &self.rpc, &self.config).await
     }
 

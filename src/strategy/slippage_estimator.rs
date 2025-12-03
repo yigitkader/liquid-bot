@@ -1,6 +1,6 @@
 use crate::core::config::Config;
 use solana_sdk::pubkey::Pubkey;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -181,11 +181,30 @@ impl SlippageEstimator {
         // Convert percentage to basis points
         let slippage_bps = (price_impact_pct * 100.0) as u16;
         
-        // Calculate hop count from route plan
+        // Calculate hop count from route plan and log route details
         let hop_count = quote.route_plan
             .as_ref()
             .map(|route| route.len() as u8)
             .unwrap_or(1);
+        
+        // Log route plan details for debugging and monitoring
+        if let Some(ref route_plan) = quote.route_plan {
+            log::debug!(
+                "Jupiter route plan: {} hop(s), details: {:?}",
+                hop_count,
+                route_plan.iter().enumerate().map(|(i, hop)| {
+                    format!(
+                        "Hop {}: AMM={:?}, Label={:?}, Input={:?}, Output={:?}, Percent={:?}",
+                        i + 1,
+                        hop.swap_info.as_ref().and_then(|s| s.amm_key.as_ref()),
+                        hop.swap_info.as_ref().and_then(|s| s.label.as_ref()),
+                        hop.swap_info.as_ref().and_then(|s| s.input_mint.as_ref()),
+                        hop.swap_info.as_ref().and_then(|s| s.output_mint.as_ref()),
+                        hop.percent
+                    )
+                }).collect::<Vec<_>>()
+            );
+        }
         
         Ok((slippage_bps.min(self.config.max_slippage_bps), hop_count))
     }

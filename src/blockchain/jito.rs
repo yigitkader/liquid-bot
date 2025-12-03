@@ -9,7 +9,6 @@ use solana_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use base64;
 
 /// Jito Bundle for MEV protection
 /// Bundles allow transactions to be included atomically in a block
@@ -87,7 +86,8 @@ impl JitoClient {
                 use bincode::serialize;
                 let bytes = serialize(tx)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
-                Ok(base64::encode(&bytes))
+                use base64::{Engine as _, engine::general_purpose};
+                Ok(general_purpose::STANDARD.encode(&bytes))
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
@@ -129,7 +129,17 @@ impl JitoClient {
             .await
             .context("Failed to parse Jito response")?;
 
+        // Try to deserialize using BundleResponse struct
         if let Some(result) = bundle_response.get("result") {
+            if let Ok(bundle_resp) = serde_json::from_value::<BundleResponse>(result.clone()) {
+                log::info!(
+                    "✅ Jito bundle sent successfully: bundle_id={}, slot={:?}",
+                    bundle_resp.bundle_id,
+                    bundle_resp.slot
+                );
+                return Ok(bundle_resp.bundle_id);
+            }
+            // Fallback to manual parsing if deserialization fails
             if let Some(bundle_id) = result.get("bundleId").and_then(|v| v.as_str()) {
                 log::info!("✅ Jito bundle sent successfully: bundle_id={}", bundle_id);
                 return Ok(bundle_id.to_string());

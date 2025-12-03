@@ -44,32 +44,8 @@ chrono = "0.4"
 # path = "src/bin/validate_reserve.rs"
 
 [[bin]]
-name = "validate_obligation"
-path = "src/bin/validate_obligation.rs"
-
-[[bin]]
-name = "test_instruction_format"
-path = "src/bin/test_instruction_format.rs"
-
-[[bin]]
-name = "validate_instruction_format"
-path = "src/bin/validate_instruction_format.rs"
-
-[[bin]]
-name = "find_and_test_obligation"
-path = "src/bin/find_and_test_obligation.rs"
-
-[[bin]]
-name = "test_obligation_direct"
-path = "src/bin/test_obligation_direct.rs"
-
-[[bin]]
 name = "validate_system"
 path = "src/bin/validate_system.rs"
-
-[[bin]]
-name = "validate_instruction_accounts"
-path = "src/bin/validate_instruction_accounts.rs"
 
 [[bin]]
 name = "test_production_features"

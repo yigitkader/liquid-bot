@@ -91,14 +91,53 @@ impl SwitchboardOracle {
             return Ok(price_data);
         }
         
-        // All offsets failed
+        // All fixed offsets failed - try dynamic offset detection
+        log::warn!(
+            "Failed to parse Switchboard account at fixed offsets {:?}. Trying dynamic offset detection...",
+            POSSIBLE_OFFSETS
+        );
+        
+        if let Ok(detected_offset) = Self::determine_price_offset(data, owner) {
+            log::info!(
+                "Dynamic offset detection found offset: {}",
+                detected_offset
+            );
+            
+            // Try parsing at detected offset using appropriate method
+            if detected_offset >= 200 {
+                // Likely AggregatorAccount structure - use parse_aggregator_result
+                if let Ok(price_data) = Self::parse_aggregator_result(data, detected_offset) {
+                    if Self::is_valid_price(&price_data) {
+                        log::info!(
+                            "Switchboard oracle parsed successfully at detected offset {} (AggregatorAccount): price=${:.4}, confidence=${:.4}, timestamp={}",
+                            detected_offset, price_data.price, price_data.confidence, price_data.timestamp
+                        );
+                        return Ok(price_data);
+                    }
+                }
+            } else {
+                // Likely simpler structure - use parse_with_offset
+                if let Ok(price_data) = Self::parse_with_offset(data, detected_offset) {
+                    if Self::is_valid_price(&price_data) {
+                        log::info!(
+                            "Switchboard oracle parsed successfully at detected offset {} (simple structure): price=${:.4}, confidence=${:.4}, timestamp={}",
+                            detected_offset, price_data.price, price_data.confidence, price_data.timestamp
+                        );
+                        return Ok(price_data);
+                    }
+                }
+            }
+        }
+        
+        // All parsing attempts failed
         log::error!(
-            "Failed to parse Switchboard account at any offset. Account size: {} bytes, owner: {}",
+            "Failed to parse Switchboard account at any offset (tried fixed offsets {:?} and dynamic detection). Account size: {} bytes, owner: {}",
+            POSSIBLE_OFFSETS,
             data.len(),
             owner
         );
         Err(anyhow::anyhow!(
-            "Failed to parse Switchboard account: tried offsets {:?}, account size: {} bytes",
+            "Failed to parse Switchboard account: tried offsets {:?} and dynamic detection, account size: {} bytes",
             POSSIBLE_OFFSETS,
             data.len()
         ))

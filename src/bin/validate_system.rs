@@ -497,7 +497,7 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
         .context("Invalid main market address")?;
 
     // 1) Eğer TEST_OBLIGATION_PUBKEY tanımlıysa, doğrudan o hesabı detaylı incele
-    if let Some(cfg) = config {
+    if let Some(_cfg) = config {
         if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
             if !test_obligation_str.trim().is_empty() {
                 match Pubkey::try_from(test_obligation_str.trim()) {
@@ -533,10 +533,10 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
 
                                         for (i, bor) in obligation.borrows.iter().enumerate() {
                                             log::info!(
-                                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
+                                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wads={}, market_value_raw={}, market_value_usd={:.6}",
                                                 i,
                                                 bor.borrow_reserve,
-                                                bor.borrowed_amount_wad,
+                                                bor.borrowed_amount_wads.value,
                                                 bor.market_value.value,
                                                 bor.market_value.to_f64()
                                             );
@@ -623,10 +623,10 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
 
                         for (i, bor) in obligation.borrows.iter().enumerate() {
                             log::info!(
-                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wad={}, market_value_raw={}, market_value_usd={:.6}",
+                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wads={}, market_value_raw={}, market_value_usd={:.6}",
                                 i,
                                 bor.borrow_reserve,
-                                bor.borrowed_amount_wad,
+                                bor.borrowed_amount_wads.value,
                                 bor.market_value.value,
                                 bor.market_value.to_f64()
                             );

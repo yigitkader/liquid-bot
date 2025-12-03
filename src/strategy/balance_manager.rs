@@ -165,7 +165,11 @@ impl BalanceManager {
     /// Get available balance while holding a read lock on reserved map.
     /// This is used internally to avoid double-locking.
     /// Uses cache if available, falls back to RPC.
-    async fn get_available_balance_locked(
+    /// 
+    /// # Safety
+    /// Caller must hold a read lock on `reserved` map for the entire duration of this call.
+    /// This method does NOT acquire the reserved lock itself.
+    pub async fn get_available_balance_locked(
         &self,
         mint: &Pubkey,
         reserved: &HashMap<Pubkey, u64>,

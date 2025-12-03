@@ -129,7 +129,6 @@ impl Analyzer {
                         // Since scale down doesn't remove permits (just updates target),
                         // we need to be careful not to add too many permits
                         // Strategy: Add permits to reach new_workers target, but respect MAX_CONCURRENT_VALIDATIONS
-                        let available_permits = semaphore.available_permits();
                         let permits_to_add = new_workers.saturating_sub(current);
                         
                         // Respect MAX_CONCURRENT_VALIDATIONS limit

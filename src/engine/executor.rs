@@ -426,10 +426,16 @@ impl Executor {
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
             return Err(anyhow::anyhow!("DRY_RUN mode: Transaction not sent to blockchain"));
-        } else if let Some(ref jito) = self.jito_client {
-            // Send via Jito bundle for MEV protection with retries
-            // ✅ send_via_jito_with_retry will build FRESH tx + sign ONCE
-            self.send_via_jito_with_retry(&tx_builder, jito).await?
+        } else if self.use_jito {
+            if let Some(ref jito) = self.jito_client {
+                // Send via Jito bundle for MEV protection with retries
+                // ✅ send_via_jito_with_retry will build FRESH tx + sign ONCE
+                self.send_via_jito_with_retry(&tx_builder, jito).await?
+            } else {
+                // Jito enabled but client creation failed - fallback to standard RPC
+                log::warn!("⚠️  USE_JITO=true but Jito client is None - falling back to standard RPC");
+                self.send_with_retry(&tx_builder).await?
+            }
         } else {
             // Fallback to standard RPC (vulnerable to front-running) with retries
             // ✅ send_with_retry will build FRESH tx + sign ONCE for each retry
