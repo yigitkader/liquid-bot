@@ -52,16 +52,28 @@ impl SwitchboardOracle {
         // This prevents using stale data from an older offset when newer data exists at a different offset
         // Example: Offset 200 has stale data (valid), offset 361 has fresh data (valid)
         // Old code would return stale data from offset 200 - now we return fresh data from offset 361
+        //
+        // ✅ FIX: Use offset index as tie-breaker when timestamps are same
+        // Problem: timestamp is always current time (not parsed) → all offsets have same timestamp
+        // Solution: When timestamps are equal, prefer higher offset (likely newer structure)
         let mut best_price: Option<(PriceData, usize)> = None;
         
         for &offset in POSSIBLE_OFFSETS {
             if let Ok(price_data) = Self::try_parse_at_offset(data, offset, SCALE) {
                 if Self::is_valid_price(&price_data) {
-                    // Check if this is better (more recent) than the current best
-                    if let Some((best, _)) = &best_price {
+                    // Check if this is better than the current best
+                    if let Some((best, best_offset)) = &best_price {
                         if price_data.timestamp > best.timestamp {
+                            // More recent timestamp - definitely better
                             best_price = Some((price_data, offset));
+                        } else if price_data.timestamp == best.timestamp {
+                            // Same timestamp (likely both using current time) - use offset as tie-breaker
+                            // Prefer higher offset (likely newer structure)
+                            if offset > *best_offset {
+                                best_price = Some((price_data, offset));
+                            }
                         }
+                        // If timestamp is less, keep current best
                     } else {
                         // First valid price found
                         best_price = Some((price_data, offset));

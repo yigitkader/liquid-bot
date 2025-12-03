@@ -187,17 +187,19 @@ impl Validator {
 
         // Step 1: Oracle freshness - debt (parallel with collateral)
         // ✅ CRITICAL: For free RPC endpoints, run oracle checks sequentially to avoid rate limits
-        // Each check_oracle_freshness_static already has 100ms delay for free RPC,
-        // but running them in parallel can still cause rate limit violations
+        // ✅ FIX: Add 100ms delay ONCE before sequential checks, not per-check
+        // Problem: Each check added 100ms delay → 200ms total delay + 2 RPC calls = ~20s per opportunity
+        // Solution: Add delay once, then run checks sequentially WITHOUT extra delays
         let (debt_result, collateral_result) = if config.is_free_rpc_endpoint() {
-            // Sequential execution for free RPC to prevent rate limit violations
-            let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config).await;
-            let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config).await;
+            // Add 100ms delay ONCE, then run checks sequentially WITHOUT extra delays
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
+            let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
             (debt_result, collateral_result)
         } else {
             // Parallel execution for premium RPC (faster, no rate limit concerns)
-            let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config);
-            let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config);
+            let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false);
+            let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false);
             tokio::join!(debt_oracle_task, collateral_oracle_task)
         };
         
@@ -299,10 +301,10 @@ impl Validator {
     }
 
     async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
-        Self::check_oracle_freshness_static(mint, &self.rpc, &self.config).await
+        Self::check_oracle_freshness_static(mint, &self.rpc, &self.config, false).await
     }
 
-    async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
+    async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config, skip_delay: bool) -> Result<()> {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use tokio::time::{Duration, timeout};
         
@@ -318,9 +320,11 @@ impl Validator {
             // - 1 req/10s for getProgramAccounts
             // - ~10 req/s for getAccount (but we should be conservative)
             // This prevents rate limit violations when multiple oracle checks run in parallel
-            if config.is_free_rpc_endpoint() {
+            // ✅ FIX: Skip delay if already added before sequential calls (skip_delay=true)
+            if config.is_free_rpc_endpoint() && !skip_delay {
                 // Minimum 100ms delay between oracle checks to avoid rate limit
                 // This is especially important when debt and collateral checks run in parallel
+                // Note: When called sequentially, delay is added once before both calls
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             

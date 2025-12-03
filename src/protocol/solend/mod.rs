@@ -107,14 +107,18 @@ impl Protocol for SolendProtocol {
         
         // ✅ CRITICAL FIX: Use threshold * safety_margin (NOT threshold / safety_margin)
         // This matches analyzer's logic: analyzer liquidates when HF < threshold * safety_margin
-        // So parser should skip when HF >= threshold * safety_margin (same threshold value)
+        // So parser should skip when HF > threshold * safety_margin (strict inequality to match analyzer)
         // Example: threshold=1.0, safety_margin=0.95
-        //   - Analyzer: liquidate if HF < 0.95
-        //   - Parser: skip if HF >= 0.95 (consistent!)
-        // ✅ FIX: Use >= instead of > to handle boundary case (HF = 0.95 exactly)
-        // Without this, positions at exactly the threshold are parsed but never liquidated
+        //   - Analyzer: liquidate if HF < 0.95 (strict inequality)
+        //   - Parser: skip if HF > 0.95 (strict inequality for symmetry)
+        // ✅ FIX: Use > (strict inequality) instead of >= to match analyzer's strict inequality (<)
+        // This ensures consistent handling of boundary cases:
+        //   - HF = 0.95 exactly: Parser parses, Analyzer doesn't liquidate (both use strict inequality)
+        //   - HF = 0.949: Parser parses, Analyzer liquidates (both use strict inequality)
+        //   - HF = 0.951: Parser skips, Analyzer doesn't liquidate (both use strict inequality)
+        // Using strict inequality on both sides ensures symmetry and prevents edge case inconsistencies
         let skip_threshold = self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
-        if health_factor >= skip_threshold {
+        if health_factor > skip_threshold {
             return None;
         }
         

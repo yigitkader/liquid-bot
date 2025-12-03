@@ -414,32 +414,83 @@ impl BalanceManager {
         // Acquire write lock FIRST - this prevents race conditions
         let mut reserved = self.reserved.write().await;
         
-        // ✅ CRITICAL FIX: Invalidate cache BEFORE checking balance to prevent TOCTOU race condition
-        // Scenario:
-        //   Thread A: get_available_balance() → cache hit, returns 1000 (stale)
-        //   [100ms delay - network/CPU]
-        //   Thread B: reserve(500) → succeeds, reserved=500
-        //   Thread A: reserve(1000) → cache still shows 1000, reserved=500 → available=500 → WRONG!
-        // 
-        // Solution: Invalidate cache in reserve() to force fresh RPC call
-        // This ensures we always use the most up-to-date balance when reserving
-        {
-            use crate::protocol::solend::accounts::get_associated_token_address;
-            let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
-                .with_context(|| format!("Failed to derive ATA for mint {} (cache invalidation)", mint))?;
-            
+        use crate::protocol::solend::accounts::get_associated_token_address;
+        let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
+            .with_context(|| format!("Failed to derive ATA for mint {}", mint))?;
+        
+        // ✅ CRITICAL FIX: Hold cache lock DURING RPC call to prevent TOCTOU race condition
+        // Problem: Cache invalidated, lock released, RPC call happens (100ms+)
+        //          Another thread updates cache with stale data during RPC call
+        //          get_available_balance_locked() uses stale cache → incorrect balance!
+        //
+        // Solution: Hold balances write lock throughout entire operation:
+        //   1. Invalidate cache
+        //   2. Make RPC call (while holding lock - prevents other threads from updating cache)
+        //   3. Update cache with fresh data
+        //   4. Calculate available balance
+        //   5. Release lock
+        let available = {
             let mut balances = self.balances.write().await;
-            balances.remove(&ata); // Force cache invalidation - next read will use RPC
+            
+            // Invalidate cache
+            balances.remove(&ata);
             log::debug!(
                 "BalanceManager: Cache invalidated for mint {} (ata={}) before reserve check",
                 mint,
                 ata
             );
-        }
-        
-        // Check available balance while holding the lock
-        // ✅ Now get_available_balance_locked() will use fresh RPC call (cache was invalidated)
-        let available = self.get_available_balance_locked(mint, &reserved).await?;
+            
+            // Make RPC call while holding lock (prevents other threads from updating cache)
+            let account = match self.rpc.get_account(&ata).await {
+                Ok(acc) => acc,
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
+                        // ATA doesn't exist - balance is 0
+                        balances.insert(ata, CachedBalance {
+                            amount: 0,
+                            timestamp: Instant::now(),
+                        });
+                        // Calculate available balance (0 - reserved)
+                        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+                        let available = 0u64.saturating_sub(reserved_amount);
+                        
+                        // Check if sufficient balance is available
+                        if available < amount {
+                            return Err(anyhow::anyhow!(
+                                "Insufficient balance for mint {}: need {}, available {} (ATA doesn't exist)",
+                                mint,
+                                amount,
+                                available
+                            ));
+                        }
+                        
+                        // Sufficient balance - reserve it
+                        *reserved.entry(*mint).or_insert(0) += amount;
+                        return Ok(());
+                    }
+                    return Err(e).context("Failed to fetch account balance during reserve");
+                }
+            };
+            
+            if account.data.len() < 72 {
+                return Err(anyhow::anyhow!("Invalid token account data"));
+            }
+            
+            let balance_bytes: [u8; 8] = account.data[64..72].try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
+            let actual = u64::from_le_bytes(balance_bytes);
+            
+            // Update cache with fresh data (while still holding lock)
+            balances.insert(ata, CachedBalance {
+                amount: actual,
+                timestamp: Instant::now(),
+            });
+            
+            // Calculate available balance (using reserved value that was read before cache lock)
+            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+            actual.saturating_sub(reserved_amount)
+        };
 
         if available < amount {
             return Err(anyhow::anyhow!(

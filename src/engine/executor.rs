@@ -379,15 +379,18 @@ impl Executor {
                         let is_timeout = error_str.contains("timeout") || error_str.contains("timed out");
                         
                         if is_timeout {
-                            // ✅ FIX: Don't cache on timeout - we don't know if ATA exists!
-                            // If we cache it and ATA doesn't exist, next opportunity will skip create_ata → transaction FAIL!
+                            // ✅ FIX: Cache pessimistically on timeout - assume ATA missing
+                            // Prevents repeated RPC calls on consecutive timeouts
+                            // Without this, repeated timeouts = repeated double instructions = transaction failures
                             log::warn!(
-                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction (idempotent) but NOT caching (unknown state)",
+                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction and caching pessimistically (assuming ATA missing)",
                                 destination_collateral
                             );
                             let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
                             tx_builder.add_instruction(create_ata_ix);
-                            // ❌ NO cache.insert() here - we don't know if ATA exists!
+                            // Cache pessimistically: assume ATA missing to prevent repeated RPC calls
+                            cache.insert(destination_collateral);
+                            log::warn!("Cached ATA as missing due to timeout (pessimistic caching)");
                         } else {
                             // Other errors (network, etc.) - add instruction, cache pessimistically
                             // This assumes ATA doesn't exist (safe assumption for non-timeout errors)

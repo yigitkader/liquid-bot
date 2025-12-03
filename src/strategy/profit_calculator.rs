@@ -145,6 +145,10 @@ impl ProfitCalculator {
 // ✅ CRITICAL FIX: Pre-computed HashSet of stablecoin Pubkeys for O(1) lookups
 // This eliminates the need to parse strings on every opportunity check
 // Performance improvement: 16,000 parse/sec → 16,000 HashSet.contains()/sec (much faster)
+//
+// ✅ CRITICAL FIX: Explicit error handling - don't silently ignore parse errors!
+// Problem: filter_map() silently skips invalid mints → HashSet incomplete → wrong fee calculation
+// Solution: Panic on parse errors to catch configuration mistakes early
 static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
     vec![
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
@@ -155,8 +159,23 @@ static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
         "AZsHEMXd36Bj1EMNXhowJajpUXzrKcK57wW4ZGXVa7yR", // BUSD
         "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", // TUSD
         "EchesyfXePKdLbiHRbgTbYq4qP8zF8LzF6S9X5YJ7KzN", // USDP (Pax Dollar)
-    ]
-    .into_iter()
-    .filter_map(|s| Pubkey::from_str(s).ok())
-    .collect()
+    ];
+    
+    // ✅ CRITICAL FIX: Explicit error handling - don't silently ignore parse errors!
+    // Problem: filter_map() silently skips invalid mints → HashSet incomplete → wrong fee calculation
+    // Solution: Panic on parse errors to catch configuration mistakes early
+    let mut set = HashSet::new();
+    for s in mints {
+        match Pubkey::from_str(s) {
+            Ok(pk) => {
+                set.insert(pk);
+            }
+            Err(e) => {
+                // ✅ Log error - don't silently ignore!
+                eprintln!("FATAL: Invalid stablecoin mint '{}': {}", s, e);
+                panic!("Stablecoin configuration error: Failed to parse mint '{}': {}", s, e);
+            }
+        }
+    }
+    set
 }
