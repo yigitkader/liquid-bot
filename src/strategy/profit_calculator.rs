@@ -150,7 +150,7 @@ impl ProfitCalculator {
 // Problem: filter_map() silently skips invalid mints → HashSet incomplete → wrong fee calculation
 // Solution: Panic on parse errors to catch configuration mistakes early
 static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
-    vec![
+    let mints = vec![
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
         "EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCWNWqxWV4J6o", // DAI
@@ -178,4 +178,4 @@ static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
         }
     }
     set
-}
+});
