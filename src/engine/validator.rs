@@ -316,9 +316,13 @@ impl Validator {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use tokio::time::{Duration, timeout};
 
-        const ORACLE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+        // ✅ FIX: Use RPC timeout for consistency with oracle reading
+        // read_pyth_price uses rpc.request_timeout() (default 10s), so validator timeout should match
+        // Add 1s buffer to account for async overhead
+        let oracle_timeout = rpc.request_timeout();
+        let oracle_check_timeout = oracle_timeout + Duration::from_secs(1);
 
-        let timeout_result = timeout(ORACLE_CHECK_TIMEOUT, async {
+        let timeout_result = timeout(oracle_check_timeout, async {
             if config.is_free_rpc_endpoint() && !skip_delay {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -415,9 +419,10 @@ impl Validator {
             .await;
 
         timeout_result.map_err(|_| anyhow::anyhow!(
-            "Oracle check timeout after {:?} for mint {}",
-            ORACLE_CHECK_TIMEOUT,
-            mint
+            "Oracle check timeout after {:?} for mint {} (RPC timeout: {:?})",
+            oracle_check_timeout,
+            mint,
+            oracle_timeout
         ))??;
 
         Ok(())
@@ -439,17 +444,22 @@ impl Validator {
         ).await
             .context("Failed to estimate real-time slippage")?;
 
-        let oracle_confidence = estimator.read_oracle_confidence(opp.debt_mint).await
-            .context("Failed to read oracle confidence")?;
+        // ✅ FIX: Read oracle confidence for BOTH debt and collateral mints
+        // Swap involves both input (debt) and output (collateral), each has oracle uncertainty
+        let debt_confidence = estimator.read_oracle_confidence(opp.debt_mint).await
+            .context("Failed to read debt mint oracle confidence")?;
+        let collateral_confidence = estimator.read_oracle_confidence(opp.collateral_mint).await
+            .context("Failed to read collateral mint oracle confidence")?;
 
-        // Combine base slippage and oracle confidence using quadratic sum
+        // Combine base slippage and both oracle confidences using quadratic sum
         // This is statistically more accurate for combining independent uncertainties
         // than simple addition, which can lead to overly conservative estimates
-        // Formula: sqrt(base_slippage^2 + oracle_confidence^2)
+        // Formula: sqrt(base_slippage^2 + debt_confidence^2 + collateral_confidence^2)
         let total_slippage = {
-            let base_f64 = base_slippage as f64;
-            let oracle_f64 = oracle_confidence as f64;
-            let sum_squares = base_f64 * base_f64 + oracle_f64 * oracle_f64;
+            let base = base_slippage as f64;
+            let debt_conf = debt_confidence as f64;
+            let coll_conf = collateral_confidence as f64;
+            let sum_squares = base * base + debt_conf * debt_conf + coll_conf * coll_conf;
             (sum_squares.sqrt()) as u16
         };
 
@@ -457,10 +467,11 @@ impl Validator {
         let final_slippage = total_slippage.min(config.max_slippage_bps);
 
         log::debug!(
-            "Validator: slippage breakdown for position {}: base={} bps, oracle_confidence={} bps, total={} bps (max {} bps)",
+            "Validator: slippage breakdown for position {}: base={} bps, debt_oracle_conf={} bps, collateral_oracle_conf={} bps, total={} bps (max {} bps)",
             opp.position.address,
             base_slippage,
-            oracle_confidence,
+            debt_confidence,
+            collateral_confidence,
             final_slippage,
             config.max_slippage_bps
         );

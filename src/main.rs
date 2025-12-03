@@ -63,17 +63,13 @@ async fn main() -> Result<()> {
     );
     log::info!("✅ RPC client initialized");
 
-    // ✅ CRITICAL: Start reserve cache FIRST with longer delay
+    // ✅ CRITICAL: Start reserve cache FIRST (initial refresh happens immediately)
     // This prevents RPC storm on startup when both reserve cache and scanner call get_program_accounts
     liquid_bot::protocol::solend::instructions::start_reserve_cache_refresh(
         Arc::clone(&rpc),
         config.clone(),
     );
-    log::info!("✅ Reserve cache background refresh started (30s initial delay)");
-
-    // ✅ CRITICAL: Wait before starting scanner to prevent double RPC call
-    // Scanner will call get_program_accounts() immediately, so we delay to avoid hitting rate limits
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    log::info!("✅ Reserve cache background refresh started (initial refresh in progress)");
 
     // ✅ CRITICAL FIX: ALWAYS wait for reserve cache initialization, regardless of RPC type
     // Both Scanner and Executor need reserve cache to avoid unnecessary get_program_accounts() calls
@@ -87,7 +83,7 @@ async fn main() -> Result<()> {
     log::info!(
         "⏳ Waiting for reserve cache initial population before starting Scanner and Executor..."
     );
-    let cache_timeout = tokio::time::Duration::from_secs(40); // 30s delay + 10s buffer for RPC call
+    let cache_timeout = tokio::time::Duration::from_secs(15); // RPC call timeout + buffer (no initial 30s delay)
     if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(
         cache_timeout,
     )

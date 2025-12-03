@@ -210,6 +210,23 @@ impl Executor {
     }
 
     fn record_error(&self) -> Result<()> {
+        // ✅ FIX: Check for overflow BEFORE incrementing to prevent wraparound
+        // If we're near u32::MAX, reset to max_consecutive_errors to keep threshold check working
+        let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
+        
+        if previous_value >= u32::MAX - 10 {
+            // Safety margin: reset before overflow to prevent wraparound
+            log::error!(
+                "🚨 CRITICAL: Executor error counter near overflow ({}), resetting to max_consecutive_errors ({})",
+                previous_value,
+                self.config.max_consecutive_errors
+            );
+            self.consecutive_errors.store(self.config.max_consecutive_errors, Ordering::Relaxed);
+            // Still check threshold after reset
+            return self.check_error_threshold();
+        }
+
+        // Now safely increment
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
         log::warn!(
             "Executor: consecutive errors: {}/{}",
@@ -532,7 +549,7 @@ impl Executor {
         let mut main_tx = tx_builder.build(blockhash);
 
         sign_transaction(&mut main_tx, &self.wallet)
-            .context("Failed to sign main transaction - double signing detected")?;
+            .context("Failed to sign main transaction")?;
 
         bundle.add_transaction(main_tx);
 

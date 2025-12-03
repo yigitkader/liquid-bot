@@ -60,15 +60,24 @@ impl Scanner {
     }
 
     fn record_error(&self) -> Result<()> {
-        let previous_value = self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-        let errors = previous_value
-            .checked_add(1)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Error counter overflow: consecutive_errors reached u32::MAX ({}). This indicates a critical system issue.",
-                    u32::MAX
-                )
-            })?;
+        // ✅ FIX: Check for overflow BEFORE incrementing to prevent wraparound
+        // If we're near u32::MAX, reset to max_consecutive_errors to keep threshold check working
+        let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
+        
+        if previous_value >= u32::MAX - 10 {
+            // Safety margin: reset before overflow to prevent wraparound
+            log::error!(
+                "🚨 CRITICAL: Scanner error counter near overflow ({}), resetting to max_consecutive_errors ({})",
+                previous_value,
+                self.config.max_consecutive_errors
+            );
+            self.consecutive_errors.store(self.config.max_consecutive_errors, Ordering::Relaxed);
+            // Still check threshold after reset
+            return self.check_error_threshold();
+        }
+
+        // Now safely increment
+        let errors = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
 
         log::warn!(
             "Scanner: consecutive errors: {}/{}",

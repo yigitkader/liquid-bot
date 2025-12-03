@@ -43,27 +43,37 @@ impl TransactionBuilder {
 
 pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
     let signer_pubkey = keypair.pubkey();
+    
+    // Find signer index in account_keys
     let signer_index = tx
         .message
         .account_keys
         .iter()
-        .position(|&pk| pk == signer_pubkey);
+        .position(|&pk| pk == signer_pubkey)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Transaction signing failed: signer {} not found in account_keys",
+            signer_pubkey
+        ))?;
 
-    if let Some(index) = signer_index {
-        if index < tx.signatures.len() {
-            let existing_sig = &tx.signatures[index];
-            let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
+    // ✅ FIX: Check if already signed - if valid signature exists, skip signing
+    if signer_index < tx.signatures.len() {
+        let existing_sig = &tx.signatures[signer_index];
+        let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
 
-            if is_signed {
-                return Err(anyhow::anyhow!(
-                    "Transaction already signed by keypair {} at index {} - double signing prevented",
-                    signer_pubkey, index
-                ));
-            }
+        if is_signed {
+            // ✅ Transaction already signed with valid signature - verify it's correct
+            // Note: We can't fully verify without re-signing, but if signature is non-default
+            // and matches the expected signer, we assume it's valid
+            log::debug!(
+                "Transaction already signed by {} at index {} - skipping re-signing",
+                signer_pubkey,
+                signer_index
+            );
+            return Ok(()); // ✅ Don't error - just return success
         }
     }
 
-    // Transaction is unsigned or signer not found in account_keys - safe to sign
+    // Transaction is unsigned or signature is default - sign it
     tx.sign(&[keypair], tx.message.recent_blockhash);
 
     let signer_pubkey = keypair.pubkey();

@@ -234,6 +234,54 @@ impl Analyzer {
         )
         .await?;
 
+        // ✅ FIX: Validate that selected debt and collateral assets have sufficient amounts
+        // This prevents attempting to liquidate more than available, which would cause transaction failure
+        let debt_asset = position
+            .debt_assets
+            .iter()
+            .find(|a| a.mint == debt_mint);
+
+        if let Some(debt_asset) = debt_asset {
+            if debt_asset.amount_usd < max_liquidatable_usd {
+                log::debug!(
+                    "Analyzer: Insufficient debt in selected asset {}: need ${:.2}, have ${:.2}",
+                    debt_mint,
+                    max_liquidatable_usd,
+                    debt_asset.amount_usd
+                );
+                return None;
+            }
+        } else {
+            log::debug!(
+                "Analyzer: Selected debt mint {} not found in position debt assets",
+                debt_mint
+            );
+            return None;
+        }
+
+        let collateral_asset = position
+            .collateral_assets
+            .iter()
+            .find(|a| a.mint == collateral_mint);
+
+        if let Some(collateral_asset) = collateral_asset {
+            if collateral_asset.amount_usd < seizable_collateral_usd {
+                log::debug!(
+                    "Analyzer: Insufficient collateral in selected asset {}: need ${:.2}, have ${:.2}",
+                    collateral_mint,
+                    seizable_collateral_usd,
+                    collateral_asset.amount_usd
+                );
+                return None;
+            }
+        } else {
+            log::debug!(
+                "Analyzer: Selected collateral mint {} not found in position collateral assets",
+                collateral_mint
+            );
+            return None;
+        }
+
         use crate::strategy::profit_calculator::ProfitCalculator;
         let profit_calc = ProfitCalculator::new(config.clone());
 
@@ -246,34 +294,62 @@ impl Analyzer {
             collateral_mint,
         };
 
-        let hop_count = if debt_mint != collateral_mint && config.use_jupiter_api {
-            use crate::strategy::slippage_estimator::SlippageEstimator;
-            let estimator = SlippageEstimator::new(config.clone());
-            // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
-            let amount = 1_000_000u64;
-            match estimator
-                .estimate_dex_slippage_with_route(debt_mint, collateral_mint, amount)
-                .await
-            {
-                Ok((_slippage, hop_count)) => {
-                    log::debug!(
-                        "Analyzer: Got hop_count={} from Jupiter API for swap {} -> {}",
-                        hop_count,
-                        debt_mint,
-                        collateral_mint
-                    );
-                    Some(hop_count)
+        // ✅ FIX: Determine hop_count with conservative fallback
+        // If Jupiter API fails or is disabled, use conservative estimate based on pair type
+        let hop_count = if debt_mint != collateral_mint {
+            if config.use_jupiter_api {
+                use crate::strategy::slippage_estimator::SlippageEstimator;
+                let estimator = SlippageEstimator::new(config.clone());
+                // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
+                let amount = 1_000_000u64;
+                match estimator
+                    .estimate_dex_slippage_with_route(debt_mint, collateral_mint, amount)
+                    .await
+                {
+                    Ok((_slippage, hop_count)) => {
+                        log::debug!(
+                            "Analyzer: Got hop_count={} from Jupiter API for swap {} -> {}",
+                            hop_count,
+                            debt_mint,
+                            collateral_mint
+                        );
+                        Some(hop_count)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Analyzer: Failed to get hop count from Jupiter API: {} - using conservative estimate",
+                            e
+                        );
+                        // ✅ Fallback: Conservative estimate based on pair type
+                        // Stablecoin pairs typically need 1 hop, others may need 2+ hops
+                        let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&debt_mint, &collateral_mint);
+                        let estimated_hop_count = if is_stablecoin_pair { 1 } else { 2 };
+                        log::debug!(
+                            "Analyzer: Using conservative hop_count={} for {} -> {} (stablecoin_pair={})",
+                            estimated_hop_count,
+                            debt_mint,
+                            collateral_mint,
+                            is_stablecoin_pair
+                        );
+                        Some(estimated_hop_count)
+                    }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "Analyzer: Failed to get hop count from Jupiter API: {} - using default (1 hop)",
-                        e
-                    );
-                    None
-                }
+            } else {
+                // ✅ Jupiter API disabled - use conservative estimate
+                let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&debt_mint, &collateral_mint);
+                let estimated_hop_count = if is_stablecoin_pair { 1 } else { 2 };
+                log::debug!(
+                    "Analyzer: Jupiter API disabled, using conservative hop_count={} for {} -> {} (stablecoin_pair={})",
+                    estimated_hop_count,
+                    debt_mint,
+                    collateral_mint,
+                    is_stablecoin_pair
+                );
+                Some(estimated_hop_count)
             }
         } else {
-            None
+            // No swap needed (same mint)
+            Some(0)
         };
 
         let net_profit = profit_calc.calculate_net_profit(&temp_opp, hop_count);

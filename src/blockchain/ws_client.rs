@@ -395,7 +395,7 @@ impl WsClient {
                         SubscriptionType::Program(program_id) => {
                             self.subscribe_program(program_id).await.map(|new_id| {
                                 log::info!(
-                                    "Resubscribed: {} -> {} (program: {})",
+                                    "✅ Resubscribed: {} -> {} (program: {})",
                                     old_id,
                                     new_id,
                                     program_id
@@ -406,7 +406,7 @@ impl WsClient {
                         SubscriptionType::Account(pubkey) => {
                             self.subscribe_account(pubkey).await.map(|new_id| {
                                 log::info!(
-                                    "Resubscribed: {} -> {} (account: {})",
+                                    "✅ Resubscribed: {} -> {} (account: {})",
                                     old_id,
                                     new_id,
                                     pubkey
@@ -415,7 +415,7 @@ impl WsClient {
                             })
                         }
                         SubscriptionType::Slot => self.subscribe_slot().await.map(|new_id| {
-                            log::info!("Resubscribed: {} -> {} (slot)", old_id, new_id);
+                            log::info!("✅ Resubscribed: {} -> {} (slot)", old_id, new_id);
                             new_id
                         }),
                     };
@@ -425,8 +425,14 @@ impl WsClient {
                             // Successfully resubscribed
                         }
                         Err(e) => {
-                            log::warn!("Failed to resubscribe {}: {}", old_id, e);
+                            log::error!("❌ Resubscribe failed for {}: {}", old_id, e);
                             failed_subscriptions.push((*old_id, info.clone()));
+                            
+                            // ✅ FIX: Restore failed subscription to HashMap for retry on next reconnect
+                            // This prevents memory leak where subscriptions are lost after failed reconnects
+                            let mut subscriptions = self.subscriptions.lock().await;
+                            subscriptions.insert(*old_id, info.clone());
+                            log::warn!("   Restored old subscription {} for retry", old_id);
                         }
                     }
                 }
@@ -436,7 +442,7 @@ impl WsClient {
                         "Retrying {} failed subscriptions...",
                         failed_subscriptions.len()
                     );
-                    for (old_id, info) in failed_subscriptions {
+                    for (old_id, info) in failed_subscriptions.iter() {
                         let retry_result = match &info.subscription_type {
                             SubscriptionType::Program(program_id) => {
                                 self.subscribe_program(program_id).await
@@ -449,14 +455,18 @@ impl WsClient {
 
                         match retry_result {
                             Ok(new_id) => {
-                                log::info!("Retry successful: {} -> {}", old_id, new_id);
+                                log::info!("✅ Retry successful: {} -> {}", old_id, new_id);
+                                // Remove old subscription ID from HashMap since we have new one
+                                let mut subscriptions = self.subscriptions.lock().await;
+                                subscriptions.remove(old_id);
                             }
                             Err(e) => {
                                 log::error!(
-                                    "Retry failed for {}: {} (subscription will be lost)",
+                                    "❌ Retry failed for {}: {} (subscription kept for next reconnect)",
                                     old_id,
                                     e
                                 );
+                                // Subscription already restored in HashMap above, will retry on next reconnect
                             }
                         }
                     }

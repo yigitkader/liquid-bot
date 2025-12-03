@@ -220,15 +220,17 @@ impl ReserveCache {
 
     pub fn start_background_refresh(self: Arc<Self>, rpc: Arc<RpcClient>, config: Config) {
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-
+            // ✅ FIX: Perform initial refresh immediately, then start periodic refresh
+            // This prevents race condition where cache is empty for 30s, causing
+            // Scanner/Executor to make unnecessary RPC calls (get_program_accounts)
             log::info!("Performing initial reserve cache refresh...");
             if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
-                log::warn!("Initial reserve cache refresh failed: {}", e);
+                log::error!("Initial reserve cache refresh FAILED: {}", e);
             } else {
-                log::info!("Initial reserve cache refresh completed successfully");
+                log::info!("✅ Initial reserve cache populated successfully");
             }
 
+            // Now start periodic refresh
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
 

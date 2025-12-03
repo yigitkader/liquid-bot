@@ -118,7 +118,7 @@ impl ProfitCalculator {
         fee
     }
 
-    fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
+    pub fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
         STABLECOIN_PAIRS.contains(&(*mint1, *mint2))
     }
 }

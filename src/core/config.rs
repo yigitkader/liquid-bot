@@ -356,6 +356,32 @@ impl Config {
             ));
         }
 
+        // ✅ FIX: Validate slippage_final_multiplier (safety margin for model uncertainty)
+        if self.slippage_final_multiplier < 1.0 || self.slippage_final_multiplier > 2.0 {
+            return Err(anyhow::anyhow!(
+                "SLIPPAGE_FINAL_MULTIPLIER must be between 1.0 and 2.0 (safety margin), got: {}",
+                self.slippage_final_multiplier
+            ));
+        }
+
+        // ✅ FIX: Validate z_score_95 (statistical parameter)
+        // Standard value is 1.96 for 95% confidence interval
+        if (self.z_score_95 - 1.96).abs() > 0.01 {
+            log::warn!(
+                "⚠️  Z_SCORE_95={} is not standard (expected: 1.96 for 95% confidence interval)",
+                self.z_score_95
+            );
+            log::warn!("   Using non-standard z-score may lead to incorrect statistical calculations");
+        }
+
+        // ✅ FIX: Validate liquidation_bonus (typically 0-20%)
+        if self.liquidation_bonus < 0.0 || self.liquidation_bonus > 0.20 {
+            return Err(anyhow::anyhow!(
+                "LIQUIDATION_BONUS must be between 0.0 and 0.20 (0-20%), got: {}",
+                self.liquidation_bonus
+            ));
+        }
+
         // RPC Rate Limit Check: Free RPC endpoints require longer polling intervals
         if self.is_free_rpc_endpoint() && self.poll_interval_ms < 10000 {
             return Err(anyhow::anyhow!(

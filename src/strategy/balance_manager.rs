@@ -54,13 +54,16 @@ impl BalanceManager {
     pub async fn get_available_balance(&self, mint: &Pubkey) -> Result<u64> {
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
-        let reserved = self.reserved.read().await;
 
         {
             let balances = self.balances.read().await;
             if let Some(cached) = balances.get(&ata) {
                 if cached.timestamp.elapsed() < CACHE_TTL {
-                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+                    // Read reserved amount without holding it across other locks/RPC calls
+                    let reserved_amount = {
+                        let reserved = self.reserved.read().await;
+                        reserved.get(mint).copied().unwrap_or(0)
+                    };
                     let available = cached.amount.saturating_sub(reserved_amount);
                     log::debug!(
                         "BalanceManager: Cache hit for mint {} (ata={}): cached={}, reserved={}, available={}, age={:.2}s",
@@ -82,8 +85,6 @@ impl BalanceManager {
             ata
         );
 
-        let reserved = self.reserved.read().await;
-
         let account = match self.rpc.get_account(&ata).await {
             Ok(acc) => acc,
             Err(e) => {
@@ -97,7 +98,6 @@ impl BalanceManager {
                         self.wallet
                     );
 
-                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
                     let mut balances = self.balances.write().await;
                     balances.insert(
                         ata,
@@ -106,6 +106,11 @@ impl BalanceManager {
                             timestamp: Instant::now(),
                         },
                     );
+
+                    let reserved_amount = {
+                        let reserved = self.reserved.read().await;
+                        reserved.get(mint).copied().unwrap_or(0)
+                    };
 
                     return Ok(0u64.saturating_sub(reserved_amount));
                 }
@@ -122,7 +127,6 @@ impl BalanceManager {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
         let actual = u64::from_le_bytes(balance_bytes);
-        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
 
         // Update cache with RPC result (while still holding reserved lock)
         {
@@ -135,6 +139,11 @@ impl BalanceManager {
                 },
             );
         }
+
+        let reserved_amount = {
+            let reserved = self.reserved.read().await;
+            reserved.get(mint).copied().unwrap_or(0)
+        };
 
         let available = actual.saturating_sub(reserved_amount);
         Ok(available)
@@ -387,95 +396,85 @@ impl BalanceManager {
     }
 
     pub async fn reserve(&self, mint: &Pubkey, amount: u64) -> Result<()> {
-        let mut reserved = self.reserved.write().await;
-
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
             .with_context(|| format!("Failed to derive ATA for mint {}", mint))?;
 
-        let available = {
-            let mut balances = self.balances.write().await;
+        // Step 1: Fetch latest balance from RPC (no locks held to avoid blocking)
+        let rpc_account_result = self.rpc.get_account(&ata).await;
 
-            balances.remove(&ata);
-            log::debug!(
-                "BalanceManager: Cache invalidated for mint {} (ata={}) before reserve check",
-                mint,
-                ata
-            );
+        // Step 2: Decode balance
+        let actual = match rpc_account_result {
+            Ok(account) => {
+                if account.data.len() < 72 {
+                    return Err(anyhow::anyhow!("Invalid token account data"));
+                }
 
-            let account = match self.rpc.get_account(&ata).await {
-                Ok(acc) => acc,
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("AccountNotFound")
-                        || error_msg.contains("account not found")
-                    {
-                        // ATA doesn't exist - balance is 0
-                        balances.insert(
-                            ata,
-                            CachedBalance {
-                                amount: 0,
-                                timestamp: Instant::now(),
-                            },
-                        );
-                        // Calculate available balance (0 - reserved)
-                        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                        let available = 0u64.saturating_sub(reserved_amount);
-
-                        // Check if sufficient balance is available
-                        if available < amount {
-                            return Err(anyhow::anyhow!(
-                                "Insufficient balance for mint {}: need {}, available {} (ATA doesn't exist)",
-                                mint,
-                                amount,
-                                available
-                            ));
-                        }
-
-                        // Sufficient balance - reserve it
-                        *reserved.entry(*mint).or_insert(0) += amount;
-                        return Ok(());
-                    }
+                let balance_bytes: [u8; 8] = account.data[64..72]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
+                u64::from_le_bytes(balance_bytes)
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
+                {
+                    // ATA doesn't exist - balance is 0
+                    0
+                } else {
                     return Err(e).context("Failed to fetch account balance during reserve");
                 }
-            };
-
-            if account.data.len() < 72 {
-                return Err(anyhow::anyhow!("Invalid token account data"));
             }
-
-            let balance_bytes: [u8; 8] = account.data[64..72]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
-            let actual = u64::from_le_bytes(balance_bytes);
-
-            // Update cache with fresh data (while still holding lock)
-            balances.insert(
-                ata,
-                CachedBalance {
-                    amount: actual,
-                    timestamp: Instant::now(),
-                },
-            );
-
-            // Calculate available balance (using reserved value that was read before cache lock)
-            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-            actual.saturating_sub(reserved_amount)
         };
+
+        // ✅ FIX: Hold BOTH locks simultaneously to prevent race condition
+        // Lock order: balances -> reserved (consistent with other methods)
+        let mut balances = self.balances.write().await;
+        let mut reserved = self.reserved.write().await;
+
+        // Step 3: Calculate new reserved amount BEFORE updating cache
+        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+        let new_reserved = reserved_amount.saturating_add(amount);
+
+        // Step 4: Calculate available balance with NEW reserved amount
+        let available = actual.saturating_sub(new_reserved);
 
         if available < amount {
             return Err(anyhow::anyhow!(
-                "Insufficient balance for mint {}: need {}, available {}",
+                "Insufficient balance for mint {}: need {}, available {} (balance: {}, reserved: {} -> {})",
                 mint,
                 amount,
-                available
+                available,
+                actual,
+                reserved_amount,
+                new_reserved
             ));
         }
 
-        // Reserve the amount atomically (add to existing reserved amount)
-        *reserved.entry(*mint).or_insert(0) += amount;
+        // Step 5: Update reserved FIRST (before cache update)
+        reserved.insert(*mint, new_reserved);
 
-        // Lock is released here, but reservation is already committed.
+        // Step 6: Update cache AFTER reserved is updated (prevents race condition)
+        // Other threads reading cache will see correct reserved amount
+        balances.insert(
+            ata,
+            CachedBalance {
+                amount: actual,
+                timestamp: Instant::now(),
+            },
+        );
+
+        log::debug!(
+            "BalanceManager: Reserved {} for mint {} (balance: {}, reserved: {} -> {}, available: {})",
+            amount,
+            mint,
+            actual,
+            reserved_amount,
+            new_reserved,
+            available
+        );
+
+        // Both locks released here atomically
         Ok(())
     }
 
