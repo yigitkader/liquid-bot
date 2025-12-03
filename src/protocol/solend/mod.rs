@@ -173,12 +173,10 @@ impl Protocol for SolendProtocol {
     }
 }
 
+// ✅ FIX: Pre-computed discriminator to avoid SHA256 calculation on every call
+// SHA256("account:Obligation")[..8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7]
+const OBLIGATION_DISCRIMINATOR: [u8; 8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7];
+
 fn get_obligation_discriminator() -> [u8; 8] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"account:Obligation");
-    let hash = hasher.finalize();
-    let mut discriminator = [0u8; 8];
-    discriminator.copy_from_slice(&hash[..8]);
-    discriminator
+    OBLIGATION_DISCRIMINATOR
 }

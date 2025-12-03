@@ -31,6 +31,9 @@ struct ReserveCacheInner {
     initialized: bool,
 }
 
+// ✅ FIX: Fetch lock to prevent multiple threads from making concurrent RPC calls
+static FETCH_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> = Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
 struct ReserveCache {
     inner: RwLock<ReserveCacheInner>,
 }
@@ -52,6 +55,7 @@ impl ReserveCache {
         rpc: &Arc<RpcClient>,
         config: &Config,
     ) -> Result<Pubkey> {
+        // Fast path: check cache first
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -59,27 +63,27 @@ impl ReserveCache {
             }
         }
 
+        // Slow path: acquire fetch lock to prevent concurrent RPC calls
+        let _lock = FETCH_LOCK.lock().await;
+        
+        // Double-check after acquiring fetch lock (another thread may have populated cache)
+        {
+            let inner = self.inner.read().await;
+            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
+                return Ok(*reserve);
+            }
+        }
+
+        // Fetch from RPC (only one thread will do this)
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
-
-        {
-            let inner = self.inner.read().await;
-            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
-                // Başka thread cache'i güncellemiş, gereksiz write işlemini atla
-                return Ok(*reserve);
-            }
-        }
-
+        
+        // Update cache using extend instead of override to preserve other entries
         {
             let mut inner = self.inner.write().await;
-
-            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
-                return Ok(*reserve);
-            }
-
-            inner.mint_to_reserve = mint_to_reserve;
+            // ✅ FIX: Use extend instead of override to prevent losing other thread's entries
+            inner.mint_to_reserve.extend(mint_to_reserve);
             inner.initialized = true;
-
-            // Now get the reserve we just cached
+            
             inner
                 .mint_to_reserve
                 .get(mint)

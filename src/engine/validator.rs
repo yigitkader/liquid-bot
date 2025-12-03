@@ -316,11 +316,10 @@ impl Validator {
         use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use tokio::time::{Duration, timeout};
 
-        // ✅ FIX: Use RPC timeout for consistency with oracle reading
-        // read_pyth_price uses rpc.request_timeout() (default 10s), so validator timeout should match
-        // Add 1s buffer to account for async overhead
-        let oracle_timeout = rpc.request_timeout();
-        let oracle_check_timeout = oracle_timeout + Duration::from_secs(1);
+        // ✅ FIX: Use shorter timeout than RPC timeout to prevent double-waiting
+        // read_pyth_price uses rpc.request_timeout() (default 10s), but we want to fail faster
+        // Set timeout to 5s to prevent total wait time of 10s (RPC) + 10s (outer timeout) = 20s
+        let oracle_check_timeout = Duration::from_secs(5);
 
         let timeout_result = timeout(oracle_check_timeout, async {
             if config.is_free_rpc_endpoint() && !skip_delay {
@@ -419,10 +418,9 @@ impl Validator {
             .await;
 
         timeout_result.map_err(|_| anyhow::anyhow!(
-            "Oracle check timeout after {:?} for mint {} (RPC timeout: {:?})",
+            "Oracle check timeout after {:?} for mint {}",
             oracle_check_timeout,
-            mint,
-            oracle_timeout
+            mint
         ))??;
 
         Ok(())

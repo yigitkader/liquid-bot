@@ -43,11 +43,23 @@ impl Analyzer {
         let mut last_scale_down = Instant::now();
         const SCALE_DOWN_THRESHOLD: Duration = Duration::from_secs(60);
         const SCALE_DOWN_INTERVAL: Duration = Duration::from_secs(30);
+        // ✅ FIX: Task limit to prevent unlimited task spawning
+        const MAX_CONCURRENT_TASKS: usize = 1000;
 
         loop {
             match receiver.recv().await {
                 Ok(Event::AccountUpdated { position, .. })
                 | Ok(Event::AccountDiscovered { position, .. }) => {
+                    // ✅ FIX: Check task limit before spawning
+                    if tasks.len() >= MAX_CONCURRENT_TASKS {
+                        log::warn!(
+                            "Analyzer: Task queue full ({} tasks), dropping event for position {}",
+                            tasks.len(),
+                            position.address
+                        );
+                        continue;
+                    }
+
                     let permit = match semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
@@ -64,6 +76,9 @@ impl Analyzer {
                     tasks.spawn(async move {
                         let _permit = permit;
 
+                        // Run actual work
+                        // ✅ FIX: Permit will be dropped here (RAII), releasing semaphore even if task panics
+                        // Panics are caught by JoinSet in the cleanup loop below
                         if Self::is_liquidatable_static(&position, &config) {
                             if let Some(opportunity) =
                                 Self::calculate_opportunity_static(position, protocol, config).await

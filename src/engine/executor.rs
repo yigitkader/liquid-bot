@@ -18,6 +18,13 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
+/// ATA cache entry with timestamp for cleanup
+#[derive(Clone, Debug)]
+struct AtaCacheEntry {
+    timestamp: Instant,
+    verified: bool,
+}
+
 struct TxLock {
     locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
     lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
@@ -138,7 +145,9 @@ pub struct Executor {
     use_jito: bool,
     // Cache of ATAs we've already included create_ata instructions for
     // This avoids redundant instructions within the same executor instance
-    ata_cache: Arc<RwLock<HashSet<Pubkey>>>,
+    // ✅ FIX: Use HashMap with timestamp for cleanup to prevent memory leak
+    ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>>,
+    ata_cache_cleanup_token: CancellationToken,
 }
 
 impl Executor {
@@ -176,6 +185,43 @@ impl Executor {
             log::warn!("⚠️  WARNING: Without Jito, transactions are vulnerable to front-running!");
         }
 
+        let ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        let ata_cache_cleanup_token = CancellationToken::new();
+        
+        // ✅ FIX: Start background cleanup task for ATA cache
+        let cache_for_cleanup = Arc::clone(&ata_cache);
+        let cleanup_token = ata_cache_cleanup_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(3600)) => {
+                        // Run cleanup every hour
+                        let mut cache = cache_for_cleanup.write().await;
+                        let now = Instant::now();
+                        
+                        // Remove entries older than 24 hours
+                        let before_len = cache.len();
+                        cache.retain(|_, entry| {
+                            now.duration_since(entry.timestamp) < Duration::from_secs(86400)
+                        });
+                        let after_len = cache.len();
+                        
+                        if before_len != after_len {
+                            log::debug!(
+                                "Executor: ATA cache cleanup: removed {} entries ({} remaining)",
+                                before_len - after_len,
+                                after_len
+                            );
+                        }
+                    }
+                    _ = cleanup_token.cancelled() => {
+                        log::info!("Executor ATA cache cleanup task shutting down gracefully");
+                        break;
+                    }
+                }
+            }
+        });
+
         Executor {
             event_bus,
             rpc,
@@ -187,7 +233,8 @@ impl Executor {
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             jito_client,
             use_jito,
-            ata_cache: Arc::new(RwLock::new(HashSet::new())),
+            ata_cache,
+            ata_cache_cleanup_token,
         }
     }
 
@@ -243,6 +290,7 @@ impl Executor {
     pub fn shutdown(&self) {
         log::info!("Executor: shutting down gracefully, cancelling background tasks");
         self.tx_lock.cancel_cleanup();
+        self.ata_cache_cleanup_token.cancel();
     }
 
     fn is_retryable_error(&self, error: &anyhow::Error) -> bool {
@@ -333,7 +381,7 @@ impl Executor {
         tx_builder.add_compute_budget(200_000, 1_000);
         let mut cache = self.ata_cache.write().await;
 
-        if !cache.contains(&destination_collateral) {
+        if !cache.contains_key(&destination_collateral) {
             // Cache miss - check RPC to see if ATA actually exists
             log::debug!(
                 "Executor: Cache miss for ATA {}, checking on-chain existence...",
@@ -342,7 +390,10 @@ impl Executor {
 
             match self.rpc.get_account(&destination_collateral).await {
                 Ok(_) => {
-                    cache.insert(destination_collateral);
+                    cache.insert(destination_collateral, AtaCacheEntry {
+                        timestamp: Instant::now(),
+                        verified: true,
+                    });
                     log::debug!(
                         "Executor: ATA {} exists on-chain, added to cache, skipping create_ata instruction",
                         destination_collateral
@@ -361,7 +412,10 @@ impl Executor {
                         let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
                         tx_builder.add_instruction(create_ata_ix);
 
-                        cache.insert(destination_collateral);
+                        cache.insert(destination_collateral, AtaCacheEntry {
+                            timestamp: Instant::now(),
+                            verified: false, // Not verified yet, will be verified after transaction
+                        });
                     } else {
                         let error_str = e.to_string().to_lowercase();
                         let is_timeout =
@@ -375,6 +429,7 @@ impl Executor {
                             let create_ata_ix =
                                 self.create_ata_instruction(&opp.collateral_mint)?;
                             tx_builder.add_instruction(create_ata_ix);
+                            // Don't cache on timeout - will retry next time
                         } else {
                             log::warn!(
                                 "Executor: Failed to check ATA existence for {}: {}. Adding create_ata instruction anyway (idempotent)",
@@ -384,7 +439,10 @@ impl Executor {
                             let create_ata_ix =
                                 self.create_ata_instruction(&opp.collateral_mint)?;
                             tx_builder.add_instruction(create_ata_ix);
-                            cache.insert(destination_collateral);
+                            cache.insert(destination_collateral, AtaCacheEntry {
+                                timestamp: Instant::now(),
+                                verified: false,
+                            });
                         }
                     }
                 }

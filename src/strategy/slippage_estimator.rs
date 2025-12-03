@@ -150,9 +150,19 @@ impl SlippageEstimator {
     /// ✅ FIX: Separated into its own function for cleaner error handling
     async fn try_jupiter_quote(&self, url: &str) -> Result<(u16, u8)> {
         use anyhow::Context;
+        use tokio::time::{timeout, Duration};
 
-        // Make HTTP request
-        let response = self.client.get(url).send().await.context("Network error")?;
+        // ✅ FIX: Add timeout to prevent infinite hang if Jupiter API hangs
+        const JUPITER_TIMEOUT: Duration = Duration::from_secs(5);
+
+        // Make HTTP request with timeout
+        let response = timeout(
+            JUPITER_TIMEOUT,
+            self.client.get(url).send()
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Jupiter API timeout after {:?}", JUPITER_TIMEOUT))?
+        .context("Network error")?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!("HTTP error: {}", response.status()));

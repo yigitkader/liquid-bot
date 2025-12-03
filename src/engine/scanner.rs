@@ -352,7 +352,16 @@ impl Scanner {
                 }
 
                 // Wait before next RPC poll
-                sleep(poll_interval).await;
+                // ✅ FIX: For free RPC endpoints, use longer interval to avoid rate limits
+                // get_program_accounts is expensive (rate limit = 40 req/10s)
+                let adjusted_interval = if self.config.is_free_rpc_endpoint() {
+                    // Free RPC: minimum 2 minutes to avoid rate limit issues
+                    let min_interval = Duration::from_millis(120_000); // 2 minutes
+                    poll_interval.max(min_interval)
+                } else {
+                    poll_interval
+                };
+                sleep(adjusted_interval).await;
             }
         }
     }

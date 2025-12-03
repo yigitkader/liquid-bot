@@ -55,6 +55,15 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
             signer_pubkey
         ))?;
 
+    // ✅ FIX: Check signature array size matches account_keys size
+    if tx.signatures.len() != tx.message.account_keys.len() {
+        return Err(anyhow::anyhow!(
+            "Transaction signature array mismatch: {} signatures, {} accounts",
+            tx.signatures.len(),
+            tx.message.account_keys.len()
+        ));
+    }
+
     // ✅ FIX: Check if already signed - if valid signature exists, skip signing
     if signer_index < tx.signatures.len() {
         let existing_sig = &tx.signatures[signer_index];

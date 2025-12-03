@@ -427,12 +427,9 @@ impl WsClient {
                         Err(e) => {
                             log::error!("❌ Resubscribe failed for {}: {}", old_id, e);
                             failed_subscriptions.push((*old_id, info.clone()));
-                            
-                            // ✅ FIX: Restore failed subscription to HashMap for retry on next reconnect
-                            // This prevents memory leak where subscriptions are lost after failed reconnects
-                            let mut subscriptions = self.subscriptions.lock().await;
-                            subscriptions.insert(*old_id, info.clone());
-                            log::warn!("   Restored old subscription {} for retry", old_id);
+                            // ✅ FIX: Don't restore failed subscription - old ID is invalid
+                            // This prevents silent data loss where we think we're subscribed but aren't
+                            // The subscription will be retried below, and if that fails, it's logged
                         }
                     }
                 }
@@ -456,17 +453,17 @@ impl WsClient {
                         match retry_result {
                             Ok(new_id) => {
                                 log::info!("✅ Retry successful: {} -> {}", old_id, new_id);
-                                // Remove old subscription ID from HashMap since we have new one
-                                let mut subscriptions = self.subscriptions.lock().await;
-                                subscriptions.remove(old_id);
+                                // New subscription ID already added to HashMap by subscribe_* methods
                             }
                             Err(e) => {
                                 log::error!(
-                                    "❌ Retry failed for {}: {} (subscription kept for next reconnect)",
+                                    "❌ Retry failed for {}: {} - subscription lost, will need manual resubscription",
                                     old_id,
                                     e
                                 );
-                                // Subscription already restored in HashMap above, will retry on next reconnect
+                                // ✅ FIX: Don't restore old subscription - it's invalid
+                                // This prevents silent data loss where we think we're subscribed but aren't
+                                // Scanner/other components should handle missing subscriptions
                             }
                         }
                     }
