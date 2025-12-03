@@ -4,24 +4,24 @@ use fern;
 use log;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::signal;
 use tokio::time::{sleep, Duration};
 
-use liquid_bot::core::config::Config;
-use liquid_bot::core::events::EventBus;
 use liquid_bot::blockchain::rpc_client::RpcClient;
 use liquid_bot::blockchain::ws_client::WsClient;
-use liquid_bot::engine::scanner::Scanner;
+use liquid_bot::core::config::Config;
+use liquid_bot::core::events::EventBus;
 use liquid_bot::engine::analyzer::Analyzer;
-use liquid_bot::engine::validator::Validator;
 use liquid_bot::engine::executor::Executor;
+use liquid_bot::engine::scanner::Scanner;
+use liquid_bot::engine::validator::Validator;
+use liquid_bot::protocol::solend::SolendProtocol;
+use liquid_bot::protocol::Protocol;
 use liquid_bot::strategy::balance_manager::BalanceManager;
 use liquid_bot::utils::cache::AccountCache;
 use liquid_bot::utils::metrics::Metrics;
-use liquid_bot::protocol::Protocol;
-use liquid_bot::protocol::solend::SolendProtocol;
 
 use solana_sdk::signature::{Keypair, Signer};
 
@@ -29,11 +29,10 @@ use solana_sdk::signature::{Keypair, Signer};
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    std::fs::create_dir_all("logs")
-        .context("Failed to create logs directory")?;
-    
+    std::fs::create_dir_all("logs").context("Failed to create logs directory")?;
+
     let log_file_path = format!("logs/bot-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
-    
+
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
@@ -52,16 +51,15 @@ async fn main() -> Result<()> {
     log::info!("🚀 Starting Solana Liquidation Bot");
     log::info!("📝 Logging to: {}", log_file_path);
 
-    let config = Config::from_env()
-        .context("Failed to load configuration")?;
-    config.validate()
+    let config = Config::from_env().context("Failed to load configuration")?;
+    config
+        .validate()
         .context("Configuration validation failed")?;
 
     log::info!("✅ Configuration loaded");
 
     let rpc = Arc::new(
-        RpcClient::new(config.rpc_http_url.clone())
-            .context("Failed to create RPC client")?
+        RpcClient::new(config.rpc_http_url.clone()).context("Failed to create RPC client")?,
     );
     log::info!("✅ RPC client initialized");
 
@@ -76,7 +74,7 @@ async fn main() -> Result<()> {
     // ✅ CRITICAL: Wait before starting scanner to prevent double RPC call
     // Scanner will call get_program_accounts() immediately, so we delay to avoid hitting rate limits
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    
+
     // ✅ CRITICAL FIX: ALWAYS wait for reserve cache initialization, regardless of RPC type
     // Both Scanner and Executor need reserve cache to avoid unnecessary get_program_accounts() calls
     // Problem:
@@ -86,38 +84,42 @@ async fn main() -> Result<()> {
     // This prevents:
     //   1. Scanner calling get_program_accounts() when cache is not ready (unnecessary RPC call)
     //   2. Executor calling get_program_accounts() on first opportunity (rate limit risk)
-    log::info!("⏳ Waiting for reserve cache initial population before starting Scanner and Executor...");
+    log::info!(
+        "⏳ Waiting for reserve cache initial population before starting Scanner and Executor..."
+    );
     let cache_timeout = tokio::time::Duration::from_secs(40); // 30s delay + 10s buffer for RPC call
-    if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(cache_timeout).await {
+    if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(
+        cache_timeout,
+    )
+    .await
+    {
         log::info!("✅ Reserve cache populated, ready for Scanner and Executor");
     } else {
-        log::warn!("⚠️  Reserve cache initialization timeout - Scanner and Executor will start anyway");
-        log::warn!("   This may cause unnecessary RPC calls (get_program_accounts) if cache is not ready");
+        log::warn!(
+            "⚠️  Reserve cache initialization timeout - Scanner and Executor will start anyway"
+        );
+        log::warn!(
+            "   This may cause unnecessary RPC calls (get_program_accounts) if cache is not ready"
+        );
         log::warn!("   Monitor for rate limit errors, especially on first opportunity");
     }
-    
+
     log::info!("⏳ Starting account discovery...");
 
     let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));
-    ws.connect().await
-        .context("Failed to connect WebSocket")?;
+    ws.connect().await.context("Failed to connect WebSocket")?;
     log::info!("✅ WebSocket client initialized");
 
-    let wallet_keypair = load_wallet(&config.wallet_path)
-        .context("Failed to load wallet")?;
+    let wallet_keypair = load_wallet(&config.wallet_path).context("Failed to load wallet")?;
     let wallet = Arc::new(wallet_keypair);
     let wallet_pubkey = wallet.pubkey();
     log::info!("✅ Wallet loaded: {}", wallet_pubkey);
 
     // Ensure required ATAs exist (simple on-chain check, no cache needed)
     use liquid_bot::utils::ata_manager;
-    ata_manager::ensure_required_atas(
-        Arc::clone(&rpc),
-        Arc::clone(&wallet),
-        &config,
-    )
-    .await
-    .context("Failed to ensure required ATAs exist")?;
+    ata_manager::ensure_required_atas(Arc::clone(&rpc), Arc::clone(&wallet), &config)
+        .await
+        .context("Failed to ensure required ATAs exist")?;
     log::info!("✅ ATA setup completed");
 
     let event_bus = EventBus::new(config.event_bus_buffer_size);
@@ -126,10 +128,10 @@ async fn main() -> Result<()> {
     let balance_manager = Arc::new(
         BalanceManager::new(Arc::clone(&rpc), wallet_pubkey)
             .with_config(config.clone())
-            .with_websocket(Arc::clone(&ws))
+            .with_websocket(Arc::clone(&ws)),
     );
     log::info!("✅ Balance manager initialized");
-    
+
     // Start balance monitoring via WebSocket
     let balance_manager_monitor = Arc::clone(&balance_manager);
     tokio::spawn(async move {
@@ -152,11 +154,13 @@ async fn main() -> Result<()> {
     let cache = Arc::new(AccountCache::new());
     log::info!("✅ Account cache initialized");
 
-    let protocol: Arc<dyn Protocol> = Arc::new(
-        SolendProtocol::new(&config)
-            .context("Failed to initialize Solend protocol")?
+    let protocol: Arc<dyn Protocol> =
+        Arc::new(SolendProtocol::new(&config).context("Failed to initialize Solend protocol")?);
+    log::info!(
+        "✅ Protocol initialized: {} (program: {})",
+        protocol.id(),
+        protocol.program_id()
     );
-    log::info!("✅ Protocol initialized: {} (program: {})", protocol.id(), protocol.program_id());
 
     let scanner = Scanner::new(
         Arc::clone(&rpc),
@@ -166,11 +170,7 @@ async fn main() -> Result<()> {
         Arc::clone(&cache),
         config.clone(),
     );
-    let analyzer = Analyzer::new(
-        event_bus.clone(),
-        Arc::clone(&protocol),
-        config.clone(),
-    );
+    let analyzer = Analyzer::new(event_bus.clone(), Arc::clone(&protocol), config.clone());
     let validator = Validator::new(
         event_bus.clone(),
         Arc::clone(&balance_manager),
@@ -235,7 +235,10 @@ async fn main() -> Result<()> {
 
             // Wallet USDC balance (available, reserved-aware)
             if let Ok(usdc_mint) = solana_sdk::pubkey::Pubkey::from_str(&usdc_mint_str) {
-                match balance_manager_clone.get_available_balance(&usdc_mint).await {
+                match balance_manager_clone
+                    .get_available_balance(&usdc_mint)
+                    .await
+                {
                     Ok(available) => {
                         let available_usdc = available as f64 / 1_000_000.0; // USDC: 6 decimals
                         log::info!(
@@ -245,10 +248,7 @@ async fn main() -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        log::warn!(
-                            "⚠️ Failed to read available USDC balance for wallet: {}",
-                            e
-                        );
+                        log::warn!("⚠️ Failed to read available USDC balance for wallet: {}", e);
                     }
                 }
             } else {
@@ -263,14 +263,17 @@ async fn main() -> Result<()> {
     log::info!("✅ All components initialized");
     log::info!("⏳ Waiting for shutdown signal (Ctrl+C)...");
 
-    signal::ctrl_c().await
+    signal::ctrl_c()
+        .await
         .context("Failed to listen for shutdown signal")?;
 
     log::info!("🛑 Shutting down gracefully...");
 
     // ✅ CRITICAL: Stop balance monitoring FIRST (clear subscriptions)
     // This prevents race conditions where account updates arrive after shutdown
-    balance_manager.stop_monitoring().await
+    balance_manager
+        .stop_monitoring()
+        .await
         .context("Failed to stop balance monitoring")?;
 
     // Then shutdown other components...
@@ -283,13 +286,12 @@ async fn main() -> Result<()> {
 
 fn load_wallet(path: &str) -> Result<Keypair> {
     let wallet_path = Path::new(path);
-    
+
     if !wallet_path.exists() {
         return Err(anyhow::anyhow!("Wallet file not found: {}", path));
     }
 
-    let keypair_bytes = fs::read(wallet_path)
-        .context("Failed to read wallet file")?;
+    let keypair_bytes = fs::read(wallet_path).context("Failed to read wallet file")?;
 
     if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
         if keypair.len() == 64 {
@@ -304,9 +306,7 @@ fn load_wallet(path: &str) -> Result<Keypair> {
     }
 
     if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
-        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim())
-            .into_vec()
-        {
+        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim()).into_vec() {
             if keypair_bytes_decoded.len() == 64 {
                 return Keypair::from_bytes(&keypair_bytes_decoded)
                     .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
@@ -314,5 +314,7 @@ fn load_wallet(path: &str) -> Result<Keypair> {
         }
     }
 
-    Err(anyhow::anyhow!("Invalid wallet format: expected 64 bytes, JSON array, or base58 string"))
+    Err(anyhow::anyhow!(
+        "Invalid wallet format: expected 64 bytes, JSON array, or base58 string"
+    ))
 }

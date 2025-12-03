@@ -4,18 +4,18 @@
 use anyhow::{Context, Result};
 use dotenv::dotenv;
 use solana_sdk::{
+    instruction::Instruction,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
-    instruction::Instruction,
 };
-use std::sync::Arc;
-use std::str::FromStr;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use liquid_bot::core::config::Config;
 use liquid_bot::blockchain::rpc_client::RpcClient;
+use liquid_bot::core::config::Config;
 use liquid_bot::protocol::solend::accounts::get_associated_token_address;
 
 #[tokio::main]
@@ -25,17 +25,13 @@ async fn main() -> Result<()> {
 
     println!("🔧 Creating ATAs for bot wallet...\n");
 
-    let config = Config::from_env()
-        .context("Failed to load config")?;
+    let config = Config::from_env().context("Failed to load config")?;
 
     let rpc = Arc::new(
-        RpcClient::new(config.rpc_http_url.clone())
-            .context("Failed to create RPC client")?
+        RpcClient::new(config.rpc_http_url.clone()).context("Failed to create RPC client")?,
     );
 
-    // Load wallet using the same method as main.rs
-    let wallet = load_wallet(&config.wallet_path)
-        .context("Failed to load wallet")?;
+    let wallet = load_wallet(&config.wallet_path).context("Failed to load wallet")?;
     let wallet_pubkey = wallet.pubkey();
 
     println!("Wallet: {}\n", wallet_pubkey);
@@ -44,9 +40,18 @@ async fn main() -> Result<()> {
     let mints = vec![
         ("USDC", config.usdc_mint.as_str()),
         ("SOL", config.sol_mint.as_str()),
-        ("USDT", config.usdt_mint.as_ref().map(|s| s.as_str()).unwrap_or("")),
-        ("ETH", config.eth_mint.as_ref().map(|s| s.as_str()).unwrap_or("")),
-        ("BTC", config.btc_mint.as_ref().map(|s| s.as_str()).unwrap_or("")),
+        (
+            "USDT",
+            config.usdt_mint.as_ref().map(|s| s.as_str()).unwrap_or(""),
+        ),
+        (
+            "ETH",
+            config.eth_mint.as_ref().map(|s| s.as_str()).unwrap_or(""),
+        ),
+        (
+            "BTC",
+            config.btc_mint.as_ref().map(|s| s.as_str()).unwrap_or(""),
+        ),
     ];
 
     let mut instructions = Vec::new();
@@ -57,21 +62,18 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let mint = Pubkey::from_str(mint_str)
-            .with_context(|| format!("Invalid {} mint", name))?;
+        let mint = Pubkey::from_str(mint_str).with_context(|| format!("Invalid {} mint", name))?;
 
         let ata = get_associated_token_address(&wallet_pubkey, &mint, Some(&config))
             .with_context(|| format!("Failed to derive ATA for {}", name))?;
 
-        // ATA var mı kontrol et
         match rpc.get_account(&ata).await {
             Ok(_) => {
                 println!("✅ {} ATA already exists: {}", name, ata);
             }
             Err(_) => {
                 println!("❌ {} ATA not found: {}, creating...", name, ata);
-                
-                // Create ATA instruction
+
                 let create_ata_ix = create_associated_token_account(
                     &wallet_pubkey,
                     &wallet_pubkey,
@@ -79,7 +81,7 @@ async fn main() -> Result<()> {
                     &spl_token::id(),
                     Some(&config),
                 )?;
-                
+
                 instructions.push(create_ata_ix);
                 total_atas += 1;
             }
@@ -93,7 +95,6 @@ async fn main() -> Result<()> {
 
     println!("\n📝 Creating {} ATA(s)...", total_atas);
 
-    // Send transaction
     let recent_blockhash = rpc.get_recent_blockhash().await?;
     let mut tx = Transaction::new_with_payer(&instructions, Some(&wallet_pubkey));
     tx.sign(&[&wallet], recent_blockhash);
@@ -116,13 +117,12 @@ async fn main() -> Result<()> {
 
 fn load_wallet(path: &str) -> Result<Keypair> {
     let wallet_path = Path::new(path);
-    
+
     if !wallet_path.exists() {
         return Err(anyhow::anyhow!("Wallet file not found: {}", path));
     }
 
-    let keypair_bytes = fs::read(wallet_path)
-        .context("Failed to read wallet file")?;
+    let keypair_bytes = fs::read(wallet_path).context("Failed to read wallet file")?;
 
     if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
         if keypair.len() == 64 {
@@ -137,9 +137,7 @@ fn load_wallet(path: &str) -> Result<Keypair> {
     }
 
     if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
-        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim())
-            .into_vec()
-        {
+        if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim()).into_vec() {
             if keypair_bytes_decoded.len() == 64 {
                 return Keypair::from_bytes(&keypair_bytes_decoded)
                     .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
@@ -147,7 +145,9 @@ fn load_wallet(path: &str) -> Result<Keypair> {
         }
     }
 
-    Err(anyhow::anyhow!("Invalid wallet format: expected 64 bytes, JSON array, or base58 string"))
+    Err(anyhow::anyhow!(
+        "Invalid wallet format: expected 64 bytes, JSON array, or base58 string"
+    ))
 }
 
 fn create_associated_token_account(
@@ -158,14 +158,15 @@ fn create_associated_token_account(
     config: Option<&Config>,
 ) -> Result<Instruction> {
     use liquid_bot::protocol::solend::accounts::get_associated_token_program_id;
-    
+
     let associated_token_program = get_associated_token_program_id(config)?;
 
     let ata = Pubkey::find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &associated_token_program,
-    ).0;
-    
+    )
+    .0;
+
     Ok(Instruction {
         program_id: associated_token_program,
         accounts: vec![
@@ -179,7 +180,6 @@ fn create_associated_token_account(
             ),
             solana_sdk::instruction::AccountMeta::new_readonly(*token_program, false),
         ],
-        data: vec![], // Create instruction has no data
+        data: vec![],
     })
 }
-

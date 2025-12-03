@@ -2,30 +2,29 @@ pub mod accounts;
 pub mod instructions;
 pub mod types;
 
-use crate::core::types::{Position, Opportunity};
-use crate::core::config::Config;
-use crate::protocol::{Protocol, LiquidationParams};
 use crate::blockchain::rpc_client::RpcClient;
-use solana_sdk::{pubkey::Pubkey, instruction::Instruction, account::Account};
-use async_trait::async_trait;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::core::config::Config;
+use crate::core::types::{Opportunity, Position};
+use crate::protocol::{LiquidationParams, Protocol};
 use anyhow::Result;
+use async_trait::async_trait;
+use solana_sdk::{account::Account, instruction::Instruction, pubkey::Pubkey};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub struct SolendProtocol {
     program_id: Pubkey,
     config: Config,
 }
 
-// Sadece sınırlı sayıda obligation'ı derinlemesine loglamak için
 static LOGGED_OBLIGATIONS: AtomicUsize = AtomicUsize::new(0);
 
 impl SolendProtocol {
     pub fn new(config: &Config) -> Result<Self> {
         let program_id = Pubkey::from_str(&config.solend_program_id)
             .map_err(|e| anyhow::anyhow!("Invalid Solend program ID: {}", e))?;
-        
+
         Ok(SolendProtocol {
             program_id,
             config: config.clone(),
@@ -44,58 +43,38 @@ impl Protocol for SolendProtocol {
     }
 
     async fn parse_position(&self, account: &Account) -> Option<Position> {
+        use crate::core::types::{Asset, Position};
         use crate::protocol::solend::types::SolendObligation;
-        use crate::core::types::{Position, Asset};
         use log;
 
         let data_len = account.data.len();
 
-        // ✅ CRITICAL FIX: Discriminator check BEFORE size check
-        // Problem: Discriminator check sadece 8 byte gerektirirken, size check 1200 byte gerektiriyor
-        // Bu gereksiz parse attempt'lerine yol açıyor - yanlış account type'ları 1200 byte okunana kadar
-        // bekliyor, sonra discriminator check yapılıyor.
-        //
-        // Çözüm: Discriminator check'i size check'ten ÖNCE yap
-        // 1. Önce 8 byte check (discriminator okunabilir mi?)
-        // 2. Sonra discriminator check (doğru account type mı?)
-        // 3. Sonra size check (tam obligation size mı?)
-        //
-        // Bu sıralama gereksiz parse attempt'lerini önler ve performansı artırır
-        
-        // FAST PATH 1: Discriminator check (ONLY 8 bytes needed - fastest check!)
-        // This filters out wrong account types immediately by checking the account discriminator
-        // Solend uses Anchor framework which prefixes accounts with discriminator
         const DISCRIMINATOR_SIZE: usize = 8;
         if data_len < DISCRIMINATOR_SIZE {
             return None; // Can't even read discriminator, skip immediately
         }
-        
+
         let account_discriminator = &account.data[0..DISCRIMINATOR_SIZE];
         let expected_discriminator = get_obligation_discriminator();
-        
+
         if account_discriminator != expected_discriminator {
             return None; // Wrong account type, skip immediately (before expensive size check)
         }
-        
-        // FAST PATH 2: Size check (1200-1500 bytes expected for obligation accounts)
-        // This quickly filters out wrong account types before expensive parsing
-        // Only check size AFTER discriminator matches (optimization)
+
         const MIN_OBLIGATION_SIZE: usize = 1200;
         const MAX_OBLIGATION_SIZE: usize = 1500;
-        
+
         if data_len < MIN_OBLIGATION_SIZE || data_len > MAX_OBLIGATION_SIZE {
             return None; // Wrong account type, skip immediately
         }
-        
-        // Obligation parse et
+
         let obligation = match SolendObligation::from_account_data(&account.data) {
             Ok(obl) => obl,
             Err(e) => {
-                // Parse error - log sadece ilk birkaç kez (spam önlemek için)
                 static PARSE_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
-                
+
                 let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                
+
                 if count < 10 {
                     log::debug!(
                         "SolendProtocol: failed to parse obligation (data_len={}): {}",
@@ -103,53 +82,32 @@ impl Protocol for SolendProtocol {
                         e
                     );
                 }
-                
+
                 return None;
             }
         };
-        
-        // FAST PATH 3: Skip empty obligations immediately
+
         if obligation.deposits.is_empty() && obligation.borrows.is_empty() {
             return None;
         }
-        
-        // FAST PATH 4: Quick health factor check BEFORE expensive USD calculations
-        // This filters out healthy positions early, avoiding unnecessary work
-        // ✅ CRITICAL FIX: Use the SAME threshold calculation as analyzer for consistency
-        // Analyzer uses: HF < (threshold * safety_margin) to liquidate
-        // Parser should use: HF > (threshold * safety_margin) to skip (inverse logic)
-        // This ensures parser and analyzer agree on which positions are liquidatable
+
         let health_factor = obligation.calculate_health_factor();
-        
-        // ✅ CRITICAL FIX: Use threshold * safety_margin (NOT threshold / safety_margin)
-        // This matches analyzer's logic: analyzer liquidates when HF < threshold * safety_margin
-        // So parser should skip when HF > threshold * safety_margin (strict inequality to match analyzer)
-        // Example: threshold=1.0, safety_margin=0.95
-        //   - Analyzer: liquidate if HF < 0.95 (strict inequality)
-        //   - Parser: skip if HF > 0.95 (strict inequality for symmetry)
-        // ✅ FIX: Use > (strict inequality) instead of >= to match analyzer's strict inequality (<)
-        // This ensures consistent handling of boundary cases:
-        //   - HF = 0.95 exactly: Parser parses, Analyzer doesn't liquidate (both use strict inequality)
-        //   - HF = 0.949: Parser parses, Analyzer liquidates (both use strict inequality)
-        //   - HF = 0.951: Parser skips, Analyzer doesn't liquidate (both use strict inequality)
-        // Using strict inequality on both sides ensures symmetry and prevents edge case inconsistencies
-        let skip_threshold = self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
+        let skip_threshold =
+            self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
         if health_factor > skip_threshold {
             return None;
         }
-        
-        // Only now do expensive USD calculations for potentially liquidatable positions
+
         let collateral_usd = obligation.total_deposited_value_usd();
         let debt_usd = obligation.total_borrowed_value_usd();
-        
+
         // Zero-value obligation check (after health factor, but still useful)
         if collateral_usd < 0.01 && debt_usd < 0.01 {
             return None;
         }
 
-        // Log detaylı info (sadece ilk birkaç kez) - debug level to avoid production log spam
         let logged = LOGGED_OBLIGATIONS.fetch_add(1, Ordering::Relaxed);
-        
+
         if logged < 5 {
             log::debug!(
                 "🧩 Solend Obligation Parsed: owner={}, hf={:.6}, deposited=${:.2}, borrowed=${:.2}, deposits={}, borrows={}",
@@ -215,11 +173,8 @@ impl Protocol for SolendProtocol {
     }
 }
 
-/// Get the obligation account discriminator
-/// Solend uses Anchor framework which prefixes accounts with discriminator
-/// Discriminator is the first 8 bytes of SHA256("account:Obligation")
 fn get_obligation_discriminator() -> [u8; 8] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"account:Obligation");
     let hash = hasher.finalize();

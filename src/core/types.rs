@@ -28,4 +28,3 @@ pub struct Opportunity {
     pub debt_mint: Pubkey,
     pub collateral_mint: Pubkey,
 }
-

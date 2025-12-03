@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -16,10 +16,18 @@ pub struct AccountUpdate {
 
 pub struct WsClient {
     url: String,
-    connection: Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>,
+    connection: Arc<
+        Mutex<
+            Option<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+            >,
+        >,
+    >,
     subscriptions: Arc<Mutex<HashMap<u64, SubscriptionInfo>>>,
     next_request_id: Arc<Mutex<u64>>,
-    account_update_tx: broadcast::Sender<AccountUpdate>, // Broadcast channel for account updates
+    account_update_tx: broadcast::Sender<AccountUpdate>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +46,7 @@ use std::sync::Arc;
 
 impl WsClient {
     pub fn new(url: String) -> Self {
-        let (tx, _) = broadcast::channel(1000); // Buffer up to 1000 account updates
+        let (tx, _) = broadcast::channel(1000);
         WsClient {
             url,
             connection: Arc::new(Mutex::new(None)),
@@ -48,8 +56,6 @@ impl WsClient {
         }
     }
 
-    /// Subscribe to account updates via broadcast channel.
-    /// This allows multiple listeners (e.g., Scanner and BalanceManager) to receive updates.
     pub fn subscribe_account_updates(&self) -> broadcast::Receiver<AccountUpdate> {
         self.account_update_tx.subscribe()
     }
@@ -58,7 +64,7 @@ impl WsClient {
         let (ws_stream, _) = connect_async(&self.url)
             .await
             .context("Failed to connect to WebSocket")?;
-        
+
         let mut conn = self.connection.lock().await;
         *conn = Some(ws_stream);
         Ok(())
@@ -79,9 +85,11 @@ impl WsClient {
         let mut conn = self.connection.lock().await;
         if let Some(ref mut stream) = *conn {
             let message = Message::Text(serde_json::to_string(&request)?);
-            stream.send(message).await
+            stream
+                .send(message)
+                .await
                 .context("Failed to send WebSocket message")?;
-            } else {
+        } else {
             return Err(anyhow::anyhow!("WebSocket not connected"));
         }
 
@@ -97,26 +105,29 @@ impl WsClient {
                         Ok(Message::Text(text)) => {
                             let response: serde_json::Value = serde_json::from_str(&text)
                                 .context("Failed to parse WebSocket response")?;
-                            
+
                             if let Some(id) = response.get("id").and_then(|v| v.as_u64()) {
                                 if id == expected_id {
                                     if let Some(result) = response.get("result") {
                                         return Ok(result.clone());
                                     } else if let Some(error) = response.get("error") {
-                                        return Err(anyhow::anyhow!("WebSocket RPC error: {}", error));
+                                        return Err(anyhow::anyhow!(
+                                            "WebSocket RPC error: {}",
+                                            error
+                                        ));
                                     }
                                 }
                             }
                         }
                         Ok(Message::Close(_)) => {
                             return Err(anyhow::anyhow!("WebSocket connection closed"));
-            }
-            Err(e) => {
+                        }
+                        Err(e) => {
                             return Err(anyhow::anyhow!("WebSocket error: {}", e));
                         }
                         _ => {}
                     }
-                    } else {
+                } else {
                     return Err(anyhow::anyhow!("WebSocket stream ended"));
                 }
             }
@@ -136,20 +147,23 @@ impl WsClient {
 
         let request_id = self.send_request("programSubscribe", params).await?;
         let result = self.wait_for_response(request_id).await?;
-        
-        let subscription_id = result.as_u64()
+
+        let subscription_id = result
+            .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
         let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(subscription_id, SubscriptionInfo {
-            subscription_type: SubscriptionType::Program(*program_id),
-        });
+        subscriptions.insert(
+            subscription_id,
+            SubscriptionInfo {
+                subscription_type: SubscriptionType::Program(*program_id),
+            },
+        );
 
         Ok(subscription_id)
     }
 
     pub async fn subscribe_account(&self, pubkey: &Pubkey) -> Result<u64> {
-        // Solana WebSocket API requires params as an array, not an object
         let params = json!([
             pubkey.to_string(),
             {
@@ -160,14 +174,18 @@ impl WsClient {
 
         let request_id = self.send_request("accountSubscribe", params).await?;
         let result = self.wait_for_response(request_id).await?;
-        
-        let subscription_id = result.as_u64()
+
+        let subscription_id = result
+            .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
         let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(subscription_id, SubscriptionInfo {
-            subscription_type: SubscriptionType::Account(*pubkey),
-        });
+        subscriptions.insert(
+            subscription_id,
+            SubscriptionInfo {
+                subscription_type: SubscriptionType::Account(*pubkey),
+            },
+        );
 
         Ok(subscription_id)
     }
@@ -177,14 +195,18 @@ impl WsClient {
 
         let request_id = self.send_request("slotSubscribe", params).await?;
         let result = self.wait_for_response(request_id).await?;
-        
-        let subscription_id = result.as_u64()
+
+        let subscription_id = result
+            .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
         let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(subscription_id, SubscriptionInfo {
-            subscription_type: SubscriptionType::Slot,
-        });
+        subscriptions.insert(
+            subscription_id,
+            SubscriptionInfo {
+                subscription_type: SubscriptionType::Slot,
+            },
+        );
 
         Ok(subscription_id)
     }
@@ -204,83 +226,97 @@ impl WsClient {
                 Message::Text(text) => {
                     if let Ok(notification) = serde_json::from_str::<serde_json::Value>(&text) {
                         let method = notification.get("method").and_then(|m| m.as_str());
-                        
-                        if method == Some("programNotification") || method == Some("accountNotification") {
+
+                        if method == Some("programNotification")
+                            || method == Some("accountNotification")
+                        {
                             if let Some(params) = notification.get("params") {
-                                // Get subscription ID to identify which account/program this is for
-                                let subscription_id = params.get("subscription")
-                                    .and_then(|v| v.as_u64());
-                                
+                                let subscription_id =
+                                    params.get("subscription").and_then(|v| v.as_u64());
+
                                 if let Some(result) = params.get("result") {
-                                    // Extract slot from context (correct location)
-                                    let slot = result.get("context")
+                                    let slot = result
+                                        .get("context")
                                         .and_then(|c| c.get("slot"))
                                         .and_then(|s| s.as_u64())
                                         .unwrap_or(0);
-                                    
-                                    // Extract account info from value
-                                    let account_info = result.get("value")
-                                        .and_then(|v| v.as_object());
-                                    
+
+                                    let account_info =
+                                        result.get("value").and_then(|v| v.as_object());
+
                                     if let Some(value) = account_info {
-                                        // For accountNotification, pubkey is in the subscription mapping
-                                        // For programNotification, pubkey is in value.pubkey
                                         let pubkey = if method == Some("accountNotification") {
-                                            // Get pubkey from subscription mapping
                                             if let Some(sub_id) = subscription_id {
                                                 let subscriptions = self.subscriptions.lock().await;
-                                                subscriptions.get(&sub_id)
-                                                    .and_then(|info| {
-                                                        if let SubscriptionType::Account(pk) = &info.subscription_type {
-                                                            Some(*pk)
-                                                        } else {
-                                                            None
-                                                        }
-                                                    })
+                                                subscriptions.get(&sub_id).and_then(|info| {
+                                                    if let SubscriptionType::Account(pk) =
+                                                        &info.subscription_type
+                                                    {
+                                                        Some(*pk)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
                                             } else {
                                                 None
                                             }
                                         } else {
-                                            // programNotification: pubkey is in value.pubkey
-                                            value.get("pubkey")
+                                            value
+                                                .get("pubkey")
                                                 .and_then(|v| v.as_str())
                                                 .and_then(|s| s.parse::<Pubkey>().ok())
                                         };
-                                        
-                                        // Extract account data
-                                        let account_data = value.get("data")
+
+                                        let account_data = value
+                                            .get("data")
                                             .and_then(|d| d.as_array())
                                             .filter(|arr| arr.len() >= 2)
                                             .and_then(|arr| arr[0].as_str());
-                                        
-                                        // Extract owner (program_id) - correct field location
-                                        let owner = value.get("owner")
-                                            .or_else(|| value.get("account").and_then(|a| a.get("owner")))
+
+                                        let owner = value
+                                            .get("owner")
+                                            .or_else(|| {
+                                                value.get("account").and_then(|a| a.get("owner"))
+                                            })
                                             .and_then(|v| v.as_str())
                                             .and_then(|s| s.parse::<Pubkey>().ok());
-                                        
-                                        // Extract lamports (correct field location)
-                                        let lamports = value.get("lamports")
-                                            .or_else(|| value.get("account").and_then(|a| a.get("lamports")))
+
+                                        let lamports = value
+                                            .get("lamports")
+                                            .or_else(|| {
+                                                value.get("account").and_then(|a| a.get("lamports"))
+                                            })
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
-                                        
-                                        // Extract executable
-                                        let executable = value.get("executable")
-                                            .or_else(|| value.get("account").and_then(|a| a.get("executable")))
+
+                                        let executable = value
+                                            .get("executable")
+                                            .or_else(|| {
+                                                value
+                                                    .get("account")
+                                                    .and_then(|a| a.get("executable"))
+                                            })
                                             .and_then(|v| v.as_bool())
                                             .unwrap_or(false);
-                                        
-                                        // Extract rent_epoch
-                                        let rent_epoch = value.get("rentEpoch")
+
+                                        let rent_epoch = value
+                                            .get("rentEpoch")
                                             .or_else(|| value.get("rent_epoch"))
-                                            .or_else(|| value.get("account").and_then(|a| a.get("rentEpoch")))
+                                            .or_else(|| {
+                                                value
+                                                    .get("account")
+                                                    .and_then(|a| a.get("rentEpoch"))
+                                            })
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
-                                        
-                                        if let (Some(pk), Some(owner_pk), Some(base64_data)) = (pubkey, owner, account_data) {
-                                            use base64::{Engine as _, engine::general_purpose};
-                                            if let Ok(decoded) = general_purpose::STANDARD.decode(base64_data) {
+
+                                        if let (Some(pk), Some(owner_pk), Some(base64_data)) =
+                                            (pubkey, owner, account_data)
+                                        {
+                                            use base64::{engine::general_purpose, Engine as _};
+                                            if let Ok(decoded) =
+                                                general_purpose::STANDARD.decode(base64_data)
+                                            {
                                                 let account = solana_sdk::account::Account {
                                                     lamports,
                                                     data: decoded,
@@ -288,16 +324,15 @@ impl WsClient {
                                                     executable,
                                                     rent_epoch,
                                                 };
-                                                
+
                                                 let update = AccountUpdate {
                                                     pubkey: pk,
                                                     account,
                                                     slot,
                                                 };
-                                                
-                                                // Broadcast to all subscribers (non-blocking)
+
                                                 let _ = self.account_update_tx.send(update.clone());
-                                                
+
                                                 return Some(update);
                                             }
                                         }
@@ -316,84 +351,75 @@ impl WsClient {
         None
     }
 
-    /// Attempt to reconnect WebSocket with exponential backoff.
-    /// 
-    /// ✅ CRITICAL FIX: Returns Result instead of panicking to allow graceful degradation.
-    /// If WebSocket cannot be reconnected, caller can fall back to RPC polling mode.
-    /// This prevents bot from crashing and losing all profit opportunities.
-    /// 
-    /// Returns Ok(()) if reconnected successfully, Err if all attempts failed.
     pub async fn reconnect_with_backoff(&self) -> Result<()> {
         const MAX_RECONNECT_ATTEMPTS: usize = 10;
         let mut backoff = Duration::from_secs(1);
-        
+
         for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
             sleep(backoff).await;
-            
-            log::info!("WebSocket reconnect attempt {}/{}", attempt, MAX_RECONNECT_ATTEMPTS);
-            
+
+            log::info!(
+                "WebSocket reconnect attempt {}/{}",
+                attempt,
+                MAX_RECONNECT_ATTEMPTS
+            );
+
             if self.connect().await.is_ok() {
-                log::info!("✅ WebSocket reconnected successfully on attempt {}", attempt);
-                
-                // ✅ CRITICAL FIX: Clear old subscriptions BEFORE resubscribing
-                // Problem: Old subscription IDs are invalid after reconnection but remain in HashMap
-                // This causes memory leak where HashMap grows indefinitely with stale IDs
-                //
-                // Senaryo:
-                // 1. Initial connect: Subscription ID 123 (programSubscribe)
-                // 2. Connection lost → reconnect
-                // 3. Resubscribe: Yeni subscription ID 456
-                // 4. HashMap'te: {123: Info, 456: Info} ← 123 STALE!
-                // 5. Her reconnect'te +1 entry → memory leak!
-                //
-                // Çözüm: ÖNCE old subscriptions'ı temizle, SONRA resubscribe
+                log::info!(
+                    "✅ WebSocket reconnected successfully on attempt {}",
+                    attempt
+                );
+
                 let old_subscriptions = {
                     let mut subscriptions = self.subscriptions.lock().await;
                     let old_count = subscriptions.len();
                     let old = subscriptions.clone(); // Clone before clearing
-                    
+
                     // ✅ CRITICAL: Clear old subscription IDs to prevent memory leak
                     subscriptions.clear();
-                    
+
                     if old_count > 0 {
                         log::info!(
                             "Cleared {} stale subscription(s) before resubscribing (preventing memory leak)",
                             old_count
                         );
                     }
-                    
+
                     old
                 };
-                
-                // ✅ FIX: Resubscribe with error tracking to handle failed subscriptions
-                // Track failed subscriptions and retry them once to improve reliability
+
                 let mut failed_subscriptions = Vec::new();
-                
+
                 for (old_id, info) in old_subscriptions.iter() {
                     let resubscribe_result = match &info.subscription_type {
                         SubscriptionType::Program(program_id) => {
-                            self.subscribe_program(program_id).await
-                                .map(|new_id| {
-                                    log::info!("Resubscribed: {} -> {} (program: {})", old_id, new_id, program_id);
-                                    new_id
-                                })
+                            self.subscribe_program(program_id).await.map(|new_id| {
+                                log::info!(
+                                    "Resubscribed: {} -> {} (program: {})",
+                                    old_id,
+                                    new_id,
+                                    program_id
+                                );
+                                new_id
+                            })
                         }
                         SubscriptionType::Account(pubkey) => {
-                            self.subscribe_account(pubkey).await
-                                .map(|new_id| {
-                                    log::info!("Resubscribed: {} -> {} (account: {})", old_id, new_id, pubkey);
-                                    new_id
-                                })
+                            self.subscribe_account(pubkey).await.map(|new_id| {
+                                log::info!(
+                                    "Resubscribed: {} -> {} (account: {})",
+                                    old_id,
+                                    new_id,
+                                    pubkey
+                                );
+                                new_id
+                            })
                         }
-                        SubscriptionType::Slot => {
-                            self.subscribe_slot().await
-                                .map(|new_id| {
-                                    log::info!("Resubscribed: {} -> {} (slot)", old_id, new_id);
-                                    new_id
-                                })
-                        }
+                        SubscriptionType::Slot => self.subscribe_slot().await.map(|new_id| {
+                            log::info!("Resubscribed: {} -> {} (slot)", old_id, new_id);
+                            new_id
+                        }),
                     };
-                    
+
                     match resubscribe_result {
                         Ok(_) => {
                             // Successfully resubscribed
@@ -404,10 +430,12 @@ impl WsClient {
                         }
                     }
                 }
-                
-                // Retry failed subscriptions once
+
                 if !failed_subscriptions.is_empty() {
-                    log::info!("Retrying {} failed subscriptions...", failed_subscriptions.len());
+                    log::info!(
+                        "Retrying {} failed subscriptions...",
+                        failed_subscriptions.len()
+                    );
                     for (old_id, info) in failed_subscriptions {
                         let retry_result = match &info.subscription_type {
                             SubscriptionType::Program(program_id) => {
@@ -416,32 +444,32 @@ impl WsClient {
                             SubscriptionType::Account(pubkey) => {
                                 self.subscribe_account(pubkey).await
                             }
-                            SubscriptionType::Slot => {
-                                self.subscribe_slot().await
-                            }
+                            SubscriptionType::Slot => self.subscribe_slot().await,
                         };
-                        
+
                         match retry_result {
                             Ok(new_id) => {
                                 log::info!("Retry successful: {} -> {}", old_id, new_id);
                             }
                             Err(e) => {
-                                log::error!("Retry failed for {}: {} (subscription will be lost)", old_id, e);
+                                log::error!(
+                                    "Retry failed for {}: {} (subscription will be lost)",
+                                    old_id,
+                                    e
+                                );
                             }
                         }
                     }
                 }
-                
-                // ✅ old_subscriptions is dropped here (no memory leak)
-                return Ok(()); // Successfully reconnected
+
+                return Ok(());
             }
-            
-            // Exponential backoff with max cap
+
             backoff = backoff.saturating_mul(2);
             if backoff > Duration::from_secs(60) {
                 backoff = Duration::from_secs(60);
             }
-            
+
             log::warn!(
                 "WebSocket reconnect attempt {}/{} failed, retrying in {:.1}s...",
                 attempt,
@@ -449,9 +477,7 @@ impl WsClient {
                 backoff.as_secs_f64()
             );
         }
-        
-        // Max reconnect attempts reached - return error instead of panicking
-        // This allows caller to fall back to RPC polling mode
+
         log::error!(
             "❌ WebSocket connection permanently lost after {} attempts. Network may be down or RPC endpoint unreachable.",
             MAX_RECONNECT_ATTEMPTS

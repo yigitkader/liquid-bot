@@ -1,7 +1,7 @@
 use crate::core::config::Config;
-use solana_sdk::pubkey::Pubkey;
 use anyhow::Result;
 use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
 use std::time::Duration;
 
 pub struct SlippageEstimator {
@@ -59,7 +59,8 @@ impl SlippageEstimator {
         amount: u64,
     ) -> Result<(u16, u8)> {
         if self.config.use_jupiter_api {
-            self.estimate_with_jupiter_route(input_mint, output_mint, amount).await
+            self.estimate_with_jupiter_route(input_mint, output_mint, amount)
+                .await
         } else {
             // Fallback: assume 1 hop (direct swap)
             let slippage = self.estimate_with_multipliers(amount)?;
@@ -74,7 +75,9 @@ impl SlippageEstimator {
         amount: u64,
     ) -> Result<u16> {
         if self.config.use_jupiter_api {
-            let (slippage, _) = self.estimate_with_jupiter_route(input_mint, output_mint, amount).await?;
+            let (slippage, _) = self
+                .estimate_with_jupiter_route(input_mint, output_mint, amount)
+                .await?;
             Ok(slippage)
         } else {
             self.estimate_with_multipliers(amount)
@@ -92,9 +95,7 @@ impl SlippageEstimator {
         const MAX_RETRIES: u32 = 3;
         let url = format!(
             "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
-            input_mint,
-            output_mint,
-            amount
+            input_mint, output_mint, amount
         );
 
         // Helper function for exponential backoff
@@ -108,7 +109,7 @@ impl SlippageEstimator {
         };
 
         let mut last_error = None;
-        
+
         // ✅ FIX: Cleaner retry loop - try Jupiter API, fallback on all errors
         for attempt in 1..=MAX_RETRIES {
             match self.try_jupiter_quote(&url).await {
@@ -117,9 +118,14 @@ impl SlippageEstimator {
                     return Ok((slippage, hop_count));
                 }
                 Err(e) => {
-                    log::warn!("Jupiter API attempt {}/{} failed: {}", attempt, MAX_RETRIES, e);
+                    log::warn!(
+                        "Jupiter API attempt {}/{} failed: {}",
+                        attempt,
+                        MAX_RETRIES,
+                        e
+                    );
                     last_error = Some(e);
-                    
+
                     if attempt < MAX_RETRIES {
                         let backoff = get_backoff(attempt);
                         tokio::time::sleep(backoff).await;
@@ -128,84 +134,98 @@ impl SlippageEstimator {
                 }
             }
         }
-        
+
         // ✅ All retries exhausted - use fallback
         log::warn!(
             "Jupiter API failed after {} attempts (last error: {:?}), using fallback",
             MAX_RETRIES,
             last_error
         );
-        
+
         let slippage = self.estimate_with_multipliers(amount)?;
         Ok((slippage, 1))
     }
-    
+
     /// Try to get a quote from Jupiter API (single attempt, no retries)
     /// ✅ FIX: Separated into its own function for cleaner error handling
     async fn try_jupiter_quote(&self, url: &str) -> Result<(u16, u8)> {
         use anyhow::Context;
-        
+
         // Make HTTP request
-        let response = self.client.get(url).send().await
-            .context("Network error")?;
-        
+        let response = self.client.get(url).send().await.context("Network error")?;
+
         if !response.status().is_success() {
             return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
         }
-        
+
         // Read response body
-        let response_text = response.text().await
+        let response_text = response
+            .text()
+            .await
             .context("Failed to read response body")?;
-        
+
         // Parse JSON response
-        let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
-            .context("Failed to parse JSON")?;
-        
+        let quote: JupiterQuoteResponse =
+            serde_json::from_str(&response_text).context("Failed to parse JSON")?;
+
         // Extract price impact
-        let price_impact_str = quote.price_impact_pct
+        let price_impact_str = quote
+            .price_impact_pct
             .ok_or_else(|| anyhow::anyhow!("No price impact in response"))?;
-        
+
         // Parse price impact percentage
-        let price_impact_pct = price_impact_str.parse::<f64>()
+        let price_impact_pct = price_impact_str
+            .parse::<f64>()
             .context("Failed to parse price impact")?;
-        
+
         // ✅ Validate BEFORE using
         if price_impact_pct < 0.0 {
-            return Err(anyhow::anyhow!("Negative price impact: {}", price_impact_pct));
+            return Err(anyhow::anyhow!(
+                "Negative price impact: {}",
+                price_impact_pct
+            ));
         }
-        
+
         if price_impact_pct > 100.0 {
-            return Err(anyhow::anyhow!("Suspiciously high price impact: {}%", price_impact_pct));
+            return Err(anyhow::anyhow!(
+                "Suspiciously high price impact: {}%",
+                price_impact_pct
+            ));
         }
-        
+
         // Convert percentage to basis points
         let slippage_bps = (price_impact_pct * 100.0) as u16;
-        
+
         // Calculate hop count from route plan and log route details
-        let hop_count = quote.route_plan
+        let hop_count = quote
+            .route_plan
             .as_ref()
             .map(|route| route.len() as u8)
             .unwrap_or(1);
-        
+
         // Log route plan details for debugging and monitoring
         if let Some(ref route_plan) = quote.route_plan {
             log::debug!(
                 "Jupiter route plan: {} hop(s), details: {:?}",
                 hop_count,
-                route_plan.iter().enumerate().map(|(i, hop)| {
-                    format!(
-                        "Hop {}: AMM={:?}, Label={:?}, Input={:?}, Output={:?}, Percent={:?}",
-                        i + 1,
-                        hop.swap_info.as_ref().and_then(|s| s.amm_key.as_ref()),
-                        hop.swap_info.as_ref().and_then(|s| s.label.as_ref()),
-                        hop.swap_info.as_ref().and_then(|s| s.input_mint.as_ref()),
-                        hop.swap_info.as_ref().and_then(|s| s.output_mint.as_ref()),
-                        hop.percent
-                    )
-                }).collect::<Vec<_>>()
+                route_plan
+                    .iter()
+                    .enumerate()
+                    .map(|(i, hop)| {
+                        format!(
+                            "Hop {}: AMM={:?}, Label={:?}, Input={:?}, Output={:?}, Percent={:?}",
+                            i + 1,
+                            hop.swap_info.as_ref().and_then(|s| s.amm_key.as_ref()),
+                            hop.swap_info.as_ref().and_then(|s| s.label.as_ref()),
+                            hop.swap_info.as_ref().and_then(|s| s.input_mint.as_ref()),
+                            hop.swap_info.as_ref().and_then(|s| s.output_mint.as_ref()),
+                            hop.percent
+                        )
+                    })
+                    .collect::<Vec<_>>()
             );
         }
-        
+
         Ok((slippage_bps.min(self.config.max_slippage_bps), hop_count))
     }
 
@@ -223,18 +243,20 @@ impl SlippageEstimator {
     }
 
     pub async fn read_oracle_confidence(&self, mint: Pubkey) -> Result<u16> {
-        use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use crate::blockchain::rpc_client::RpcClient;
-        use std::sync::Arc;
+        use crate::protocol::oracle::{get_pyth_oracle_account, read_pyth_price};
         use anyhow::Context;
-        
+        use std::sync::Arc;
+
         let rpc = Arc::new(
             RpcClient::new(self.config.rpc_http_url.clone())
-                .context("Failed to create RPC client for oracle confidence")?
+                .context("Failed to create RPC client for oracle confidence")?,
         );
-        
+
         if let Some(oracle_account) = get_pyth_oracle_account(&mint, Some(&self.config))? {
-            if let Some(price_data) = read_pyth_price(&oracle_account, Arc::clone(&rpc), Some(&self.config)).await? {
+            if let Some(price_data) =
+                read_pyth_price(&oracle_account, Arc::clone(&rpc), Some(&self.config)).await?
+            {
                 let confidence_pct = (price_data.confidence / price_data.price) * 100.0;
                 let confidence_bps = (confidence_pct * 100.0) as u16;
                 Ok(confidence_bps.min(10000))

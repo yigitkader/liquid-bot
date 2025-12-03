@@ -24,14 +24,17 @@ impl PythOracle {
         Self::parse_pyth_account(&account_data.data, config)
     }
 
-    pub fn parse_pyth_account(data: &[u8], config: Option<&crate::config::Config>) -> Result<PriceData> {
+    pub fn parse_pyth_account(
+        data: &[u8],
+        config: Option<&crate::config::Config>,
+    ) -> Result<PriceData> {
         let pyth_program_id_str = config
             .map(|c| c.pyth_program_id.as_str())
             .unwrap_or("FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH");
         let pyth_program_id = pyth_program_id_str
             .parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
-        
+
         let mut account = solana_sdk::account::Account {
             lamports: 0,
             data: data.to_vec(),
@@ -39,21 +42,19 @@ impl PythOracle {
             executable: false,
             rent_epoch: 0,
         };
-        
-        let feed = SolanaPriceAccount::account_to_feed(
-            &pyth_program_id,
-            &mut account
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to parse Pyth account: {}", e))?;
-        
+
+        let feed = SolanaPriceAccount::account_to_feed(&pyth_program_id, &mut account)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Pyth account: {}", e))?;
+
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
             .as_secs() as i64;
-        
-        let price_data = feed.get_price_no_older_than(current_time, 60)
+
+        let price_data = feed
+            .get_price_no_older_than(current_time, 60)
             .ok_or_else(|| anyhow::anyhow!("Price data is too old"))?;
-        
+
         Ok(PriceData {
             price: price_data.price as f64 * 10_f64.powi(price_data.expo),
             confidence: price_data.conf as f64 * 10_f64.powi(price_data.expo),
@@ -62,4 +63,3 @@ impl PythOracle {
         })
     }
 }
-

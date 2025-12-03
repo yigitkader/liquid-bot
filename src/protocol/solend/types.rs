@@ -255,15 +255,15 @@ impl SolendObligation {
             closeable,
         })
     }
-    
+
     pub fn total_deposited_value_usd(&self) -> f64 {
         self.deposited_value.to_f64()
     }
-    
+
     pub fn total_borrowed_value_usd(&self) -> f64 {
         self.borrowed_value.to_f64()
     }
-    
+
     pub fn calculate_health_factor(&self) -> f64 {
         // Solend'de health factor, toplam borcun basit oranı (deposited / borrowed)
         // yerine, LTV ile ağırlıklandırılmış teminat üzerinden hesaplanır.

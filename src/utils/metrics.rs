@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 pub struct Metrics {
     opportunities_found: AtomicU64,
@@ -58,10 +58,16 @@ impl Metrics {
         };
 
         let p95_latency_ms = if !latencies.is_empty() {
-            let mut sorted = latencies.iter().map(|d| d.as_millis() as u64).collect::<Vec<_>>();
+            let mut sorted = latencies
+                .iter()
+                .map(|d| d.as_millis() as u64)
+                .collect::<Vec<_>>();
             sorted.sort();
             let index = (sorted.len() as f64 * 0.95) as usize;
-            sorted.get(index.min(sorted.len() - 1)).copied().unwrap_or(0)
+            sorted
+                .get(index.min(sorted.len() - 1))
+                .copied()
+                .unwrap_or(0)
         } else {
             0
         };

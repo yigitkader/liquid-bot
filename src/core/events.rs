@@ -1,33 +1,18 @@
-use super::types::{Position, Opportunity};
+use super::types::{Opportunity, Position};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    AccountDiscovered {
-        pubkey: Pubkey,
-        position: Position,
-    },
-    AccountUpdated {
-        pubkey: Pubkey,
-        position: Position,
-    },
-    
-    OpportunityFound {
-        opportunity: Opportunity,
-    },
-    
-    OpportunityApproved {
-        opportunity: Opportunity,
-    },
-    
-    TransactionSent {
-        signature: String,
-    },
-    TransactionConfirmed {
-        signature: String,
-        success: bool,
-    },
+    AccountDiscovered { pubkey: Pubkey, position: Position },
+    AccountUpdated { pubkey: Pubkey, position: Position },
+
+    OpportunityFound { opportunity: Opportunity },
+
+    OpportunityApproved { opportunity: Opportunity },
+
+    TransactionSent { signature: String },
+    TransactionConfirmed { signature: String, success: bool },
 }
 
 #[derive(Clone)]

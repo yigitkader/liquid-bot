@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-    system_instruction,
-    hash::Hash,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_sdk::{
+    hash::Hash,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    system_instruction,
+    transaction::Transaction,
+};
 use std::sync::Arc;
 
-/// Jito Bundle for MEV protection
-/// Bundles allow transactions to be included atomically in a block
 #[derive(Debug, Clone)]
 pub struct JitoBundle {
     transactions: Vec<Transaction>,
@@ -37,7 +35,6 @@ impl JitoBundle {
     }
 }
 
-/// Jito client for sending bundles
 pub struct JitoClient {
     url: String,
     tip_account: Pubkey,
@@ -54,7 +51,7 @@ struct BundleResponse {
 
 impl JitoClient {
     /// Create a new Jito client
-    /// 
+    ///
     /// # Arguments
     /// * `url` - Jito block engine URL (e.g., "https://mainnet.block-engine.jito.wtf")
     /// * `tip_account` - Jito tip account (e.g., "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3")
@@ -67,18 +64,10 @@ impl JitoClient {
         }
     }
 
-    /// Send a bundle to Jito block engine
-    /// 
-    /// This method:
-    /// 1. Serializes the bundle
-    /// 2. Sends it to Jito block engine
-    /// 3. Returns the bundle ID for tracking
-    /// 
     /// Note: Tip transaction should be added separately using add_tip_transaction
     pub async fn send_bundle(&self, bundle: &JitoBundle) -> Result<String> {
         use reqwest::Client;
 
-        // Serialize transactions to base64
         let serialized_txs: Vec<String> = bundle
             .transactions
             .iter()
@@ -86,7 +75,7 @@ impl JitoClient {
                 use bincode::serialize;
                 let bytes = serialize(tx)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
-                use base64::{Engine as _, engine::general_purpose};
+                use base64::{engine::general_purpose, Engine as _};
                 Ok(general_purpose::STANDARD.encode(&bytes))
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
@@ -105,7 +94,6 @@ impl JitoClient {
             bundle.tip_amount
         );
 
-        // Send to Jito block engine
         let client = Client::new();
         let response = client
             .post(&self.url)
@@ -129,7 +117,6 @@ impl JitoClient {
             .await
             .context("Failed to parse Jito response")?;
 
-        // Try to deserialize using BundleResponse struct
         if let Some(result) = bundle_response.get("result") {
             if let Ok(bundle_resp) = serde_json::from_value::<BundleResponse>(result.clone()) {
                 log::info!(
@@ -139,7 +126,7 @@ impl JitoClient {
                 );
                 return Ok(bundle_resp.bundle_id);
             }
-            // Fallback to manual parsing if deserialization fails
+
             if let Some(bundle_id) = result.get("bundleId").and_then(|v| v.as_str()) {
                 log::info!("✅ Jito bundle sent successfully: bundle_id={}", bundle_id);
                 return Ok(bundle_id.to_string());
@@ -153,10 +140,6 @@ impl JitoClient {
         Err(anyhow::anyhow!("Unexpected Jito response format"))
     }
 
-    /// Add a tip transaction to the bundle
-    /// 
-    /// The tip transaction pays the Jito tip account to incentivize
-    /// block producers to include the bundle in the next block.
     pub fn add_tip_transaction(
         &self,
         bundle: &mut JitoBundle,
@@ -164,53 +147,42 @@ impl JitoClient {
         blockhash: Hash,
     ) -> Result<()> {
         let wallet_pubkey = wallet.pubkey();
-        
-        // Create transfer instruction to tip account
-        let tip_ix = system_instruction::transfer(
-            &wallet_pubkey,
-            &bundle.tip_account,
-            bundle.tip_amount,
-        );
-        
-        // Build tip transaction
+
+        let tip_ix =
+            system_instruction::transfer(&wallet_pubkey, &bundle.tip_account, bundle.tip_amount);
+
         let mut tip_tx = Transaction::new_with_payer(&[tip_ix], Some(&wallet_pubkey));
         tip_tx.message.recent_blockhash = blockhash;
         tip_tx.sign(&[wallet.as_ref()], blockhash);
-        
-        // Add tip transaction as the first transaction in the bundle
-        // Tip must be first for Jito to process it correctly
+
         bundle.transactions.insert(0, tip_tx);
-        
+
         log::debug!(
             "Jito: Added tip transaction: {} lamports to {}",
             bundle.tip_amount,
             bundle.tip_account
         );
-        
+
         Ok(())
     }
 
-    /// Get default tip account
     pub fn tip_account(&self) -> &Pubkey {
         &self.tip_account
     }
-
-    /// Get default tip amount
     pub fn default_tip_amount(&self) -> u64 {
         self.default_tip_amount
     }
 }
 
-/// Helper function to create Jito client from config
 pub fn create_jito_client(_config: &crate::core::config::Config) -> Option<JitoClient> {
     // Check if Jito is enabled in config
     // For now, we'll use default Jito mainnet settings
     let jito_url = std::env::var("JITO_BLOCK_ENGINE_URL")
         .unwrap_or_else(|_| "https://mainnet.block-engine.jito.wtf".to_string());
-    
+
     let tip_account_str = std::env::var("JITO_TIP_ACCOUNT")
         .unwrap_or_else(|_| "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3".to_string());
-    
+
     let tip_account = tip_account_str.parse::<Pubkey>().ok()?;
     let tip_amount = std::env::var("JITO_TIP_AMOUNT_LAMPORTS")
         .unwrap_or_else(|_| "10000000".to_string()) // 0.01 SOL
@@ -219,4 +191,3 @@ pub fn create_jito_client(_config: &crate::core::config::Config) -> Option<JitoC
 
     Some(JitoClient::new(jito_url, tip_account, tip_amount))
 }
-

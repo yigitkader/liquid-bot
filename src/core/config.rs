@@ -124,10 +124,12 @@ impl Config {
                 .unwrap_or_else(|_| "100".to_string()) // 1% minimum profit margin
                 .parse()
                 .context("Invalid MIN_PROFIT_MARGIN_BPS value")?,
-            default_oracle_confidence_slippage_bps: env::var("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS")
-                .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
-                .parse()
-                .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
+            default_oracle_confidence_slippage_bps: env::var(
+                "DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS",
+            )
+            .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
+            .parse()
+            .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
             slippage_final_multiplier: env::var("SLIPPAGE_FINAL_MULTIPLIER")
                 .unwrap_or_else(|_| "1.1".to_string()) // 10% safety margin for model uncertainty
                 .parse()
@@ -264,10 +266,12 @@ impl Config {
             slippage_calibration_file: env::var("SLIPPAGE_CALIBRATION_FILE")
                 .ok()
                 .or_else(|| Some("slippage_calibration.json".to_string())), // Default file
-            slippage_min_measurements_per_category: env::var("SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
+            slippage_min_measurements_per_category: env::var(
+                "SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY",
+            )
+            .unwrap_or_else(|_| "10".to_string())
+            .parse()
+            .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
             main_lending_market_address: env::var("MAIN_LENDING_MARKET_ADDRESS")
                 .ok()
                 .or_else(|| Some("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY".to_string())),
@@ -288,7 +292,10 @@ impl Config {
                 .ok()
                 .or_else(|| Some("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E".to_string())),
             default_pyth_oracle_mappings_json: env::var("DEFAULT_PYTH_ORACLE_MAPPINGS_JSON").ok(),
-            default_switchboard_oracle_mappings_json: env::var("DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON").ok(),
+            default_switchboard_oracle_mappings_json: env::var(
+                "DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON",
+            )
+            .ok(),
         };
 
         config.validate()?;
@@ -341,7 +348,7 @@ impl Config {
                 self.hf_liquidation_threshold
             ));
         }
-        
+
         if self.liquidation_safety_margin <= 0.0 || self.liquidation_safety_margin > 1.0 {
             return Err(anyhow::anyhow!(
                 "LIQUIDATION_SAFETY_MARGIN must be between 0.0 and 1.0, got: {}",
@@ -369,7 +376,7 @@ impl Config {
         // - $2.0: Minimum (error if below in production)
         // - $5.0: Recommended (warning if below in production)
         // - $10.0: Safe (info if at or above in production)
-        
+
         if !self.dry_run {
             // Production mode: Strict validation
             if self.min_profit_usd < 2.0 {
@@ -423,10 +430,13 @@ impl Config {
 
         let is_free_rpc = self.is_free_rpc_endpoint();
         let is_premium_rpc = self.is_premium_rpc_endpoint();
-        
+
         // Note: Free RPC + short polling check is now done earlier in validate() as a hard error
         if is_free_rpc && self.poll_interval_ms >= 10000 {
-            log::info!("✅ Free RPC endpoint with safe polling interval: {}ms", self.poll_interval_ms);
+            log::info!(
+                "✅ Free RPC endpoint with safe polling interval: {}ms",
+                self.poll_interval_ms
+            );
         } else if is_premium_rpc {
             log::info!("✅ Premium RPC endpoint detected");
             if self.poll_interval_ms < 10000 {
@@ -444,15 +454,17 @@ impl Config {
                 "⚠️  Recommended: POLL_INTERVAL_MS=10000 (10s) minimum for RPC polling fallback"
             );
         }
-        
+
         if is_free_rpc {
             log::warn!("");
             log::warn!("💡 NOT: WebSocket varsayılan olarak kullanılacak.");
-            log::warn!("   Eğer WebSocket başarısız olursa RPC polling fallback olarak devreye girecek.");
+            log::warn!(
+                "   Eğer WebSocket başarısız olursa RPC polling fallback olarak devreye girecek."
+            );
             log::warn!("   Fallback durumunda free RPC + kısa polling interval sorun yaratabilir.");
             log::warn!("");
         }
-        
+
         log::info!("✅ WebSocket will be used as primary data source (best practice)");
         log::info!("   - Real-time updates (<100ms latency)");
         log::info!("   - No rate limits");
@@ -464,26 +476,40 @@ impl Config {
         }
 
         if self.solend_program_id.len() < 32 || self.solend_program_id.len() > 44 {
-            log::warn!("⚠️  SOLEND_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.solend_program_id.len());
+            log::warn!(
+                "⚠️  SOLEND_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
+                self.solend_program_id.len()
+            );
         }
         if self.pyth_program_id.len() < 32 || self.pyth_program_id.len() > 44 {
-            log::warn!("⚠️  PYTH_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.pyth_program_id.len());
+            log::warn!(
+                "⚠️  PYTH_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
+                self.pyth_program_id.len()
+            );
         }
         if self.switchboard_program_id.len() < 32 || self.switchboard_program_id.len() > 44 {
-            log::warn!("⚠️  SWITCHBOARD_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)", self.switchboard_program_id.len());
+            log::warn!(
+                "⚠️  SWITCHBOARD_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
+                self.switchboard_program_id.len()
+            );
         }
 
         if self.priority_fee_per_cu == 0 {
             log::warn!("⚠️  PRIORITY_FEE_PER_CU is 0, transactions may be slow or fail");
         }
         if self.dex_fee_bps > 1000 {
-            log::warn!("⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value", self.dex_fee_bps);
+            log::warn!(
+                "⚠️  DEX_FEE_BPS={} is very high (>10%), double-check this value",
+                self.dex_fee_bps
+            );
         }
 
         if !self.dry_run && !self.use_jupiter_api {
             log::warn!("");
             log::warn!("⚠️  SLIPPAGE CALIBRATION REQUIRED: Jupiter API is disabled (USE_JUPITER_API=false)");
-            log::warn!("   Using ESTIMATED slippage multipliers - these MUST be calibrated in production!");
+            log::warn!(
+                "   Using ESTIMATED slippage multipliers - these MUST be calibrated in production!"
+            );
             log::warn!("   ");
             log::warn!("   After first 10-20 liquidations:");
             log::warn!("   1. Measure actual slippage from Solscan transactions");
@@ -492,7 +518,9 @@ impl Config {
             log::warn!("   ");
             log::warn!("   See docs/SLIPPAGE_CALIBRATION.md for detailed instructions");
             log::warn!("   ");
-            log::warn!("   RECOMMENDED: Enable Jupiter API (USE_JUPITER_API=true) for real-time slippage");
+            log::warn!(
+                "   RECOMMENDED: Enable Jupiter API (USE_JUPITER_API=true) for real-time slippage"
+            );
             log::warn!("");
         } else if self.use_jupiter_api {
             log::info!("✅ Jupiter API enabled - using real-time slippage estimation");
