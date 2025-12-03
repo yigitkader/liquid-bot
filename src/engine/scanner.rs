@@ -351,6 +351,45 @@ impl Scanner {
                         }
                     }
                     Err(e) => {
+                        let error_str = e.to_string().to_lowercase();
+                        
+                        // ✅ CRITICAL FIX: Rate limit errors (429) are expected on free RPC
+                        // Problem: 30 consecutive 429 errors → bot panic (crash)
+                        // Solution: Don't count rate limit errors as fatal, apply backoff instead
+                        if error_str.contains("429") 
+                            || error_str.contains("rate limit")
+                            || error_str.contains("too many requests")
+                        {
+                            // Rate limit: expected for free RPC, don't count as fatal error
+                            log::warn!(
+                                "Scanner: Rate limit hit (429), applying exponential backoff (not counting as fatal error)"
+                            );
+                            
+                            // Calculate adjusted interval first
+                            let base_interval = if self.config.is_free_rpc_endpoint() {
+                                let min_interval = Duration::from_millis(120_000); // 2 minutes
+                                poll_interval.max(min_interval)
+                            } else {
+                                poll_interval
+                            };
+                            
+                            // Exponential backoff for rate limits: 2x base interval (capped at 10 minutes)
+                            // This gives RPC time to recover from rate limit
+                            let backoff_interval = base_interval * 2;
+                            let max_backoff = Duration::from_millis(600_000); // 10 minutes max
+                            let backoff_interval = backoff_interval.min(max_backoff);
+                            
+                            log::info!(
+                                "Scanner: Rate limit backoff: waiting {:?} before next poll (base: {:?}, 2x backoff)",
+                                backoff_interval,
+                                base_interval
+                            );
+                            
+                            sleep(backoff_interval).await;
+                            continue; // Don't call record_error(), just retry after backoff
+                        }
+                        
+                        // Other errors: count as fatal (network errors, server errors, etc.)
                         log::error!("Scanner: RPC polling failed: {}", e);
                         self.record_error()?;
                     }

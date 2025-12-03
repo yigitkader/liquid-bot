@@ -189,11 +189,17 @@ impl Executor {
         let ata_cache_cleanup_token = CancellationToken::new();
         
         // ✅ CRITICAL FIX: Start background cleanup task for ATA cache with aggressive cleanup
-        // Problem: 24-hour TTL is too long - thousands of ATAs can accumulate in high-volume scenarios
-        // Solution: Use 4-hour TTL + cache size limit to prevent memory leak
-        const ATA_CACHE_TTL_SECONDS: u64 = 4 * 3600; // 4 hours (was 24 hours)
-        const ATA_CACHE_MAX_SIZE: usize = 1000; // Maximum cache entries before aggressive cleanup
-        const CLEANUP_INTERVAL_SECONDS: u64 = 1800; // Run cleanup every 30 minutes (was 1 hour)
+        // Problem: High-volume scenarios (100k liquidations/day) can generate 200k ATA checks/day
+        //   - 4-hour TTL too long → stale entries accumulate
+        //   - 1000 entry limit too low → constant eviction → cache thrashing → RPC storms
+        //   - 30-minute cleanup too infrequent → memory grows between cleanups
+        // Solution: More aggressive settings for production high-volume scenarios
+        //   - 1-hour TTL: ATAs are generally static, 1 hour is sufficient
+        //   - 10k entry limit: Supports ~33k ATAs in 4 hours (200k/day / 6 = 33k/4h)
+        //   - 10-minute cleanup: More frequent cleanup prevents memory growth
+        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600; // 1 hour (reduced from 4 hours)
+        const ATA_CACHE_MAX_SIZE: usize = 10000; // 10k entries (increased from 1k)
+        const CLEANUP_INTERVAL_SECONDS: u64 = 600; // 10 minutes (reduced from 30 minutes)
         
         let cache_for_cleanup = Arc::clone(&ata_cache);
         let cleanup_token = ata_cache_cleanup_token.clone();
@@ -206,7 +212,7 @@ impl Executor {
                         
                         let before_len = cache.len();
                         
-                        // Strategy 1: Remove entries older than TTL (4 hours)
+                        // Strategy 1: Remove entries older than TTL (1 hour)
                         cache.retain(|_, entry| {
                             now.duration_since(entry.timestamp) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
                         });

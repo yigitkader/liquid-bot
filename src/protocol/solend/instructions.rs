@@ -13,7 +13,7 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use spl_token;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,7 +200,7 @@ impl ReserveCache {
         
         // ✅ CLEANUP: Remove cache entries for reserves that no longer exist on-chain
         // This prevents stale cache entries from accumulating when reserves are removed
-        let rpc_reserve_set: std::collections::HashSet<Pubkey> = mint_to_reserve.values().copied().collect();
+        let rpc_reserve_set: HashSet<Pubkey> = mint_to_reserve.values().copied().collect();
         let mut removed_count = 0;
         
         // Remove mint_to_reserve entries for reserves that no longer exist

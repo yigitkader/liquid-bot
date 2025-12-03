@@ -108,9 +108,14 @@ impl SlippageEstimator {
             Duration::from_millis(backoff_ms)
         };
 
-        let mut last_error = None;
+        let mut last_error: Option<String> = None;
 
-        // ✅ FIX: Cleaner retry loop - try Jupiter API, fallback on all errors
+        // ✅ FIX: Smart retry logic - only retry retryable errors
+        // Problem: Previous implementation retried ALL errors, including:
+        //   - 4xx client errors (bad request) → will never succeed
+        //   - Parse errors → will never succeed
+        //   - Missing data errors → will never succeed
+        // Solution: Only retry transient errors (5xx, timeouts, network errors, rate limits)
         for attempt in 1..=MAX_RETRIES {
             match self.try_jupiter_quote(&url).await {
                 Ok((slippage, hop_count)) => {
@@ -118,13 +123,29 @@ impl SlippageEstimator {
                     return Ok((slippage, hop_count));
                 }
                 Err(e) => {
+                    // Check if error is retryable BEFORE storing
+                    let is_retryable = Self::is_retryable_error(&e);
+                    let error_msg = e.to_string();
+                    last_error = Some(error_msg.clone());
+                    
+                    if !is_retryable {
+                        // Non-retryable error (4xx, parse error, etc.) - fail immediately
+                        log::warn!(
+                            "Jupiter API attempt {}/{} failed with non-retryable error: {} (falling back immediately)",
+                            attempt,
+                            MAX_RETRIES,
+                            error_msg
+                        );
+                        break; // Exit retry loop immediately
+                    }
+                    
+                    // Retryable error - log and retry if attempts remaining
                     log::warn!(
-                        "Jupiter API attempt {}/{} failed: {}",
+                        "Jupiter API attempt {}/{} failed (retrying): {}",
                         attempt,
                         MAX_RETRIES,
-                        e
+                        error_msg
                     );
-                    last_error = Some(e);
 
                     if attempt < MAX_RETRIES {
                         let backoff = get_backoff(attempt);
@@ -137,13 +158,51 @@ impl SlippageEstimator {
 
         // ✅ All retries exhausted - use fallback
         log::warn!(
-            "Jupiter API failed after {} attempts (last error: {:?}), using fallback",
+            "Jupiter API failed after {} attempts (last error: {}), using fallback",
             MAX_RETRIES,
-            last_error
+            last_error.as_deref().unwrap_or("unknown")
         );
 
         let slippage = self.estimate_with_multipliers(amount)?;
         Ok((slippage, 1))
+    }
+
+    /// Check if an error is retryable
+    /// ✅ FIX: Only retry transient errors, not permanent client errors
+    /// Retryable: 5xx server errors, timeouts, network errors, rate limits (429)
+    /// Non-retryable: 4xx client errors, parse errors, missing data
+    fn is_retryable_error(error: &anyhow::Error) -> bool {
+        let error_str = error.to_string().to_lowercase();
+
+        // ✅ Retry: Server errors, network errors, timeouts, rate limits
+        // Note: Check specific retryable errors first (429 rate limit is 4xx but retryable)
+        if error_str.contains("timeout")
+            || error_str.contains("network error")
+            || error_str.contains("connection")
+            || error_str.contains("http error: 429") // Rate limit (4xx but retryable with backoff)
+            || error_str.contains("http error: 5") // 5xx server errors
+            || error_str.contains("http error: 503") // Service unavailable
+            || error_str.contains("http error: 502") // Bad gateway
+            || error_str.contains("http error: 504") // Gateway timeout
+        {
+            return true;
+        }
+
+        // ❌ Don't retry: Client errors (except 429), parse errors, missing data
+        // Note: Check for 4xx AFTER checking 429 (to avoid matching 429)
+        if error_str.contains("http error: 4") // 4xx client errors (400, 401, 403, 404, etc., but NOT 429)
+            || error_str.contains("failed to parse json")
+            || error_str.contains("failed to parse")
+            || error_str.contains("no price impact in response")
+            || error_str.contains("negative price impact")
+            || error_str.contains("suspiciously high price impact")
+        {
+            return false;
+        }
+
+        // Default: retry (conservative approach for unknown errors)
+        // This ensures we don't miss transient errors that might not be clearly categorized
+        true
     }
 
     /// Try to get a quote from Jupiter API (single attempt, no retries)

@@ -180,12 +180,18 @@ impl Validator {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
 
         use tokio::time::{Duration, timeout};
-        // ✅ FIX: Total timeout = RPC timeout + buffer for parallel checks
-        // Each oracle check uses RPC timeout, and they run in parallel (premium RPC) or sequential (free RPC)
-        // For parallel: max(RPC timeout) = RPC timeout, so total = RPC timeout + small buffer
-        // For sequential: RPC timeout + RPC timeout = 2 * RPC timeout, but we use single timeout for both
+        // ✅ FIX: Total timeout must account for sequential vs parallel oracle checks
+        // - Premium RPC: Oracle checks run in parallel → max(RPC timeout) = RPC timeout
+        // - Free RPC: Oracle checks run sequentially → RPC timeout + RPC timeout = 2 * RPC timeout
+        // Without this fix, free RPC sequential calls (10s + 10s = 20s) would timeout at 12s, causing validation failures
         let rpc_timeout = rpc.request_timeout();
-        let total_oracle_timeout = rpc_timeout + Duration::from_secs(2); // RPC timeout + 2s buffer
+        let total_oracle_timeout = if config.is_free_rpc_endpoint() {
+            // Sequential calls: debt oracle (10s) + collateral oracle (10s) + buffer
+            rpc_timeout * 2 + Duration::from_secs(2) // 22s for 10s RPC timeout
+        } else {
+            // Parallel calls: max(RPC timeout) + buffer
+            rpc_timeout + Duration::from_secs(2) // 12s for 10s RPC timeout
+        };
 
         let (debt_result, collateral_result) = timeout(total_oracle_timeout, async {
             if config.is_free_rpc_endpoint() {
