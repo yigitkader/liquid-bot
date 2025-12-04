@@ -1,7 +1,26 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::env;
 use std::path::Path;
 use crate::core::registry::{ProgramIds, MintAddresses, ReserveAddresses, LendingMarketAddresses};
+
+fn env_str(key: &str, default: &str) -> String {
+    env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, default: &str, err_msg: &str) -> Result<T>
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display + Send + Sync + 'static,
+{
+    env_str(key, default).parse().map_err(|e| anyhow::anyhow!("{}: {}", err_msg, e))
+}
+
+fn env_opt_str(key: &str) -> Option<String> {
+    env::var(key).ok()
+}
+
+fn env_opt_with_default(key: &str, default: String) -> Option<String> {
+    env_opt_str(key).or(Some(default))
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -74,234 +93,70 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let config = Config {
-            rpc_http_url: env::var("RPC_HTTP_URL")
-                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
-            rpc_ws_url: env::var("RPC_WS_URL")
-                .unwrap_or_else(|_| "wss://api.mainnet-beta.solana.com".to_string()),
-            wallet_path: env::var("WALLET_PATH")
-                .unwrap_or_else(|_| "./secret/bot-wallet.json".to_string()),
-            hf_liquidation_threshold: env::var("HF_LIQUIDATION_THRESHOLD")
-                .unwrap_or_else(|_| "1.0".to_string())
-                .parse()
-                .context("Invalid HF_LIQUIDATION_THRESHOLD value")?,
-            liquidation_safety_margin: env::var("LIQUIDATION_SAFETY_MARGIN")
-                .unwrap_or_else(|_| "0.95".to_string()) // Default: 0.95 (5% safety margin)
-                .parse()
-                .context("Invalid LIQUIDATION_SAFETY_MARGIN value (must be between 0.0 and 1.0)")?,
-            min_profit_usd: env::var("MIN_PROFIT_USD")
-                .unwrap_or_else(|_| "5.0".to_string()) // Default: $5 (production-safe)
-                .parse()
-                .context("Invalid MIN_PROFIT_USD value")?,
-            max_slippage_bps: env::var("MAX_SLIPPAGE_BPS")
-                .unwrap_or_else(|_| "50".to_string())
-                .parse()
-                .context("Invalid MAX_SLIPPAGE_BPS value")?,
-            poll_interval_ms: env::var("POLL_INTERVAL_MS")
-                .unwrap_or_else(|_| "30000".to_string()) // Default: 30s (safer for free RPC endpoints)
-                .parse()
-                .context("Invalid POLL_INTERVAL_MS value")?,
-            dry_run: env::var("DRY_RUN")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .context("Invalid DRY_RUN value (must be 'true' or 'false')")?,
-            solend_program_id: env::var("SOLEND_PROGRAM_ID")
-                .unwrap_or_else(|_| ProgramIds::SOLEND.to_string()),
-            pyth_program_id: env::var("PYTH_PROGRAM_ID")
-                .unwrap_or_else(|_| ProgramIds::PYTH.to_string()),
-            switchboard_program_id: env::var("SWITCHBOARD_PROGRAM_ID")
-                .unwrap_or_else(|_| ProgramIds::SWITCHBOARD.to_string()),
-            priority_fee_per_cu: env::var("PRIORITY_FEE_PER_CU")
-                .unwrap_or_else(|_| "1000".to_string()) // 1000 micro-lamports per CU
-                .parse()
-                .context("Invalid PRIORITY_FEE_PER_CU value")?,
-            base_transaction_fee_lamports: env::var("BASE_TRANSACTION_FEE_LAMPORTS")
-                .unwrap_or_else(|_| "5000".to_string()) // ~0.000005 SOL (Solana base fee)
-                .parse()
-                .context("Invalid BASE_TRANSACTION_FEE_LAMPORTS value")?,
-            dex_fee_bps: env::var("DEX_FEE_BPS")
-                .unwrap_or_else(|_| "20".to_string()) // 0.2% (typical for Jupiter/Raydium)
-                .parse()
-                .context("Invalid DEX_FEE_BPS value")?,
-            min_profit_margin_bps: env::var("MIN_PROFIT_MARGIN_BPS")
-                .unwrap_or_else(|_| "100".to_string()) // 1% minimum profit margin
-                .parse()
-                .context("Invalid MIN_PROFIT_MARGIN_BPS value")?,
-            default_oracle_confidence_slippage_bps: env::var(
-                "DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS",
-            )
-            .unwrap_or_else(|_| "100".to_string()) // 1% default when oracle unavailable
-            .parse()
-            .context("Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
-            slippage_final_multiplier: env::var("SLIPPAGE_FINAL_MULTIPLIER")
-                .unwrap_or_else(|_| "1.1".to_string()) // 10% safety margin for model uncertainty
-                .parse()
-                .context("Invalid SLIPPAGE_FINAL_MULTIPLIER value")?,
-            min_reserve_lamports: env::var("MIN_RESERVE_LAMPORTS")
-                .unwrap_or_else(|_| "1000000".to_string()) // 0.001 SOL minimum reserve for transaction fees
-                .parse()
-                .context("Invalid MIN_RESERVE_LAMPORTS value")?,
-            usdc_reserve_address: env::var("USDC_RESERVE_ADDRESS")
-                .ok()
-                .or_else(|| Some(ReserveAddresses::USDC.to_string())),
-            sol_reserve_address: env::var("SOL_RESERVE_ADDRESS")
-                .ok()
-                .or_else(|| Some(ReserveAddresses::SOL.to_string())),
-            associated_token_program_id: env::var("ASSOCIATED_TOKEN_PROGRAM_ID")
-                .unwrap_or_else(|_| ProgramIds::ASSOCIATED_TOKEN.to_string()),
-            sol_price_fallback_usd: env::var("SOL_PRICE_FALLBACK_USD")
-                .unwrap_or_else(|_| "150.0".to_string())
-                .parse()
-                .context("Invalid SOL_PRICE_FALLBACK_USD value")?,
-            oracle_mappings_json: env::var("ORACLE_MAPPINGS_JSON").ok(),
-            max_oracle_age_seconds: env::var("MAX_ORACLE_AGE_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .context("Invalid MAX_ORACLE_AGE_SECONDS value (must be u64)")?,
-            oracle_read_fee_lamports: env::var("ORACLE_READ_FEE_LAMPORTS")
-                .unwrap_or_else(|_| "5000".to_string())
-                .parse()
-                .context("Invalid ORACLE_READ_FEE_LAMPORTS value")?,
-            oracle_accounts_read: env::var("ORACLE_ACCOUNTS_READ")
-                .unwrap_or_else(|_| "1".to_string())
-                .parse()
-                .context("Invalid ORACLE_ACCOUNTS_READ value")?,
-            liquidation_compute_units: env::var("LIQUIDATION_COMPUTE_UNITS")
-                .unwrap_or_else(|_| "200000".to_string())
-                .parse()
-                .context("Invalid LIQUIDATION_COMPUTE_UNITS value")?,
-            z_score_95: env::var("Z_SCORE_95")
-                .unwrap_or_else(|_| "1.96".to_string())
-                .parse()
-                .context("Invalid Z_SCORE_95 value")?,
-            slippage_size_small_threshold_usd: env::var("SLIPPAGE_SIZE_SMALL_THRESHOLD_USD")
-                .unwrap_or_else(|_| "10000.0".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_SIZE_SMALL_THRESHOLD_USD value")?,
-            slippage_size_large_threshold_usd: env::var("SLIPPAGE_SIZE_LARGE_THRESHOLD_USD")
-                .unwrap_or_else(|_| "100000.0".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_SIZE_LARGE_THRESHOLD_USD value")?,
-            slippage_multiplier_small: env::var("SLIPPAGE_MULTIPLIER_SMALL")
-                .unwrap_or_else(|_| "0.5".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_MULTIPLIER_SMALL value")?,
-            slippage_multiplier_medium: env::var("SLIPPAGE_MULTIPLIER_MEDIUM")
-                .unwrap_or_else(|_| "0.6".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_MULTIPLIER_MEDIUM value")?,
-            slippage_multiplier_large: env::var("SLIPPAGE_MULTIPLIER_LARGE")
-                .unwrap_or_else(|_| "0.8".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_MULTIPLIER_LARGE value")?,
-            slippage_estimation_multiplier: env::var("SLIPPAGE_ESTIMATION_MULTIPLIER")
-                .unwrap_or_else(|_| "0.5".to_string())
-                .parse()
-                .context("Invalid SLIPPAGE_ESTIMATION_MULTIPLIER value")?,
-            tx_lock_timeout_seconds: env::var("TX_LOCK_TIMEOUT_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .context("Invalid TX_LOCK_TIMEOUT_SECONDS value")?,
-            max_retries: env::var("MAX_RETRIES")
-                .unwrap_or_else(|_| "3".to_string())
-                .parse()
-                .context("Invalid MAX_RETRIES value")?,
-            initial_retry_delay_ms: env::var("INITIAL_RETRY_DELAY_MS")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .context("Invalid INITIAL_RETRY_DELAY_MS value")?,
-            default_compute_units: env::var("DEFAULT_COMPUTE_UNITS")
-                .unwrap_or_else(|_| "200000".to_string())
-                .parse()
-                .context("Invalid DEFAULT_COMPUTE_UNITS value")?,
-            default_priority_fee_per_cu: env::var("DEFAULT_PRIORITY_FEE_PER_CU")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .context("Invalid DEFAULT_PRIORITY_FEE_PER_CU value")?,
-            ws_listener_sleep_seconds: env::var("WS_LISTENER_SLEEP_SECONDS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .context("Invalid WS_LISTENER_SLEEP_SECONDS value")?,
-            max_consecutive_errors: env::var("MAX_CONSECUTIVE_ERRORS")
-                .unwrap_or_else(|_| "30".to_string())
-                .parse()
-                .context("Invalid MAX_CONSECUTIVE_ERRORS value")?,
-            expected_reserve_size: env::var("EXPECTED_RESERVE_SIZE")
-                .unwrap_or_else(|_| "619".to_string())
-                .parse()
-                .context("Invalid EXPECTED_RESERVE_SIZE value")?,
-            liquidation_bonus: env::var("LIQUIDATION_BONUS")
-                .unwrap_or_else(|_| "0.05".to_string())
-                .parse()
-                .context("Invalid LIQUIDATION_BONUS value")?,
-            close_factor: env::var("CLOSE_FACTOR")
-                .unwrap_or_else(|_| "0.5".to_string())
-                .parse()
-                .context("Invalid CLOSE_FACTOR value")?,
-            max_liquidation_slippage: env::var("MAX_LIQUIDATION_SLIPPAGE")
-                .unwrap_or_else(|_| "0.01".to_string())
-                .parse()
-                .context("Invalid MAX_LIQUIDATION_SLIPPAGE value")?,
-            event_bus_buffer_size: env::var("EVENT_BUS_BUFFER_SIZE")
-                .unwrap_or_else(|_| "50000".to_string()) // Increased from 10000 to 50000 to prevent lag
-                .parse()
-                .context("Invalid EVENT_BUS_BUFFER_SIZE value")?,
-            analyzer_max_workers: env::var("ANALYZER_MAX_WORKERS")
-                .unwrap_or_else(|_| "4".to_string())
-                .parse()
-                .context("Invalid ANALYZER_MAX_WORKERS value")?,
-            analyzer_max_workers_limit: env::var("ANALYZER_MAX_WORKERS_LIMIT")
-                .unwrap_or_else(|_| "16".to_string())
-                .parse()
-                .context("Invalid ANALYZER_MAX_WORKERS_LIMIT value")?,
-            health_manager_max_error_age_seconds: env::var("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .context("Invalid HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS value")?,
-            retry_jitter_max_ms: env::var("RETRY_JITTER_MAX_MS")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .context("Invalid RETRY_JITTER_MAX_MS value")?,
-            use_jupiter_api: env::var("USE_JUPITER_API")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            slippage_calibration_file: env::var("SLIPPAGE_CALIBRATION_FILE")
-                .ok()
-                .or_else(|| Some("slippage_calibration.json".to_string())), // Default file
-            slippage_min_measurements_per_category: env::var(
-                "SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY",
-            )
-            .unwrap_or_else(|_| "10".to_string())
-            .parse()
-            .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
-            main_lending_market_address: env::var("MAIN_LENDING_MARKET_ADDRESS")
-                .ok()
-                .or_else(|| Some(LendingMarketAddresses::MAIN.to_string())),
-            test_wallet_pubkey: env::var("TEST_WALLET_PUBKEY")
-                .ok()
-                .or_else(|| Some("11111111111111111111111111111111".to_string())),
-            usdc_mint: env::var("USDC_MINT")
-                .unwrap_or_else(|_| MintAddresses::USDC.to_string()),
-            sol_mint: env::var("SOL_MINT")
-                .unwrap_or_else(|_| MintAddresses::SOL.to_string()),
-            usdt_mint: env::var("USDT_MINT")
-                .ok()
-                .or_else(|| Some(MintAddresses::USDT.to_string())),
-            eth_mint: env::var("ETH_MINT")
-                .ok()
-                .or_else(|| Some(MintAddresses::ETH.to_string())),
-            btc_mint: env::var("BTC_MINT")
-                .ok()
-                .or_else(|| Some(MintAddresses::BTC.to_string())),
-            default_pyth_oracle_mappings_json: env::var("DEFAULT_PYTH_ORACLE_MAPPINGS_JSON").ok(),
-            default_switchboard_oracle_mappings_json: env::var(
-                "DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON",
-            )
-            .ok(),
-            unwrap_wsol_after_liquidation: env::var("UNWRAP_WSOL_AFTER_LIQUIDATION")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false), // Default: false (optional feature)
+            rpc_http_url: env_str("RPC_HTTP_URL", "https://api.mainnet-beta.solana.com"),
+            rpc_ws_url: env_str("RPC_WS_URL", "wss://api.mainnet-beta.solana.com"),
+            wallet_path: env_str("WALLET_PATH", "./secret/bot-wallet.json"),
+            hf_liquidation_threshold: env_parse("HF_LIQUIDATION_THRESHOLD", "1.0", "Invalid HF_LIQUIDATION_THRESHOLD value")?,
+            liquidation_safety_margin: env_parse("LIQUIDATION_SAFETY_MARGIN", "0.95", "Invalid LIQUIDATION_SAFETY_MARGIN value (must be between 0.0 and 1.0)")?,
+            min_profit_usd: env_parse("MIN_PROFIT_USD", "5.0", "Invalid MIN_PROFIT_USD value")?,
+            max_slippage_bps: env_parse("MAX_SLIPPAGE_BPS", "50", "Invalid MAX_SLIPPAGE_BPS value")?,
+            poll_interval_ms: env_parse("POLL_INTERVAL_MS", "30000", "Invalid POLL_INTERVAL_MS value")?,
+            dry_run: env_parse("DRY_RUN", "true", "Invalid DRY_RUN value (must be 'true' or 'false')")?,
+            solend_program_id: env_str("SOLEND_PROGRAM_ID", &ProgramIds::SOLEND.to_string()),
+            pyth_program_id: env_str("PYTH_PROGRAM_ID", &ProgramIds::PYTH.to_string()),
+            switchboard_program_id: env_str("SWITCHBOARD_PROGRAM_ID", &ProgramIds::SWITCHBOARD.to_string()),
+            priority_fee_per_cu: env_parse("PRIORITY_FEE_PER_CU", "1000", "Invalid PRIORITY_FEE_PER_CU value")?,
+            base_transaction_fee_lamports: env_parse("BASE_TRANSACTION_FEE_LAMPORTS", "5000", "Invalid BASE_TRANSACTION_FEE_LAMPORTS value")?,
+            dex_fee_bps: env_parse("DEX_FEE_BPS", "20", "Invalid DEX_FEE_BPS value")?,
+            min_profit_margin_bps: env_parse("MIN_PROFIT_MARGIN_BPS", "100", "Invalid MIN_PROFIT_MARGIN_BPS value")?,
+            default_oracle_confidence_slippage_bps: env_parse("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS", "100", "Invalid DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS value")?,
+            slippage_final_multiplier: env_parse("SLIPPAGE_FINAL_MULTIPLIER", "1.1", "Invalid SLIPPAGE_FINAL_MULTIPLIER value")?,
+            min_reserve_lamports: env_parse("MIN_RESERVE_LAMPORTS", "1000000", "Invalid MIN_RESERVE_LAMPORTS value")?,
+            usdc_reserve_address: env_opt_with_default("USDC_RESERVE_ADDRESS", ReserveAddresses::USDC.to_string()),
+            sol_reserve_address: env_opt_with_default("SOL_RESERVE_ADDRESS", ReserveAddresses::SOL.to_string()),
+            associated_token_program_id: env_str("ASSOCIATED_TOKEN_PROGRAM_ID", &ProgramIds::ASSOCIATED_TOKEN.to_string()),
+            sol_price_fallback_usd: env_parse("SOL_PRICE_FALLBACK_USD", "150.0", "Invalid SOL_PRICE_FALLBACK_USD value")?,
+            oracle_mappings_json: env_opt_str("ORACLE_MAPPINGS_JSON"),
+            max_oracle_age_seconds: env_parse("MAX_ORACLE_AGE_SECONDS", "60", "Invalid MAX_ORACLE_AGE_SECONDS value (must be u64)")?,
+            oracle_read_fee_lamports: env_parse("ORACLE_READ_FEE_LAMPORTS", "5000", "Invalid ORACLE_READ_FEE_LAMPORTS value")?,
+            oracle_accounts_read: env_parse("ORACLE_ACCOUNTS_READ", "1", "Invalid ORACLE_ACCOUNTS_READ value")?,
+            liquidation_compute_units: env_parse("LIQUIDATION_COMPUTE_UNITS", "200000", "Invalid LIQUIDATION_COMPUTE_UNITS value")?,
+            z_score_95: env_parse("Z_SCORE_95", "1.96", "Invalid Z_SCORE_95 value")?,
+            slippage_size_small_threshold_usd: env_parse("SLIPPAGE_SIZE_SMALL_THRESHOLD_USD", "10000.0", "Invalid SLIPPAGE_SIZE_SMALL_THRESHOLD_USD value")?,
+            slippage_size_large_threshold_usd: env_parse("SLIPPAGE_SIZE_LARGE_THRESHOLD_USD", "100000.0", "Invalid SLIPPAGE_SIZE_LARGE_THRESHOLD_USD value")?,
+            slippage_multiplier_small: env_parse("SLIPPAGE_MULTIPLIER_SMALL", "0.5", "Invalid SLIPPAGE_MULTIPLIER_SMALL value")?,
+            slippage_multiplier_medium: env_parse("SLIPPAGE_MULTIPLIER_MEDIUM", "0.6", "Invalid SLIPPAGE_MULTIPLIER_MEDIUM value")?,
+            slippage_multiplier_large: env_parse("SLIPPAGE_MULTIPLIER_LARGE", "0.8", "Invalid SLIPPAGE_MULTIPLIER_LARGE value")?,
+            slippage_estimation_multiplier: env_parse("SLIPPAGE_ESTIMATION_MULTIPLIER", "0.5", "Invalid SLIPPAGE_ESTIMATION_MULTIPLIER value")?,
+            tx_lock_timeout_seconds: env_parse("TX_LOCK_TIMEOUT_SECONDS", "60", "Invalid TX_LOCK_TIMEOUT_SECONDS value")?,
+            max_retries: env_parse("MAX_RETRIES", "3", "Invalid MAX_RETRIES value")?,
+            initial_retry_delay_ms: env_parse("INITIAL_RETRY_DELAY_MS", "1000", "Invalid INITIAL_RETRY_DELAY_MS value")?,
+            default_compute_units: env_parse("DEFAULT_COMPUTE_UNITS", "200000", "Invalid DEFAULT_COMPUTE_UNITS value")?,
+            default_priority_fee_per_cu: env_parse("DEFAULT_PRIORITY_FEE_PER_CU", "1000", "Invalid DEFAULT_PRIORITY_FEE_PER_CU value")?,
+            ws_listener_sleep_seconds: env_parse("WS_LISTENER_SLEEP_SECONDS", "60", "Invalid WS_LISTENER_SLEEP_SECONDS value")?,
+            max_consecutive_errors: env_parse("MAX_CONSECUTIVE_ERRORS", "30", "Invalid MAX_CONSECUTIVE_ERRORS value")?,
+            expected_reserve_size: env_parse("EXPECTED_RESERVE_SIZE", "619", "Invalid EXPECTED_RESERVE_SIZE value")?,
+            liquidation_bonus: env_parse("LIQUIDATION_BONUS", "0.05", "Invalid LIQUIDATION_BONUS value")?,
+            close_factor: env_parse("CLOSE_FACTOR", "0.5", "Invalid CLOSE_FACTOR value")?,
+            max_liquidation_slippage: env_parse("MAX_LIQUIDATION_SLIPPAGE", "0.01", "Invalid MAX_LIQUIDATION_SLIPPAGE value")?,
+            event_bus_buffer_size: env_parse("EVENT_BUS_BUFFER_SIZE", "50000", "Invalid EVENT_BUS_BUFFER_SIZE value")?,
+            analyzer_max_workers: env_parse("ANALYZER_MAX_WORKERS", "4", "Invalid ANALYZER_MAX_WORKERS value")?,
+            analyzer_max_workers_limit: env_parse("ANALYZER_MAX_WORKERS_LIMIT", "16", "Invalid ANALYZER_MAX_WORKERS_LIMIT value")?,
+            health_manager_max_error_age_seconds: env_parse("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS", "300", "Invalid HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS value")?,
+            retry_jitter_max_ms: env_parse("RETRY_JITTER_MAX_MS", "1000", "Invalid RETRY_JITTER_MAX_MS value")?,
+            use_jupiter_api: env_str("USE_JUPITER_API", "true").parse().unwrap_or(true),
+            slippage_calibration_file: env_opt_with_default("SLIPPAGE_CALIBRATION_FILE", "slippage_calibration.json".to_string()),
+            slippage_min_measurements_per_category: env_parse("SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY", "10", "Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
+            main_lending_market_address: env_opt_with_default("MAIN_LENDING_MARKET_ADDRESS", LendingMarketAddresses::MAIN.to_string()),
+            test_wallet_pubkey: env_opt_with_default("TEST_WALLET_PUBKEY", "11111111111111111111111111111111".to_string()),
+            usdc_mint: env_str("USDC_MINT", &MintAddresses::USDC.to_string()),
+            sol_mint: env_str("SOL_MINT", &MintAddresses::SOL.to_string()),
+            usdt_mint: env_opt_with_default("USDT_MINT", MintAddresses::USDT.to_string()),
+            eth_mint: env_opt_with_default("ETH_MINT", MintAddresses::ETH.to_string()),
+            btc_mint: env_opt_with_default("BTC_MINT", MintAddresses::BTC.to_string()),
+            default_pyth_oracle_mappings_json: env_opt_str("DEFAULT_PYTH_ORACLE_MAPPINGS_JSON"),
+            default_switchboard_oracle_mappings_json: env_opt_str("DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON"),
+            unwrap_wsol_after_liquidation: env_str("UNWRAP_WSOL_AFTER_LIQUIDATION", "false").parse().unwrap_or(false),
         };
 
         config.validate()?;
@@ -507,23 +362,14 @@ impl Config {
             log::warn!("⚠️  Make sure you have tested thoroughly in dry-run mode!");
         }
 
-        if self.solend_program_id.len() < 32 || self.solend_program_id.len() > 44 {
-            log::warn!(
-                "⚠️  SOLEND_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
-                self.solend_program_id.len()
-            );
-        }
-        if self.pyth_program_id.len() < 32 || self.pyth_program_id.len() > 44 {
-            log::warn!(
-                "⚠️  PYTH_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
-                self.pyth_program_id.len()
-            );
-        }
-        if self.switchboard_program_id.len() < 32 || self.switchboard_program_id.len() > 44 {
-            log::warn!(
-                "⚠️  SWITCHBOARD_PROGRAM_ID length seems unusual: {} (expected 32-44 chars)",
-                self.switchboard_program_id.len()
-            );
+        for (name, id) in [
+            ("SOLEND_PROGRAM_ID", &self.solend_program_id),
+            ("PYTH_PROGRAM_ID", &self.pyth_program_id),
+            ("SWITCHBOARD_PROGRAM_ID", &self.switchboard_program_id),
+        ] {
+            if id.len() < 32 || id.len() > 44 {
+                log::warn!("⚠️  {} length seems unusual: {} (expected 32-44 chars)", name, id.len());
+            }
         }
 
         if self.priority_fee_per_cu == 0 {

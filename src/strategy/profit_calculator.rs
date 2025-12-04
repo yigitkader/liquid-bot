@@ -129,49 +129,11 @@ impl ProfitCalculator {
 
         let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
         
-        // ✅ FIX: Use conservative estimate when hop_count is None (Jupiter API failed)
-        // Problem: Previous code used 2 hops for non-stablecoin pairs, but 3-hop swaps exist (e.g., ETH → SOL → USDC)
-        //   This underestimates DEX fees (2 hop × 0.2% = 0.4% vs actual 3 hop × 0.2% = 0.6%)
-        //   Example: $10,000 swap with 3 hops but estimated as 2 hops = $20 fee underestimation
-        // Solution: Use conservative estimate to avoid fee underestimation
-        //   - Stablecoin pairs: 1 hop (direct swap, very reliable)
-        //   - Regular pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
-        //   Note: This may slightly overestimate fees for 1-2 hop swaps, but prevents losses from 3-hop swaps
-        let hop_count = if let Some(count) = hop_count {
-            count
-        } else {
-            // ✅ FIX: Improved hop count estimation for Jupiter API failures
-            // Problem: Previous code used 3 hops for all non-stablecoin pairs, but major pairs
-            //   (ETH-SOL, BTC-SOL, etc.) typically use 2 hops, not 3
-            //   This overestimates fees (3 hop × 20 bps = 60 bps vs actual 2 hop × 20 bps = 40 bps)
-            //   Example: $10,000 swap with 2 hops but estimated as 3 hops = $20 fee overestimation
-            //   Result: Profitable opportunities are rejected due to overestimated fees
-            // Solution: Check if pair is major pair (SOL, ETH, BTC, USDC, USDT combinations)
-            //   - Stablecoin pairs: 1 hop (direct swap, very reliable)
-            //   - Major pairs: 2 hops (SOL-ETH, SOL-BTC, ETH-USDC, etc. - typically 2 hops)
-            //   - Other pairs: 3 hops (conservative default for less liquid pairs)
-            let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
-            let estimated_hop_count = if is_stablecoin_pair {
-                1 // Stablecoin pairs usually direct swap (USDC ↔ USDT) - very reliable
-            } else if self.is_major_pair(&opp.debt_mint, &opp.collateral_mint) {
-                2 // Major pairs (SOL-ETH, SOL-BTC, ETH-USDC, etc.) typically 2 hops
-                  // Examples: ETH → SOL → USDC (2 hops), BTC → SOL → USDC (2 hops)
-                  // These pairs have high liquidity and direct routes, usually 2 hops max
-            } else {
-                3 // Other pairs: Use 3 hops as conservative default to cover multi-hop swaps
-                  // Examples: Small cap token → SOL → USDC → USDT (3 hops)
-                  // This prevents fee underestimation for less liquid pairs
-            };
-            log::warn!(
-                "ProfitCalculator: hop_count is None for {} -> {}, using estimate: {} hops (stablecoin_pair: {}, major_pair: {})",
-                opp.debt_mint,
-                opp.collateral_mint,
-                estimated_hop_count,
-                is_stablecoin_pair,
-                self.is_major_pair(&opp.debt_mint, &opp.collateral_mint)
-            );
-            estimated_hop_count
-        };
+        let hop_count = hop_count.unwrap_or_else(|| {
+            let estimated = self.estimate_hop_count(&opp.debt_mint, &opp.collateral_mint);
+            log::warn!("ProfitCalculator: hop_count is None for {} -> {}, using estimate: {} hops", opp.debt_mint, opp.collateral_mint, estimated);
+            estimated
+        });
 
         // ✅ CRITICAL FIX: Use Jupiter API for all pairs, not just stablecoin pairs
         // Problem: 
@@ -345,9 +307,6 @@ impl ProfitCalculator {
     }
 
     pub fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
-        // ✅ FIX: Handle initialization error gracefully
-        // If sets failed to initialize (should never happen if init_stablecoin_sets() succeeded),
-        // return false (conservative - treat as non-stablecoin pair)
         STABLECOIN_PAIRS
             .as_ref()
             .map(|pairs| pairs.contains(&(*mint1, *mint2)))
@@ -357,42 +316,25 @@ impl ProfitCalculator {
             })
     }
 
-    /// Check if a pair is a major pair (SOL, ETH, BTC, USDC, USDT combinations)
-    /// Major pairs typically have high liquidity and direct routes, usually 2 hops max
-    /// Examples: ETH-SOL, BTC-SOL, ETH-USDC, BTC-USDC, etc.
     pub fn is_major_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
-        // Get major token mints from config (with fallback to defaults)
-        let sol_mint = self.config.sol_mint.parse::<Pubkey>().ok();
-        let usdc_mint = self.config.usdc_mint.parse::<Pubkey>().ok();
-        let usdt_mint = self.config.usdt_mint.as_ref()
-            .and_then(|s| s.parse::<Pubkey>().ok());
-        let eth_mint = self.config.eth_mint.as_ref()
-            .and_then(|s| s.parse::<Pubkey>().ok());
-        let btc_mint = self.config.btc_mint.as_ref()
-            .and_then(|s| s.parse::<Pubkey>().ok());
-
-        // Build set of major tokens
-        let mut major_tokens = HashSet::new();
-        if let Some(sol) = sol_mint {
-            major_tokens.insert(sol);
-        }
-        if let Some(usdc) = usdc_mint {
-            major_tokens.insert(usdc);
-        }
-        if let Some(usdt) = usdt_mint {
-            major_tokens.insert(usdt);
-        }
-        if let Some(eth) = eth_mint {
-            major_tokens.insert(eth);
-        }
-        if let Some(btc) = btc_mint {
-            major_tokens.insert(btc);
-        }
-
-        // Check if both mints are major tokens
-        // Major pairs: SOL-ETH, SOL-BTC, ETH-USDC, BTC-USDC, etc.
-        // These pairs have high liquidity and typically use 2 hops
+        let major_tokens: HashSet<Pubkey> = [
+            self.config.sol_mint.parse::<Pubkey>().ok(),
+            self.config.usdc_mint.parse::<Pubkey>().ok(),
+            self.config.usdt_mint.as_ref().and_then(|s| s.parse::<Pubkey>().ok()),
+            self.config.eth_mint.as_ref().and_then(|s| s.parse::<Pubkey>().ok()),
+            self.config.btc_mint.as_ref().and_then(|s| s.parse::<Pubkey>().ok()),
+        ].into_iter().flatten().collect();
         major_tokens.contains(mint1) && major_tokens.contains(mint2)
+    }
+
+    pub fn estimate_hop_count(&self, mint1: &Pubkey, mint2: &Pubkey) -> u8 {
+        if self.is_stablecoin_pair(mint1, mint2) {
+            1
+        } else if self.is_major_pair(mint1, mint2) {
+            2
+        } else {
+            3
+        }
     }
 }
 

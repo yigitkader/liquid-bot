@@ -421,15 +421,9 @@ impl Validator {
     }
 
     async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config, skip_delay: bool) -> Result<()> {
-        use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account, read_oracle_price};
+        use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account};
         use tokio::time::{Duration, timeout};
 
-        // ✅ CRITICAL FIX: Oracle timeout MUST equal RPC timeout to prevent double-waiting
-        // Problem: If oracle timeout < RPC timeout, we wait for oracle timeout, then RPC timeout triggers
-        //   Example: oracle timeout (5s) → RPC timeout (10s) → Total wait: 15s ❌
-        // Solution: Set oracle timeout = RPC timeout so we only wait once
-        //   Example: oracle timeout (10s) = RPC timeout (10s) → Total wait: 10s ✅
-        // This prevents cascading timeouts and reduces validation latency
         let oracle_check_timeout = rpc.request_timeout();
 
         let timeout_result = timeout(oracle_check_timeout, async {
@@ -437,221 +431,32 @@ impl Validator {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
-            // ✅ FIX: Support both Pyth and Switchboard oracles
-            // Try Pyth first, then Switchboard as fallback
             let pyth_account = get_pyth_oracle_account(mint, Some(config)).ok().flatten();
             let switchboard_account = get_switchboard_oracle_account(mint, Some(config)).ok().flatten();
 
             if pyth_account.is_none() && switchboard_account.is_none() {
                 log::warn!("No oracle found (Pyth or Switchboard) for mint: {}, skipping freshness check", mint);
-                return Ok(());
+                return Err(anyhow::anyhow!("No oracle found for mint {}", mint));
             }
 
-            let max_age = config.max_oracle_age_seconds;
-            let price_data = match read_oracle_price(
+            let price_data = Self::read_oracle_price_data(
+                mint,
                 pyth_account.as_ref(),
                 switchboard_account.as_ref(),
-                Arc::clone(rpc),
-                Some(config),
-            ).await {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
-                    let oracle_account = pyth_account.or(switchboard_account).unwrap();
-                    return Err(anyhow::anyhow!(
-                        "Failed to read oracle price data for mint {} ({} oracle={}) - price data is None",
-                        mint,
-                        oracle_type,
-                        oracle_account
-                    ));
-                }
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
-                    let oracle_account = pyth_account.or(switchboard_account).unwrap();
-                    
-                    if error_str.contains("timeout") || error_str.contains("timed out") {
-                        log::error!(
-                            "Validator: {} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}",
-                            oracle_type,
-                            mint,
-                            oracle_account,
-                            e
-                        );
-                        return Err(anyhow::anyhow!(
-                            "{} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}",
-                            oracle_type,
-                            mint,
-                            oracle_account,
-                            e
-                        ));
-                    }
+                rpc,
+                config,
+            ).await?;
 
-                    log::error!(
-                        "Validator: failed to read {} price for mint {} (oracle={}): {}",
-                        oracle_type,
-                        mint,
-                        oracle_account,
-                        e
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Failed to read oracle price data for mint {} ({} oracle={}): {}",
-                        mint,
-                        oracle_type,
-                        oracle_account,
-                        e
-                    ));
-                }
-            };
-            
             let oracle_account = pyth_account.or(switchboard_account).unwrap();
             let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
+
+            Self::validate_price_data(mint, &price_data, oracle_type, &oracle_account, config.max_oracle_age_seconds)?;
 
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
                 .as_secs() as i64;
-
             let age_seconds = current_time - price_data.timestamp;
-            if age_seconds > max_age as i64 {
-                log::error!(
-                    "Validator: {} oracle price data is stale for mint {} (oracle {}): {} seconds old (max: {} seconds)",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    age_seconds,
-                    max_age
-                );
-                return Err(anyhow::anyhow!(
-                    "{} oracle price data is stale for mint {} (oracle {}): {} seconds old (max: {} seconds)",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    age_seconds,
-                    max_age
-                ));
-            }
-
-            // ✅ FIX: Validate price value - reject invalid prices (0, negative, or unreasonably large)
-            // Problem: Oracle freshness check only validates timestamp, not the price itself
-            // If oracle returns 0 or invalid price, validation would pass, causing liquidation failures
-            // Solution: Add price validation to catch invalid oracle data before it causes transaction failures
-            if price_data.price <= 0.0 {
-                log::error!(
-                    "Validator: {} oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price
-                );
-                return Err(anyhow::anyhow!(
-                    "{} oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price
-                ));
-            }
-
-            // ✅ FIX: Validate price is within reasonable bounds (prevent overflow/underflow issues)
-            // Very large prices (> $1 trillion) or very small prices (< $0.0001) are likely errors
-            const MAX_REASONABLE_PRICE: f64 = 1_000_000_000_000.0; // $1 trillion
-            const MIN_REASONABLE_PRICE: f64 = 0.0001; // $0.0001
-            if price_data.price > MAX_REASONABLE_PRICE {
-                log::error!(
-                    "Validator: {} oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price,
-                    MAX_REASONABLE_PRICE
-                );
-                return Err(anyhow::anyhow!(
-                    "{} oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price,
-                    MAX_REASONABLE_PRICE
-                ));
-            }
-            if price_data.price < MIN_REASONABLE_PRICE {
-                log::error!(
-                    "Validator: {} oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price,
-                    MIN_REASONABLE_PRICE
-                );
-                return Err(anyhow::anyhow!(
-                    "{} oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.price,
-                    MIN_REASONABLE_PRICE
-                ));
-            }
-
-            // ✅ FIX: Validate confidence is reasonable (not negative, not unreasonably large)
-            // Negative confidence is invalid, very high confidence relative to price suggests data corruption
-            if price_data.confidence < 0.0 {
-                log::error!(
-                    "Validator: {} oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.confidence
-                );
-                return Err(anyhow::anyhow!(
-                    "{} oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
-                    oracle_type,
-                    mint,
-                    oracle_account,
-                    price_data.confidence
-                ));
-            }
-
-            // ✅ CRITICAL FIX: Validate confidence-to-price ratio for BOTH Pyth and Switchboard oracles
-            // Problem: Previous code only validated confidence for Pyth oracle
-            //   - Switchboard oracle can also have high confidence relative to price
-            //   - Example: Price $150, Confidence $50 → 33% uncertainty (very risky!)
-            //   - This causes high slippage risk with liquidations
-            // Solution: Apply confidence validation to both Pyth and Switchboard oracles
-            //   - Same threshold (25%) applies to both oracle types
-            //   - Volatile assets (SOL, ETH, BTC): 15-20% confidence is normal
-            //   - Stablecoins (USDC, USDT): typically < 1% confidence
-            //   - 25% threshold catches truly unreliable data while allowing normal volatility
-            //   - Example: SOL price $150, confidence $20 → 13.3% ratio → ACCEPT ✅
-            //   - Example: SOL price $100, confidence $30 → 30% ratio → REJECT ❌ (too high)
-            //   - Example: Price $150, confidence $50 → 33% ratio → REJECT ❌ (too risky)
-            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.25; // 25% max uncertainty (was 10%)
-            if price_data.price > 0.0 {
-                let confidence_ratio = price_data.confidence / price_data.price;
-                if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {
-                    log::error!(
-                        "Validator: {} oracle confidence is too high relative to price for mint {} (oracle {}): price={:.4}, confidence={:.4}, ratio={:.2}% (max: {:.0}%)",
-                        oracle_type,
-                        mint,
-                        oracle_account,
-                        price_data.price,
-                        price_data.confidence,
-                        confidence_ratio * 100.0,
-                        MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
-                    );
-                    return Err(anyhow::anyhow!(
-                        "{} oracle confidence is too high relative to price for mint {} (oracle {}): confidence={:.4}, price={:.4}, ratio={:.2}% (max: {:.0}%)",
-                        oracle_type,
-                        mint,
-                        oracle_account,
-                        price_data.confidence,
-                        price_data.price,
-                        confidence_ratio * 100.0,
-                        MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
-                    ));
-                }
-            }
 
             log::debug!(
                 "Validator: {} oracle price is valid and fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4}, conf_ratio={:.2}%)",
@@ -659,21 +464,111 @@ impl Validator {
                 mint,
                 oracle_account,
                 age_seconds,
-                max_age,
+                config.max_oracle_age_seconds,
                 price_data.price,
                 price_data.confidence,
                 if price_data.price > 0.0 { (price_data.confidence / price_data.price) * 100.0 } else { 0.0 }
             );
 
             Ok(())
-        })
-            .await;
+        }).await;
 
-        timeout_result.map_err(|_| anyhow::anyhow!(
-            "Oracle check timeout after {:?} for mint {}",
-            oracle_check_timeout,
-            mint
-        ))??;
+        timeout_result.map_err(|_| anyhow::anyhow!("Oracle check timeout after {:?} for mint {}", oracle_check_timeout, mint))??;
+        Ok(())
+    }
+
+    async fn read_oracle_price_data(
+        mint: &Pubkey,
+        pyth_account: Option<&Pubkey>,
+        switchboard_account: Option<&Pubkey>,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+    ) -> Result<crate::protocol::oracle::OraclePrice> {
+        use crate::protocol::oracle::read_oracle_price;
+
+        let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
+        let oracle_account = pyth_account.or(switchboard_account).unwrap();
+
+        match read_oracle_price(pyth_account, switchboard_account, Arc::clone(rpc), Some(config)).await {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) => Err(anyhow::anyhow!(
+                "Failed to read oracle price data for mint {} ({} oracle={}) - price data is None",
+                mint, oracle_type, oracle_account
+            )),
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("timeout") || error_str.contains("timed out") {
+                    log::error!("Validator: {} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e);
+                    Err(anyhow::anyhow!("{} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e))
+                } else {
+                    log::error!("Validator: failed to read {} price for mint {} (oracle={}): {}", oracle_type, mint, oracle_account, e);
+                    Err(anyhow::anyhow!("Failed to read oracle price data for mint {} ({} oracle={}): {}", mint, oracle_type, oracle_account, e))
+                }
+            }
+        }
+    }
+
+    fn validate_price_data(
+        mint: &Pubkey,
+        price_data: &crate::protocol::oracle::OraclePrice,
+        oracle_type: &str,
+        oracle_account: &Pubkey,
+        max_age: u64,
+    ) -> Result<()> {
+        const MAX_REASONABLE_PRICE: f64 = 1_000_000_000_000.0;
+        const MIN_REASONABLE_PRICE: f64 = 0.0001;
+        const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.25;
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
+            .as_secs() as i64;
+
+        let age_seconds = current_time - price_data.timestamp;
+        if age_seconds > max_age as i64 {
+            return Err(anyhow::anyhow!(
+                "{} oracle price data is stale for mint {} (oracle {}): {} seconds old (max: {} seconds)",
+                oracle_type, mint, oracle_account, age_seconds, max_age
+            ));
+        }
+
+        if price_data.price <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "{} oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
+                oracle_type, mint, oracle_account, price_data.price
+            ));
+        }
+
+        if price_data.price > MAX_REASONABLE_PRICE {
+            return Err(anyhow::anyhow!(
+                "{} oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
+                oracle_type, mint, oracle_account, price_data.price, MAX_REASONABLE_PRICE
+            ));
+        }
+
+        if price_data.price < MIN_REASONABLE_PRICE {
+            return Err(anyhow::anyhow!(
+                "{} oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
+                oracle_type, mint, oracle_account, price_data.price, MIN_REASONABLE_PRICE
+            ));
+        }
+
+        if price_data.confidence < 0.0 {
+            return Err(anyhow::anyhow!(
+                "{} oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
+                oracle_type, mint, oracle_account, price_data.confidence
+            ));
+        }
+
+        if price_data.price > 0.0 {
+            let confidence_ratio = price_data.confidence / price_data.price;
+            if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {
+                return Err(anyhow::anyhow!(
+                    "{} oracle confidence is too high relative to price for mint {} (oracle {}): confidence={:.4}, price={:.4}, ratio={:.2}% (max: {:.0}%)",
+                    oracle_type, mint, oracle_account, price_data.confidence, price_data.price, confidence_ratio * 100.0, MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
+                ));
+            }
+        }
 
         Ok(())
     }

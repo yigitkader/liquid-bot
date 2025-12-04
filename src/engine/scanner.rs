@@ -156,107 +156,62 @@ impl Scanner {
             }
         }
 
-        // Log parse statistics
-        log::info!(
-            "Scanner: initial discovery completed. parsed_positions={}, failed_to_parse={}, total_accounts={}",
-            parsed,
-            failed,
-            accounts.len()
-        );
+        log::info!("Scanner: initial discovery completed. parsed_positions={}, failed_to_parse={}, total_accounts={}", parsed, failed, accounts.len());
         
-        // Warn if no positions were parsed
         if parsed == 0 && failed > 0 {
-            log::warn!("⚠️  WARNING: No positions were parsed from {} accounts! This may indicate:", failed);
-            log::warn!("   1. Data size filter may be incorrect (currently filtering for exactly {} bytes)", OBLIGATION_DATA_SIZE);
-            log::warn!("   2. Obligation accounts may have different sizes (expected: 1200-1500 bytes)");
-            log::warn!("   3. Account structure may not match expected obligation format");
-            log::warn!("   4. All accounts may be empty (no deposits/borrows) or malformed");
-            log::warn!("   → Check sample discriminators and pubkeys below for on-chain inspection");
+            log::warn!("⚠️  WARNING: No positions were parsed from {} accounts! Data size filter may be incorrect (filtering for {} bytes)", failed, OBLIGATION_DATA_SIZE);
         }
         
-        // Log data size distribution
-        if !data_size_distribution.is_empty() {
-            log::info!("Scanner: Data size distribution of discovered accounts:");
-            let mut sorted_sizes: Vec<_> = data_size_distribution.iter().collect();
-            sorted_sizes.sort_by(|a, b| b.1.cmp(a.1));
-            for (size, count) in sorted_sizes.iter().take(10) {
-                log::info!("  - {} bytes: {} accounts", size, count);
-            }
-            if sorted_sizes.len() > 10 {
-                log::info!("  ... and {} more size categories", sorted_sizes.len() - 10);
-            }
-        }
+        Self::log_distribution("Data size distribution", &data_size_distribution, 10);
+        Self::log_distribution("Parse failure breakdown", &parse_stats, 10);
         
-        if !parse_stats.is_empty() {
-            log::info!("Scanner: Parse failure breakdown:");
-            let mut sorted_stats: Vec<_> = parse_stats.iter().collect();
-            sorted_stats.sort_by(|a, b| b.1.cmp(a.1));
-            for (reason, count) in sorted_stats.iter().take(10) {
-                log::info!("  - {}: {} accounts", reason, count);
-            }
-            if sorted_stats.len() > 10 {
-                log::info!("  ... and {} more categories", sorted_stats.len() - 10);
-            }
-        }
-        
-        // Log sample discriminators from failed accounts (helps debug parse issues)
         if !sample_discriminators.is_empty() {
-            log::info!("Scanner: Sample discriminators from failed accounts (for debugging account types):");
-            for (idx, disc) in sample_discriminators.iter().take(5).enumerate() {
-                log::info!("  Sample {}: {:02x?}", idx + 1, disc);
-            }
+            log::info!("Scanner: Sample discriminators from failed accounts: {:?}", sample_discriminators.iter().take(5).collect::<Vec<_>>());
             if !sample_failed_pubkeys.is_empty() {
-                log::info!("Scanner: Sample failed account pubkeys (for on-chain inspection):");
-                for (idx, pubkey) in sample_failed_pubkeys.iter().take(3).enumerate() {
-                    log::info!("  Account {}: {} (check on Solana Explorer)", idx + 1, pubkey);
-                }
-            }
-            if !sample_failed_sizes.is_empty() {
-                log::info!("Scanner: Sample failed account data sizes: {:?}", sample_failed_sizes);
+                log::info!("Scanner: Sample failed account pubkeys: {:?}", sample_failed_pubkeys.iter().take(3).collect::<Vec<_>>());
             }
         }
         
-        // Log health factor distribution
         if !health_factors.is_empty() {
             health_factors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let count = health_factors.len();
-            let p50 = health_factors[count / 2];
-            let p25 = health_factors[count / 4];
-            let p75 = health_factors[(count * 3) / 4];
-            let min = health_factors[0];
-            let max = health_factors[count - 1];
             let liquidatable = health_factors.iter().filter(|&&hf| hf < self.config.hf_liquidation_threshold).count();
-            
             log::info!(
                 "Scanner: Health factor distribution ({} positions): min={:.4}, p25={:.4}, p50={:.4}, p75={:.4}, max={:.4}, liquidatable={} (HF < {})",
-                count, min, p25, p50, p75, max, liquidatable, self.config.hf_liquidation_threshold
+                count, health_factors[0], health_factors[count / 4], health_factors[count / 2], health_factors[(count * 3) / 4], health_factors[count - 1], liquidatable, self.config.hf_liquidation_threshold
             );
         }
 
         Ok(parsed)
     }
 
-    /// Categorize why an account failed to parse
     fn categorize_parse_failure(account: &solana_sdk::account::Account) -> Option<String> {
         let data_len = account.data.len();
         const MIN_OBLIGATION_SIZE: usize = 1200;
         const MAX_OBLIGATION_SIZE: usize = 1500;
         
         if data_len < MIN_OBLIGATION_SIZE {
-            return Some(format!("data_too_small ({} < {})", data_len, MIN_OBLIGATION_SIZE));
+            Some(format!("data_too_small ({} < {})", data_len, MIN_OBLIGATION_SIZE))
+        } else if data_len > MAX_OBLIGATION_SIZE {
+            Some(format!("data_too_large ({} > {})", data_len, MAX_OBLIGATION_SIZE))
+        } else {
+            Some("parse_failed_or_empty".to_string())
         }
-        
-        if data_len > MAX_OBLIGATION_SIZE {
-            return Some(format!("data_too_large ({} > {})", data_len, MAX_OBLIGATION_SIZE));
+    }
+
+    fn log_distribution<T: std::fmt::Display>(name: &str, distribution: &std::collections::HashMap<T, usize>, max_items: usize) {
+        if distribution.is_empty() {
+            return;
         }
-        
-        // ✅ FIX: Removed discriminator check - now we try to parse all accounts in size range
-        // If parse fails, it's either:
-        // 1. Wrong account structure (not an obligation)
-        // 2. Parse error (malformed data)
-        // 3. Empty position (no deposits/borrows)
-        // We can't distinguish without actually parsing, so return generic
-        Some("parse_failed_or_empty".to_string())
+        log::info!("Scanner: {}:", name);
+        let mut sorted: Vec<_> = distribution.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (key, count) in sorted.iter().take(max_items) {
+            log::info!("  - {}: {} accounts", key, count);
+        }
+        if sorted.len() > max_items {
+            log::info!("  ... and {} more categories", sorted.len() - max_items);
+        }
     }
 
     pub async fn start_monitoring(&self) -> Result<()> {

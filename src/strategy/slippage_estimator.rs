@@ -62,35 +62,11 @@ impl SlippageEstimator {
             self.estimate_with_jupiter_route(input_mint, output_mint, amount)
                 .await
         } else {
-            // ✅ FIX: Use same fallback logic as Jupiter API failure case
-            // This ensures consistent hop_count estimation whether Jupiter is disabled or fails
-            // - Stablecoin pairs: 1 hop (direct swap, very reliable)
-            // - Major pairs: 2 hops (SOL-ETH, SOL-BTC, ETH-USDC, etc. - typically 2 hops)
-            // - Other pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
             use crate::strategy::profit_calculator::ProfitCalculator;
             let profit_calc = ProfitCalculator::new(self.config.clone());
-            let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&input_mint, &output_mint);
-            let is_major_pair = profit_calc.is_major_pair(&input_mint, &output_mint);
-            let estimated_hop_count = if is_stablecoin_pair {
-                1
-            } else if is_major_pair {
-                2
-            } else {
-                3
-            };
-            
+            let estimated_hop_count = profit_calc.estimate_hop_count(&input_mint, &output_mint);
             let slippage = self.estimate_with_multipliers(amount)?;
-            
-            log::debug!(
-                "SlippageEstimator: Jupiter API disabled, using fallback hop_count={} for {} -> {} (stablecoin_pair={}, major_pair={}, slippage={} bps)",
-                estimated_hop_count,
-                input_mint,
-                output_mint,
-                is_stablecoin_pair,
-                is_major_pair,
-                slippage
-            );
-            
+            log::debug!("SlippageEstimator: Jupiter API disabled, using fallback hop_count={} for {} -> {}, slippage={} bps", estimated_hop_count, input_mint, output_mint, slippage);
             Ok((slippage, estimated_hop_count))
         }
     }
@@ -204,36 +180,12 @@ impl SlippageEstimator {
             }
         }
 
-        // ✅ FIX: Use fallback with conservative hop_count estimation
-        // Problem: Previous code returned error, but analyzer.rs had its own fallback logic
-        //   This created inconsistency and duplicate fallback code
-        // Solution: Handle fallback here with consistent logic based on pair type
-        //   - Stablecoin pairs: 1 hop (direct swap, very reliable)
-        //   - Regular pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
-        log::warn!(
-            "Jupiter API failed after {} attempts: {} - using conservative fallback",
-            MAX_RETRIES,
-            last_error.as_deref().unwrap_or("unknown")
-        );
-        
-        // Use conservative fallback based on pair type
+        log::warn!("Jupiter API failed after {} attempts: {} - using fallback", MAX_RETRIES, last_error.as_deref().unwrap_or("unknown"));
         use crate::strategy::profit_calculator::ProfitCalculator;
         let profit_calc = ProfitCalculator::new(self.config.clone());
-        let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&input_mint, &output_mint);
-        let estimated_hop_count = if is_stablecoin_pair { 1 } else { 3 };
-        
-        // Use multiplier-based slippage estimation as fallback
+        let estimated_hop_count = profit_calc.estimate_hop_count(&input_mint, &output_mint);
         let slippage = self.estimate_with_multipliers(amount)?;
-        
-        log::debug!(
-            "SlippageEstimator: Using fallback hop_count={} for {} -> {} (stablecoin_pair={}, slippage={} bps)",
-            estimated_hop_count,
-            input_mint,
-            output_mint,
-            is_stablecoin_pair,
-            slippage
-        );
-        
+        log::debug!("SlippageEstimator: Using fallback hop_count={} for {} -> {}, slippage={} bps", estimated_hop_count, input_mint, output_mint, slippage);
         Ok((slippage, estimated_hop_count))
     }
 

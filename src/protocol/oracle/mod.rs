@@ -27,108 +27,29 @@ pub fn get_pyth_oracle_account(
     config: Option<&crate::config::Config>,
 ) -> Result<Option<Pubkey>> {
     if let Some(cfg) = config {
-        if let Some(ref mappings_json) = cfg.oracle_mappings_json {
-            if let Ok(Some(account)) = parse_oracle_mappings_from_json(mappings_json, mint, "pyth")
-            {
-                return Ok(Some(account));
-            }
-        }
-        if let Some(ref mappings_json) = cfg.default_pyth_oracle_mappings_json {
-            if let Ok(Some(account)) = parse_oracle_mappings_from_json(mappings_json, mint, "pyth")
-            {
-                return Ok(Some(account));
+        for json in [&cfg.oracle_mappings_json, &cfg.default_pyth_oracle_mappings_json] {
+            if let Some(ref mappings_json) = json {
+                if let Ok(Some(account)) = parse_oracle_mappings_from_json(mappings_json, mint, "pyth") {
+                    return Ok(Some(account));
+                }
             }
         }
     }
 
-    if let Some(cfg) = config {
-        if let Ok(usdc) = cfg.usdc_mint.parse::<Pubkey>() {
-            if *mint == usdc {
-                if let Ok(pyth) = "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98".parse::<Pubkey>() {
-                    return Ok(Some(pyth));
-                }
-            }
-        }
-        if let Ok(sol) = cfg.sol_mint.parse::<Pubkey>() {
-            if *mint == sol {
-                if let Ok(pyth) = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".parse::<Pubkey>() {
-                    return Ok(Some(pyth));
-                }
-            }
-        }
-        if let Some(ref usdt_str) = cfg.usdt_mint {
-            if let Ok(usdt) = usdt_str.parse::<Pubkey>() {
-                if *mint == usdt {
-                    if let Ok(pyth) =
-                        "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz".parse::<Pubkey>()
-                    {
-                        return Ok(Some(pyth));
-                    }
-                }
-            }
-        }
-        if let Some(ref eth_str) = cfg.eth_mint {
-            if let Ok(eth) = eth_str.parse::<Pubkey>() {
-                if *mint == eth {
-                    if let Ok(pyth) =
-                        "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB".parse::<Pubkey>()
-                    {
-                        return Ok(Some(pyth));
-                    }
-                }
-            }
-        }
-        if let Some(ref btc_str) = cfg.btc_mint {
-            if let Ok(btc) = btc_str.parse::<Pubkey>() {
-                if *mint == btc {
-                    if let Ok(pyth) =
-                        "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU".parse::<Pubkey>()
-                    {
-                        return Ok(Some(pyth));
-                    }
-                }
-            }
-        }
-    } else {
-        let default_usdc: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            .parse()
-            .unwrap();
-        let default_sol: Pubkey = "So11111111111111111111111111111111111111112"
-            .parse()
-            .unwrap();
-        let default_usdt: Pubkey = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-            .parse()
-            .unwrap();
-        let default_eth: Pubkey = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-            .parse()
-            .unwrap();
-        let default_btc: Pubkey = "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"
-            .parse()
-            .unwrap();
+    let mappings = [
+        (config.and_then(|c| c.usdc_mint.parse::<Pubkey>().ok()).or_else(|| "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().ok()), "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98"),
+        (config.and_then(|c| c.sol_mint.parse::<Pubkey>().ok()).or_else(|| "So11111111111111111111111111111111111111112".parse().ok()), "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
+        (config.and_then(|c| c.usdt_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".parse().ok()), "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz"),
+        (config.and_then(|c| c.eth_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs".parse().ok()), "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB"),
+        (config.and_then(|c| c.btc_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E".parse().ok()), "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU"),
+    ];
 
-        if *mint == default_usdc {
-            if let Ok(pyth) = "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98".parse::<Pubkey>() {
-                return Ok(Some(pyth));
-            }
-        }
-        if *mint == default_sol {
-            if let Ok(pyth) = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".parse::<Pubkey>() {
-                return Ok(Some(pyth));
-            }
-        }
-        if *mint == default_usdt {
-            if let Ok(pyth) = "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz".parse::<Pubkey>() {
-                return Ok(Some(pyth));
-            }
-        }
-        if *mint == default_eth {
-            if let Ok(pyth) = "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB".parse::<Pubkey>() {
-                return Ok(Some(pyth));
-            }
-        }
-        if *mint == default_btc {
-            if let Ok(pyth) = "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU".parse::<Pubkey>() {
-                return Ok(Some(pyth));
+    for (check_mint, oracle) in mappings.iter() {
+        if let Some(check) = check_mint {
+            if *mint == *check {
+                if let Ok(pyth) = oracle.parse::<Pubkey>() {
+                    return Ok(Some(pyth));
+                }
             }
         }
     }
@@ -141,81 +62,27 @@ pub fn get_switchboard_oracle_account(
     config: Option<&crate::config::Config>,
 ) -> Result<Option<Pubkey>> {
     if let Some(cfg) = config {
-        if let Some(ref mappings_json) = cfg.oracle_mappings_json {
-            if let Ok(Some(account)) =
-                parse_oracle_mappings_from_json(mappings_json, mint, "switchboard")
-            {
-                return Ok(Some(account));
-            }
-        }
-        if let Some(ref mappings_json) = cfg.default_switchboard_oracle_mappings_json {
-            if let Ok(Some(account)) =
-                parse_oracle_mappings_from_json(mappings_json, mint, "switchboard")
-            {
-                return Ok(Some(account));
+        for json in [&cfg.oracle_mappings_json, &cfg.default_switchboard_oracle_mappings_json] {
+            if let Some(ref mappings_json) = json {
+                if let Ok(Some(account)) = parse_oracle_mappings_from_json(mappings_json, mint, "switchboard") {
+                    return Ok(Some(account));
+                }
             }
         }
     }
 
-    if let Some(cfg) = config {
-        if let Ok(usdc) = cfg.usdc_mint.parse::<Pubkey>() {
-            if *mint == usdc {
-                if let Ok(switchboard) =
-                    "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD".parse::<Pubkey>()
-                {
-                    return Ok(Some(switchboard));
-                }
-            }
-        }
-        if let Some(ref usdt_str) = cfg.usdt_mint {
-            if let Ok(usdt) = usdt_str.parse::<Pubkey>() {
-                if *mint == usdt {
-                    if let Ok(switchboard) =
-                        "ETAaeeuQBwsh9mM2gqtwWSbEkf2M8GJ2iVZ3gJgKqJz".parse::<Pubkey>()
-                    {
-                        return Ok(Some(switchboard));
-                    }
-                }
-            }
-        }
-        if let Ok(sol) = cfg.sol_mint.parse::<Pubkey>() {
-            if *mint == sol {
-                if let Ok(switchboard) =
-                    "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".parse::<Pubkey>()
-                {
-                    return Ok(Some(switchboard));
-                }
-            }
-        }
-    } else {
-        let default_usdc: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            .parse()
-            .unwrap();
-        let default_usdt: Pubkey = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-            .parse()
-            .unwrap();
-        let default_sol: Pubkey = "So11111111111111111111111111111111111111112"
-            .parse()
-            .unwrap();
+    let mappings = [
+        (config.and_then(|c| c.usdc_mint.parse::<Pubkey>().ok()).or_else(|| "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().ok()), "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD"),
+        (config.and_then(|c| c.usdt_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".parse().ok()), "ETAaeeuQBwsh9mM2gqtwWSbEkf2M8GJ2iVZ3gJgKqJz"),
+        (config.and_then(|c| c.sol_mint.parse::<Pubkey>().ok()).or_else(|| "So11111111111111111111111111111111111111112".parse().ok()), "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
+    ];
 
-        if *mint == default_usdc {
-            if let Ok(switchboard) =
-                "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD".parse::<Pubkey>()
-            {
-                return Ok(Some(switchboard));
-            }
-        }
-        if *mint == default_usdt {
-            if let Ok(switchboard) = "ETAaeeuQBwsh9mM2gqtwWSbEkf2M8GJ2iVZ3gJgKqJz".parse::<Pubkey>()
-            {
-                return Ok(Some(switchboard));
-            }
-        }
-        if *mint == default_sol {
-            if let Ok(switchboard) =
-                "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".parse::<Pubkey>()
-            {
-                return Ok(Some(switchboard));
+    for (check_mint, oracle) in mappings.iter() {
+        if let Some(check) = check_mint {
+            if *mint == *check {
+                if let Ok(switchboard) = oracle.parse::<Pubkey>() {
+                    return Ok(Some(switchboard));
+                }
             }
         }
     }

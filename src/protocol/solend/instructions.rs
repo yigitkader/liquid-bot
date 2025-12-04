@@ -55,7 +55,6 @@ impl ReserveCache {
         rpc: &Arc<RpcClient>,
         config: &Config,
     ) -> Result<Pubkey> {
-        // Fast path: check cache first
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -63,10 +62,8 @@ impl ReserveCache {
             }
         }
 
-        // Slow path: acquire fetch lock to prevent concurrent RPC calls
         let _lock = FETCH_LOCK.lock().await;
         
-        // Double-check after acquiring fetch lock (another thread may have populated cache)
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -74,31 +71,14 @@ impl ReserveCache {
             }
         }
 
-        // ✅ FIX: Don't check initialized before fetch - race condition risk
-        // Problem: Thread A fetches reserves, extends cache, sets initialized=true
-        //   Thread B acquires lock, sees initialized=true, returns error immediately
-        //   But Thread A might have just added Thread B's mint in the extend!
-        // Solution: Always fetch if mint not found (fetch lock prevents duplicate fetches)
-        //   Check again after extend to see if mint was added
-
-        // Fetch from RPC (only one thread will do this due to fetch lock)
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         
-        // ✅ FIX: Extend cache (don't override) to prevent losing other thread's entries
-        // Problem: Thread A fetches USDC+SOL, Thread B fetches USDT
-        //   If Thread B overrides instead of extends, Thread A's data is lost
-        // Solution: Always use extend to merge new data with existing cache
         {
             let mut inner = self.inner.write().await;
             inner.mint_to_reserve.extend(mint_to_reserve);
             inner.initialized = true;
         }
         
-        // ✅ FIX: Check cache again AFTER extend - another thread may have added our mint
-        // This is the correct place to check if mint exists, not before extend
-        // Problem: Early initialized check (removed above) could return error even if
-        //   another thread just added the mint in extend
-        // Solution: Always check after extend, only return error if still not found
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
@@ -106,8 +86,7 @@ impl ReserveCache {
             }
         }
         
-        // If still not found after extend, return error
-        Err(anyhow::anyhow!("Reserve not found for mint: {} (not found in fetched reserves)", mint))
+        Err(anyhow::anyhow!("Reserve not found for mint: {}", mint))
     }
 
     async fn get_reserve_data(
@@ -233,69 +212,21 @@ impl ReserveCache {
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         let mut inner = self.inner.write().await;
         
-        // ✅ CRITICAL FIX: Replace cache entirely to prevent memory leak
-        // Problem: Previous implementation used extend() which kept stale entries:
-        //   - Thread A calls get_reserve_for_mint, extends cache with stale data
-        //   - Thread B calls get_reserve_for_mint, extends cache with more stale data
-        //   - refresh_from_rpc extends again, keeping all stale entries
-        //   - Result: Cache grows unbounded, deleted reserves stay in cache forever
-        // Solution: Replace cache entirely with fresh RPC data
-        //   - This ensures only current reserves are cached
-        //   - Cleanup happens automatically by replacing, not extending
-        //   - Prevents memory leak from accumulating stale entries
         let rpc_reserve_set: HashSet<Pubkey> = mint_to_reserve.values().copied().collect();
-        
-        // Count entries that will be removed
         let old_mint_count = inner.mint_to_reserve.len();
         let old_data_count = inner.reserve_data.len();
         
-        // ✅ CRITICAL FIX: Replace reserve_data cache entirely (don't use retain)
-        // Problem: retain() only removes stale entries but doesn't prevent accumulation
-        //   - If new reserves are added, their data is added via get_reserve_data()
-        //   - But if old reserves are deleted, retain() removes them
-        //   - However, if get_reserve_data() is never called for a reserve, its data
-        //     might stay in cache even if the reserve is deleted (edge case)
-        // Solution: Build new reserve_data cache with only current reserves
-        //   - Keep only reserve_data entries for reserves that still exist on-chain
-        //   - This ensures reserve_data cache matches mint_to_reserve cache exactly
-        //   - Prevents memory leak from stale reserve_data entries
-        let mut new_reserve_data = HashMap::new();
-        for (reserve, data) in &inner.reserve_data {
-            if rpc_reserve_set.contains(reserve) {
-                // Reserve still exists on-chain - keep its data
-                new_reserve_data.insert(*reserve, data.clone());
-            }
-        }
-        
-        // Replace reserve_data cache entirely (same approach as mint_to_reserve)
-        let removed_data_count = old_data_count.saturating_sub(new_reserve_data.len());
-        inner.reserve_data = new_reserve_data;
-        
-        // ✅ CRITICAL: Replace mint_to_reserve cache entirely (don't extend)
-        // This ensures we only have current reserves from RPC, preventing memory leak
-        // Note: get_reserve_for_mint uses fetch lock, so concurrent fetches are safe
-        //   If another thread fetches between refreshes, it will extend, but the next
-        //   refresh will clean it up by replacing with fresh RPC data
+        inner.reserve_data.retain(|reserve, _| rpc_reserve_set.contains(reserve));
         inner.mint_to_reserve = mint_to_reserve;
         inner.initialized = true;
         
-        let new_mint_count = inner.mint_to_reserve.len();
-        let removed_mint_count = old_mint_count.saturating_sub(new_mint_count);
+        let removed_mint_count = old_mint_count.saturating_sub(inner.mint_to_reserve.len());
+        let removed_data_count = old_data_count.saturating_sub(inner.reserve_data.len());
         
         if removed_mint_count > 0 || removed_data_count > 0 {
-            log::info!(
-                "Reserve cache refresh: {} mint mappings (removed {} stale), {} reserve data entries (removed {} stale)",
-                new_mint_count,
-                removed_mint_count,
-                inner.reserve_data.len(),
-                removed_data_count
-            );
+            log::info!("Reserve cache refresh: {} mint mappings (removed {} stale), {} reserve data entries (removed {} stale)", inner.mint_to_reserve.len(), removed_mint_count, inner.reserve_data.len(), removed_data_count);
         } else {
-            log::debug!(
-                "Reserve cache refresh: {} mint mappings, {} reserve data entries (no cleanup needed)",
-                new_mint_count,
-                inner.reserve_data.len()
-            );
+            log::debug!("Reserve cache refresh: {} mint mappings, {} reserve data entries", inner.mint_to_reserve.len(), inner.reserve_data.len());
         }
 
         Ok(())
@@ -408,36 +339,20 @@ pub async fn get_reserve_address_from_mint(
     rpc: &Arc<RpcClient>,
     config: &Config,
 ) -> Result<Pubkey> {
-    let _mint_str = mint.to_string();
+    let config_reserves = [
+        (config.usdc_mint.parse::<Pubkey>().ok(), config.usdc_reserve_address.as_ref()),
+        (config.sol_mint.parse::<Pubkey>().ok(), config.sol_reserve_address.as_ref()),
+    ];
 
-    if let Some(usdc_mint) = Pubkey::from_str(&config.usdc_mint).ok() {
-        if *mint == usdc_mint {
-            if let Some(usdc_reserve_str) = &config.usdc_reserve_address {
-                return Pubkey::from_str(usdc_reserve_str)
-                    .context("Invalid USDC reserve address in config");
+    for (config_mint, reserve_str) in config_reserves.iter() {
+        if let (Some(cfg_mint), Some(reserve)) = (config_mint, reserve_str) {
+            if *mint == *cfg_mint {
+                return Pubkey::from_str(reserve).context("Invalid reserve address in config");
             }
         }
     }
 
-    if let Some(sol_mint) = Pubkey::from_str(&config.sol_mint).ok() {
-        if *mint == sol_mint {
-            if let Some(sol_reserve_str) = &config.sol_reserve_address {
-                return Pubkey::from_str(sol_reserve_str)
-                    .context("Invalid SOL reserve address in config");
-            }
-        }
-    }
-
-    let _market_address = config
-        .main_lending_market_address
-        .as_ref()
-        .and_then(|s| Pubkey::from_str(s).ok())
-        .ok_or_else(|| anyhow::anyhow!("Main lending market address not configured"))?;
-
-    RESERVE_CACHE
-        .as_ref()
-        .get_reserve_for_mint(mint, rpc, config)
-        .await
+    RESERVE_CACHE.as_ref().get_reserve_for_mint(mint, rpc, config).await
 }
 
 // This is called in hotpath (get_program_accounts filtering) - hash calculation was expensive

@@ -1071,57 +1071,11 @@ impl Executor {
         tx_builder: &TransactionBuilder,
         jito_client: &Arc<JitoClient>,
     ) -> Result<solana_sdk::signature::Signature> {
-        const MAX_TX_RETRIES: u32 = 3;
-
-        for attempt in 1..=MAX_TX_RETRIES {
-            match self.send_via_jito(tx_builder, jito_client).await {
-                Ok(sig) => {
-                    if sig == solana_sdk::signature::Signature::default() {
-                        log::error!(
-                            "Invalid signature returned (all zeros) on attempt {}",
-                            attempt
-                        );
-                        if attempt < MAX_TX_RETRIES {
-                            log::warn!("Retrying due to invalid signature...");
-                            sleep(Duration::from_millis(500 * attempt as u64)).await;
-                            continue;
-                        }
-                        return Err(anyhow::anyhow!(
-                            "Invalid signature returned (all zeros) after {} attempts",
-                            MAX_TX_RETRIES
-                        ));
-                    }
-                    if attempt > 1 {
-                        log::info!("✅ Transaction sent successfully on attempt {}", attempt);
-                    }
-                    return Ok(sig);
-                }
-                Err(e) => {
-                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
-
-                    if is_retryable && attempt < MAX_TX_RETRIES {
-                        log::warn!(
-                            "Jito TX failed (attempt {}/{}), retrying: {}",
-                            attempt,
-                            MAX_TX_RETRIES,
-                            e
-                        );
-                        sleep(Duration::from_millis(500 * attempt as u64)).await;
-                    } else {
-                        if attempt >= MAX_TX_RETRIES {
-                            log::error!("Jito TX failed after {} attempts: {}", MAX_TX_RETRIES, e);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        // Should never reach here, but return error just in case
-        Err(anyhow::anyhow!(
-            "Failed to send transaction after {} attempts",
-            MAX_TX_RETRIES
-        ))
+        Self::retry_with_backoff(
+            || async { self.send_via_jito(tx_builder, jito_client).await },
+            |sig| sig == solana_sdk::signature::Signature::default(),
+            "Jito TX",
+        ).await
     }
 
     async fn send_via_jito(
@@ -1182,47 +1136,62 @@ impl Executor {
         &self,
         tx_builder: &TransactionBuilder,
     ) -> Result<solana_sdk::signature::Signature> {
+        Self::retry_with_backoff(
+            || async {
+                let blockhash = self.rpc.get_recent_blockhash().await?;
+                let mut tx = tx_builder.build(blockhash);
+                sign_transaction(&mut tx, &self.wallet)
+                    .context("Failed to sign transaction - double signing detected")?;
+                send_and_confirm(tx, Arc::clone(&self.rpc)).await
+            },
+            |_| false,
+            "RPC TX",
+        ).await
+    }
+
+    async fn retry_with_backoff<F, Fut, P>(
+        op: F,
+        is_invalid: P,
+        op_name: &str,
+    ) -> Result<solana_sdk::signature::Signature>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<solana_sdk::signature::Signature>>,
+        P: Fn(solana_sdk::signature::Signature) -> bool,
+    {
         const MAX_TX_RETRIES: u32 = 3;
 
         for attempt in 1..=MAX_TX_RETRIES {
-            let blockhash = self.rpc.get_recent_blockhash().await?;
-            let mut tx = tx_builder.build(blockhash);
-            sign_transaction(&mut tx, &self.wallet)
-                .context("Failed to sign transaction - double signing detected")?;
-
-            match send_and_confirm(tx, Arc::clone(&self.rpc)).await {
+            match op().await {
                 Ok(sig) => {
+                    if is_invalid(sig) {
+                        log::error!("Invalid signature returned (all zeros) on attempt {}", attempt);
+                        if attempt < MAX_TX_RETRIES {
+                            log::warn!("Retrying due to invalid signature...");
+                            sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("Invalid signature returned (all zeros) after {} attempts", MAX_TX_RETRIES));
+                    }
                     if attempt > 1 {
-                        log::info!("✅ Transaction sent successfully on attempt {}", attempt);
+                        log::info!("✅ {} sent successfully on attempt {}", op_name, attempt);
                     }
                     return Ok(sig);
                 }
                 Err(e) => {
                     let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
-
                     if is_retryable && attempt < MAX_TX_RETRIES {
-                        log::warn!(
-                            "RPC TX failed (attempt {}/{}), retrying: {}",
-                            attempt,
-                            MAX_TX_RETRIES,
-                            e
-                        );
-                        // Exponential backoff: 500ms, 1000ms, 2000ms
+                        log::warn!("{} failed (attempt {}/{}), retrying: {}", op_name, attempt, MAX_TX_RETRIES, e);
                         sleep(Duration::from_millis(500 * attempt as u64)).await;
                     } else {
                         if attempt >= MAX_TX_RETRIES {
-                            log::error!("RPC TX failed after {} attempts: {}", MAX_TX_RETRIES, e);
+                            log::error!("{} failed after {} attempts: {}", op_name, MAX_TX_RETRIES, e);
                         }
                         return Err(e);
                     }
                 }
             }
         }
-
-        // Should never reach here, but return error just in case
-        Err(anyhow::anyhow!(
-            "Failed to send transaction after {} attempts",
-            MAX_TX_RETRIES
-        ))
+        Err(anyhow::anyhow!("Failed to send transaction after {} attempts", MAX_TX_RETRIES))
     }
 }
