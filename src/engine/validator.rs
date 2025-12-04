@@ -280,59 +280,48 @@ impl Validator {
         // Without this fix, free RPC sequential calls (10s + 10s = 20s) would timeout at 12s, causing validation failures
         let rpc_timeout = rpc.request_timeout();
         let total_oracle_timeout = if config.is_free_rpc_endpoint() {
-            // Sequential calls: debt oracle (10s) + collateral oracle (10s) + buffer
-            // ✅ FIX: Increased buffer from 2s to 5s to handle network delays and prevent timeouts
-            // Free RPC sequential checks are more vulnerable to small delays, so larger buffer is safer
-            rpc_timeout * 2 + Duration::from_secs(5) // 25s for 10s RPC timeout (was 22s)
+            rpc_timeout * 2 + Duration::from_secs(5)
         } else {
-            // Parallel calls: max(RPC timeout) + buffer
-            rpc_timeout + Duration::from_secs(2) // 12s for 10s RPC timeout
+            rpc_timeout + Duration::from_secs(2)
         };
 
         let (debt_result, collateral_result) = timeout(total_oracle_timeout, async {
             if config.is_free_rpc_endpoint() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                let debt_result = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
-                let collateral_result = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
-                (debt_result, collateral_result)
+                let debt = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
+                let collateral = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
+                (debt, collateral)
             } else {
-                let debt_oracle_task = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false);
-                let collateral_oracle_task = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false);
-                tokio::join!(debt_oracle_task, collateral_oracle_task)
+                tokio::join!(
+                    Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false),
+                    Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false)
+                )
             }
         }).await.map_err(|_| anyhow::anyhow!(
-            "Total oracle check timeout after {:?} (debt + collateral checks exceeded time limit, RPC timeout: {:?})",
-            total_oracle_timeout,
-            rpc_timeout
+            "Oracle check timeout after {:?} (RPC timeout: {:?})",
+            total_oracle_timeout, rpc_timeout
         ))?;
 
-        if let Err(e) = debt_result {
-            log::debug!("   ❌ Debt oracle FAILED: {}", e);
-            return Err(e);
-        }
+        debt_result.map_err(|e| {
+            log::debug!("❌ Debt oracle failed: {}", e);
+            e
+        })?;
+        collateral_result.map_err(|e| {
+            log::debug!("❌ Collateral oracle failed: {}", e);
+            e
+        })?;
 
-        if let Err(e) = collateral_result {
-            log::debug!("   ❌ Collateral oracle FAILED: {}", e);
-            return Err(e);
-        }
+        let _ = Self::verify_ata_exists_static(&opp.debt_mint, rpc, config).await;
+        let _ = Self::verify_ata_exists_static(&opp.collateral_mint, rpc, config).await;
 
-        if let Err(e) = Self::verify_ata_exists_static(&opp.debt_mint, rpc, config).await {
-            log::debug!("   ⚠️  Debt ATA verification warning: {} (continuing - ATA can be auto-created)", e);
-        }
-        if let Err(e) = Self::verify_ata_exists_static(&opp.collateral_mint, rpc, config).await {
-            log::debug!("   ⚠️  Collateral ATA verification warning: {} (continuing - ATA can be auto-created)", e);
-        }
-
-        let slippage = match Self::get_realtime_slippage_static(opp, rpc, config).await {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("   ❌ Slippage calculation FAILED: {}", e);
-                return Err(e);
-            }
-        };
+        let slippage = Self::get_realtime_slippage_static(opp, rpc, config).await
+            .map_err(|e| {
+                log::debug!("❌ Slippage calculation failed: {}", e);
+                e
+            })?;
+        
         if slippage > config.max_slippage_bps {
-            log::debug!("   ❌ Slippage too high: {} bps (max: {})", slippage, config.max_slippage_bps);
-            return Err(anyhow::anyhow!("Slippage too high: {} bps", slippage));
+            return Err(anyhow::anyhow!("Slippage too high: {} bps (max: {})", slippage, config.max_slippage_bps));
         }
 
         log::debug!("✅ Validation passed for position: {}", opp.position.address);
@@ -515,61 +504,33 @@ impl Validator {
         oracle_account: &Pubkey,
         max_age: u64,
     ) -> Result<()> {
-        const MAX_REASONABLE_PRICE: f64 = 1_000_000_000_000.0;
-        const MIN_REASONABLE_PRICE: f64 = 0.0001;
-        const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.25;
+        const MAX_PRICE: f64 = 1_000_000_000_000.0;
+        const MIN_PRICE: f64 = 0.0001;
+        const MAX_CONF_RATIO: f64 = 0.25;
 
-        let current_time = std::time::SystemTime::now()
+        let age = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
-            .as_secs() as i64;
+            .map_err(|e| anyhow::anyhow!("Time error: {}", e))?
+            .as_secs() as i64 - price_data.timestamp;
 
-        let age_seconds = current_time - price_data.timestamp;
-        if age_seconds > max_age as i64 {
-            return Err(anyhow::anyhow!(
-                "{} oracle price data is stale for mint {} (oracle {}): {} seconds old (max: {} seconds)",
-                oracle_type, mint, oracle_account, age_seconds, max_age
-            ));
+        if age > max_age as i64 {
+            return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, max_age));
         }
-
         if price_data.price <= 0.0 {
-            return Err(anyhow::anyhow!(
-                "{} oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
-                oracle_type, mint, oracle_account, price_data.price
-            ));
+            return Err(anyhow::anyhow!("{} oracle invalid price for {}: {:.4}", oracle_type, mint, price_data.price));
         }
-
-        if price_data.price > MAX_REASONABLE_PRICE {
-            return Err(anyhow::anyhow!(
-                "{} oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
-                oracle_type, mint, oracle_account, price_data.price, MAX_REASONABLE_PRICE
-            ));
+        if !(MIN_PRICE..=MAX_PRICE).contains(&price_data.price) {
+            return Err(anyhow::anyhow!("{} oracle price out of range for {}: {:.4}", oracle_type, mint, price_data.price));
         }
-
-        if price_data.price < MIN_REASONABLE_PRICE {
-            return Err(anyhow::anyhow!(
-                "{} oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
-                oracle_type, mint, oracle_account, price_data.price, MIN_REASONABLE_PRICE
-            ));
-        }
-
         if price_data.confidence < 0.0 {
-            return Err(anyhow::anyhow!(
-                "{} oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
-                oracle_type, mint, oracle_account, price_data.confidence
-            ));
+            return Err(anyhow::anyhow!("{} oracle negative confidence for {}: {:.4}", oracle_type, mint, price_data.confidence));
         }
-
         if price_data.price > 0.0 {
-            let confidence_ratio = price_data.confidence / price_data.price;
-            if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {
-                return Err(anyhow::anyhow!(
-                    "{} oracle confidence is too high relative to price for mint {} (oracle {}): confidence={:.4}, price={:.4}, ratio={:.2}% (max: {:.0}%)",
-                    oracle_type, mint, oracle_account, price_data.confidence, price_data.price, confidence_ratio * 100.0, MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
-                ));
+            let conf_ratio = price_data.confidence / price_data.price;
+            if conf_ratio > MAX_CONF_RATIO {
+                return Err(anyhow::anyhow!("{} oracle confidence too high for {}: {:.2}% (max: {:.0}%)", oracle_type, mint, conf_ratio * 100.0, MAX_CONF_RATIO * 100.0));
             }
         }
-
         Ok(())
     }
 

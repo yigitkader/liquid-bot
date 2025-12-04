@@ -264,49 +264,26 @@ impl Scanner {
                         failed_subscriptions.len()
                     );
                     
-                    // Try to restore failed subscriptions
-                    let mut restored_count = 0;
+                    let mut restored = 0;
                     for info in &failed_subscriptions {
-                        let restore_result = match &info.subscription_type {
-                            crate::blockchain::ws_client::SubscriptionType::Program(program_id) => {
-                                self.ws.subscribe_program(program_id).await
-                            }
-                            crate::blockchain::ws_client::SubscriptionType::Account(pubkey) => {
-                                self.ws.subscribe_account(pubkey).await
-                            }
-                            crate::blockchain::ws_client::SubscriptionType::Slot => {
-                                self.ws.subscribe_slot().await
-                            }
+                        let result = match &info.subscription_type {
+                            crate::blockchain::ws_client::SubscriptionType::Program(id) => self.ws.subscribe_program(id).await,
+                            crate::blockchain::ws_client::SubscriptionType::Account(pk) => self.ws.subscribe_account(pk).await,
+                            crate::blockchain::ws_client::SubscriptionType::Slot => self.ws.subscribe_slot().await,
                         };
-                        
-                        match restore_result {
-                            Ok(new_id) => {
-                                restored_count += 1;
-                                log::info!("✅ Restored failed subscription: new_id={}", new_id);
-                            }
-                            Err(e) => {
-                                log::warn!("⚠️  Failed to restore subscription: {}", e);
-                            }
+                        if result.is_ok() {
+                            restored += 1;
                         }
                     }
                     
-                    if restored_count == failed_subscriptions.len() {
-                        // All subscriptions restored - clear failed list
+                    if restored == failed_subscriptions.len() {
                         self.ws.clear_failed_subscriptions().await;
-                        log::info!("✅ All {} failed subscription(s) restored successfully", restored_count);
+                        log::info!("✅ All {} subscription(s) restored", restored);
                     } else {
-                        log::warn!(
-                            "⚠️  Only {}/{} subscription(s) restored. {} still failed.",
-                            restored_count,
-                            failed_subscriptions.len(),
-                            failed_subscriptions.len() - restored_count
-                        );
-                        // Publish event to notify other components
-                        if let Err(e) = self.event_bus.publish(Event::SubscriptionLost {
-                            count: failed_subscriptions.len() - restored_count,
-                        }) {
-                            log::error!("Scanner: Failed to publish SubscriptionLost event: {}", e);
-                        }
+                        log::warn!("⚠️  Only {}/{} subscription(s) restored", restored, failed_subscriptions.len());
+                        let _ = self.event_bus.publish(Event::SubscriptionLost {
+                            count: failed_subscriptions.len() - restored,
+                        });
                     }
                 }
             }
@@ -320,25 +297,16 @@ impl Scanner {
                         update.slot
                     );
 
-                    match self.protocol.parse_position(&update.account, Some(Arc::clone(&self.rpc))).await {
-                        Some(position) => {
-                            self.cache.update(update.pubkey, position.clone()).await;
-                            if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
-                                pubkey: update.pubkey,
-                                position,
-                            }) {
-                                log::error!("Scanner: Failed to publish AccountUpdated: {}", e);
-                                self.record_error()?;
-                                continue;
-                            }
-                            self.reset_errors();
+                    if let Some(position) = self.protocol.parse_position(&update.account, Some(Arc::clone(&self.rpc))).await {
+                        self.cache.update(update.pubkey, position.clone()).await;
+                        if self.event_bus.publish(Event::AccountUpdated {
+                            pubkey: update.pubkey,
+                            position,
+                        }).is_err() {
+                            self.record_error()?;
+                            continue;
                         }
-                        None => {
-                            log::debug!(
-                                "Scanner: WS account {} could not be parsed into a Position",
-                                update.pubkey
-                            );
-                        }
+                        self.reset_errors();
                     }
                 } else {
                     log::warn!("WebSocket connection lost (listen() returned None), attempting reconnect...");
@@ -347,27 +315,21 @@ impl Scanner {
 
                     match self.ws.reconnect_with_backoff().await {
                         Ok(()) => {
-                            log::info!("✅ WebSocket reconnected, resubscribing...");
                             match self.ws.subscribe_program(&program_id).await {
                                 Ok(id) => {
                                     subscription_id = Some(id);
-                                    log::info!("✅ WebSocket resubscribed successfully");
+                                    log::info!("✅ WebSocket reconnected and resubscribed");
                                     self.reset_errors();
                                 }
-                        Err(e) => {
-                            log::warn!("⚠️  WebSocket resubscription failed: {}. Falling back to RPC polling.", e);
-                            log::info!("📡 Scanner: Switching to RPC polling mode (WebSocket unavailable)");
-                            use_websocket = false;
-                            subscription_id = None;
-                        }
+                                Err(e) => {
+                                    log::warn!("⚠️  WebSocket resubscription failed: {}, falling back to RPC polling", e);
+                                    use_websocket = false;
+                                    subscription_id = None;
+                                }
                             }
                         }
                         Err(e) => {
-                            log::error!("❌ WebSocket reconnection failed: {}", e);
-                            log::warn!(
-                                "⚠️  Falling back to RPC polling mode to continue operation..."
-                            );
-                            log::info!("📡 Scanner: Switching to RPC polling mode (WebSocket reconnection failed after 10 attempts)");
+                            log::error!("❌ WebSocket reconnection failed: {}, falling back to RPC polling", e);
                             use_websocket = false;
                             subscription_id = None;
                         }
@@ -390,33 +352,14 @@ impl Scanner {
                         log::debug!("Scanner: RPC polling fetched {} accounts", accounts.len());
 
                         for (pubkey, account) in accounts {
-                            match self.protocol.parse_position(&account, Some(Arc::clone(&self.rpc))).await {
-                                Some(position) => {
-                                    let cached = self.cache.get(&pubkey).await;
-                                    let should_publish = if let Some(cached_pos) = &cached {
-                                        cached_pos.health_factor != position.health_factor
-                                    } else {
-                                        true
-                                    };
-
-                                    self.cache.update(pubkey, position.clone()).await;
-
-                                    if should_publish {
-                                        if let Err(e) = self
-                                            .event_bus
-                                            .publish(Event::AccountUpdated { pubkey, position })
-                                        {
-                                            log::error!(
-                                                "Scanner: Failed to publish AccountUpdated: {}",
-                                                e
-                                            );
-                                            self.record_error()?;
-                                            continue;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // Parse failure is not a critical error
+                            if let Some(position) = self.protocol.parse_position(&account, Some(Arc::clone(&self.rpc))).await {
+                                let should_publish = self.cache.get(&pubkey).await
+                                    .map(|cached| cached.health_factor != position.health_factor)
+                                    .unwrap_or(true);
+                                self.cache.update(pubkey, position.clone()).await;
+                                if should_publish && self.event_bus.publish(Event::AccountUpdated { pubkey, position }).is_err() {
+                                    self.record_error()?;
+                                    continue;
                                 }
                             }
                         }

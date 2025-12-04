@@ -145,23 +145,11 @@ struct TxLockGuard {
 
 impl Drop for TxLockGuard {
     fn drop(&mut self) {
-        // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
-        // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
-        //   Subsequent write().unwrap() calls will panic, crashing the entire executor
-        // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
-        //   - If lock is poisoned, skip cleanup (self-healing)
-        //   - Log warning but don't panic - allows executor to continue operating
-        //   - This is especially important in Drop, as panics in Drop are double-panic (fatal)
         if let Ok(mut locked) = self.locked.write() {
             locked.remove(&self.address);
-        } else {
-            log::warn!("TxLockGuard: locked RwLock is poisoned during drop, skipping cleanup (self-healing)");
         }
-        
         if let Ok(mut lock_times) = self.lock_times.write() {
             lock_times.remove(&self.address);
-        } else {
-            log::warn!("TxLockGuard: lock_times RwLock is poisoned during drop, skipping cleanup (self-healing)");
         }
     }
 }
@@ -407,18 +395,15 @@ impl Executor {
                             self.reset_errors();
                         }
                         Err(e) => {
-                            log::error!(
-                                "Executor: ❌ Failed to execute liquidation for position {} (debt={}, collateral={}, est_profit=${:.4}): {}",
-                                opportunity.position.address,
-                                opportunity.debt_mint,
-                                opportunity.collateral_mint,
-                                opportunity.estimated_profit,
-                                e
-                            );
-                            if let Err(panic_err) = self.record_error() {
-                                log::error!("🚨 Executor panic triggered: {}", panic_err);
-                                return Err(panic_err);
-                            }
+                    log::error!(
+                        "Executor: ❌ Failed to execute liquidation for position {} (debt={}, collateral={}, est_profit=${:.4}): {}",
+                        opportunity.position.address, opportunity.debt_mint, opportunity.collateral_mint,
+                        opportunity.estimated_profit, e
+                    );
+                    if let Err(panic_err) = self.record_error() {
+                        log::error!("🚨 Executor panic triggered: {}", panic_err);
+                        return Err(panic_err);
+                    }
                         }
                     }
                 }
@@ -442,19 +427,11 @@ impl Executor {
 
         let wallet_pubkey = self.wallet.pubkey();
         
-        // ✅ FIX: Check if debt_mint is WSOL - if so, we need to wrap native SOL to WSOL
         use crate::protocol::solend::instructions::{is_wsol_mint, build_wrap_sol_instruction};
         let source_liquidity_ata = get_associated_token_address(&wallet_pubkey, &opp.debt_mint, Some(&self.config))
             .context("Failed to derive source liquidity ATA")?;
-        
-        let destination_collateral =
-            get_associated_token_address(&wallet_pubkey, &opp.collateral_mint, Some(&self.config))
-                .context("Failed to derive destination collateral ATA")?;
-        
-        // ✅ FIX: Create ATAs in separate transactions to avoid compute unit limit
-        // Problem: ATA creation (~15k CU each) + liquidation instruction can exceed 200k CU limit
-        // Solution: Create ATAs first in separate transaction(s), then send liquidation transaction
-        // This ensures liquidation transaction stays within compute unit limits
+        let destination_collateral = get_associated_token_address(&wallet_pubkey, &opp.collateral_mint, Some(&self.config))
+            .context("Failed to derive destination collateral ATA")?;
         let mut cache = self.ata_cache.write().await;
         
         // Check and create source liquidity ATA (for WSOL) if needed
