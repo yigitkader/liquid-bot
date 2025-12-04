@@ -321,17 +321,10 @@ pub async fn read_switchboard_price(
     rpc_client: Arc<RpcClient>,
 ) -> Result<Option<OraclePrice>> {
     use crate::protocol::oracle::switchboard::SwitchboardOracle;
-
-    log::debug!(
-        "Reading Switchboard oracle price from account: {}",
-        oracle_account
-    );
-
     match SwitchboardOracle::read_price(oracle_account, rpc_client).await {
         Ok(price_data) => {
             log::info!("Switchboard oracle price read successfully: account={}, price=${:.4}, confidence=${:.4}, timestamp={}", 
                 oracle_account, price_data.price, price_data.confidence, price_data.timestamp);
-
             Ok(Some(OraclePrice {
                 price: price_data.price,
                 confidence: price_data.confidence,
@@ -340,11 +333,7 @@ pub async fn read_switchboard_price(
             }))
         }
         Err(e) => {
-            log::error!(
-                "Failed to read Switchboard oracle price from account {}: {}",
-                oracle_account,
-                e
-            );
+            log::error!("Failed to read Switchboard oracle price from account {}: {}", oracle_account, e);
             Ok(None)
         }
     }
@@ -358,25 +347,13 @@ pub async fn read_oracle_price(
 ) -> Result<Option<OraclePrice>> {
     if let Some(pyth_pubkey) = pyth_account {
         if let Some(price) = read_pyth_price(pyth_pubkey, Arc::clone(&rpc_client), config).await? {
-            log::debug!(
-                "Read price from Pyth oracle: ${:.4} (confidence: ${:.4})",
-                price.price,
-                price.confidence
-            );
             return Ok(Some(price));
         }
     }
-
     if let Some(switchboard_pubkey) = switchboard_account {
         if let Some(price) = read_switchboard_price(switchboard_pubkey, rpc_client).await? {
-            log::debug!(
-                "Read price from Switchboard oracle: ${:.4} (confidence: ${:.4})",
-                price.price,
-                price.confidence
-            );
             return Ok(Some(price));
         }
     }
-
     Ok(None)
 }

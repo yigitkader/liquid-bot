@@ -12,7 +12,6 @@
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -39,41 +38,15 @@ impl ProgramIds {
     /// Token-2022 Program ID (Token Extensions)
     pub const TOKEN_2022: &'static str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
     
-    /// Solend Program ID'yi Pubkey olarak döndürür
-    pub fn solend() -> Result<Pubkey> {
-        Pubkey::from_str(Self::SOLEND)
-            .context("Failed to parse Solend program ID")
-    }
+    pub fn solend() -> Result<Pubkey> { Self::parse(Self::SOLEND, "Solend program ID") }
+    pub fn pyth() -> Result<Pubkey> { Self::parse(Self::PYTH, "Pyth program ID") }
+    pub fn switchboard() -> Result<Pubkey> { Self::parse(Self::SWITCHBOARD, "Switchboard program ID") }
+    pub fn associated_token() -> Result<Pubkey> { Self::parse(Self::ASSOCIATED_TOKEN, "Associated Token program ID") }
+    pub fn token_2022() -> Result<Pubkey> { Self::parse(Self::TOKEN_2022, "Token-2022 program ID") }
+    pub fn token() -> Result<Pubkey> { Self::parse(Self::TOKEN, "Token program ID") }
     
-    /// Pyth Program ID'yi Pubkey olarak döndürür
-    pub fn pyth() -> Result<Pubkey> {
-        Pubkey::from_str(Self::PYTH)
-            .context("Failed to parse Pyth program ID")
-    }
-    
-    /// Switchboard Program ID'yi Pubkey olarak döndürür
-    pub fn switchboard() -> Result<Pubkey> {
-        Pubkey::from_str(Self::SWITCHBOARD)
-            .context("Failed to parse Switchboard program ID")
-    }
-    
-    /// Associated Token Program ID'yi Pubkey olarak döndürür
-    pub fn associated_token() -> Result<Pubkey> {
-        Pubkey::from_str(Self::ASSOCIATED_TOKEN)
-            .context("Failed to parse Associated Token program ID")
-    }
-    
-    /// Token-2022 Program ID'yi Pubkey olarak döndürür
-    pub fn token_2022() -> Result<Pubkey> {
-        Pubkey::from_str(Self::TOKEN_2022)
-            .context("Failed to parse Token-2022 program ID")
-    }
-    
-    /// Standard Token Program ID'yi Pubkey olarak döndürür
-    /// Not: spl_token::id() kullanılabilir ama registry üzerinden erişim tutarlılık sağlar
-    pub fn token() -> Result<Pubkey> {
-        Pubkey::from_str(Self::TOKEN)
-            .context("Failed to parse Token program ID")
+    fn parse(addr: &str, name: &str) -> Result<Pubkey> {
+        Pubkey::from_str(addr).with_context(|| format!("Failed to parse {}", name))
     }
 }
 
@@ -114,34 +87,14 @@ impl MintAddresses {
     /// USDP Mint (Pax Dollar)
     pub const USDP: &'static str = "EchesyfXePKdLbiHRbgTbYq4qP8zF8LzF6S9X5YJ7KzN";
     
-    /// USDC Mint'ini Pubkey olarak döndürür
-    pub fn usdc() -> Result<Pubkey> {
-        Pubkey::from_str(Self::USDC)
-            .context("Failed to parse USDC mint address")
-    }
+    pub fn usdc() -> Result<Pubkey> { Self::parse(Self::USDC, "USDC mint") }
+    pub fn sol() -> Result<Pubkey> { Self::parse(Self::SOL, "SOL mint") }
+    pub fn usdt() -> Result<Pubkey> { Self::parse(Self::USDT, "USDT mint") }
+    pub fn eth() -> Result<Pubkey> { Self::parse(Self::ETH, "ETH mint") }
+    pub fn btc() -> Result<Pubkey> { Self::parse(Self::BTC, "BTC mint") }
     
-    /// SOL Mint'ini Pubkey olarak döndürür
-    pub fn sol() -> Result<Pubkey> {
-        Pubkey::from_str(Self::SOL)
-            .context("Failed to parse SOL mint address")
-    }
-    
-    /// USDT Mint'ini Pubkey olarak döndürür
-    pub fn usdt() -> Result<Pubkey> {
-        Pubkey::from_str(Self::USDT)
-            .context("Failed to parse USDT mint address")
-    }
-    
-    /// ETH Mint'ini Pubkey olarak döndürür
-    pub fn eth() -> Result<Pubkey> {
-        Pubkey::from_str(Self::ETH)
-            .context("Failed to parse ETH mint address")
-    }
-    
-    /// BTC Mint'ini Pubkey olarak döndürür
-    pub fn btc() -> Result<Pubkey> {
-        Pubkey::from_str(Self::BTC)
-            .context("Failed to parse BTC mint address")
+    fn parse(addr: &str, name: &str) -> Result<Pubkey> {
+        Pubkey::from_str(addr).with_context(|| format!("Failed to parse {}", name))
     }
     
     /// Tüm stablecoin mint adreslerini döndürür
@@ -181,16 +134,11 @@ impl ReserveAddresses {
     /// SOL Reserve Address (Mainnet)
     pub const SOL: &'static str = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36";
     
-    /// USDC Reserve adresini Pubkey olarak döndürür
-    pub fn usdc() -> Result<Pubkey> {
-        Pubkey::from_str(Self::USDC)
-            .context("Failed to parse USDC reserve address")
-    }
+    pub fn usdc() -> Result<Pubkey> { Self::parse(Self::USDC, "USDC reserve") }
+    pub fn sol() -> Result<Pubkey> { Self::parse(Self::SOL, "SOL reserve") }
     
-    /// SOL Reserve adresini Pubkey olarak döndürür
-    pub fn sol() -> Result<Pubkey> {
-        Pubkey::from_str(Self::SOL)
-            .context("Failed to parse SOL reserve address")
+    fn parse(addr: &str, name: &str) -> Result<Pubkey> {
+        Pubkey::from_str(addr).with_context(|| format!("Failed to parse {}", name))
     }
 }
 
@@ -201,10 +149,8 @@ impl LendingMarketAddresses {
     /// Main Lending Market Address (Mainnet)
     pub const MAIN: &'static str = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY";
     
-    /// Main Lending Market adresini Pubkey olarak döndürür
     pub fn main() -> Result<Pubkey> {
-        Pubkey::from_str(Self::MAIN)
-            .context("Failed to parse main lending market address")
+        Pubkey::from_str(Self::MAIN).context("Failed to parse main lending market address")
     }
 }
 
@@ -225,37 +171,11 @@ impl IdlFiles {
         PathBuf::from("idl/solend.json")
     }
     
-    /// Solend IDL dosyasının var olup olmadığını kontrol eder
-    pub fn solend_exists() -> bool {
-        Self::solend().exists()
-    }
-    
-    /// Pyth IDL dosyasının path'ini döndürür
-    /// 
-    /// Not: Şu anda kullanılmıyor - pyth-sdk-solana SDK kullanılıyor.
-    /// Gelecekte Anchor IDL parsing için eklenebilir.
-    pub fn pyth() -> PathBuf {
-        PathBuf::from("idl/pyth.json")
-    }
-    
-    /// Pyth IDL dosyasının var olup olmadığını kontrol eder
-    pub fn pyth_exists() -> bool {
-        Self::pyth().exists()
-    }
-    
-    /// Switchboard IDL dosyasının path'ini döndürür
-    /// 
-    /// Not: Şu anda kullanılmıyor - switchboard-on-demand SDK kullanılıyor.
-    /// Kodda "Full SDK integration would require Anchor IDL parsing" notu var.
-    /// Gelecekte tam entegrasyon için eklenebilir.
-    pub fn switchboard() -> PathBuf {
-        PathBuf::from("idl/switchboard.json")
-    }
-    
-    /// Switchboard IDL dosyasının var olup olmadığını kontrol eder
-    pub fn switchboard_exists() -> bool {
-        Self::switchboard().exists()
-    }
+    pub fn solend_exists() -> bool { Self::solend().exists() }
+    pub fn pyth() -> PathBuf { PathBuf::from("idl/pyth.json") }
+    pub fn pyth_exists() -> bool { Self::pyth().exists() }
+    pub fn switchboard() -> PathBuf { PathBuf::from("idl/switchboard.json") }
+    pub fn switchboard_exists() -> bool { Self::switchboard().exists() }
     
     /// Tüm IDL dosyalarının var olup olmadığını kontrol eder
     /// 
@@ -303,103 +223,28 @@ impl IdlSources {
     /// Switchboard V2 IDL'i
     pub const SWITCHBOARD_GITHUB: &'static str = "https://raw.githubusercontent.com/switchboard-xyz/switchboard-v2/main/programs/aggregator/program-idl.json";
     
-    /// Solend IDL'i GitHub'dan çeker ve kaydeder
-    /// 
-    /// Returns: Ok(()) başarılı, Err(e) hata durumunda
     pub async fn fetch_solend() -> Result<()> {
-        log::info!("Fetching Solend IDL from GitHub...");
-        
-        let response = reqwest::get(Self::SOLEND_GITHUB)
-            .await
-            .context("Failed to fetch Solend IDL from GitHub")?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch Solend IDL: HTTP {}",
-                response.status()
-            ));
-        }
-        
-        let idl_content = response.text().await
-            .context("Failed to read Solend IDL content")?;
-        
-        // IDL dizinini oluştur
-        fs::create_dir_all("idl")
-            .context("Failed to create idl directory")?;
-        
-        // IDL'i kaydet
-        let path = IdlFiles::solend();
-        let mut file = fs::File::create(&path)
-            .with_context(|| format!("Failed to create file: {:?}", path))?;
-        
-        file.write_all(idl_content.as_bytes())
-            .with_context(|| format!("Failed to write IDL to {:?}", path))?;
-        
-        log::info!("✅ Solend IDL saved to {:?}", path);
-        Ok(())
+        Self::fetch_idl(Self::SOLEND_GITHUB, IdlFiles::solend(), "Solend").await
     }
     
-    /// Pyth IDL'i GitHub'dan çeker ve kaydeder
     pub async fn fetch_pyth() -> Result<()> {
-        log::info!("Fetching Pyth IDL from GitHub...");
-        
-        let response = reqwest::get(Self::PYTH_GITHUB)
-            .await
-            .context("Failed to fetch Pyth IDL from GitHub")?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch Pyth IDL: HTTP {}",
-                response.status()
-            ));
-        }
-        
-        let idl_content = response.text().await
-            .context("Failed to read Pyth IDL content")?;
-        
-        fs::create_dir_all("idl")
-            .context("Failed to create idl directory")?;
-        
-        let path = IdlFiles::pyth();
-        let mut file = fs::File::create(&path)
-            .with_context(|| format!("Failed to create file: {:?}", path))?;
-        
-        file.write_all(idl_content.as_bytes())
-            .with_context(|| format!("Failed to write IDL to {:?}", path))?;
-        
-        log::info!("✅ Pyth IDL saved to {:?}", path);
-        Ok(())
+        Self::fetch_idl(Self::PYTH_GITHUB, IdlFiles::pyth(), "Pyth").await
     }
     
-    /// Switchboard IDL'i GitHub'dan çeker ve kaydeder
     pub async fn fetch_switchboard() -> Result<()> {
-        log::info!("Fetching Switchboard IDL from GitHub...");
-        
-        let response = reqwest::get(Self::SWITCHBOARD_GITHUB)
-            .await
-            .context("Failed to fetch Switchboard IDL from GitHub")?;
-        
+        Self::fetch_idl(Self::SWITCHBOARD_GITHUB, IdlFiles::switchboard(), "Switchboard").await
+    }
+    
+    async fn fetch_idl(url: &str, path: PathBuf, name: &str) -> Result<()> {
+        log::info!("Fetching {} IDL from GitHub...", name);
+        let response = reqwest::get(url).await.with_context(|| format!("Failed to fetch {} IDL", name))?;
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch Switchboard IDL: HTTP {}",
-                response.status()
-            ));
+            return Err(anyhow::anyhow!("Failed to fetch {} IDL: HTTP {}", name, response.status()));
         }
-        
-        let idl_content = response.text().await
-            .context("Failed to read Switchboard IDL content")?;
-        
-        fs::create_dir_all("idl")
-            .context("Failed to create idl directory")?;
-        
-        let path = IdlFiles::switchboard();
-        let mut file = fs::File::create(&path)
-            .with_context(|| format!("Failed to create file: {:?}", path))?;
-        
-        file.write_all(idl_content.as_bytes())
-            .with_context(|| format!("Failed to write IDL to {:?}", path))?;
-        
-        log::info!("✅ Switchboard IDL saved to {:?}", path);
+        let content = response.text().await.with_context(|| format!("Failed to read {} IDL content", name))?;
+        fs::create_dir_all("idl").context("Failed to create idl directory")?;
+        fs::write(&path, content.as_bytes()).with_context(|| format!("Failed to write {} IDL to {:?}", name, path))?;
+        log::info!("✅ {} IDL saved to {:?}", name, path);
         Ok(())
     }
     

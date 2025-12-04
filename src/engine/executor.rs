@@ -631,23 +631,7 @@ impl Executor {
         // Unwrap will be handled separately after checking ATA balance post-liquidation
         // This prevents unwrap failures from affecting liquidation success
 
-        let signature = if self.config.dry_run {
-            log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
-            return Err(anyhow::anyhow!(
-                "DRY_RUN mode: Transaction not sent to blockchain"
-            ));
-        } else if self.use_jito {
-            if let Some(ref jito) = self.jito_client {
-                self.send_via_jito_with_retry(&tx_builder, jito).await?
-            } else {
-                log::warn!(
-                    "⚠️  USE_JITO=true but Jito client is None - falling back to standard RPC"
-                );
-                self.send_with_retry(&tx_builder).await?
-            }
-        } else {
-            self.send_with_retry(&tx_builder).await?
-        };
+        let signature = self.send_transaction(&tx_builder).await?;
 
         self.balance_manager
             .release(&opp.debt_mint, opp.max_liquidatable)
@@ -701,32 +685,12 @@ impl Executor {
                         unwrap_tx_builder.add_compute_budget(200_000, 1_000);
                         unwrap_tx_builder.add_instruction(unwrap_ix);
                         
-                        // Send unwrap transaction
-                        if self.config.dry_run {
-                            log::info!("DRY RUN: Would send unwrap transaction (not sending to blockchain)");
-                        } else {
-                            match if self.use_jito {
-                                if let Some(ref jito) = self.jito_client {
-                                    self.send_via_jito_with_retry(&unwrap_tx_builder, jito).await
-                                } else {
-                                    self.send_with_retry(&unwrap_tx_builder).await
-                                }
-                            } else {
-                                self.send_with_retry(&unwrap_tx_builder).await
-                            } {
-                                Ok(unwrap_sig) => {
-                                    log::info!(
-                                        "Executor: Successfully unwrapped WSOL to native SOL (signature: {})",
-                                        unwrap_sig
-                                    );
-                                }
-                                Err(e) => {
-                                    // Log warning but don't fail - unwrap is optional
-                                    log::warn!(
-                                        "Executor: Failed to send WSOL unwrap transaction (optional): {}",
-                                        e
-                                    );
-                                }
+                        match self.send_transaction(&unwrap_tx_builder).await {
+                            Ok(unwrap_sig) => {
+                                log::info!("Executor: Successfully unwrapped WSOL to native SOL (signature: {})", unwrap_sig);
+                            }
+                            Err(e) => {
+                                log::warn!("Executor: Failed to send WSOL unwrap transaction (optional): {}", e);
                             }
                         }
                     }
@@ -742,6 +706,23 @@ impl Executor {
         }
 
         Ok(signature)
+    }
+
+    async fn send_transaction(&self, tx_builder: &TransactionBuilder) -> Result<solana_sdk::signature::Signature> {
+        if self.config.dry_run {
+            log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
+            return Err(anyhow::anyhow!("DRY_RUN mode: Transaction not sent to blockchain"));
+        }
+        if self.use_jito {
+            if let Some(ref jito) = self.jito_client {
+                self.send_via_jito_with_retry(tx_builder, jito).await
+            } else {
+                log::warn!("⚠️  USE_JITO=true but Jito client is None - falling back to standard RPC");
+                self.send_with_retry(tx_builder).await
+            }
+        } else {
+            self.send_with_retry(tx_builder).await
+        }
     }
 
     /// Create ATA in a separate transaction to avoid compute unit limit issues
@@ -764,18 +745,11 @@ impl Executor {
         ata_tx_builder.add_compute_budget(200_000, 1_000);
         ata_tx_builder.add_instruction(create_ata_ix);
         
-        // Send ATA creation transaction
         let ata_sig = if self.config.dry_run {
             log::info!("DRY RUN: Would send ATA creation transaction");
-            return Ok(()); // Skip in dry run mode
-        } else if self.use_jito {
-            if let Some(ref jito) = self.jito_client {
-                self.send_via_jito_with_retry(&ata_tx_builder, jito).await?
-            } else {
-                self.send_with_retry(&ata_tx_builder).await?
-            }
+            return Ok(());
         } else {
-            self.send_with_retry(&ata_tx_builder).await?
+            self.send_transaction(&ata_tx_builder).await.context("Failed to send ATA creation transaction")?
         };
         
         log::info!(

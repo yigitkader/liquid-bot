@@ -13,6 +13,17 @@ pub struct PriceData {
 }
 
 impl SwitchboardOracle {
+    fn validate_switchboard_owner(owner: &Pubkey) -> Result<()> {
+        use std::str::FromStr;
+        let v2 = Pubkey::from_str("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f")
+            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V2 program ID"))?;
+        let v3 = Pubkey::from_str("SBondMDrcV3K4car5PJkHEWZ9dcZLwJKAychnZgyZQ")
+            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V3 program ID"))?;
+        if *owner != v2 && *owner != v3 {
+            return Err(anyhow::anyhow!("Account owner {} is not a Switchboard program (expected {} or {})", owner, v2, v3));
+        }
+        Ok(())
+    }
     pub async fn read_price(account: &Pubkey, rpc: Arc<RpcClient>) -> Result<PriceData> {
         log::debug!("Reading Switchboard oracle price from account: {}", account);
 
@@ -76,25 +87,8 @@ impl SwitchboardOracle {
         )
     }
 
-    /// Parse Switchboard account using official SDK
-    /// This is the preferred method as it uses proper account structure parsing
     fn parse_with_sdk(data: &[u8], owner: &Pubkey) -> Result<PriceData> {
-        use std::str::FromStr;
-        
-        // Check if owner matches Switchboard program IDs
-        let switchboard_v2_program_id = Pubkey::from_str("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f")
-            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V2 program ID"))?;
-        let switchboard_v3_program_id = Pubkey::from_str("SBondMDrcV3K4car5PJkHEWZ9dcZLwJKAychnZgyZQ")
-            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V3 program ID"))?;
-
-        if *owner != switchboard_v2_program_id && *owner != switchboard_v3_program_id {
-            return Err(anyhow::anyhow!(
-                "Account owner {} is not a Switchboard program (expected {} or {})",
-                owner,
-                switchboard_v2_program_id,
-                switchboard_v3_program_id
-            ));
-        }
+        Self::validate_switchboard_owner(owner)?;
 
         // Try to parse as Switchboard V2 AggregatorAccount using SDK
         // The SDK provides proper deserialization based on account structure
@@ -213,24 +207,8 @@ impl SwitchboardOracle {
             owner
         );
 
-        // ✅ CRITICAL FIX: Validate owner before parsing (improved safety)
-        // Problem: Previous code didn't validate owner, allowing any account to be parsed
-        //   This could lead to parsing wrong account types as Switchboard feeds
-        // Solution: Validate owner matches Switchboard program IDs before parsing
-        use std::str::FromStr;
-        let switchboard_v2_program_id = Pubkey::from_str("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f")
-            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V2 program ID"))?;
-        let switchboard_v3_program_id = Pubkey::from_str("SBondMDrcV3K4car5PJkHEWZ9dcZLwJKAychnZgyZQ")
-            .map_err(|_| anyhow::anyhow!("Invalid Switchboard V3 program ID"))?;
-
-        if *owner != switchboard_v2_program_id && *owner != switchboard_v3_program_id {
-            return Err(anyhow::anyhow!(
-                "Account owner {} is not a Switchboard program (expected {} or {}). Refusing to parse with heuristic method.",
-                owner,
-                switchboard_v2_program_id,
-                switchboard_v3_program_id
-            ));
-        }
+        Self::validate_switchboard_owner(owner)
+            .map_err(|e| anyhow::anyhow!("Refusing to parse with heuristic method: {}", e))?;
 
         const POSSIBLE_OFFSETS: &[usize] = &[361, 200, 216, 232];
         const SCALE: u32 = 9; // Switchboard standard scale (10^9)
