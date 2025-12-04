@@ -355,6 +355,58 @@ impl RpcClient {
         .context("Failed to spawn blocking task")?
     }
 
+    /// Check transaction signature status
+    /// Returns Ok(Some(true)) if transaction is confirmed successfully
+    /// Returns Ok(Some(false)) if transaction failed
+    /// Returns Ok(None) if transaction not found (not yet confirmed or not in history)
+    /// Returns Err if RPC error occurred
+    pub async fn get_signature_status(&self, signature: &Signature) -> Result<Option<bool>> {
+        self.rate_limit().await;
+        let _permit = self
+            .rate_limiter
+            .acquire()
+            .await
+            .context("Failed to acquire rate limiter permit")?;
+
+        let client = Arc::clone(&self.client);
+        let sig = *signature;
+        let timeout_duration = self.request_timeout;
+
+        timeout(
+            timeout_duration,
+            tokio::task::spawn_blocking(move || {
+                // Use get_signature_status (without config) - searches transaction history by default
+                // Returns Result<Option<TransactionStatus>, Error>
+                // TransactionStatus has an err field which is Option<TransactionError>
+                match client.get_signature_status(&sig) {
+                    Ok(Some(transaction_status)) => {
+                        // transaction_status.err is Result<(), TransactionError>
+                        if transaction_status.err.is_err() {
+                            // Transaction failed
+                            Ok(Some(false))
+                        } else {
+                            // Transaction confirmed (no error)
+                            Ok(Some(true))
+                        }
+                    }
+                    Ok(None) => {
+                        // Transaction not found (not yet confirmed or not in history)
+                        Ok(None)
+                    }
+                    Err(e) => Err(anyhow::anyhow!("RPC error checking signature status: {}", e)),
+                }
+            }),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "RPC request timeout after {:?} for get_signature_status",
+                timeout_duration
+            )
+        })?
+        .context("Failed to spawn blocking task")?
+    }
+
     pub async fn get_recent_blockhash(&self) -> Result<Hash> {
         self.rate_limit().await;
         let _permit = self

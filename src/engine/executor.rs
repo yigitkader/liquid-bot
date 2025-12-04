@@ -587,9 +587,16 @@ impl Executor {
                     native_sol_balance
                 );
                 
-                // Add WSOL wrap instructions (transfer + sync_native)
-                let wrap_instructions = build_wrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata, wrap_amount)
-                    .context("Failed to build WSOL wrap instructions")?;
+                // Add WSOL wrap instructions (create_ata if needed + transfer + sync_native)
+                let wrap_instructions = build_wrap_sol_instruction(
+                    &wallet_pubkey,
+                    &source_liquidity_ata,
+                    wrap_amount,
+                    Some(&self.rpc),
+                    Some(&self.config),
+                )
+                .await
+                .context("Failed to build WSOL wrap instructions")?;
                 for wrap_ix in wrap_instructions {
                     tx_builder.add_instruction(wrap_ix);
                 }
@@ -811,25 +818,167 @@ impl Executor {
                         );
                         tokio::time::sleep(Duration::from_millis(VERIFICATION_DELAY_MS)).await;
                     } else {
+                        // ✅ CRITICAL FIX: Check transaction signature status before fallback
+                        // Problem: Verification timeout doesn't mean transaction failed
+                        //   - Transaction may be confirmed but ATA not yet visible (network delay)
+                        //   - If we fallback and add create_ata to liquidation tx, we get duplicate error
+                        // Solution: Check transaction signature status:
+                        //   1. If confirmed (no error) → wait longer (transaction succeeded, ATA will appear)
+                        //   2. If failed (error) → return error (don't fallback, transaction failed)
+                        //   3. If not found → wait longer (transaction may still be processing)
                         log::warn!(
                             "Executor: ATA {} verification failed after {} attempts: {}",
                             ata,
                             MAX_VERIFICATION_ATTEMPTS,
                             e
                         );
-                        log::warn!(
-                            "   Transaction was sent: {}, ATA may still be creating. Will add to liquidation transaction as fallback.",
+                        log::info!(
+                            "Executor: Checking transaction signature status for {}...",
                             ata_sig
                         );
-                        // Cache as unverified - will add to liquidation tx as fallback
-                        Self::evict_lru_if_needed(cache);
-                        let now = Instant::now();
-                        cache.insert(*ata, AtaCacheEntry {
-                            created_at: now,
-                            last_accessed: now,
-                            verified: false,
-                        });
-                        return Ok(()); // Don't fail - fallback will handle it
+                        
+                        match self.rpc.get_signature_status(&ata_sig).await {
+                            Ok(Some(true)) => {
+                                // Transaction confirmed successfully - wait longer for ATA to appear
+                                log::info!(
+                                    "Executor: ATA creation transaction {} confirmed successfully, waiting longer for ATA to appear...",
+                                    ata_sig
+                                );
+                                const EXTENDED_WAIT_ATTEMPTS: u32 = 10;
+                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000; // 1 second
+                                
+                                for extended_attempt in 1..=EXTENDED_WAIT_ATTEMPTS {
+                                    match self.rpc.get_account(ata).await {
+                                        Ok(_) => {
+                                            log::info!(
+                                                "Executor: ATA {} verified after extended wait (attempt {})",
+                                                ata,
+                                                extended_attempt
+                                            );
+                                            Self::evict_lru_if_needed(cache);
+                                            let now = Instant::now();
+                                            cache.insert(*ata, AtaCacheEntry {
+                                                created_at: now,
+                                                last_accessed: now,
+                                                verified: true,
+                                            });
+                                            return Ok(());
+                                        }
+                                        Err(e) => {
+                                            if extended_attempt < EXTENDED_WAIT_ATTEMPTS {
+                                                log::debug!(
+                                                    "Executor: ATA {} extended wait attempt {} failed, retrying...: {}",
+                                                    ata,
+                                                    extended_attempt,
+                                                    e
+                                                );
+                                                tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
+                                            } else {
+                                                log::warn!(
+                                                    "Executor: ATA {} still not found after extended wait ({} attempts), but transaction confirmed. ATA may have been created but not yet visible.",
+                                                    ata,
+                                                    EXTENDED_WAIT_ATTEMPTS
+                                                );
+                                                // Transaction confirmed but ATA not visible - mark as verified anyway
+                                                // This prevents duplicate create_ata in liquidation tx
+                                                Self::evict_lru_if_needed(cache);
+                                                let now = Instant::now();
+                                                cache.insert(*ata, AtaCacheEntry {
+                                                    created_at: now,
+                                                    last_accessed: now,
+                                                    verified: true, // Mark as verified since transaction succeeded
+                                                });
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Some(false)) => {
+                                // Transaction failed - return error (don't fallback)
+                                log::error!(
+                                    "Executor: ATA creation transaction {} FAILED. Will NOT add to liquidation transaction as fallback.",
+                                    ata_sig
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "ATA creation transaction {} failed. ATA {} was not created.",
+                                    ata_sig,
+                                    ata
+                                ));
+                            }
+                            Ok(None) => {
+                                // Transaction not found (may still be processing) - wait longer
+                                log::warn!(
+                                    "Executor: ATA creation transaction {} not found in history (may still be processing). Waiting longer...",
+                                    ata_sig
+                                );
+                                const EXTENDED_WAIT_ATTEMPTS: u32 = 10;
+                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000; // 1 second
+                                
+                                for extended_attempt in 1..=EXTENDED_WAIT_ATTEMPTS {
+                                    match self.rpc.get_account(ata).await {
+                                        Ok(_) => {
+                                            log::info!(
+                                                "Executor: ATA {} verified after extended wait (attempt {})",
+                                                ata,
+                                                extended_attempt
+                                            );
+                                            Self::evict_lru_if_needed(cache);
+                                            let now = Instant::now();
+                                            cache.insert(*ata, AtaCacheEntry {
+                                                created_at: now,
+                                                last_accessed: now,
+                                                verified: true,
+                                            });
+                                            return Ok(());
+                                        }
+                                        Err(e) => {
+                                            if extended_attempt < EXTENDED_WAIT_ATTEMPTS {
+                                                log::debug!(
+                                                    "Executor: ATA {} extended wait attempt {} failed, retrying...: {}",
+                                                    ata,
+                                                    extended_attempt,
+                                                    e
+                                                );
+                                                tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
+                                            } else {
+                                                log::warn!(
+                                                    "Executor: ATA {} still not found after extended wait ({} attempts). Transaction {} may still be processing. Will add to liquidation transaction as fallback.",
+                                                    ata,
+                                                    EXTENDED_WAIT_ATTEMPTS,
+                                                    ata_sig
+                                                );
+                                                // Transaction may still be processing - fallback to liquidation tx
+                                                Self::evict_lru_if_needed(cache);
+                                                let now = Instant::now();
+                                                cache.insert(*ata, AtaCacheEntry {
+                                                    created_at: now,
+                                                    last_accessed: now,
+                                                    verified: false,
+                                                });
+                                                return Ok(()); // Fallback will handle it
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(status_err) => {
+                                // Error checking signature status - log warning but proceed with fallback
+                                log::warn!(
+                                    "Executor: Failed to check transaction signature status for {}: {}. Will add to liquidation transaction as fallback.",
+                                    ata_sig,
+                                    status_err
+                                );
+                                Self::evict_lru_if_needed(cache);
+                                let now = Instant::now();
+                                cache.insert(*ata, AtaCacheEntry {
+                                    created_at: now,
+                                    last_accessed: now,
+                                    verified: false,
+                                });
+                                return Ok(()); // Fallback will handle it
+                            }
+                        }
                     }
                 }
             }

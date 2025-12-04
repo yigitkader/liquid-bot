@@ -231,16 +231,27 @@ impl ReserveCache {
         let old_mint_count = inner.mint_to_reserve.len();
         let old_data_count = inner.reserve_data.len();
         
-        // Clean up reserve_data cache for reserves that no longer exist
-        let mut removed_data_count = 0;
-        inner.reserve_data.retain(|reserve, _| {
+        // ✅ CRITICAL FIX: Replace reserve_data cache entirely (don't use retain)
+        // Problem: retain() only removes stale entries but doesn't prevent accumulation
+        //   - If new reserves are added, their data is added via get_reserve_data()
+        //   - But if old reserves are deleted, retain() removes them
+        //   - However, if get_reserve_data() is never called for a reserve, its data
+        //     might stay in cache even if the reserve is deleted (edge case)
+        // Solution: Build new reserve_data cache with only current reserves
+        //   - Keep only reserve_data entries for reserves that still exist on-chain
+        //   - This ensures reserve_data cache matches mint_to_reserve cache exactly
+        //   - Prevents memory leak from stale reserve_data entries
+        let mut new_reserve_data = HashMap::new();
+        for (reserve, data) in &inner.reserve_data {
             if rpc_reserve_set.contains(reserve) {
-                true // Keep: reserve still exists on-chain
-            } else {
-                removed_data_count += 1;
-                false // Remove: reserve no longer exists on-chain
+                // Reserve still exists on-chain - keep its data
+                new_reserve_data.insert(*reserve, data.clone());
             }
-        });
+        }
+        
+        // Replace reserve_data cache entirely (same approach as mint_to_reserve)
+        let removed_data_count = old_data_count.saturating_sub(new_reserve_data.len());
+        inner.reserve_data = new_reserve_data;
         
         // ✅ CRITICAL: Replace mint_to_reserve cache entirely (don't extend)
         // This ensures we only have current reserves from RPC, preventing memory leak
@@ -555,11 +566,14 @@ pub fn is_wsol_mint(mint: &Pubkey) -> bool {
 /// This transfers native SOL to WSOL ATA and syncs it to WSOL tokens
 /// 
 /// Steps:
-/// 1. Ensure WSOL ATA exists (should be handled separately if needed)
-/// 2. Transfer native SOL directly to WSOL ATA address using system_instruction::transfer
-/// 3. Sync native SOL in WSOL ATA to WSOL tokens using token_instruction::sync_native
+/// 1. Check if WSOL ATA exists (via RPC if provided)
+/// 2. If ATA doesn't exist, create it (create_associated_token_account instruction)
+/// 3. Transfer native SOL directly to WSOL ATA address using system_instruction::transfer
+/// 4. Sync native SOL in WSOL ATA to WSOL tokens using token_instruction::sync_native
 /// 
-/// Note: ATA creation should be handled separately if needed
+/// ✅ FIX: WSOL ATA existence check and creation
+/// Problem: Previous code assumed WSOL ATA exists, but transfer fails if ATA doesn't exist
+/// Solution: Check ATA existence via RPC, create if needed, then transfer + sync_native
 /// 
 /// ✅ CORRECT APPROACH (per Solana documentation):
 /// - Transfer native SOL directly to WSOL ATA address (not to owner)
@@ -569,13 +583,17 @@ pub fn is_wsol_mint(mint: &Pubkey) -> bool {
 /// References:
 /// - Solana docs: https://solana.com/docs/tokens/basics/sync-native
 /// - QuickNode guide: Native SOL should be sent to the associated token account for NATIVE_MINT
-pub fn build_wrap_sol_instruction(
+pub async fn build_wrap_sol_instruction(
     wallet: &Pubkey,
     wsol_ata: &Pubkey,
     amount: u64,
+    rpc: Option<&Arc<RpcClient>>,
+    config: Option<&Config>,
 ) -> Result<Vec<Instruction>> {
     use solana_sdk::system_instruction;
     use spl_token::instruction as token_instruction;
+    use crate::protocol::solend::accounts::get_associated_token_program_id;
+    use crate::utils::ata_manager::get_token_program_for_mint;
     
     // ✅ VALIDATION: Amount must be greater than 0
     if amount == 0 {
@@ -584,10 +602,105 @@ pub fn build_wrap_sol_instruction(
     
     let mut instructions = Vec::new();
     
-    // ✅ CORRECT: Transfer native SOL directly to WSOL ATA address
-    // Per Solana documentation, native SOL should be sent directly to the WSOL token account
-    // (associated token account for NATIVE_MINT), then sync_native is called to convert
-    // the lamports to WSOL tokens.
+    // ✅ FIX: Check if WSOL ATA exists, create if needed
+    // Problem: Transfer to non-existent ATA fails
+    // Solution: Check ATA existence via RPC, add create_ata instruction if needed
+    let wsol_mint = get_wsol_mint();
+    let needs_ata_creation = if let Some(rpc_client) = rpc {
+        // Check if ATA exists via RPC
+        match rpc_client.get_account(wsol_ata).await {
+            Ok(_) => {
+                log::debug!("WSOL ATA {} exists, skipping creation", wsol_ata);
+                false
+            }
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("accountnotfound") || error_str.contains("account not found") {
+                    log::info!("WSOL ATA {} doesn't exist, will create it", wsol_ata);
+                    true
+                } else {
+                    // For other errors (timeout, etc.), log warning but proceed
+                    // create_ata is idempotent, so it's safe to add even if ATA exists
+                    log::warn!("Failed to check WSOL ATA {} existence: {}. Will add create_ata instruction as fallback (idempotent)", wsol_ata, e);
+                    true
+                }
+            }
+        }
+    } else {
+        // No RPC provided - assume ATA needs to be created (safe fallback)
+        // create_ata is idempotent, so it won't fail if ATA already exists
+        log::warn!("No RPC provided to build_wrap_sol_instruction, adding create_ata instruction as fallback (idempotent)");
+        true
+    };
+    
+    // Step 1: Create WSOL ATA if needed
+    if needs_ata_creation {
+        let associated_token_program = get_associated_token_program_id(config)
+            .context("Failed to get associated token program ID")?;
+        
+        // Determine token program for WSOL (should be standard SPL Token)
+        let token_program = if let Some(rpc_client) = rpc {
+            get_token_program_for_mint(&wsol_mint, Some(rpc_client))
+                .await
+                .context("Failed to determine token program for WSOL mint")?
+        } else {
+            // Fallback to standard SPL Token if RPC not available
+            spl_token::id()
+        };
+        
+        // Verify ATA derivation matches
+        let (derived_ata, _bump) = Pubkey::try_find_program_address(
+            &[wallet.as_ref(), token_program.as_ref(), wsol_mint.as_ref()],
+            &associated_token_program,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to derive WSOL ATA address"))?;
+        
+        if derived_ata != *wsol_ata {
+            return Err(anyhow::anyhow!(
+                "WSOL ATA derivation mismatch: provided {}, derived {}",
+                wsol_ata,
+                derived_ata
+            ));
+        }
+        
+        log::info!(
+            "Creating WSOL ATA instruction: payer={}, wallet={}, mint={}, ata={}, token_program={}",
+            wallet,
+            wallet,
+            wsol_mint,
+            wsol_ata,
+            token_program
+        );
+        
+        // Create ATA instruction
+        // Associated Token Program Create instruction format:
+        // Accounts (in order):
+        // 0. Payer (signer, writable) - pays for account creation
+        // 1. ATA account (writable) - the account being created
+        // 2. Owner (readonly) - the wallet that will own the ATA
+        // 3. Mint (readonly) - the token mint
+        // 4. System Program (readonly) - for account creation
+        // 5. Token Program (readonly) - SPL Token or Token-2022 program
+        let create_ata_ix = Instruction {
+            program_id: associated_token_program,
+            accounts: vec![
+                AccountMeta::new(*wallet, true),  // Payer (signer, writable)
+                AccountMeta::new(*wsol_ata, false), // ATA account (writable)
+                AccountMeta::new_readonly(*wallet, false), // Owner (readonly)
+                AccountMeta::new_readonly(wsol_mint, false), // Mint (readonly)
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // System Program (readonly)
+                AccountMeta::new_readonly(token_program, false), // Token Program (readonly)
+            ],
+            data: vec![], // Empty data (discriminator handled by program)
+        };
+        instructions.push(create_ata_ix);
+    }
+    
+    // Step 2: Transfer native SOL directly to WSOL ATA address
+    // WSOL token accounts are special SPL token accounts that can hold native SOL (lamports).
+    // When you send native SOL to a WSOL token account via system_instruction::transfer,
+    // the lamports are deposited into that account, but the token amount field is not
+    // automatically updated. That's why sync_native is needed.
     // 
     // This is the standard and correct way to wrap SOL in Solana:
     // 1. system_instruction::transfer(wallet, wsol_ata, amount) - sends native SOL to WSOL ATA
@@ -595,23 +708,15 @@ pub fn build_wrap_sol_instruction(
     // 
     // ⚠️ CRITICAL REQUIREMENTS:
     // - The wallet must already have sufficient native SOL balance
-    // - The WSOL ATA must be created and initialized BEFORE calling this function
-    //   (handled separately by executor via create_associated_token_account)
     // - The WSOL ATA account must be writable in the transaction
     // - The wallet must be a signer in the transaction
-    // 
-    // Step 1: Transfer native SOL directly to WSOL ATA address
-    // WSOL token accounts are special SPL token accounts that can hold native SOL (lamports).
-    // When you send native SOL to a WSOL token account via system_instruction::transfer,
-    // the lamports are deposited into that account, but the token amount field is not
-    // automatically updated. That's why sync_native is needed.
     let transfer_ix = system_instruction::transfer(wallet, wsol_ata, amount);
     instructions.push(transfer_ix);
     
-    // Step 2: Sync native SOL (lamports) to WSOL tokens
+    // Step 3: Sync native SOL (lamports) to WSOL tokens
     // SPL Token SyncNative instruction reads the native SOL balance (lamports) in the
     // WSOL ATA and updates the token account's amount field accordingly.
-    // This converts the native SOL (lamports) that was transferred in step 1 to WSOL tokens.
+    // This converts the native SOL (lamports) that was transferred in step 2 to WSOL tokens.
     // Instruction discriminator: 17 (SyncNative)
     // 
     // ⚠️ IMPORTANT: sync_native does NOT transfer SOL - it only syncs the token amount

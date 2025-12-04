@@ -65,20 +65,29 @@ impl SlippageEstimator {
             // ✅ FIX: Use same fallback logic as Jupiter API failure case
             // This ensures consistent hop_count estimation whether Jupiter is disabled or fails
             // - Stablecoin pairs: 1 hop (direct swap, very reliable)
-            // - Regular pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
+            // - Major pairs: 2 hops (SOL-ETH, SOL-BTC, ETH-USDC, etc. - typically 2 hops)
+            // - Other pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
             use crate::strategy::profit_calculator::ProfitCalculator;
             let profit_calc = ProfitCalculator::new(self.config.clone());
             let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&input_mint, &output_mint);
-            let estimated_hop_count = if is_stablecoin_pair { 1 } else { 3 };
+            let is_major_pair = profit_calc.is_major_pair(&input_mint, &output_mint);
+            let estimated_hop_count = if is_stablecoin_pair {
+                1
+            } else if is_major_pair {
+                2
+            } else {
+                3
+            };
             
             let slippage = self.estimate_with_multipliers(amount)?;
             
             log::debug!(
-                "SlippageEstimator: Jupiter API disabled, using fallback hop_count={} for {} -> {} (stablecoin_pair={}, slippage={} bps)",
+                "SlippageEstimator: Jupiter API disabled, using fallback hop_count={} for {} -> {} (stablecoin_pair={}, major_pair={}, slippage={} bps)",
                 estimated_hop_count,
                 input_mint,
                 output_mint,
                 is_stablecoin_pair,
+                is_major_pair,
                 slippage
             );
             
@@ -135,10 +144,15 @@ impl SlippageEstimator {
         //   - Missing data errors → will never succeed
         // Solution: Only retry transient errors (5xx, timeouts, network errors, rate limits)
         // 
-        // ✅ CRITICAL FIX: Explicit loop control to prevent infinite loops
-        // Problem: If is_retryable_error always returns true for unknown errors, and we don't
-        //   explicitly break on the last attempt, the loop could appear to hang or not reach fallback
-        // Solution: Explicitly check if we're on the last attempt and break to ensure fallback is reached
+        // ✅ CRITICAL FIX: Explicit loop control to prevent infinite loops and ensure fallback is reached
+        // Problem: Previous code had separate checks for !is_retryable and attempt >= MAX_RETRIES
+        //   - If is_retryable is true but attempt >= MAX_RETRIES, we need to break
+        //   - If is_retryable is false, we need to break immediately
+        //   - Separate checks could lead to confusion or missed break conditions
+        // Solution: Combine both conditions in a single check to ensure we always break when needed
+        //   - Break if error is NOT retryable (immediate failure)
+        //   - Break if we've reached max retries (even if error is retryable)
+        //   - This guarantees fallback is always reached when retries are exhausted
         for attempt in 1..=MAX_RETRIES {
             match self.try_jupiter_quote(&url).await {
                 Ok((slippage, hop_count)) => {
@@ -151,30 +165,31 @@ impl SlippageEstimator {
                     let error_msg = e.to_string();
                     last_error = Some(error_msg.clone());
                     
-                    if !is_retryable {
-                        // Non-retryable error (4xx, parse error, etc.) - fail immediately
-                        log::warn!(
-                            "Jupiter API attempt {}/{} failed with non-retryable error: {} (falling back immediately)",
-                            attempt,
-                            MAX_RETRIES,
-                            error_msg
-                        );
-                        break; // Exit retry loop immediately
+                    // ✅ CRITICAL FIX: Combined break condition ensures fallback is always reached
+                    // Break if:
+                    //   1. Error is NOT retryable (non-retryable errors should fail immediately)
+                    //   2. We've reached max retries (even if error is retryable, we must stop and use fallback)
+                    // This prevents infinite loops and guarantees fallback is reached
+                    if !is_retryable || attempt >= MAX_RETRIES {
+                        if !is_retryable {
+                            log::warn!(
+                                "Jupiter API attempt {}/{} failed with non-retryable error: {} (falling back immediately)",
+                                attempt,
+                                MAX_RETRIES,
+                                error_msg
+                            );
+                        } else {
+                            log::warn!(
+                                "Jupiter API attempt {}/{} failed with retryable error: {} (max retries reached, falling back)",
+                                attempt,
+                                MAX_RETRIES,
+                                error_msg
+                            );
+                        }
+                        break; // Exit retry loop - fallback will be used
                     }
                     
-                    // Retryable error - check if we should continue or break
-                    if attempt >= MAX_RETRIES {
-                        // Last attempt failed with retryable error - break to reach fallback
-                        log::warn!(
-                            "Jupiter API attempt {}/{} failed with retryable error: {} (max retries reached, falling back)",
-                            attempt,
-                            MAX_RETRIES,
-                            error_msg
-                        );
-                        break; // Explicitly break to ensure fallback is reached
-                    }
-                    
-                    // Not the last attempt - log and retry
+                    // Not the last attempt AND error is retryable - log and retry
                     log::warn!(
                         "Jupiter API attempt {}/{} failed (retrying): {}",
                         attempt,

@@ -238,109 +238,23 @@ impl BalanceManager {
         Ok(available)
     }
 
-    pub async fn get_available_balance_locked(
-        &self,
-        mint: &Pubkey,
-        reserved: &HashMap<Pubkey, u64>,
-    ) -> Result<u64> {
-        // ✅ FIX: Solend uses WSOL (Wrapped SOL), not native SOL
-        // For SOL/WSOL, read WSOL ATA balance instead of native SOL balance
-        let config = self.config.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Config not set for BalanceManager"))?;
-        use std::str::FromStr;
-        use crate::protocol::solend::instructions::is_wsol_mint;
-        
-        let sol_mint = Pubkey::from_str(&config.sol_mint)
-            .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
-        
-        if mint == &sol_mint || is_wsol_mint(mint) {
-            // WSOL: read from WSOL ATA
-            use crate::protocol::solend::accounts::get_associated_token_address;
-            let wsol_ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
-                .context("Failed to derive WSOL ATA")?;
-            
-            // Check cache first
-            {
-                let balances = self.balances.read().await;
-                if let Some(cached) = balances.get(&wsol_ata) {
-                    if cached.timestamp.elapsed() < CACHE_TTL {
-                        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                        return Ok(cached.amount.saturating_sub(reserved_amount));
-                    }
-                }
-            }
-            
-            // Cache miss or stale - fetch from RPC using helper function
-            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
-            use crate::utils::helpers::read_ata_balance;
-            let wsol_balance = match read_ata_balance(&wsol_ata, &self.rpc).await {
-                Ok(balance) => balance,
-                Err(e) => {
-                    // RPC error (not AccountNotFound) - propagate error
-                    return Err(e).context("Failed to fetch WSOL ATA account");
-                }
-            };
-            
-            // Update cache
-            {
-                let mut balances = self.balances.write().await;
-                balances.insert(
-                    wsol_ata,
-                    CachedBalance {
-                        amount: wsol_balance,
-                        timestamp: Instant::now(),
-                    },
-                );
-            }
-            
-            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-            return Ok(wsol_balance.saturating_sub(reserved_amount));
-        }
-        
-        // SPL tokens: use ATA
-        use crate::protocol::solend::accounts::get_associated_token_address;
-        let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
-
-        {
-            // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
-            // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
-            let balances = self.balances.read().await;
-            if let Some(cached) = balances.get(&ata) {
-                if cached.timestamp.elapsed() < CACHE_TTL {
-                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                    return Ok(cached.amount.saturating_sub(reserved_amount));
-                }
-                // Stale cache, fall through to RPC
-            }
-        }
-
-        // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
-        use crate::utils::helpers::read_ata_balance;
-        let actual = match read_ata_balance(&ata, &self.rpc).await {
-            Ok(balance) => balance,
-            Err(e) => {
-                // RPC error (not AccountNotFound) - propagate error
-                return Err(e).context("Failed to fetch token account balance");
-            }
-        };
-
-        // Update cache
-        // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
-        // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
-        {
-            let mut balances = self.balances.write().await;
-            balances.insert(
-                ata,
-                CachedBalance {
-                    amount: actual,
-                    timestamp: Instant::now(),
-                },
-            );
-        }
-
-        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-        Ok(actual.saturating_sub(reserved_amount))
-    }
+    // ❌ REMOVED: get_available_balance_locked() - Deadlock risk
+    // 
+    // Problem: This function had deadlock risk because:
+    //   - Caller passes `reserved` HashMap (already locked by caller)
+    //   - Function acquires `balances` lock internally
+    //   - If caller locks in order: reserved -> balances
+    //   - But function locks in order: balances -> reserved
+    //   - Result: Deadlock risk if caller doesn't follow correct lock order
+    //
+    // Solution: Removed function entirely - it's not used anywhere in the codebase
+    //   - Use `get_available_balance()` instead, which properly enforces lock order
+    //   - Lock order is always: balances -> reserved (consistent across all functions)
+    //
+    // If you need this functionality in the future:
+    //   1. Ensure caller locks in order: balances -> reserved
+    //   2. Document lock order requirement clearly
+    //   3. Consider using a lock order enforcement mechanism (compile-time check)
 
     pub async fn start_monitoring(&self) -> Result<()> {
         let ws = self

@@ -64,43 +64,68 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
         ));
     }
 
-    // ✅ CRITICAL FIX: Check if already signed - if valid signature exists, skip signing
-    // This prevents double-signing which can cause signature mismatch errors
-    // Early return guarantees that code after this block will NOT execute if already signed
-    //
-    // SAFETY FOR JITO BUNDLES:
-    // - Jito bundles contain multiple transactions (tip tx + main tx)
-    // - Each transaction is signed separately - this is CORRECT and SAFE
-    // - The early return here prevents accidentally signing the SAME transaction twice
-    // - Different transactions in a bundle are different Transaction objects, so no conflict
+    // ✅ CRITICAL FIX: Verify if transaction is already signed with correct keypair
+    // Problem: Previous check only verified signature is non-default, but didn't verify
+    //   if signature is valid for the expected keypair. This could cause issues if:
+    //   - Transaction was signed with wrong keypair (signature mismatch)
+    //   - Transaction was partially signed (invalid signature)
+    // Solution: Verify signature validity before skipping re-signing
+    //   This prevents double-signing AND ensures signature is correct for the keypair
     if signer_index < tx.signatures.len() {
         let existing_sig = &tx.signatures[signer_index];
         let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
 
         if is_signed {
-            // ✅ Transaction already signed with valid signature - skip re-signing
-            // Note: We can't fully verify without re-signing, but if signature is non-default
-            // and matches the expected signer, we assume it's valid
-            log::debug!(
-                "Transaction already signed by {} at index {} - skipping re-signing to prevent double-signing",
-                signer_pubkey,
-                signer_index
-            );
-            // ✅ EARLY RETURN: Code after this point will NOT execute
-            // This guarantees that tx.sign() will NOT be called if transaction is already signed
-            // This is SAFE for Jito bundles because:
-            //   1. Each transaction in bundle is signed once (tip tx, main tx)
-            //   2. They are different Transaction objects, so signing each once is correct
-            //   3. This check prevents accidentally signing the SAME transaction object twice
-            return Ok(());
+            // ✅ FIX: Verify signature is valid for this keypair before skipping
+            // This ensures we don't skip signing if signature is invalid or from wrong keypair
+            // Transaction message needs to be serialized for verification
+            use bincode::serialize;
+            let message_bytes = serialize(&tx.message)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize transaction message for signature verification: {}", e))?;
+            
+            // Verify signature with the expected keypair
+            let is_valid = existing_sig.verify(signer_pubkey.as_ref(), &message_bytes);
+            
+            if is_valid {
+                // ✅ Transaction already signed with VALID signature for this keypair - skip re-signing
+                // This is SAFE because:
+                //   1. Signature is verified to be valid for the expected keypair
+                //   2. Re-signing would create a different signature (even if valid), causing mismatch
+                //   3. Jito bundles: Each transaction is signed once (tip tx, main tx) - this is correct
+                log::debug!(
+                    "Transaction already signed with valid signature by {} at index {} - skipping re-signing to prevent double-signing",
+                    signer_pubkey,
+                    signer_index
+                );
+                return Ok(());
+            } else {
+                // ⚠️ Signature exists but is INVALID for this keypair
+                // This could happen if:
+                //   - Transaction was signed with wrong keypair
+                //   - Transaction message changed after signing
+                //   - Signature is corrupted
+                // Solution: Re-sign with correct keypair (will overwrite invalid signature)
+                log::warn!(
+                    "Transaction signature at index {} is invalid for keypair {} - re-signing with correct keypair",
+                    signer_index,
+                    signer_pubkey
+                );
+                // Continue to signing below - will overwrite invalid signature
+            }
         }
     }
 
-    // ✅ Transaction is unsigned or signature is default - sign it
-    // This code path is ONLY reached if:
+    // ✅ Transaction is unsigned, signature is default, or signature is invalid - sign it
+    // This code path is reached if:
     //   1. Transaction is not signed (signature is default)
-    //   2. Signer index is valid and within bounds
-    //   3. Signature array size matches account_keys size
+    //   2. Signature exists but is invalid for this keypair
+    //   3. Signer index is valid and within bounds
+    //   4. Signature array size matches account_keys size
+    // 
+    // ✅ SAFE FOR JITO BUNDLES:
+    // - tx.sign() will overwrite existing signature if invalid
+    // - Each transaction in bundle is a different Transaction object
+    // - Tip tx and main tx are signed separately - this is correct
     tx.sign(&[keypair], tx.message.recent_blockhash);
 
     // Verify signing succeeded
