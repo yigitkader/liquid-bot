@@ -54,32 +54,43 @@ impl TxLock {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(10)) => {
                 // Run cleanup every 10 seconds
-                let mut locked_guard = locked.write().unwrap();
-                let mut lock_times_guard = lock_times.write().unwrap();
+                // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
+                // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
+                //   Subsequent write().unwrap() calls will panic, crashing the entire executor
+                // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
+                //   - If lock is poisoned, skip cleanup this cycle (self-healing)
+                //   - Log warning but don't crash - allows executor to continue operating
+                if let Ok(mut locked_guard) = locked.write() {
+                    if let Ok(mut lock_times_guard) = lock_times.write() {
+                        // Remove expired locks
+                        let expired_addresses: Vec<Pubkey> = lock_times_guard
+                            .iter()
+                            .filter_map(|(address, time)| {
+                                if time.elapsed().as_secs() >= timeout_seconds {
+                                    Some(*address)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
 
-                // Remove expired locks
-                let expired_addresses: Vec<Pubkey> = lock_times_guard
-                    .iter()
-                    .filter_map(|(address, time)| {
-                        if time.elapsed().as_secs() >= timeout_seconds {
-                            Some(*address)
-                        } else {
-                            None
+                        for address in &expired_addresses {
+                            locked_guard.remove(address);
+                            lock_times_guard.remove(address);
                         }
-                    })
-                    .collect();
 
-                for address in &expired_addresses {
-                    locked_guard.remove(address);
-                    lock_times_guard.remove(address);
+                        if !expired_addresses.is_empty() {
+                            log::debug!(
+                                "TxLock: cleaned up {} expired lock(s)",
+                                expired_addresses.len()
+                            );
+                        }
+                    } else {
+                        log::warn!("TxLock: lock_times RwLock is poisoned, skipping cleanup cycle (self-healing)");
+                    }
+                } else {
+                    log::warn!("TxLock: locked RwLock is poisoned, skipping cleanup cycle (self-healing)");
                 }
-
-                if !expired_addresses.is_empty() {
-                    log::debug!(
-                        "TxLock: cleaned up {} expired lock(s)",
-                        expired_addresses.len()
-                    );
-                        }
                     }
                     _ = cancel.cancelled() => {
                         log::info!("TxLock cleanup task shutting down gracefully");
@@ -95,8 +106,16 @@ impl TxLock {
     }
 
     fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
-        let mut locked = self.locked.write().unwrap();
-        let mut lock_times = self.lock_times.write().unwrap();
+        // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
+        // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
+        //   Subsequent write().unwrap() calls will panic, crashing the entire executor
+        // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
+        //   - If lock is poisoned, return error instead of panicking
+        //   - This allows caller to handle error gracefully instead of crashing
+        let mut locked = self.locked.write()
+            .map_err(|_| anyhow::anyhow!("Lock is poisoned (previous panic detected) - cannot acquire lock"))?;
+        let mut lock_times = self.lock_times.write()
+            .map_err(|_| anyhow::anyhow!("Lock times is poisoned (previous panic detected) - cannot acquire lock"))?;
 
         if let Some(lock_time) = lock_times.get(address) {
             if lock_time.elapsed().as_secs() >= self.timeout_seconds {
@@ -126,10 +145,24 @@ struct TxLockGuard {
 
 impl Drop for TxLockGuard {
     fn drop(&mut self) {
-        let mut locked = self.locked.write().unwrap();
-        let mut lock_times = self.lock_times.write().unwrap();
-        locked.remove(&self.address);
-        lock_times.remove(&self.address);
+        // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
+        // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
+        //   Subsequent write().unwrap() calls will panic, crashing the entire executor
+        // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
+        //   - If lock is poisoned, skip cleanup (self-healing)
+        //   - Log warning but don't panic - allows executor to continue operating
+        //   - This is especially important in Drop, as panics in Drop are double-panic (fatal)
+        if let Ok(mut locked) = self.locked.write() {
+            locked.remove(&self.address);
+        } else {
+            log::warn!("TxLockGuard: locked RwLock is poisoned during drop, skipping cleanup (self-healing)");
+        }
+        
+        if let Ok(mut lock_times) = self.lock_times.write() {
+            lock_times.remove(&self.address);
+        } else {
+            log::warn!("TxLockGuard: lock_times RwLock is poisoned during drop, skipping cleanup (self-healing)");
+        }
     }
 }
 

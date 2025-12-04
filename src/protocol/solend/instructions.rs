@@ -460,11 +460,19 @@ pub async fn build_liquidate_obligation_ix(
     opportunity: &Opportunity,
     liquidator: &Pubkey,
     rpc: Option<Arc<RpcClient>>,
+    config: &crate::core::config::Config,
 ) -> Result<Instruction> {
+    // ✅ CRITICAL FIX: Accept Config as parameter instead of calling from_env()
+    // Problem: Previous code called Config::from_env() here, which could lead to:
+    //   - Inconsistent config values if env vars change during runtime
+    //   - Different behavior in test vs prod if different .env files are used
+    //   - Non-deterministic behavior if config is loaded multiple times
+    // Solution: Accept Config as parameter (dependency injection)
+    //   - Config is loaded once in main.rs and passed to all components
+    //   - Ensures consistent config values throughout the application lifecycle
+    //   - Makes testing easier (can inject test config)
     let rpc =
         rpc.ok_or_else(|| anyhow::anyhow!("RPC client required for liquidation instruction"))?;
-
-    let config = crate::core::config::Config::from_env().context("Failed to load config")?;
 
     let program_id =
         Pubkey::from_str(&config.solend_program_id).context("Invalid Solend program ID")?;

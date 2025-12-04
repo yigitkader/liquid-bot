@@ -76,19 +76,27 @@ impl ProfitCalculator {
     fn calculate_tx_fee(&self) -> f64 {
         let base_fee = self.config.base_transaction_fee_lamports;
         
-        // ✅ FIX: Correct priority fee calculation
+        // ✅ CRITICAL FIX: Use ceil() for conservative priority fee calculation
+        // Problem: Previous code used integer division (priority_fee_micro_lamports / 1_000_000)
+        //   Integer division always rounds down, causing systematic underestimation of priority fee
+        //   Example: 1_500_000 micro-lamports / 1_000_000 = 1 lamport (should be 1.5)
+        //   This bias can cause profitable trades to appear unprofitable at profit margins
+        // Solution: Use ceil() to round up (conservative approach)
+        //   - Ensures we don't underestimate transaction fees
+        //   - Prevents losses from fee underestimation in marginal profit scenarios
+        //   - Formula: ceil(micro_lamports / 1_000_000.0)
         // priority_fee_per_cu is in micro-lamports per CU (1 micro-lamport = 0.000001 lamport)
-        // Formula: (compute_units × priority_fee_per_cu) / 1_000_000
-        // This converts from micro-lamports to lamports
+        // Formula: ceil((compute_units × priority_fee_per_cu) / 1_000_000.0)
         let priority_fee_micro_lamports = self.config.liquidation_compute_units as u64
             * self.config.priority_fee_per_cu;
-        let priority_fee = priority_fee_micro_lamports / 1_000_000; // Convert micro-lamports to lamports
+        let priority_fee = (priority_fee_micro_lamports as f64 / 1_000_000.0).ceil() as u64;
         
         let total_lamports = base_fee + priority_fee;
         let total_usd = total_lamports as f64 * self.config.sol_price_fallback_usd / 1e9;
         log::debug!(
-            "ProfitCalculator: tx_fee -> base_fee_lamports={}, priority_fee_lamports={}, total_lamports={}, sol_price_fallback_usd={}, total_usd={:.6}",
+            "ProfitCalculator: tx_fee -> base_fee_lamports={}, priority_fee_micro_lamports={}, priority_fee_lamports={} (ceil), total_lamports={}, sol_price_fallback_usd={}, total_usd={:.6}",
             base_fee,
+            priority_fee_micro_lamports,
             priority_fee,
             total_lamports,
             self.config.sol_price_fallback_usd,
@@ -338,7 +346,16 @@ impl ProfitCalculator {
     }
 
     pub fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {
-        STABLECOIN_PAIRS.contains(&(*mint1, *mint2))
+        // ✅ FIX: Handle initialization error gracefully
+        // If sets failed to initialize (should never happen if init_stablecoin_sets() succeeded),
+        // return false (conservative - treat as non-stablecoin pair)
+        STABLECOIN_PAIRS
+            .as_ref()
+            .map(|pairs| pairs.contains(&(*mint1, *mint2)))
+            .unwrap_or_else(|e| {
+                log::error!("Stablecoin pairs not initialized: {} - treating as non-stablecoin pair", e);
+                false
+            })
     }
 
     /// Check if a pair is a major pair (SOL, ETH, BTC, USDC, USDT combinations)
@@ -380,7 +397,14 @@ impl ProfitCalculator {
     }
 }
 
-static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
+// ✅ FIX: Use Lazy<Result<...>> to allow initialization errors without panic
+// Problem: Previous code used panic! when stablecoin mint parsing failed
+//   This causes entire bot to crash in production, even if error occurs during runtime
+// Solution: Use Result-based initialization that can be checked at startup
+//   - init_stablecoin_sets() function validates and initializes sets
+//   - main.rs calls this at startup and exits gracefully on error
+//   - Runtime access uses unwrap_or_else with empty set fallback (should never happen if init succeeded)
+static STABLECOIN_SET: Lazy<Result<HashSet<Pubkey>, String>> = Lazy::new(|| {
     let mints = vec![
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -399,22 +423,32 @@ static STABLECOIN_SET: Lazy<HashSet<Pubkey>> = Lazy::new(|| {
                 set.insert(pk);
             }
             Err(e) => {
-                // ✅ Log error - don't silently ignore!
-                eprintln!("FATAL: Invalid stablecoin mint '{}': {}", s, e);
-                panic!(
+                // ✅ FIX: Return error instead of panic
+                // This allows main.rs to handle error gracefully at startup
+                let error_msg = format!(
                     "Stablecoin configuration error: Failed to parse mint '{}': {}",
                     s, e
                 );
+                log::error!("{}", error_msg);
+                return Err(error_msg);
             }
         }
     }
-    set
+    Ok(set)
 });
 
-static STABLECOIN_PAIRS: Lazy<HashSet<(Pubkey, Pubkey)>> = Lazy::new(|| {
-    let stablecoins: Vec<Pubkey> = STABLECOIN_SET.iter().copied().collect();
+static STABLECOIN_PAIRS: Lazy<Result<HashSet<(Pubkey, Pubkey)>, String>> = Lazy::new(|| {
+    // ✅ FIX: Handle STABLECOIN_SET initialization error
+    let stablecoins = match STABLECOIN_SET.as_ref() {
+        Ok(set) => set.iter().copied().collect::<Vec<Pubkey>>(),
+        Err(e) => {
+            let error_msg = format!("Failed to initialize stablecoin pairs: {}", e);
+            log::error!("{}", error_msg);
+            return Err(error_msg);
+        }
+    };
+    
     let mut pairs = HashSet::new();
-
     for i in &stablecoins {
         for j in &stablecoins {
             if i != j {
@@ -425,5 +459,35 @@ static STABLECOIN_PAIRS: Lazy<HashSet<(Pubkey, Pubkey)>> = Lazy::new(|| {
             }
         }
     }
-    pairs
+    Ok(pairs)
 });
+
+/// Initialize stablecoin sets and validate configuration
+/// 
+/// This function should be called at startup (in main.rs) to ensure
+/// stablecoin configuration is valid before the bot starts running.
+/// 
+/// Returns:
+/// - Ok(()): Stablecoin sets initialized successfully
+/// - Err(String): Configuration error (invalid mint address, etc.)
+/// 
+/// ✅ FIX: Fail-fast at startup instead of panic during runtime
+/// Problem: Previous code used panic! when stablecoin mint parsing failed
+///   This causes entire bot to crash, even if error occurs during runtime
+/// Solution: Validate configuration at startup and exit gracefully on error
+///   - This function checks if sets initialized successfully
+///   - main.rs calls this and exits with error code if validation fails
+///   - Runtime access uses unwrap_or_else (should never fail if init succeeded)
+pub fn init_stablecoin_sets() -> Result<(), String> {
+    // Force initialization by accessing the Lazy values
+    // This will trigger parsing and return any errors
+    STABLECOIN_SET.as_ref().map_err(|e| e.clone())?;
+    STABLECOIN_PAIRS.as_ref().map_err(|e| e.clone())?;
+    
+    log::info!("✅ Stablecoin sets initialized successfully ({} stablecoins, {} pairs)", 
+        STABLECOIN_SET.as_ref().unwrap().len(),
+        STABLECOIN_PAIRS.as_ref().unwrap().len()
+    );
+    
+    Ok(())
+}

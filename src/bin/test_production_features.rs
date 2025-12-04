@@ -178,10 +178,13 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("No collateral assets in position"))?,
                 };
 
+                // ✅ CRITICAL FIX: Pass config parameter instead of letting function call from_env()
+                // This ensures consistent config values and follows dependency injection pattern
                 let instruction = build_liquidate_obligation_ix(
                     &opportunity,
                     &test_liquidator,
                     Some(Arc::clone(&rpc)),
+                    config,
                 ).await
                     .context("Failed to build liquidation instruction")?;
 

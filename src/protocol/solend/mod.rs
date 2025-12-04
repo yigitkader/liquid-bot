@@ -336,7 +336,9 @@ impl Protocol for SolendProtocol {
         liquidator: &Pubkey,
         rpc: Option<Arc<RpcClient>>,
     ) -> Result<Instruction> {
-        instructions::build_liquidate_obligation_ix(opportunity, liquidator, rpc).await
+        // ✅ CRITICAL FIX: Pass self.config instead of letting function call from_env()
+        // This ensures consistent config values throughout the application lifecycle
+        instructions::build_liquidate_obligation_ix(opportunity, liquidator, rpc, &self.config).await
     }
 
     fn liquidation_params(&self) -> LiquidationParams {

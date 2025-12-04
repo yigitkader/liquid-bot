@@ -83,6 +83,17 @@ async fn main() -> Result<()> {
 
     log::info!("✅ Configuration loaded");
 
+    // ✅ CRITICAL FIX: Initialize stablecoin sets at startup (fail-fast on config errors)
+    // Problem: Previous code used panic! when stablecoin mint parsing failed
+    //   This causes entire bot to crash, even if error occurs during runtime
+    // Solution: Validate stablecoin configuration at startup and exit gracefully on error
+    //   - init_stablecoin_sets() validates all stablecoin mint addresses
+    //   - If validation fails, bot exits with error code (fail-fast)
+    //   - This prevents runtime panics and allows graceful error handling
+    liquid_bot::strategy::profit_calculator::init_stablecoin_sets()
+        .map_err(|e| anyhow::anyhow!("Stablecoin configuration error: {}", e))
+        .context("Failed to initialize stablecoin sets - check stablecoin mint addresses in code")?;
+
     let rpc = Arc::new(
         RpcClient::new(config.rpc_http_url.clone()).context("Failed to create RPC client")?,
     );
