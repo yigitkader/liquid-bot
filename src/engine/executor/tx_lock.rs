@@ -9,10 +9,9 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
-/// Transaction lock to prevent concurrent transactions on the same account
 pub struct TxLock {
-    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
-    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
+    locked: Arc<RwLock<HashSet<Pubkey>>>,
+    lock_times: Arc<RwLock<HashMap<Pubkey, Instant>>>,
     timeout_seconds: u64,
     cancel_token: CancellationToken,
 }
@@ -20,8 +19,8 @@ pub struct TxLock {
 impl TxLock {
     pub fn new(timeout_seconds: u64) -> Self {
         TxLock {
-            locked: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            lock_times: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            locked: Arc::new(RwLock::new(HashSet::new())),
+            lock_times: Arc::new(RwLock::new(HashMap::new())),
             timeout_seconds,
             cancel_token: CancellationToken::new(),
         }
@@ -37,8 +36,8 @@ impl TxLock {
             loop {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(10)) => {
-                        if let Ok(mut locked_guard) = locked.write() {
-                            if let Ok(mut lock_times_guard) = lock_times.write() {
+                        let mut locked_guard = locked.write().await;
+                        let mut lock_times_guard = lock_times.write().await;
                                 // Remove expired locks
                                 let expired_addresses: Vec<Pubkey> = lock_times_guard
                                     .iter()
@@ -56,14 +55,8 @@ impl TxLock {
                                     lock_times_guard.remove(address);
                                 }
 
-                                if !expired_addresses.is_empty() {
-                                    log::debug!("TxLock: cleaned up {} expired lock(s)", expired_addresses.len());
-                                }
-                            } else {
-                                log::warn!("TxLock: lock_times RwLock is poisoned, skipping cleanup cycle");
-                            }
-                        } else {
-                            log::warn!("TxLock: locked RwLock is poisoned, skipping cleanup cycle");
+                        if !expired_addresses.is_empty() {
+                            log::debug!("TxLock: cleaned up {} expired lock(s)", expired_addresses.len());
                         }
                     }
                     _ = cancel.cancelled() => {
@@ -79,11 +72,9 @@ impl TxLock {
         self.cancel_token.cancel();
     }
 
-    pub fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
-        let mut locked = self.locked.write()
-            .map_err(|_| anyhow::anyhow!("Lock is poisoned - cannot acquire lock"))?;
-        let mut lock_times = self.lock_times.write()
-            .map_err(|_| anyhow::anyhow!("Lock times is poisoned - cannot acquire lock"))?;
+    pub async fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
+        let mut locked = self.locked.write().await;
+        let mut lock_times = self.lock_times.write().await;
 
         if let Some(lock_time) = lock_times.get(address) {
             if lock_time.elapsed().as_secs() >= self.timeout_seconds {
@@ -105,20 +96,44 @@ impl TxLock {
     }
 }
 
-/// Guard that automatically releases the lock when dropped
 pub struct TxLockGuard {
-    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
-    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
+    locked: Arc<RwLock<HashSet<Pubkey>>>,
+    lock_times: Arc<RwLock<HashMap<Pubkey, Instant>>>,
     address: Pubkey,
 }
 
 impl Drop for TxLockGuard {
     fn drop(&mut self) {
-        if let Ok(mut locked) = self.locked.write() {
-            locked.remove(&self.address);
+        // Drop must be synchronous, so we use blocking write()
+        // This is acceptable because:
+        // - The operation is very fast (just HashSet/HashMap remove)
+        // - Happens during cleanup, not in hot path
+        // - Alternative (async Drop) doesn't exist in Rust
+        
+        // Use try_write() to avoid blocking if possible
+        // If it fails, spawn a task to clean up asynchronously
+        if let Ok(mut locked_guard) = self.locked.try_write() {
+            locked_guard.remove(&self.address);
+        } else {
+            // Lock is held, spawn async task to clean up later
+            let locked = Arc::clone(&self.locked);
+            let address = self.address;
+            tokio::spawn(async move {
+                let mut locked_guard = locked.write().await;
+                locked_guard.remove(&address);
+            });
         }
-        if let Ok(mut lock_times) = self.lock_times.write() {
-            lock_times.remove(&self.address);
+        
+        if let Ok(mut lock_times_guard) = self.lock_times.try_write() {
+            lock_times_guard.remove(&self.address);
+        } else {
+            // Lock is held, spawn async task to clean up later
+            let lock_times = Arc::clone(&self.lock_times);
+            let address = self.address;
+            tokio::spawn(async move {
+                let mut lock_times_guard = lock_times.write().await;
+                lock_times_guard.remove(&address);
+            });
         }
     }
 }

@@ -152,7 +152,7 @@ impl Executor {
                         opportunity.max_liquidatable,
                         opportunity.estimated_profit
                     );
-                    let _guard = match self.tx_lock.try_lock(&opportunity.position.address) {
+                    let _guard = match self.tx_lock.try_lock(&opportunity.position.address).await {
                         Ok(guard) => guard,
                         Err(_) => {
                             log::warn!(
