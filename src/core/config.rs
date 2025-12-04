@@ -329,48 +329,4 @@ impl Config {
         Ok(())
     }
 
-    /// Get RPC configuration group
-    pub fn rpc(&self) -> crate::core::config_groups::RpcConfig {
-        crate::core::config_groups::RpcConfig::from(self)
-    }
-
-    /// Get trading configuration group
-    pub fn trading(&self) -> crate::core::config_groups::TradingConfig {
-        crate::core::config_groups::TradingConfig::from(self)
-    }
-
-    /// Get protocol configuration group
-    pub fn protocol(&self) -> crate::core::config_groups::ProtocolConfig {
-        crate::core::config_groups::ProtocolConfig::from(self)
-    }
-
-    /// Get oracle configuration group
-    pub fn oracle(&self) -> crate::core::config_groups::OracleConfig {
-        crate::core::config_groups::OracleConfig::from(self)
-    }
-
-    /// Get slippage configuration group
-    pub fn slippage(&self) -> crate::core::config_groups::SlippageConfig {
-        crate::core::config_groups::SlippageConfig::from(self)
-    }
-
-    /// Get transaction configuration group
-    pub fn transaction(&self) -> crate::core::config_groups::TransactionConfig {
-        crate::core::config_groups::TransactionConfig::from(self)
-    }
-
-    /// Get system configuration group
-    pub fn system(&self) -> crate::core::config_groups::SystemConfig {
-        crate::core::config_groups::SystemConfig::from(self)
-    }
-
-    /// Get token configuration group
-    pub fn tokens(&self) -> crate::core::config_groups::TokenConfig {
-        crate::core::config_groups::TokenConfig::from(self)
-    }
-
-    /// Get profit configuration group
-    pub fn profit(&self) -> crate::core::config_groups::ProfitConfig {
-        crate::core::config_groups::ProfitConfig::from(self)
-    }
 }
