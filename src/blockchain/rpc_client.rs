@@ -381,7 +381,7 @@ impl RpcClient {
                 match client.get_signature_status(&sig) {
                     Ok(Some(transaction_status)) => {
                         // transaction_status.err is Result<(), TransactionError>
-                        if transaction_status.err.is_err() {
+                        if transaction_status.err().is_some() {
                             // Transaction failed
                             Ok(Some(false))
                         } else {

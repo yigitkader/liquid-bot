@@ -802,7 +802,6 @@ async fn validate_instruction_formats(rpc_client: &Arc<RpcClient>, config: Optio
             vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
         ).await {
             Ok(accounts) => {
-                use liquid_bot::protocol::solend::types::SolendObligation;
                 use liquid_bot::protocol::solend::SolendProtocol;
                 use liquid_bot::protocol::Protocol;
                 

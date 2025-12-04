@@ -337,7 +337,9 @@ impl Executor {
             entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
             // Keep only the most-recently-used entries
             let to_keep = ATA_CACHE_MAX_SIZE.saturating_sub(1000); // Keep 1k below max for buffer
-            for (pubkey, entry) in entries.into_iter().skip(entries.len().saturating_sub(to_keep)) {
+            let entries_len = entries.len();
+            let skip_count = entries_len.saturating_sub(to_keep);
+            for (pubkey, entry) in entries.into_iter().skip(skip_count) {
                 cache.insert(pubkey, entry);
             }
         }

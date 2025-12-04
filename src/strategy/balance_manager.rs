@@ -648,6 +648,7 @@ impl BalanceManager {
 
     /// Internal helper: Reserve balance assuming we already know the actual balance
     /// This ensures consistent lock ordering: balances -> reserved
+    #[allow(dead_code)] // Internal helper method, may be used in future optimizations
     async fn reserve_with_balance(&self, mint: &Pubkey, amount: u64, actual: u64) -> Result<()> {
         // ✅ DEADLOCK PREVENTION: Lock order MUST be consistent
         // Lock order: balances -> reserved (ALWAYS in this order)

@@ -16,11 +16,14 @@ pub struct ProfitCalculator {
 #[derive(Debug, Deserialize)]
 struct SwapInfo {
     #[serde(rename = "ammKey")]
+    #[allow(dead_code)] // Required for deserialization, may be used for route analysis
     amm_key: Option<String>,
     label: Option<String>,
     #[serde(rename = "inputMint")]
+    #[allow(dead_code)] // Required for deserialization, may be used for route analysis
     input_mint: Option<String>,
     #[serde(rename = "outputMint")]
+    #[allow(dead_code)] // Required for deserialization, may be used for route analysis
     output_mint: Option<String>,
 }
 
@@ -28,6 +31,7 @@ struct SwapInfo {
 struct RoutePlan {
     #[serde(rename = "swapInfo")]
     swap_info: Option<SwapInfo>,
+    #[allow(dead_code)] // Required for deserialization, may be used for route analysis
     percent: Option<u8>,
 }
 

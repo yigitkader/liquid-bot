@@ -129,7 +129,7 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
                             match rpc.get_account(&test_obligation).await {
                                 Ok(account) => {
                                     log::info!("Using TEST_OBLIGATION_PUBKEY for instruction building test: {}", test_obligation);
-                                    return Ok(vec![(test_obligation, account)]);
+                                    vec![(test_obligation, account)]
                                 }
                                 Err(e) => {
                                     return Err(anyhow::anyhow!("RPC limit/timeout hit and TEST_OBLIGATION_PUBKEY account not found: {}. Please configure a valid TEST_OBLIGATION_PUBKEY or use a premium RPC with higher limits.", e));

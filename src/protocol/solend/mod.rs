@@ -167,6 +167,24 @@ impl Protocol for SolendProtocol {
             }
         }
 
+        // ✅ FIX: Use borrowed_value_upper_bound for risk assessment
+        // borrowed_value_upper_bound is the maximum possible borrowed value (considering all collateral)
+        // If current borrowed_value is close to upper_bound, the position is near maximum leverage
+        // This indicates high risk and potential for rapid health factor deterioration
+        let borrowed_upper_bound_usd = obligation.borrowed_value_upper_bound.to_f64();
+        if borrowed_upper_bound_usd > 0.0 && borrowed_value_usd > 0.0 {
+            let leverage_ratio = borrowed_value_usd / borrowed_upper_bound_usd;
+            if leverage_ratio > 0.9 {
+                log::debug!(
+                    "SolendProtocol: Position {} is near maximum leverage (borrowed=${:.2} / upper_bound=${:.2} = {:.2}%) - very high risk",
+                    obligation.owner,
+                    borrowed_value_usd,
+                    borrowed_upper_bound_usd,
+                    leverage_ratio * 100.0
+                );
+            }
+        }
+
         let collateral_usd = obligation.total_deposited_value_usd();
         let debt_usd = obligation.total_borrowed_value_usd();
 
@@ -192,8 +210,26 @@ impl Protocol for SolendProtocol {
         // ✅ FIX: Use attributed_borrow_value from ObligationCollateral
         // This shows how much of the collateral is attributed to each borrow
         // Useful for risk analysis and understanding position structure
+        // High attributed_borrow_value relative to market_value indicates that collateral is heavily utilized
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {
+            // ✅ FIX: Use attributed_borrow_value for risk assessment
+            // If attributed_borrow_value is close to market_value, this collateral is fully utilized
+            let attributed_borrow_usd = deposit.attributed_borrow_value.to_f64();
+            let market_value_usd = deposit.market_value.to_f64();
+            if market_value_usd > 0.0 {
+                let utilization_ratio = attributed_borrow_usd / market_value_usd;
+                if utilization_ratio > 0.95 {
+                    log::debug!(
+                        "SolendProtocol: Collateral {} in position {} is heavily utilized (attributed=${:.2} / market=${:.2} = {:.2}%)",
+                        deposit.deposit_reserve,
+                        obligation.owner,
+                        attributed_borrow_usd,
+                        market_value_usd,
+                        utilization_ratio * 100.0
+                    );
+                }
+            }
             // ✅ FIX: Fetch LTV from Reserve if RPC is available
             let ltv = if let Some(rpc_ref) = &rpc {
                 match instructions::get_reserve_address_from_mint(&deposit.deposit_reserve, rpc_ref, &self.config).await {
@@ -249,10 +285,29 @@ impl Protocol for SolendProtocol {
                 0.0 // No RPC access, cannot fetch LTV
             };
             
+            // ✅ FIX: Use cumulative_borrow_rate_wads for interest rate analysis
+            // cumulative_borrow_rate_wads tracks the cumulative interest rate over time
+            // High cumulative rate indicates high interest accrual, which increases debt over time
+            // This can be used to estimate future debt growth and risk
+            let cumulative_borrow_rate = borrow.cumulative_borrow_rate_wads.to_f64();
+            let borrowed_amount_wads_f64 = borrow.borrowed_amount_wads.to_f64();
+            
+            // Calculate interest rate impact: if cumulative rate is very high, interest is accruing rapidly
+            // Note: This is a simplified check - actual interest calculation is more complex on-chain
+            if cumulative_borrow_rate > 1.1 && borrowed_amount_wads_f64 > 0.0 {
+                // Cumulative rate > 1.1 means interest has increased debt by >10%
+                log::debug!(
+                    "SolendProtocol: Borrow {} in position {} has high cumulative interest rate ({:.6}), indicating significant interest accrual",
+                    borrow.borrow_reserve,
+                    obligation.owner,
+                    cumulative_borrow_rate
+                );
+            }
+            
             // ✅ FIX: Use borrowed_amount_wads directly (already includes interest)
-            // cumulative_borrow_rate_wads is used on-chain to calculate interest
-            // but borrowed_amount_wads is the current amount including all accrued interest
-            let borrowed_amount = borrow.borrowed_amount_wads.to_f64() as u64;
+            // borrowed_amount_wads is the current amount including all accrued interest
+            // This is the actual debt that needs to be repaid
+            let borrowed_amount = borrowed_amount_wads_f64 as u64;
             debt_assets.push(Asset {
                 mint: borrow.borrow_reserve,
                 amount: borrowed_amount,
@@ -295,8 +350,11 @@ impl Protocol for SolendProtocol {
 
 // ✅ FIX: Pre-computed discriminator to avoid SHA256 calculation on every call
 // SHA256("account:Obligation")[..8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7]
+// Note: Currently unused but kept for future use if discriminator checking is needed
+#[allow(dead_code)]
 const OBLIGATION_DISCRIMINATOR: [u8; 8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7];
 
+#[allow(dead_code)]
 fn get_obligation_discriminator() -> [u8; 8] {
     OBLIGATION_DISCRIMINATOR
 }
