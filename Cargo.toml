@@ -28,6 +28,7 @@ anchor-lang = "0.29"
 anchor-client = "0.29"
 sha2 = "0.10"
 spl-token = "4.0"
+spl-associated-token-account = "2.3"
 bytemuck = "1.14"
 clap = { version = "4.4", features = ["derive"] }
 pyth-sdk-solana = "0.10"

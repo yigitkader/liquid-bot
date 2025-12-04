@@ -300,6 +300,8 @@ fn create_ata_instruction(
         .context("Failed to get associated token program ID")?;
     let token_program = spl_token::id();
 
+    // Always use manual construction to ensure correct account order and metadata
+    // SPL library may have compatibility issues with certain Solana SDK versions
     let (ata, _bump) = Pubkey::try_find_program_address(
         &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &associated_token_program,
@@ -307,13 +309,23 @@ fn create_ata_instruction(
     .ok_or_else(|| anyhow::anyhow!("Failed to find program address for ATA"))?;
 
     log::debug!(
-        "Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}",
+        "Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, program={}",
         payer,
         wallet,
         mint,
-        ata
+        ata,
+        associated_token_program
     );
 
+    // Associated Token Program Create instruction format:
+    // Accounts (in order):
+    // 0. Payer (signer, writable) - pays for account creation
+    // 1. ATA account (writable) - the account being created
+    // 2. Owner (readonly) - the wallet that will own the ATA
+    // 3. Mint (readonly) - the token mint
+    // 4. System Program (readonly) - for account creation
+    // 5. Token Program (readonly) - SPL Token program
+    // Data: empty (discriminator is handled by program)
     Ok(Instruction {
         program_id: associated_token_program,
         accounts: vec![

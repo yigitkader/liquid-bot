@@ -265,11 +265,21 @@ if [[ "$RPC_HTTP_URL" == *"api.mainnet-beta.solana.com"* ]] || \
    [[ "$RPC_HTTP_URL" == *"api.devnet.solana.com"* ]] || \
    [[ "$RPC_HTTP_URL" == *"api.testnet.solana.com"* ]]; then
     if [ "$POLL_INTERVAL_MS" -lt 10000 ]; then
-        print_error "Free RPC + short polling detected!"
+        # WebSocket varsa WARNING, yoksa ERROR
+        if [ -n "$RPC_WS_URL" ] && [[ "$RPC_WS_URL" == wss://* ]]; then
+            print_warning "Free RPC + short polling, but WebSocket is enabled (OK)"
+            print_warning "RPC: $RPC_HTTP_URL"
+            print_warning "POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}ms (WebSocket will be used as primary)"
+            print_info "✅ WebSocket will be used as primary (RPC polling is fallback only)"
+            print_warning "If WebSocket fails, RPC polling will be slow (consider POLL_INTERVAL_MS >= 10000)"
+        else
+            print_error "Free RPC + short polling + NO WebSocket!"
         print_error "RPC: $RPC_HTTP_URL"
         print_error "POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}ms (required: >= 10000ms)"
-        print_error "Either use premium RPC or increase POLL_INTERVAL_MS to >= 10000"
+            print_error "CRITICAL: Bot will hit rate limits immediately"
+            print_error "Either use premium RPC, enable WebSocket (RPC_WS_URL), or increase POLL_INTERVAL_MS to >= 10000"
         ((FAILED++))
+        fi
     else
         print_success "Free RPC endpoint with safe polling interval: ${POLL_INTERVAL_MS}ms"
     fi
@@ -366,14 +376,35 @@ fi
 if [ -z "$MIN_PROFIT_USD" ]; then
     print_warning "MIN_PROFIT_USD not set - using default: 5.0"
 else
-    # Use awk for floating point comparison (more portable than bc)
-    MIN_PROFIT_VAL=$(echo "$MIN_PROFIT_USD" | awk '{print $1}')
-    if awk "BEGIN {exit !($MIN_PROFIT_VAL >= 5.0)}"; then
+    # Use bc for floating point comparison (more portable)
+    MIN_PROFIT_VAL=$(echo "$MIN_PROFIT_USD" | tr -d '$' | tr -d ' ')
+    if [ -n "$MIN_PROFIT_VAL" ]; then
+        # Check if bc is available
+        if command -v bc &> /dev/null; then
+            # bc ile karşılaştır
+            if [ "$(echo "$MIN_PROFIT_VAL >= 5.0" | bc -l)" -eq 1 ]; then
+                print_success "MIN_PROFIT_USD is production-safe: \$$MIN_PROFIT_USD"
+            elif [ "$(echo "$MIN_PROFIT_VAL >= 2.0" | bc -l)" -eq 1 ]; then
+                print_warning "MIN_PROFIT_USD is low for production: \$$MIN_PROFIT_USD (recommended: >= \$5.0)"
+            else
+                print_error "MIN_PROFIT_USD is too low: \$$MIN_PROFIT_USD (minimum: \$2.0 for production)"
+                ((FAILED++))
+            fi
+        else
+            # Fallback to awk if bc is not available
+            MIN_PROFIT_VAL_NUM=$(echo "$MIN_PROFIT_VAL" | awk '{print $1}')
+            if awk "BEGIN {exit !($MIN_PROFIT_VAL_NUM >= 5.0)}"; then
         print_success "MIN_PROFIT_USD is production-safe: \$$MIN_PROFIT_USD"
-    elif awk "BEGIN {exit !($MIN_PROFIT_VAL >= 1.0)}"; then
+            elif awk "BEGIN {exit !($MIN_PROFIT_VAL_NUM >= 2.0)}"; then
         print_warning "MIN_PROFIT_USD is low for production: \$$MIN_PROFIT_USD (recommended: >= \$5.0)"
+            else
+                print_error "MIN_PROFIT_USD is too low: \$$MIN_PROFIT_USD (minimum: \$2.0 for production)"
+                ((FAILED++))
+            fi
+        fi
     else
-        print_error "MIN_PROFIT_USD is too low: \$$MIN_PROFIT_USD (minimum: \$1.0 for testing)"
+        print_error "MIN_PROFIT_USD is not set or invalid"
+        ((FAILED++))
     fi
 fi
 
@@ -450,7 +481,226 @@ else
 fi
 
 # ============================================================================
-# 10. DRY-RUN TEST INSTRUCTIONS
+# JITO MEV PROTECTION CHECK
+# ============================================================================
+print_header "🛡️  Jito MEV Protection Check"
+
+if [ -z "$USE_JITO" ]; then
+    USE_JITO="false"
+fi
+
+if [ "$USE_JITO" = "true" ]; then
+    print_info "Jito is ENABLED"
+    
+    # Tip amount kontrolü
+    if [ -z "$JITO_TIP_AMOUNT_LAMPORTS" ]; then
+        print_warning "JITO_TIP_AMOUNT_LAMPORTS not set - using default: 10000000 (0.01 SOL)"
+        JITO_TIP_AMOUNT_LAMPORTS=10000000
+    fi
+    
+    if [ "$JITO_TIP_AMOUNT_LAMPORTS" -lt 5000000 ]; then
+        print_warning "Jito tip amount is low: ${JITO_TIP_AMOUNT_LAMPORTS} lamports (< 0.005 SOL)"
+        print_warning "Low tips may result in bundle rejection. Recommended: >= 0.01 SOL (10000000 lamports)"
+    else
+        TIP_SOL=$(echo "scale=4; $JITO_TIP_AMOUNT_LAMPORTS / 1000000000" | bc -l 2>/dev/null || echo "N/A")
+        print_success "Jito tip amount is sufficient: ${JITO_TIP_AMOUNT_LAMPORTS} lamports ($TIP_SOL SOL)"
+    fi
+    
+    # Block engine URL kontrolü
+    if [ -z "$JITO_BLOCK_ENGINE_URL" ]; then
+        print_error "JITO_BLOCK_ENGINE_URL not set!"
+        print_info "Using default: https://mainnet.block-engine.jito.wtf"
+        print_warning "For production, explicitly set JITO_BLOCK_ENGINE_URL"
+    else
+        if [[ "$JITO_BLOCK_ENGINE_URL" =~ ^https?:// ]]; then
+            print_success "Jito block engine: $JITO_BLOCK_ENGINE_URL"
+        else
+            print_error "JITO_BLOCK_ENGINE_URL must start with http:// or https://"
+            ((FAILED++))
+        fi
+    fi
+    
+    # Tip account kontrolü
+    if [ -z "$JITO_TIP_ACCOUNT" ]; then
+        print_error "JITO_TIP_ACCOUNT not set!"
+        print_info "Using default: 96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"
+        print_warning "For production, explicitly set JITO_TIP_ACCOUNT"
+    else
+        # Check if it looks like a valid Solana pubkey (32-44 chars, base58)
+        if [ ${#JITO_TIP_ACCOUNT} -ge 32 ] && [ ${#JITO_TIP_ACCOUNT} -le 44 ]; then
+            print_success "Jito tip account: $JITO_TIP_ACCOUNT"
+        else
+            print_error "JITO_TIP_ACCOUNT length seems invalid: ${#JITO_TIP_ACCOUNT} chars (expected: 32-44)"
+            ((FAILED++))
+        fi
+    fi
+else
+    print_warning "Jito is DISABLED (USE_JITO=false or not set)"
+    print_warning "⚠️  WITHOUT JITO: Transactions are vulnerable to front-running!"
+    print_warning "   MEV bots can see your liquidation tx in mempool and front-run it"
+    print_warning "   Recommendation: Enable Jito for mainnet (USE_JITO=true)"
+fi
+
+# ============================================================================
+# ADDITIONAL CRITICAL CONFIGURATION CHECKS
+# ============================================================================
+print_header "⚙️  Additional Critical Configuration Checks"
+
+# HF_LIQUIDATION_THRESHOLD check
+if [ -z "$HF_LIQUIDATION_THRESHOLD" ]; then
+    print_warning "HF_LIQUIDATION_THRESHOLD not set - using default: 1.0"
+else
+    HF_VAL=$(echo "$HF_LIQUIDATION_THRESHOLD" | tr -d ' ')
+    if command -v bc &> /dev/null; then
+        if [ "$(echo "$HF_VAL > 0.0 && $HF_VAL <= 10.0" | bc -l)" -eq 1 ]; then
+            print_success "HF_LIQUIDATION_THRESHOLD is valid: $HF_LIQUIDATION_THRESHOLD"
+        else
+            print_error "HF_LIQUIDATION_THRESHOLD must be between 0.0 and 10.0, got: $HF_LIQUIDATION_THRESHOLD"
+            ((FAILED++))
+        fi
+    else
+        print_info "HF_LIQUIDATION_THRESHOLD: $HF_LIQUIDATION_THRESHOLD (validation skipped - bc not available)"
+    fi
+fi
+
+# LIQUIDATION_SAFETY_MARGIN check
+if [ -z "$LIQUIDATION_SAFETY_MARGIN" ]; then
+    print_warning "LIQUIDATION_SAFETY_MARGIN not set - using default: 0.95"
+else
+    SAFETY_VAL=$(echo "$LIQUIDATION_SAFETY_MARGIN" | tr -d ' ')
+    if command -v bc &> /dev/null; then
+        if [ "$(echo "$SAFETY_VAL > 0.0 && $SAFETY_VAL <= 1.0" | bc -l)" -eq 1 ]; then
+            print_success "LIQUIDATION_SAFETY_MARGIN is valid: $LIQUIDATION_SAFETY_MARGIN"
+        else
+            print_error "LIQUIDATION_SAFETY_MARGIN must be between 0.0 and 1.0, got: $LIQUIDATION_SAFETY_MARGIN"
+            ((FAILED++))
+        fi
+    else
+        print_info "LIQUIDATION_SAFETY_MARGIN: $LIQUIDATION_SAFETY_MARGIN (validation skipped - bc not available)"
+    fi
+fi
+
+# MAX_SLIPPAGE_BPS check
+if [ -z "$MAX_SLIPPAGE_BPS" ]; then
+    print_warning "MAX_SLIPPAGE_BPS not set - using default: 50 (0.5%)"
+else
+    if [ "$MAX_SLIPPAGE_BPS" -le 10000 ]; then
+        SLIPPAGE_PCT=$(echo "scale=2; $MAX_SLIPPAGE_BPS / 100" | bc -l 2>/dev/null || echo "N/A")
+        if [ "$MAX_SLIPPAGE_BPS" -le 100 ]; then
+            print_success "MAX_SLIPPAGE_BPS is conservative: $MAX_SLIPPAGE_BPS bps ($SLIPPAGE_PCT%)"
+        elif [ "$MAX_SLIPPAGE_BPS" -le 500 ]; then
+            print_warning "MAX_SLIPPAGE_BPS is moderate: $MAX_SLIPPAGE_BPS bps ($SLIPPAGE_PCT%)"
+        else
+            print_warning "MAX_SLIPPAGE_BPS is high: $MAX_SLIPPAGE_BPS bps ($SLIPPAGE_PCT%) - may result in significant slippage"
+        fi
+    else
+        print_error "MAX_SLIPPAGE_BPS must be <= 10000 (100%), got: $MAX_SLIPPAGE_BPS"
+        ((FAILED++))
+    fi
+fi
+
+# RPC_TIMEOUT_SECONDS check
+if [ -z "$RPC_TIMEOUT_SECONDS" ]; then
+    print_warning "RPC_TIMEOUT_SECONDS not set - using default: 10"
+else
+    if [ "$RPC_TIMEOUT_SECONDS" -ge 5 ] && [ "$RPC_TIMEOUT_SECONDS" -le 60 ]; then
+        print_success "RPC_TIMEOUT_SECONDS is reasonable: ${RPC_TIMEOUT_SECONDS}s"
+    elif [ "$RPC_TIMEOUT_SECONDS" -lt 5 ]; then
+        print_warning "RPC_TIMEOUT_SECONDS is very short: ${RPC_TIMEOUT_SECONDS}s (may cause timeouts)"
+    else
+        print_warning "RPC_TIMEOUT_SECONDS is long: ${RPC_TIMEOUT_SECONDS}s (may cause slow responses)"
+    fi
+fi
+
+# PRIORITY_FEE_PER_CU check
+if [ -z "$PRIORITY_FEE_PER_CU" ]; then
+    print_warning "PRIORITY_FEE_PER_CU not set - using default: 1000 micro-lamports"
+else
+    if [ "$PRIORITY_FEE_PER_CU" -eq 0 ]; then
+        print_error "PRIORITY_FEE_PER_CU is 0 - transactions may be slow or fail"
+        ((FAILED++))
+    elif [ "$PRIORITY_FEE_PER_CU" -lt 100 ]; then
+        print_warning "PRIORITY_FEE_PER_CU is very low: $PRIORITY_FEE_PER_CU (may cause slow transactions)"
+    else
+        print_success "PRIORITY_FEE_PER_CU is set: $PRIORITY_FEE_PER_CU micro-lamports per CU"
+    fi
+fi
+
+# ============================================================================
+# 10. RESERVE CACHE INITIALIZATION CHECK
+# ============================================================================
+print_header "🗃️  Reserve Cache Initialization Check"
+
+print_info "Checking if reserve cache is initialized before Scanner/Executor..."
+
+# Check for immediate refresh (no 30s delay)
+if grep -q "Performing initial reserve cache refresh\|initial.*reserve.*cache\|refresh.*reserve.*cache.*immediately" src/main.rs 2>/dev/null || \
+   grep -q "Performing initial reserve cache refresh\|initial.*reserve.*cache\|refresh.*reserve.*cache.*immediately" src/protocol/solend/instructions.rs 2>/dev/null; then
+    print_success "Reserve cache performs immediate initial refresh (no 30s delay)"
+else
+    print_warning "Reserve cache may have 30s delay before initialization"
+    print_warning "This can cause Scanner/Executor to make unnecessary RPC calls"
+fi
+
+# Check for wait_for_reserve_cache_initialization
+if grep -q "wait_for_reserve_cache_initialization\|wait.*reserve.*cache\|reserve.*cache.*ready" src/main.rs 2>/dev/null; then
+    print_success "Main waits for reserve cache initialization before starting Scanner"
+else
+    print_warning "Main may not wait for reserve cache - Scanner will hit RPC storm if cache is not ready"
+    print_info "This is OK if reserve cache is initialized synchronously"
+fi
+
+# Check for reserve cache refresh interval
+REFRESH_INTERVAL=$(grep -oP "Duration::from_secs\(\K[0-9]+" src/protocol/solend/instructions.rs 2>/dev/null | head -1)
+if [ -n "$REFRESH_INTERVAL" ]; then
+    if [ "$REFRESH_INTERVAL" -le 600 ]; then
+        print_success "Reserve cache refresh interval: ${REFRESH_INTERVAL}s (<= 10 minutes)"
+    else
+        print_warning "Reserve cache refresh interval is long: ${REFRESH_INTERVAL}s (> 10 minutes)"
+        print_warning "Stale reserve data may cause incorrect liquidation calculations"
+    fi
+else
+    print_info "Reserve cache refresh interval not found in code (may be configurable via env var)"
+fi
+
+# ============================================================================
+# 11. BALANCE MANAGER MONITORING CHECK
+# ============================================================================
+print_header "💰 Balance Manager Monitoring Check"
+
+print_info "Checking if Balance Manager uses WebSocket for real-time balance updates..."
+
+# Check for WebSocket subscription
+if grep -q "ws.subscribe_account\|subscribe.*account\|subscribe_account" src/strategy/balance_manager.rs 2>/dev/null; then
+    print_success "Balance Manager subscribes to ATAs via WebSocket"
+else
+    print_warning "Balance Manager may not use WebSocket - balance updates will be slow"
+    print_warning "This may cause 'insufficient balance' errors if balance changes between checks"
+fi
+
+# Check for account update handler
+if grep -q "handle_account_update\|account.*update.*handler\|on_account_update" src/strategy/balance_manager.rs 2>/dev/null; then
+    print_success "Balance Manager has real-time account update handler"
+else
+    print_warning "Balance Manager may not handle real-time updates"
+    print_warning "Balance checks may be stale, leading to transaction failures"
+fi
+
+# Check for cache TTL
+CACHE_TTL=$(grep -oP "const CACHE_TTL:.*Duration::from_secs\(\K[0-9]+" src/strategy/balance_manager.rs 2>/dev/null | head -1)
+if [ -n "$CACHE_TTL" ]; then
+    if [ "$CACHE_TTL" -le 60 ]; then
+        print_success "Balance cache TTL: ${CACHE_TTL}s (<= 1 minute)"
+    else
+        print_warning "Balance cache TTL is long: ${CACHE_TTL}s (> 1 minute)"
+        print_warning "Stale balance data may cause 'insufficient balance' errors"
+    fi
+else
+    print_info "Balance cache TTL not found in code (may be configurable or use default)"
+fi
+
+# ============================================================================
+# 12. DRY-RUN TEST INSTRUCTIONS
 # ============================================================================
 print_header "🔟 Dry-Run Test Instructions"
 
@@ -472,7 +722,7 @@ print_info "✅ NEW: Bot now has RPC polling fallback - will continue operating 
 echo ""
 
 # ============================================================================
-# 11. SMALL CAPITAL TEST INSTRUCTIONS
+# 13. SMALL CAPITAL TEST INSTRUCTIONS
 # ============================================================================
 print_header "1️⃣1️⃣  Small Capital Test Instructions"
 

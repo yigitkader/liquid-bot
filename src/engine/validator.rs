@@ -187,7 +187,9 @@ impl Validator {
         let rpc_timeout = rpc.request_timeout();
         let total_oracle_timeout = if config.is_free_rpc_endpoint() {
             // Sequential calls: debt oracle (10s) + collateral oracle (10s) + buffer
-            rpc_timeout * 2 + Duration::from_secs(2) // 22s for 10s RPC timeout
+            // ✅ FIX: Increased buffer from 2s to 5s to handle network delays and prevent timeouts
+            // Free RPC sequential checks are more vulnerable to small delays, so larger buffer is safer
+            rpc_timeout * 2 + Duration::from_secs(5) // 25s for 10s RPC timeout (was 22s)
         } else {
             // Parallel calls: max(RPC timeout) + buffer
             rpc_timeout + Duration::from_secs(2) // 12s for 10s RPC timeout

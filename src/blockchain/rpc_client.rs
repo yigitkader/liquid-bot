@@ -193,27 +193,64 @@ impl RpcClient {
             .await
             .context("Failed to acquire rate limiter permit")?;
 
-        let client = Arc::clone(&self.client);
         let program_id = *program_id;
-        let timeout_duration = self.request_timeout;
+        let mut retry_count = 0;
 
-        timeout(
-            timeout_duration,
-            tokio::task::spawn_blocking(move || {
-                client
-                    .get_program_accounts(&program_id)
-                    .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-            }),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "RPC request timeout after {:?} for get_program_accounts({})",
+        loop {
+            let client = Arc::clone(&self.client);
+            let rpc_url = self.rpc_url.clone();
+            let timeout_duration = self.request_timeout;
+            
+            let result = timeout(
                 timeout_duration,
-                program_id
+                tokio::task::spawn_blocking(move || {
+                    client
+                        .get_program_accounts(&program_id)
+                        .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+                }),
             )
-        })?
-        .context("Failed to spawn blocking task")?
+            .await;
+
+            let result = match result {
+                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
+                Err(_) => {
+                    let error = anyhow::anyhow!(
+                        "RPC request timeout after {:?} for get_program_accounts({})",
+                        timeout_duration,
+                        program_id
+                    );
+                    if !self
+                        .should_retry_rate_limit(&error.to_string(), &mut retry_count)
+                        .await
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
+
+            match result {
+                Ok(Ok(accounts)) => return Ok(accounts),
+                Ok(Err(e)) => {
+                    let error_str = e.to_string();
+                    if !self
+                        .should_retry_rate_limit(&error_str, &mut retry_count)
+                        .await
+                    {
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if !self
+                        .should_retry_rate_limit(&error_str, &mut retry_count)
+                        .await
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn get_program_accounts_with_filters(
