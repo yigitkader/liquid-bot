@@ -223,19 +223,24 @@ impl IdlSources {
     /// Switchboard V2 IDL'i
     pub const SWITCHBOARD_GITHUB: &'static str = "https://raw.githubusercontent.com/switchboard-xyz/switchboard-v2/main/programs/aggregator/program-idl.json";
     
-    pub async fn fetch_solend() -> Result<()> {
-        Self::fetch_idl(Self::SOLEND_GITHUB, IdlFiles::solend(), "Solend").await
+    pub async fn fetch_solend(force: bool) -> Result<()> {
+        Self::fetch_idl(Self::SOLEND_GITHUB, IdlFiles::solend(), "Solend", force).await
     }
     
-    pub async fn fetch_pyth() -> Result<()> {
-        Self::fetch_idl(Self::PYTH_GITHUB, IdlFiles::pyth(), "Pyth").await
+    pub async fn fetch_pyth(force: bool) -> Result<()> {
+        Self::fetch_idl(Self::PYTH_GITHUB, IdlFiles::pyth(), "Pyth", force).await
     }
     
-    pub async fn fetch_switchboard() -> Result<()> {
-        Self::fetch_idl(Self::SWITCHBOARD_GITHUB, IdlFiles::switchboard(), "Switchboard").await
+    pub async fn fetch_switchboard(force: bool) -> Result<()> {
+        Self::fetch_idl(Self::SWITCHBOARD_GITHUB, IdlFiles::switchboard(), "Switchboard", force).await
     }
     
-    async fn fetch_idl(url: &str, path: PathBuf, name: &str) -> Result<()> {
+    async fn fetch_idl(url: &str, path: PathBuf, name: &str, force: bool) -> Result<()> {
+        if !force && path.exists() {
+            log::info!("⏭️  {} IDL already exists at {:?} (use force=true to update)", name, path);
+            return Ok(());
+        }
+        
         log::info!("Fetching {} IDL from GitHub...", name);
         let response = reqwest::get(url).await.with_context(|| format!("Failed to fetch {} IDL", name))?;
         if !response.status().is_success() {
@@ -257,7 +262,7 @@ impl IdlSources {
         let mut results = Vec::new();
         
         // Solend IDL (zorunlu)
-        match Self::fetch_solend().await {
+        match Self::fetch_solend(force).await {
             Ok(_) => {
                 log::info!("✅ Solend IDL fetched successfully");
                 results.push(("Solend", true));
@@ -270,7 +275,7 @@ impl IdlSources {
         
         // Pyth IDL (opsiyonel)
         if force || !IdlFiles::pyth_exists() {
-            match Self::fetch_pyth().await {
+            match Self::fetch_pyth(force).await {
                 Ok(_) => {
                     log::info!("✅ Pyth IDL fetched successfully");
                     results.push(("Pyth", true));
@@ -287,7 +292,7 @@ impl IdlSources {
         
         // Switchboard IDL (opsiyonel)
         if force || !IdlFiles::switchboard_exists() {
-            match Self::fetch_switchboard().await {
+            match Self::fetch_switchboard(force).await {
                 Ok(_) => {
                     log::info!("✅ Switchboard IDL fetched successfully");
                     results.push(("Switchboard", true));
@@ -317,7 +322,14 @@ impl IdlSources {
     /// 
     /// Bu fonksiyon Anchor CLI'nin yüklü olmasını gerektirir
     /// anchor idl fetch <program_id> --provider.cluster mainnet
-    pub async fn fetch_with_anchor_cli(program_id: &str, output_path: &PathBuf) -> Result<()> {
+    /// 
+    /// force: true ise mevcut dosyanın üzerine yazar
+    pub async fn fetch_with_anchor_cli(program_id: &str, output_path: &PathBuf, force: bool) -> Result<()> {
+        if !force && output_path.exists() {
+            log::info!("⏭️  IDL already exists at {:?} (use force=true to update)", output_path);
+            return Ok(());
+        }
+        
         log::info!("Fetching IDL using Anchor CLI for program: {}", program_id);
         
         // Anchor CLI kontrolü
@@ -334,6 +346,7 @@ impl IdlSources {
         }
         
         // Anchor CLI komutunu çalıştır
+        // anchor idl fetch <ADDRESS> --provider.cluster <CLUSTER> --out <OUT>
         let output = Command::new(CliTools::ANCHOR_CLI)
             .args(&[
                 "idl",
@@ -341,7 +354,7 @@ impl IdlSources {
                 program_id,
                 "--provider.cluster",
                 "mainnet",
-                "--file",
+                "--out",
                 output_path.to_str().unwrap(),
             ])
             .output()

@@ -51,17 +51,9 @@ name = "validate_system"
 path = "src/bin/validate_system.rs"
 
 [[bin]]
-name = "test_production_features"
-path = "src/bin/test_production_features.rs"
-
-[[bin]]
 name = "create_atas"
 path = "src/bin/create_atas.rs"
 
 [[bin]]
 name = "update_idls"
 path = "src/bin/update_idls.rs"
-
-[[bin]]
-name = "validate_dependencies"
-path = "src/bin/validate_dependencies.rs"

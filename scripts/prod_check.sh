@@ -210,11 +210,12 @@ fi
 print_header "5️⃣  Production Features Test (Real Mainnet Data)"
 
 print_info "Testing critical production features with real mainnet data..."
-if cargo run --bin test_production_features 2>&1 | tee /tmp/production_features_test.log; then
-    if grep -q "✅ ALL PRODUCTION FEATURE TESTS PASSED" /tmp/production_features_test.log; then
+if cargo run --bin validate_system 2>&1 | tee /tmp/production_features_test.log; then
+    if grep -q "Production - Liquidation Instruction Building.*Success" /tmp/production_features_test.log && \
+       grep -q "Production - WebSocket Real-Time Monitoring.*Success" /tmp/production_features_test.log; then
         print_success "All production feature tests passed"
     else
-        if grep -q "❌ SOME TESTS FAILED" /tmp/production_features_test.log; then
+        if grep -q "Production.*Failed" /tmp/production_features_test.log; then
             print_error "Some production feature tests failed - check output above"
         else
             print_warning "Production feature tests completed with warnings"

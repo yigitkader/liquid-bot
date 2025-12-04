@@ -1,16 +1,11 @@
-//! IDL Güncelleme Binary
-//! 
-//! Bu binary, tüm IDL dosyalarını resmi kaynaklardan çeker ve günceller.
-//! Registry modülündeki IdlSources fonksiyonlarını kullanır.
-
 use anyhow::{Context, Result};
 use clap::Parser;
-use liquid_bot::core::registry::IdlSources;
+use liquid_bot::core::registry::{CliTools, IdlFiles, IdlSources, ProgramIds};
 use log;
 
 #[derive(Parser, Debug)]
 #[command(name = "update_idls")]
-#[command(about = "Fetch and update IDL files from official sources")]
+#[command(about = "Fetch and update IDL files from official sources. Uses Anchor CLI by default, falls back to GitHub if Anchor CLI is not available.")]
 struct Args {
     /// Force update even if IDL files already exist
     #[arg(short, long)]
@@ -28,14 +23,13 @@ struct Args {
     #[arg(long)]
     switchboard_only: bool,
     
-    /// Use Anchor CLI to fetch IDL (requires Anchor CLI installed)
+    /// Use GitHub sources instead of Anchor CLI (fallback method)
     #[arg(long)]
-    use_anchor_cli: bool,
+    use_github: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
     
@@ -44,69 +38,98 @@ async fn main() -> Result<()> {
     log::info!("🔄 Starting IDL update process...");
     log::info!("   Force mode: {}", args.force);
     
-    if args.use_anchor_cli {
-        log::info!("📦 Using Anchor CLI for IDL fetching...");
+    let update_all = !args.solend_only && !args.pyth_only && !args.switchboard_only;
+    let do_solend = args.solend_only || update_all;
+    let do_pyth = args.pyth_only || update_all;
+    let do_switchboard = args.switchboard_only || update_all;
+    
+    let use_anchor_cli = !args.use_github && CliTools::is_anchor_cli_available();
+    
+    if use_anchor_cli {
+        log::info!("📦 Using Anchor CLI for IDL fetching (recommended method)...");
         
-        use liquid_bot::core::registry::{CliTools, IdlFiles, ProgramIds};
-        
-        if !CliTools::is_anchor_cli_available() {
-            return Err(anyhow::anyhow!(
-                "Anchor CLI not found. Please install:\n  cargo install --git https://github.com/coral-xyz/anchor avm && avm install latest && avm use latest"
-            ));
-        }
-        
-        if args.solend_only || (!args.pyth_only && !args.switchboard_only) {
+        if do_solend {
             log::info!("Fetching Solend IDL using Anchor CLI...");
-            IdlSources::fetch_with_anchor_cli(
+            match IdlSources::fetch_with_anchor_cli(
                 ProgramIds::SOLEND,
                 &IdlFiles::solend(),
-            ).await
-            .context("Failed to fetch Solend IDL with Anchor CLI")?;
+                args.force,
+            ).await {
+                Ok(_) => log::info!("✅ Solend IDL fetched successfully"),
+                Err(e) => {
+                    log::error!("❌ Failed to fetch Solend IDL with Anchor CLI: {}", e);
+                    log::info!("   Falling back to GitHub...");
+                    IdlSources::fetch_solend(args.force).await
+                        .context("Failed to fetch Solend IDL from GitHub (fallback)")?;
+                }
+            }
         }
         
-        if args.pyth_only || (!args.solend_only && !args.switchboard_only) {
+        if do_pyth {
             log::info!("Fetching Pyth IDL using Anchor CLI...");
-            IdlSources::fetch_with_anchor_cli(
+            match IdlSources::fetch_with_anchor_cli(
                 ProgramIds::PYTH,
                 &IdlFiles::pyth(),
-            ).await
-            .context("Failed to fetch Pyth IDL with Anchor CLI")?;
+                args.force,
+            ).await {
+                Ok(_) => log::info!("✅ Pyth IDL fetched successfully"),
+                Err(e) => {
+                    log::warn!("⚠️  Failed to fetch Pyth IDL with Anchor CLI: {} (optional)", e);
+                    log::info!("   Falling back to GitHub...");
+                    if let Err(gh_err) = IdlSources::fetch_pyth(args.force).await {
+                        log::warn!("⚠️  Failed to fetch Pyth IDL from GitHub: {} (optional, skipping)", gh_err);
+                    }
+                }
+            }
         }
         
-        if args.switchboard_only || (!args.solend_only && !args.pyth_only) {
+        if do_switchboard {
             log::info!("Fetching Switchboard IDL using Anchor CLI...");
-            IdlSources::fetch_with_anchor_cli(
+            match IdlSources::fetch_with_anchor_cli(
                 ProgramIds::SWITCHBOARD,
                 &IdlFiles::switchboard(),
-            ).await
-            .context("Failed to fetch Switchboard IDL with Anchor CLI")?;
+                args.force,
+            ).await {
+                Ok(_) => log::info!("✅ Switchboard IDL fetched successfully"),
+                Err(e) => {
+                    log::warn!("⚠️  Failed to fetch Switchboard IDL with Anchor CLI: {} (optional)", e);
+                    log::info!("   Falling back to GitHub...");
+                    if let Err(gh_err) = IdlSources::fetch_switchboard(args.force).await {
+                        log::warn!("⚠️  Failed to fetch Switchboard IDL from GitHub: {} (optional, skipping)", gh_err);
+                    }
+                }
+            }
         }
     } else {
-        log::info!("🌐 Using GitHub sources for IDL fetching...");
-        
-        if args.solend_only {
-            log::info!("Fetching Solend IDL...");
-            IdlSources::fetch_solend().await
-                .context("Failed to fetch Solend IDL")?;
-        } else if args.pyth_only {
-            log::info!("Fetching Pyth IDL...");
-            IdlSources::fetch_pyth().await
-                .context("Failed to fetch Pyth IDL")?;
-        } else if args.switchboard_only {
-            log::info!("Fetching Switchboard IDL...");
-            IdlSources::fetch_switchboard().await
-                .context("Failed to fetch Switchboard IDL")?;
+        if args.use_github {
+            log::info!("🌐 Using GitHub sources for IDL fetching (fallback method)...");
         } else {
-            // Fetch all
-            IdlSources::fetch_all(args.force).await
-                .context("Failed to fetch IDL files")?;
+            log::warn!("⚠️  Anchor CLI not found, falling back to GitHub sources...");
+            log::info!("   Install Anchor CLI for better reliability: cargo install --git https://github.com/coral-xyz/anchor avm && avm install latest && avm use latest");
+            log::info!("🌐 Using GitHub sources for IDL fetching...");
+        }
+        
+        if do_solend {
+            log::info!("Fetching Solend IDL...");
+            IdlSources::fetch_solend(args.force).await
+                .context("Failed to fetch Solend IDL")?;
+        }
+        
+        if do_pyth {
+            log::info!("Fetching Pyth IDL...");
+            IdlSources::fetch_pyth(args.force).await
+                .context("Failed to fetch Pyth IDL")?;
+        }
+        
+        if do_switchboard {
+            log::info!("Fetching Switchboard IDL...");
+            IdlSources::fetch_switchboard(args.force).await
+                .context("Failed to fetch Switchboard IDL")?;
         }
     }
     
     log::info!("✅ IDL update completed successfully!");
     
-    // Show summary
-    use liquid_bot::core::registry::IdlFiles;
     let (solend_exists, pyth_exists, switchboard_exists) = IdlFiles::check_all();
     
     log::info!("📊 IDL Status:");
@@ -116,4 +139,3 @@ async fn main() -> Result<()> {
     
     Ok(())
 }
-
