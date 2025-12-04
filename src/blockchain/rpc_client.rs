@@ -105,6 +105,22 @@ impl RpcClient {
 
     async fn should_retry_rate_limit(&self, error_str: &str, retry_count: &mut u32) -> bool {
         use crate::utils::error_helpers;
+        
+        // ✅ CRITICAL FIX: Check for non-retryable errors FIRST (before checking retryable ones)
+        // AccountNotFound, InvalidAccount, etc. should NEVER be retried - they indicate the account
+        // doesn't exist or is invalid, not a transient network issue
+        let error_lower = error_str.to_lowercase();
+        if error_lower.contains("accountnotfound")
+            || error_lower.contains("account not found")
+            || error_lower.contains("invalidaccount")
+            || error_lower.contains("invalid account")
+            || error_lower.contains("invalid pubkey")
+            || error_lower.contains("pubkey parse error")
+        {
+            // Non-retryable error - account doesn't exist or is invalid
+            return false;
+        }
+        
         let dummy_error = anyhow::anyhow!("{}", error_str);
         let is_retryable = error_helpers::is_retryable_error(&dummy_error)
             || error_str.contains("connection closed")
@@ -115,9 +131,26 @@ impl RpcClient {
         if is_retryable {
             *retry_count += 1;
             if *retry_count <= 5 {
-                let backoff = Duration::from_millis(500 * (*retry_count as u64));
+                // Exponential backoff: 0.5s → 1s → 2s → 4s → 8s
+                // For rate limits (429), use longer backoff: 1s → 2s → 4s → 8s → 16s
+                let base_delay_ms = if error_str.contains("429") || error_str.contains("rate limit") {
+                    1000 // Start with 1s for rate limits
+                } else {
+                    500 // Start with 0.5s for network errors
+                };
+                
+                let backoff = Duration::from_millis(base_delay_ms * (1 << (*retry_count - 1)).min(16));
+                let max_backoff = if error_str.contains("429") || error_str.contains("rate limit") {
+                    Duration::from_secs(16)
+                } else {
+                    Duration::from_secs(8)
+                };
+                let backoff = backoff.min(max_backoff);
+                
                 if error_str.contains("429") || error_str.contains("rate limit") {
                     log::warn!("Rate limit hit (429), backing off for {:?} (attempt {}/{})", backoff, *retry_count, 5);
+                } else if error_str.contains("5") && (error_str.contains("http error: 5") || error_str.contains("50")) {
+                    log::warn!("Server error (5xx), retrying after {:?} (attempt {}/{})", backoff, *retry_count, 5);
                 } else {
                     log::warn!("Connection/network error, retrying after {:?} (attempt {}/{})", backoff, *retry_count, 5);
                 }

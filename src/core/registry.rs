@@ -154,6 +154,68 @@ impl LendingMarketAddresses {
     }
 }
 
+/// Pyth Oracle adresleri için registry (Mainnet)
+/// 
+/// Not: Bu adresler Pyth Network'ün mainnet-beta cluster'ı için geçerlidir.
+/// Pyth feed adresleri değişebilir, bu yüzden düzenli olarak güncellenmelidir.
+/// Resmi kaynak: https://pyth.network/developers/price-feed-ids
+pub struct PythOracleAddresses;
+
+impl PythOracleAddresses {
+    /// SOL/USD Price Feed (Mainnet)
+    /// Feed ID: 0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d
+    pub const SOL_USD: &'static str = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG";
+    
+    /// USDC/USD Price Feed (Mainnet)
+    /// Feed ID: 0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a
+    /// Note: This is the correct mainnet address for USDC/USD feed
+    pub const USDC_USD: &'static str = "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98";
+    
+    /// USDT/USD Price Feed (Mainnet)
+    pub const USDT_USD: &'static str = "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz";
+    
+    /// ETH/USD Price Feed (Mainnet)
+    pub const ETH_USD: &'static str = "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB";
+    
+    /// BTC/USD Price Feed (Mainnet)
+    pub const BTC_USD: &'static str = "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU";
+    
+    pub fn sol_usd() -> Result<Pubkey> { Self::parse(Self::SOL_USD, "SOL/USD Pyth oracle") }
+    pub fn usdc_usd() -> Result<Pubkey> { Self::parse(Self::USDC_USD, "USDC/USD Pyth oracle") }
+    pub fn usdt_usd() -> Result<Pubkey> { Self::parse(Self::USDT_USD, "USDT/USD Pyth oracle") }
+    pub fn eth_usd() -> Result<Pubkey> { Self::parse(Self::ETH_USD, "ETH/USD Pyth oracle") }
+    pub fn btc_usd() -> Result<Pubkey> { Self::parse(Self::BTC_USD, "BTC/USD Pyth oracle") }
+    
+    fn parse(addr: &str, name: &str) -> Result<Pubkey> {
+        Pubkey::from_str(addr).with_context(|| format!("Failed to parse {}", name))
+    }
+    
+    /// Mint adresine göre Pyth oracle adresini döndürür
+    pub fn get_oracle_for_mint(mint: &Pubkey) -> Result<Option<Pubkey>> {
+        use crate::core::registry::MintAddresses;
+        
+        let sol_mint = MintAddresses::sol()?;
+        let usdc_mint = MintAddresses::usdc()?;
+        let usdt_mint = MintAddresses::usdt()?;
+        let eth_mint = MintAddresses::eth()?;
+        let btc_mint = MintAddresses::btc()?;
+        
+        Ok(if *mint == sol_mint {
+            Some(Self::sol_usd()?)
+        } else if *mint == usdc_mint {
+            Some(Self::usdc_usd()?)
+        } else if *mint == usdt_mint {
+            Some(Self::usdt_usd()?)
+        } else if *mint == eth_mint {
+            Some(Self::eth_usd()?)
+        } else if *mint == btc_mint {
+            Some(Self::btc_usd()?)
+        } else {
+            None
+        })
+    }
+}
+
 /// IDL dosyaları için registry
 /// 
 /// Not: Şu anda sadece Solend IDL aktif olarak kullanılıyor.

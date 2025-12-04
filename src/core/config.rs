@@ -119,7 +119,7 @@ impl Config {
             associated_token_program_id: env_str("ASSOCIATED_TOKEN_PROGRAM_ID", &ProgramIds::ASSOCIATED_TOKEN.to_string()),
             sol_price_fallback_usd: env_parse!("SOL_PRICE_FALLBACK_USD", "150.0"),
             oracle_mappings_json: env_opt_str("ORACLE_MAPPINGS_JSON"),
-            max_oracle_age_seconds: env_parse!("MAX_ORACLE_AGE_SECONDS", "60"),
+            max_oracle_age_seconds: env_parse!("MAX_ORACLE_AGE_SECONDS", "120"),
             oracle_read_fee_lamports: env_parse!("ORACLE_READ_FEE_LAMPORTS", "5000"),
             oracle_accounts_read: env_parse!("ORACLE_ACCOUNTS_READ", "1"),
             liquidation_compute_units: env_parse!("LIQUIDATION_COMPUTE_UNITS", "200000"),

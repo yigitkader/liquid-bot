@@ -22,6 +22,36 @@ use liquid_bot::core::types::Opportunity;
 use std::str::FromStr;
 use sha2::{Digest, Sha256};
 
+/// Load wallet pubkey from config
+/// Returns None if wallet cannot be loaded (file doesn't exist, invalid format, etc.)
+fn load_wallet_pubkey_from_config(config: Option<&Config>) -> Option<Pubkey> {
+    let cfg = config?;
+    
+    if !std::path::Path::new(&cfg.wallet_path).exists() {
+        return None;
+    }
+    
+    use solana_sdk::signature::{Keypair, Signer};
+    use std::fs;
+    
+    match fs::read(&cfg.wallet_path) {
+        Ok(keypair_bytes) => {
+            if let Ok(keypair_vec) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
+                if keypair_vec.len() == 64 {
+                    Keypair::from_bytes(&keypair_vec).ok().map(|k| k.pubkey())
+                } else {
+                    None
+                }
+            } else if keypair_bytes.len() == 64 {
+                Keypair::from_bytes(&keypair_bytes).ok().map(|k| k.pubkey())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "validate_system")]
 #[command(about = "Comprehensive system validation - validates all configs, addresses, accounts, and system integrity")]
@@ -142,9 +172,21 @@ async fn main() -> Result<()> {
 
     println!("3️⃣  Testing RPC Connection...");
     println!("{}", "-".repeat(80));
+    // Priority: 1) command line arg, 2) config from .env, 3) default
     let rpc_url = args.rpc_url.as_ref()
         .map(|s| s.as_str())
+        .or_else(|| config.as_ref().map(|c| c.rpc_http_url.as_str()))
         .unwrap_or("https://api.mainnet-beta.solana.com");
+    
+    // Log which RPC URL is being used
+    if args.rpc_url.is_some() {
+        log::info!("Using RPC URL from command line argument: {}", rpc_url);
+    } else if let Some(cfg) = config.as_ref() {
+        log::info!("Using RPC URL from config (.env): {}", rpc_url);
+    } else {
+        log::warn!("Using default RPC URL (no config found): {}", rpc_url);
+    }
+    
     let rpc_client = Arc::new(
         RpcClient::new(rpc_url.to_string())
             .context("Failed to create RPC client")?
@@ -436,9 +478,23 @@ async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>, config: Option<&Co
             ));
         }
         Err(e) => {
+            let error_str = e.to_string();
+            let error_lower = error_str.to_lowercase();
+            
+            // ✅ FIX: Provide more specific error messages based on error type
+            let error_msg = if error_lower.contains("timeout") {
+                format!("RPC timeout - endpoint may be slow or unreachable. Error: {}", e)
+            } else if error_lower.contains("connection") || error_lower.contains("econn") {
+                format!("RPC connection error - check network and endpoint URL. Error: {}", e)
+            } else if error_lower.contains("429") || error_lower.contains("rate limit") {
+                format!("RPC rate limit exceeded - consider using premium RPC. Error: {}", e)
+            } else {
+                format!("RPC connection failed: {}", e)
+            };
+            
             results.push(TestResult::failure(
                 "RPC Connection",
-                &format!("Failed: {}", e)
+                &error_msg
             ));
         }
     }
@@ -457,9 +513,23 @@ async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>, config: Option<&Co
             ));
         }
         Err(e) => {
+            let error_str = e.to_string();
+            let error_lower = error_str.to_lowercase();
+            
+            // ✅ FIX: Provide more specific error messages
+            let error_msg = if error_lower.contains("accountnotfound") || error_lower.contains("account not found") {
+                format!("Account not found (this is expected for some accounts). Error: {}", e)
+            } else if error_lower.contains("timeout") {
+                format!("RPC timeout when fetching account. Error: {}", e)
+            } else if error_lower.contains("connection") {
+                format!("RPC connection error when fetching account. Error: {}", e)
+            } else {
+                format!("Failed to fetch account: {}", e)
+            };
+            
             results.push(TestResult::failure(
                 "RPC Account Fetch",
-                &format!("Failed: {}", e)
+                &error_msg
             ));
         }
     }
@@ -721,14 +791,24 @@ async fn validate_obligation_accounts(rpc_client: &Arc<RpcClient>, config: Optio
         }
     }
 
-    let test_wallet = Pubkey::try_from("11111111111111111111111111111111")
-        .context("Invalid test wallet")?;
+    // Use wallet from config if available, otherwise skip this test
+    let test_wallet = match load_wallet_pubkey_from_config(config) {
+        Some(wallet) => wallet,
+        None => {
+            results.push(TestResult::failure(
+                "Obligation PDA Derivation",
+                "Wallet not available in config - cannot derive obligation PDA"
+            ));
+            return Ok(results);
+        }
+    };
+    
     match derive_obligation_address(&test_wallet, &main_market, &solend_program_id) {
         Ok(obligation_pda) => {
             results.push(TestResult::success_with_details(
                 "Obligation PDA Derivation",
-                "Successfully derived obligation PDA",
-                format!("Test wallet: {}, Obligation PDA: {}", test_wallet, obligation_pda)
+                "Successfully derived obligation PDA from config wallet",
+                format!("Wallet: {}, Obligation PDA: {}", test_wallet, obligation_pda)
             ));
         }
         Err(e) => {
@@ -778,19 +858,30 @@ async fn validate_pda_derivations(config: Option<&Config>) -> Result<Vec<TestRes
         }
     }
 
-    // ✅ FIX: Use REAL wallet from config or known mainnet wallet (not dummy data)
-    // Use a known mainnet wallet that likely has an obligation - this is REAL data
-    let known_wallet: Pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
-        .parse()
-        .context("Invalid known wallet")?;
+    // Use wallet from config - if not available, skip this test
+    let wallet_to_use = match load_wallet_pubkey_from_config(config) {
+        Some(wallet) => wallet,
+        None => {
+            results.push(TestResult::failure(
+                "Obligation PDA Derivation",
+                "Wallet not available in config - cannot derive obligation PDA"
+            ));
+            return Ok(results);
+        }
+    };
     
-    match derive_obligation_address(&known_wallet, &main_market, &program_id) {
+    match derive_obligation_address(&wallet_to_use, &main_market, &program_id) {
         Ok(obligation) => {
-            log::info!("✅ Derived Obligation PDA from REAL mainnet wallet: Wallet={}, Obligation={}", known_wallet, obligation);
+            log::info!("✅ Derived Obligation PDA from config wallet: Wallet={}, Obligation={}", wallet_to_use, obligation);
+            // Print obligation for .env file if TEST_OBLIGATION_PUBKEY is not set
+            if std::env::var("TEST_OBLIGATION_PUBKEY").ok().is_none() {
+                eprintln!("\n📝 Add this to your .env file (optional, for testing):");
+                eprintln!("TEST_OBLIGATION_PUBKEY={}", obligation);
+            }
             results.push(TestResult::success_with_details(
                 "Obligation PDA Derivation",
-                "Derived successfully from REAL mainnet wallet",
-                format!("Wallet: {} (known mainnet wallet), Obligation: {}", known_wallet, obligation)
+                "Derived successfully from config wallet",
+                format!("Wallet: {}, Obligation: {}", wallet_to_use, obligation)
             ));
         }
         Err(e) => {
@@ -976,7 +1067,10 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
                 }
                 Err(e) => {
                     let error_str = e.to_string();
-                    if error_str.contains("AccountNotFound") || error_str.contains("account not found") {
+                    let error_lower = error_str.to_lowercase();
+                    
+                    // ✅ FIX: AccountNotFound should not trigger retries - check immediately
+                    if error_lower.contains("accountnotfound") || error_lower.contains("account not found") {
                         log::warn!("Pyth oracle account {} not found on-chain. Trying Switchboard as fallback...", pyth_oracle);
                         // ✅ FIX: Try Switchboard oracle as fallback for USDC
                         match get_switchboard_oracle_account(&usdc_mint, config) {
@@ -989,6 +1083,20 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
                                             "Pyth oracle not found, but Switchboard oracle is available (fallback)",
                                             format!("Pyth: {} (not found), Switchboard: {} (available)", pyth_oracle, switchboard_oracle)
                                         ));
+                                    }
+                                    Err(switchboard_err) => {
+                                        let switchboard_err_str = switchboard_err.to_string().to_lowercase();
+                                        if switchboard_err_str.contains("accountnotfound") || switchboard_err_str.contains("account not found") {
+                                            results.push(TestResult::failure(
+                                                "Pyth Oracle Account (USDC)",
+                                                &format!("Neither Pyth ({}) nor Switchboard oracle found on-chain. Please check oracle address mappings in registry.", pyth_oracle)
+                                            ));
+                                        } else {
+                                            results.push(TestResult::failure(
+                                                "Pyth Oracle Account (USDC)",
+                                                &format!("Pyth not found, Switchboard fetch failed: {}. Check RPC connection.", switchboard_err)
+                                            ));
+                                        }
                                     }
                                     _ => {
                                         results.push(TestResult::failure(
@@ -1005,6 +1113,13 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
                                 ));
                             }
                         }
+                    } else if error_lower.contains("timeout") || error_lower.contains("connection") {
+                        // Network/timeout errors - these are retryable but we've already retried
+                        log::error!("Failed to fetch Pyth oracle account {} after retries: {}", pyth_oracle, e);
+                        results.push(TestResult::failure(
+                            "Pyth Oracle Account (USDC)",
+                            &format!("RPC connection/timeout error when fetching oracle account: {}. Check RPC endpoint and network connection.", e)
+                        ));
                     } else {
                         log::error!("Failed to fetch Pyth oracle account {}: {}", pyth_oracle, e);
                         results.push(TestResult::failure(
@@ -1122,11 +1237,21 @@ async fn validate_oracle_accounts(rpc_client: &Arc<RpcClient>, config: Option<&C
                 }
                 Err(e) => {
                     let error_str = e.to_string();
-                    if error_str.contains("AccountNotFound") || error_str.contains("account not found") {
+                    let error_lower = error_str.to_lowercase();
+                    
+                    // ✅ FIX: AccountNotFound should not trigger retries - check immediately
+                    if error_lower.contains("accountnotfound") || error_lower.contains("account not found") {
                         log::warn!("Pyth oracle account {} not found on-chain. This may indicate the oracle address mapping is incorrect.", pyth_oracle);
                         results.push(TestResult::failure(
                             "Pyth Oracle Account (SOL)",
                             &format!("Oracle account {} not found on-chain. The oracle address mapping may be incorrect. Please check Pyth Network documentation for the correct SOL/USD oracle address.", pyth_oracle)
+                        ));
+                    } else if error_lower.contains("timeout") || error_lower.contains("connection") {
+                        // Network/timeout errors - these are retryable but we've already retried
+                        log::error!("Failed to fetch Pyth oracle account {} after retries: {}", pyth_oracle, e);
+                        results.push(TestResult::failure(
+                            "Pyth Oracle Account (SOL)",
+                            &format!("RPC connection/timeout error when fetching oracle account: {}. Check RPC endpoint and network connection.", e)
                         ));
                     } else {
                         log::error!("Failed to fetch Pyth oracle account {}: {}", pyth_oracle, e);
@@ -1877,7 +2002,9 @@ fn validate_instruction_building_test() -> TestResult {
 }
 
 fn get_test_pyth_oracle(_config: &Config) -> Option<Pubkey> {
-    Pubkey::from_str("5SSkXsEKQepHHAewytPVwdej4ecN1gEYiT4YpqJTxDLv").ok()
+    // Use centralized registry for Pyth oracle addresses
+    use liquid_bot::core::registry::PythOracleAddresses;
+    PythOracleAddresses::usdc_usd().ok()
 }
 
 fn get_test_switchboard_oracle(_config: &Config) -> Option<Pubkey> {
@@ -2009,8 +2136,14 @@ async fn test_liquidation_instruction(rpc: &Arc<RpcClient>, config: &Config) -> 
             if position.health_factor < config.hf_liquidation_threshold {
                 found_liquidatable = true;
                 
-                let test_liquidator = Pubkey::from_str(&config.test_wallet_pubkey.as_ref().unwrap_or(&"11111111111111111111111111111111".to_string()))
-                    .context("Invalid test wallet pubkey")?;
+                // Use wallet from config for testing
+                let test_liquidator = match load_wallet_pubkey_from_config(Some(config)) {
+                    Some(wallet) => wallet,
+                    None => {
+                        log::warn!("Wallet not available in config - skipping liquidation instruction building test");
+                        continue;
+                    }
+                };
 
                 let debt_asset = position.debt_assets.first()
                     .ok_or_else(|| anyhow::anyhow!("No debt assets in position"))?;

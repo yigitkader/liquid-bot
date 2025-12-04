@@ -36,21 +36,48 @@ pub fn get_pyth_oracle_account(
         }
     }
 
-    let mappings = [
-        (config.and_then(|c| c.usdc_mint.parse::<Pubkey>().ok()).or_else(|| "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().ok()), "5SSkXsEKQepHHAewytPVwdej4epE1h4EmHtUxJ9rKT98"),
-        (config.and_then(|c| c.sol_mint.parse::<Pubkey>().ok()).or_else(|| "So11111111111111111111111111111111111111112".parse().ok()), "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"),
-        (config.and_then(|c| c.usdt_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".parse().ok()), "3vxLXJqLqF3JG5TCbYycbKWRBbCJCMx7E4xrTU5XG8Jz"),
-        (config.and_then(|c| c.eth_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs".parse().ok()), "JBu1AL4obBcCMqKBBxhpWCNUt136ijcuMZLFvTP7iWdB"),
-        (config.and_then(|c| c.btc_mint.as_ref()?.parse::<Pubkey>().ok()).or_else(|| "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E".parse().ok()), "GVXRSBjFk6e6J3NbVPXohDJetcTjaeeuykUpbQF8UoMU"),
-    ];
-
-    for (check_mint, oracle) in mappings.iter() {
-        if let Some(check) = check_mint {
-            if *mint == *check {
-                if let Ok(pyth) = oracle.parse::<Pubkey>() {
-                    return Ok(Some(pyth));
-                }
-            }
+    // Use centralized registry for Pyth oracle addresses
+    use crate::core::registry::{MintAddresses, PythOracleAddresses};
+    
+    let sol_mint = MintAddresses::sol().ok();
+    let usdc_mint = MintAddresses::usdc().ok();
+    let usdt_mint = MintAddresses::usdt().ok();
+    let eth_mint = MintAddresses::eth().ok();
+    let btc_mint = MintAddresses::btc().ok();
+    
+    // Check config mints first, then fallback to registry defaults
+    let check_mint = config.and_then(|c| c.usdc_mint.parse::<Pubkey>().ok()).or(usdc_mint);
+    if let Some(ref check) = check_mint {
+        if *mint == *check {
+            return Ok(Some(PythOracleAddresses::usdc_usd()?));
+        }
+    }
+    
+    let check_mint = config.and_then(|c| c.sol_mint.parse::<Pubkey>().ok()).or(sol_mint);
+    if let Some(ref check) = check_mint {
+        if *mint == *check {
+            return Ok(Some(PythOracleAddresses::sol_usd()?));
+        }
+    }
+    
+    let check_mint = config.and_then(|c| c.usdt_mint.as_ref()?.parse::<Pubkey>().ok()).or(usdt_mint);
+    if let Some(ref check) = check_mint {
+        if *mint == *check {
+            return Ok(Some(PythOracleAddresses::usdt_usd()?));
+        }
+    }
+    
+    let check_mint = config.and_then(|c| c.eth_mint.as_ref()?.parse::<Pubkey>().ok()).or(eth_mint);
+    if let Some(ref check) = check_mint {
+        if *mint == *check {
+            return Ok(Some(PythOracleAddresses::eth_usd()?));
+        }
+    }
+    
+    let check_mint = config.and_then(|c| c.btc_mint.as_ref()?.parse::<Pubkey>().ok()).or(btc_mint);
+    if let Some(ref check) = check_mint {
+        if *mint == *check {
+            return Ok(Some(PythOracleAddresses::btc_usd()?));
         }
     }
 
@@ -161,17 +188,16 @@ pub async fn read_pyth_price(
             );
             acc
         }
-        Ok(acc) => {
+        Ok(_acc) => {
             log::warn!(
-                "Pyth oracle account {} is empty ({} bytes)",
-                oracle_account,
-                acc.data.len()
+                "Price source: PYTH (ACCOUNT_EMPTY) - account={}, trying Switchboard fallback...",
+                oracle_account
             );
             return Ok(None);
         }
         Err(e) => {
-            log::error!(
-                "Failed to fetch Pyth oracle account {}: {}",
+            log::warn!(
+                "Price source: PYTH (ACCOUNT_NOT_FOUND) - account={}, error={}, trying Switchboard fallback...",
                 oracle_account,
                 e
             );
@@ -188,8 +214,8 @@ pub async fn read_pyth_price(
             );
         }
         Err(e) => {
-            log::error!("Failed to parse Pyth price feed for account {}: {}. Account data size: {} bytes, owner: {}", 
-                oracle_account, e, account_mut.data.len(), account_mut.owner);
+            log::warn!("Price source: PYTH (PARSE_ERROR) - account={}, error={}, trying Switchboard fallback...", 
+                oracle_account, e);
             return Ok(None);
         }
     };
@@ -270,9 +296,9 @@ pub async fn read_pyth_price(
             }
             Ok(None) => {
                 log::warn!(
-                    "Pyth price data is stale or not found for account {} (max_age={}s)",
-                    oracle_account,
-                    max_age_seconds
+                    "Price source: PYTH (STALE, max_age={}s) - account={}, trying Switchboard fallback...",
+                    max_age_seconds,
+                    oracle_account
                 );
                 return Ok(None);
             }
@@ -304,9 +330,10 @@ pub async fn read_pyth_price(
 
     let price = price_data.price as f64 * 10_f64.powi(price_data.expo);
     let confidence = price_data.conf as f64 * 10_f64.powi(price_data.expo);
+    let age_seconds = current_time - price_data.publish_time;
 
-    log::info!("Pyth oracle price read successfully: account={}, price=${:.4}, confidence=${:.4}, timestamp={}", 
-        oracle_account, price, confidence, price_data.publish_time);
+    log::info!("Price source: PYTH (fresh, age={}s, max_age={}s) - account={}, price=${:.4}, confidence=${:.4}", 
+        age_seconds, max_age_seconds, oracle_account, price, confidence);
 
     Ok(Some(OraclePrice {
         price,
@@ -323,8 +350,14 @@ pub async fn read_switchboard_price(
     use crate::protocol::oracle::switchboard::SwitchboardOracle;
     match SwitchboardOracle::read_price(oracle_account, rpc_client).await {
         Ok(price_data) => {
-            log::info!("Switchboard oracle price read successfully: account={}, price=${:.4}, confidence=${:.4}, timestamp={}", 
-                oracle_account, price_data.price, price_data.confidence, price_data.timestamp);
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
+                .as_secs() as i64;
+            let age_seconds = current_time - price_data.timestamp;
+            
+            log::info!("Price source: SWITCHBOARD (fresh, age={}s) - account={}, price=${:.4}, confidence=${:.4}", 
+                age_seconds, oracle_account, price_data.price, price_data.confidence);
             Ok(Some(OraclePrice {
                 price: price_data.price,
                 confidence: price_data.confidence,
@@ -333,7 +366,7 @@ pub async fn read_switchboard_price(
             }))
         }
         Err(e) => {
-            log::error!("Failed to read Switchboard oracle price from account {}: {}", oracle_account, e);
+            log::warn!("Price source: SWITCHBOARD (ERROR) - account={}, error={}", oracle_account, e);
             Ok(None)
         }
     }
@@ -346,14 +379,33 @@ pub async fn read_oracle_price(
     config: Option<&crate::config::Config>,
 ) -> Result<Option<OraclePrice>> {
     if let Some(pyth_pubkey) = pyth_account {
-        if let Some(price) = read_pyth_price(pyth_pubkey, Arc::clone(&rpc_client), config).await? {
-            return Ok(Some(price));
+        match read_pyth_price(pyth_pubkey, Arc::clone(&rpc_client), config).await {
+            Ok(Some(price)) => {
+                log::debug!("Using Pyth price for oracle account: {}", pyth_pubkey);
+                return Ok(Some(price));
+            }
+            Ok(None) => {
+                log::debug!("Pyth price unavailable, trying Switchboard fallback for account: {}", pyth_pubkey);
+            }
+            Err(e) => {
+                log::warn!("Pyth price read error: {}, trying Switchboard fallback", e);
+            }
         }
     }
     if let Some(switchboard_pubkey) = switchboard_account {
-        if let Some(price) = read_switchboard_price(switchboard_pubkey, rpc_client).await? {
-            return Ok(Some(price));
+        match read_switchboard_price(switchboard_pubkey, rpc_client).await {
+            Ok(Some(price)) => {
+                log::debug!("Using Switchboard price (Pyth fallback) for oracle account: {}", switchboard_pubkey);
+                return Ok(Some(price));
+            }
+            Ok(None) => {
+                log::warn!("Both Pyth and Switchboard prices unavailable for account: {}", switchboard_pubkey);
+            }
+            Err(e) => {
+                log::warn!("Switchboard price read error: {}", e);
+            }
         }
     }
+    log::error!("No oracle price available: Pyth={:?}, Switchboard={:?}", pyth_account.is_some(), switchboard_account.is_some());
     Ok(None)
 }
