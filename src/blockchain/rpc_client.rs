@@ -103,66 +103,6 @@ impl RpcClient {
         *last_time = Instant::now();
     }
 
-    async fn should_retry_rate_limit(&self, error_str: &str, retry_count: &mut u32) -> bool {
-        use crate::utils::error_helpers;
-        
-        // ✅ CRITICAL FIX: Check for non-retryable errors FIRST (before checking retryable ones)
-        // AccountNotFound, InvalidAccount, etc. should NEVER be retried - they indicate the account
-        // doesn't exist or is invalid, not a transient network issue
-        let error_lower = error_str.to_lowercase();
-        if error_lower.contains("accountnotfound")
-            || error_lower.contains("account not found")
-            || error_lower.contains("invalidaccount")
-            || error_lower.contains("invalid account")
-            || error_lower.contains("invalid pubkey")
-            || error_lower.contains("pubkey parse error")
-        {
-            // Non-retryable error - account doesn't exist or is invalid
-            return false;
-        }
-        
-        let dummy_error = anyhow::anyhow!("{}", error_str);
-        let is_retryable = error_helpers::is_retryable_error(&dummy_error)
-            || error_str.contains("connection closed")
-            || error_str.contains("connection reset")
-            || error_str.contains("ECONNRESET")
-            || error_str.contains("ECONNREFUSED");
-        
-        if is_retryable {
-            *retry_count += 1;
-            if *retry_count <= 5 {
-                // Exponential backoff: 0.5s → 1s → 2s → 4s → 8s
-                // For rate limits (429), use longer backoff: 1s → 2s → 4s → 8s → 16s
-                let base_delay_ms = if error_str.contains("429") || error_str.contains("rate limit") {
-                    1000 // Start with 1s for rate limits
-                } else {
-                    500 // Start with 0.5s for network errors
-                };
-                
-                let backoff = Duration::from_millis(base_delay_ms * (1 << (*retry_count - 1)).min(16));
-                let max_backoff = if error_str.contains("429") || error_str.contains("rate limit") {
-                    Duration::from_secs(16)
-                } else {
-                    Duration::from_secs(8)
-                };
-                let backoff = backoff.min(max_backoff);
-                
-                if error_str.contains("429") || error_str.contains("rate limit") {
-                    log::warn!("Rate limit hit (429), backing off for {:?} (attempt {}/{})", backoff, *retry_count, 5);
-                } else if error_str.contains("5") && (error_str.contains("http error: 5") || error_str.contains("50")) {
-                    log::warn!("Server error (5xx), retrying after {:?} (attempt {}/{})", backoff, *retry_count, 5);
-                } else {
-                    log::warn!("Connection/network error, retrying after {:?} (attempt {}/{})", backoff, *retry_count, 5);
-                }
-                sleep(backoff).await;
-                return true;
-            } else {
-                log::error!("Retry limit exceeded after 5 retries");
-                return false;
-            }
-        }
-        false
-    }
 
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<solana_sdk::account::Account> {
         self.rate_limit().await;
@@ -172,48 +112,40 @@ impl RpcClient {
             .await
             .context("Failed to acquire rate limiter permit")?;
 
+        use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
+        
         let pubkey = *pubkey;
-        let mut retry_count = 0;
-
-        loop {
-            let client = Arc::clone(&self.client);
-            let rpc_url = self.rpc_url.clone();
-            let timeout_duration = self.request_timeout;
-            let result = timeout(
-                timeout_duration,
-                tokio::task::spawn_blocking(move || {
-                    client
-                        .get_account(&pubkey)
-                        .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
-                }),
-            )
-            .await;
-
-            let result = match result {
-                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
+        let client = Arc::clone(&self.client);
+        let rpc_url = self.rpc_url.clone();
+        let timeout_duration = self.request_timeout;
+        
+        retry_with_backoff(
+            || {
+                let client = Arc::clone(&client);
+                let rpc_url = rpc_url.clone();
+                let pubkey = pubkey;
+                let timeout_duration = timeout_duration;
+                async move {
+                    timeout(
+                        timeout_duration,
+                        tokio::task::spawn_blocking(move || {
+                            client
+                                .get_account(&pubkey)
+                                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+                        }),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!(
                         "RPC request timeout after {:?} for get_account({})",
                         timeout_duration,
                         pubkey
-                    ));
+                    ))?
+                    .context("Failed to spawn blocking task")?
+                    .map_err(|e| e)
                 }
-            };
-
-            match result {
-                Ok(Ok(account)) => return Ok(account),
-                Ok(Err(e)) => {
-                    let error_str = e.to_string();
-                    if !self
-                        .should_retry_rate_limit(&error_str, &mut retry_count)
-                        .await
-                    {
-                        return Err(e);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+            },
+            RetryConfig::for_rpc(),
+        ).await
     }
 
     pub async fn get_program_accounts(
@@ -227,67 +159,42 @@ impl RpcClient {
             .await
             .context("Failed to acquire rate limiter permit")?;
 
+        use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
+        
         let program_id = *program_id;
-        let mut retry_count = 0;
-
-        loop {
-            let client = Arc::clone(&self.client);
-            let rpc_url = self.rpc_url.clone();
-            // ✅ FIX: get_program_accounts is expensive and can take longer than default timeout
-            // Use 3x the default timeout for this operation (min 30s, max 90s)
-            let timeout_duration = self.request_timeout * 3;
-            let timeout_duration = timeout_duration.max(Duration::from_secs(30)).min(Duration::from_secs(90));
-            
-            let result = timeout(
-                timeout_duration,
-                tokio::task::spawn_blocking(move || {
-                    client
-                        .get_program_accounts(&program_id)
-                        .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
-                }),
-            )
-            .await;
-
-            let result = match result {
-                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
-                Err(_) => {
-                    let error = anyhow::anyhow!(
+        let client = Arc::clone(&self.client);
+        let rpc_url = self.rpc_url.clone();
+        let timeout_duration = (self.request_timeout * 3)
+            .max(Duration::from_secs(30))
+            .min(Duration::from_secs(90));
+        
+        retry_with_backoff(
+            || {
+                let client = Arc::clone(&client);
+                let rpc_url = rpc_url.clone();
+                let program_id = program_id;
+                let timeout_duration = timeout_duration;
+                async move {
+                    timeout(
+                        timeout_duration,
+                        tokio::task::spawn_blocking(move || {
+                            client
+                                .get_program_accounts(&program_id)
+                                .map_err(|e| anyhow::anyhow!("RPC error ({}): {}", rpc_url, e))
+                        }),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!(
                         "RPC request timeout after {:?} for get_program_accounts({})",
                         timeout_duration,
                         program_id
-                    );
-                    if !self
-                        .should_retry_rate_limit(&error.to_string(), &mut retry_count)
-                        .await
-                    {
-                        return Err(error);
-                    }
-                    continue;
+                    ))?
+                    .context("Failed to spawn blocking task")?
+                    .map_err(|e| e)
                 }
-            };
-
-            match result {
-                Ok(Ok(accounts)) => return Ok(accounts),
-                Ok(Err(e)) => {
-                    let error_str = e.to_string();
-                    if !self
-                        .should_retry_rate_limit(&error_str, &mut retry_count)
-                        .await
-                    {
-                        return Err(e);
-                    }
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if !self
-                        .should_retry_rate_limit(&error_str, &mut retry_count)
-                        .await
-                    {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+            },
+            RetryConfig::for_rpc(),
+        ).await
     }
 
     pub async fn get_program_accounts_with_filters(
@@ -432,46 +339,35 @@ impl RpcClient {
             .await
             .context("Failed to acquire rate limiter permit")?;
 
-        let mut retry_count = 0;
-
-        loop {
-            let client = Arc::clone(&self.client);
-
-            let timeout_duration = self.request_timeout;
-            let result = timeout(
-                timeout_duration,
-                tokio::task::spawn_blocking(move || {
-                    client
-                        .get_latest_blockhash()
-                        .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
-                }),
-            )
-            .await;
-
-            let result = match result {
-                Ok(task_result) => task_result.context("Failed to spawn blocking task"),
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
+        use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
+        
+        let client = Arc::clone(&self.client);
+        let timeout_duration = self.request_timeout;
+        
+        retry_with_backoff(
+            || {
+                let client = Arc::clone(&client);
+                let timeout_duration = timeout_duration;
+                async move {
+                    timeout(
+                        timeout_duration,
+                        tokio::task::spawn_blocking(move || {
+                            client
+                                .get_latest_blockhash()
+                                .map_err(|e| anyhow::anyhow!("RPC error: {}", e))
+                        }),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!(
                         "RPC request timeout after {:?} for get_latest_blockhash",
                         timeout_duration
-                    ));
+                    ))?
+                    .context("Failed to spawn blocking task")?
+                    .map_err(|e| e)
                 }
-            };
-
-            match result {
-                Ok(Ok(hash)) => return Ok(hash),
-                Ok(Err(e)) => {
-                    let error_str = e.to_string();
-                    if !self
-                        .should_retry_rate_limit(&error_str, &mut retry_count)
-                        .await
-                    {
-                        return Err(e);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+            },
+            RetryConfig::for_rpc(),
+        ).await
     }
 
     pub async fn get_slot(&self) -> Result<u64> {
@@ -571,24 +467,4 @@ impl RpcClient {
         Ok(response.value)
     }
 
-    pub async fn retry<F, Fut, T>(&self, operation: F, max_retries: u32) -> Result<T>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        for attempt in 0..=max_retries {
-            match operation().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if attempt < max_retries {
-                        let delay_ms = 1000 * (1 << attempt);
-                        sleep(Duration::from_millis(delay_ms)).await;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        unreachable!()
-    }
 }

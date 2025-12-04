@@ -4,6 +4,7 @@ use crate::core::types::Opportunity;
 use crate::protocol::solend::accounts::{
     derive_lending_market_authority, get_associated_token_address,
 };
+use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
@@ -258,32 +259,26 @@ impl ReserveCache {
             // Scanner/Executor to make unnecessary RPC calls (get_program_accounts)
             log::info!("Performing initial reserve cache refresh...");
             
-            // ✅ FIX: Retry mechanism with exponential backoff for initial refresh
+            // ✅ FIX: Use centralized retry mechanism with exponential backoff
             // This handles transient RPC errors and timeouts
-            const MAX_RETRIES: u32 = 3;
-            const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+            let retry_config = RetryConfig {
+                max_retries: 3,
+                initial_delay_ms: 2000,
+                max_delay_ms: 16000,
+                backoff_multiplier: 2.0,
+                is_rate_limit: false,
+            };
             
-            let mut retry_count = 0;
-            let mut retry_delay = INITIAL_RETRY_DELAY;
-            
-            loop {
-                match self.refresh_from_rpc(&rpc, &config).await {
-                    Ok(()) => {
-                        log::info!("✅ Initial reserve cache populated successfully");
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count > MAX_RETRIES {
-                            log::error!("Initial reserve cache refresh FAILED after {} retries: {}", MAX_RETRIES, e);
-                            log::error!("⚠️  Reserve cache will remain empty - Scanner/Executor may make unnecessary RPC calls");
-                            break;
-                        }
-                        log::warn!("Initial reserve cache refresh failed (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                        log::info!("Retrying in {:?}...", retry_delay);
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = retry_delay * 2; // Exponential backoff
-                    }
+            match retry_with_backoff(
+                || self.refresh_from_rpc(&rpc, &config),
+                retry_config,
+            ).await {
+                Ok(()) => {
+                    log::info!("✅ Initial reserve cache populated successfully");
+                }
+                Err(e) => {
+                    log::error!("Initial reserve cache refresh FAILED after retries: {}", e);
+                    log::error!("⚠️  Reserve cache will remain empty - Scanner/Executor may make unnecessary RPC calls");
                 }
             }
 
@@ -586,9 +581,24 @@ pub async fn build_wrap_sol_instruction(
     use crate::protocol::solend::accounts::get_associated_token_program_id;
     use crate::utils::ata_manager::get_token_program_for_mint;
     
-    // ✅ VALIDATION: Amount must be greater than 0
     if amount == 0 {
         return Err(anyhow::anyhow!("Wrap amount cannot be zero"));
+    }
+    
+    if let (Some(rpc_client), Some(config)) = (rpc, config) {
+        let wallet_account = rpc_client.get_account(wallet).await
+            .context("Failed to fetch wallet account for native SOL balance check")?;
+        let native_sol = wallet_account.lamports;
+        let min_reserve = config.min_reserve_lamports;
+        let required = amount.checked_add(min_reserve)
+            .ok_or_else(|| anyhow::anyhow!("Wrap amount + reserve overflow"))?;
+        
+        if native_sol < required {
+            return Err(anyhow::anyhow!(
+                "Insufficient native SOL: need {} lamports (wrap: {} + reserve: {}), have {} lamports",
+                required, amount, min_reserve, native_sol
+            )).context("Cannot wrap SOL to WSOL - insufficient native SOL balance");
+        }
     }
     
     let mut instructions = Vec::new();

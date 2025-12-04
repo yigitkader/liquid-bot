@@ -2,7 +2,6 @@ use crate::core::config::Config;
 use anyhow::Result;
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
-use std::time::Duration;
 
 pub struct SlippageEstimator {
     config: Config,
@@ -101,104 +100,31 @@ impl SlippageEstimator {
             input_mint, output_mint, amount
         );
 
-        // Helper function for exponential backoff
-        // Exponential backoff: 1s, 2s, 4s (better for rate limit handling)
-        let get_backoff = |attempt: u32| -> Duration {
-            // attempt 1: 1000 * 2^0 = 1000ms = 1s
-            // attempt 2: 1000 * 2^1 = 2000ms = 2s
-            // attempt 3: 1000 * 2^2 = 4000ms = 4s
-            let backoff_ms = 1000 * 2_u64.pow(attempt.saturating_sub(1));
-            Duration::from_millis(backoff_ms)
+        use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
+        
+        let config = RetryConfig {
+            max_retries: MAX_RETRIES,
+            initial_delay_ms: 1000,
+            max_delay_ms: 4000,
+            backoff_multiplier: 2.0,
+            is_rate_limit: false,
         };
-
-        let mut last_error: Option<String> = None;
-
-        // ✅ FIX: Smart retry logic - only retry retryable errors
-        // Problem: Previous implementation retried ALL errors, including:
-        //   - 4xx client errors (bad request) → will never succeed
-        //   - Parse errors → will never succeed
-        //   - Missing data errors → will never succeed
-        // Solution: Only retry transient errors (5xx, timeouts, network errors, rate limits)
-        // 
-        // ✅ CRITICAL FIX: Explicit loop control to prevent infinite loops and ensure fallback is reached
-        // Problem: Previous code had separate checks for !is_retryable and attempt >= MAX_RETRIES
-        //   - If is_retryable is true but attempt >= MAX_RETRIES, we need to break
-        //   - If is_retryable is false, we need to break immediately
-        //   - Separate checks could lead to confusion or missed break conditions
-        // Solution: Combine both conditions in a single check to ensure we always break when needed
-        //   - Break if error is NOT retryable (immediate failure)
-        //   - Break if we've reached max retries (even if error is retryable)
-        //   - This guarantees fallback is always reached when retries are exhausted
-        for attempt in 1..=MAX_RETRIES {
-            match self.try_jupiter_quote(&url).await {
-                Ok((slippage, hop_count)) => {
-                    // ✅ Success - return immediately
-                    return Ok((slippage, hop_count));
-                }
-                Err(e) => {
-                    // Check if error is retryable BEFORE storing
-                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
-                    let error_msg = e.to_string();
-                    last_error = Some(error_msg.clone());
-                    
-                    // ✅ CRITICAL FIX: Combined break condition ensures fallback is always reached
-                    // Break if:
-                    //   1. Error is NOT retryable (non-retryable errors should fail immediately)
-                    //   2. We've reached max retries (even if error is retryable, we must stop and use fallback)
-                    // This prevents infinite loops and guarantees fallback is reached
-                    if !is_retryable || attempt >= MAX_RETRIES {
-                        if !is_retryable {
-                            log::warn!(
-                                "Jupiter API attempt {}/{} failed with non-retryable error: {} (falling back immediately)",
-                                attempt,
-                                MAX_RETRIES,
-                                error_msg
-                            );
-                        } else {
-                            log::warn!(
-                                "Jupiter API attempt {}/{} failed with retryable error: {} (max retries reached, falling back)",
-                                attempt,
-                                MAX_RETRIES,
-                                error_msg
-                            );
-                        }
-                        break; // Exit retry loop - fallback will be used
-                    }
-                    
-                    // Not the last attempt AND error is retryable - log and retry
-                    log::warn!(
-                        "Jupiter API attempt {}/{} failed (retrying): {}",
-                        attempt,
-                        MAX_RETRIES,
-                        error_msg
-                    );
-
-                    let backoff = get_backoff(attempt);
-                    tokio::time::sleep(backoff).await;
-                    // Loop continues to next attempt
-                }
+        
+        match retry_with_backoff(
+            || self.try_jupiter_quote(&url),
+            config,
+        ).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                log::warn!("Jupiter API failed after {} attempts: {} - using fallback", MAX_RETRIES, e);
             }
         }
-
-        log::warn!("Jupiter API failed after {} attempts: {} - using fallback", MAX_RETRIES, last_error.as_deref().unwrap_or("unknown"));
         use crate::strategy::profit_calculator::ProfitCalculator;
         let profit_calc = ProfitCalculator::new(self.config.clone());
         let estimated_hop_count = profit_calc.estimate_hop_count(&input_mint, &output_mint);
         let slippage = self.estimate_with_multipliers(amount)?;
         log::debug!("SlippageEstimator: Using fallback hop_count={} for {} -> {}, slippage={} bps", estimated_hop_count, input_mint, output_mint, slippage);
         Ok((slippage, estimated_hop_count))
-    }
-
-    /// Check if an error is retryable
-    /// ✅ FIX: Only retry transient errors, not permanent client errors
-    /// Retryable: 5xx server errors, timeouts, network errors, rate limits (429)
-    /// Check if error is retryable (delegates to shared utility)
-    /// 
-    /// Note: This method is kept for backward compatibility but delegates to
-    /// the shared `error_helpers::is_retryable_error` function.
-    #[allow(dead_code)] // Keep for backward compatibility
-    fn is_retryable_error(error: &anyhow::Error) -> bool {
-        crate::utils::error_helpers::is_retryable_error(error)
     }
 
     /// Try to get a quote from Jupiter API (single attempt, no retries)

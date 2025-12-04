@@ -262,10 +262,6 @@ impl Executor {
         }
     }
 
-    fn check_error_threshold(&self) -> Result<()> {
-        self.error_tracker.check_error_threshold()
-    }
-
     fn record_error(&self) -> Result<()> {
         self.error_tracker.record_error()
     }
@@ -304,13 +300,6 @@ impl Executor {
         log::info!("Executor: shutting down gracefully, cancelling background tasks");
         self.tx_lock.cancel_cleanup();
         self.ata_cache_cleanup_token.cancel();
-    }
-
-    /// Check if error is retryable (delegates to shared utility)
-    /// 
-    /// Note: This method delegates to the shared `error_helpers::is_retryable_error` function.
-    fn is_retryable_error(&self, error: &anyhow::Error) -> bool {
-        crate::utils::error_helpers::is_retryable_error(error)
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -849,9 +838,12 @@ impl Executor {
         tx_builder: &TransactionBuilder,
         jito_client: &Arc<JitoClient>,
     ) -> Result<solana_sdk::signature::Signature> {
-        Self::retry_with_backoff(
+        use crate::utils::error_helpers::{retry_with_validation, RetryConfig};
+        
+        retry_with_validation(
             || async { self.send_via_jito(tx_builder, jito_client).await },
-            |sig| sig == solana_sdk::signature::Signature::default(),
+            |sig: &solana_sdk::signature::Signature| *sig != solana_sdk::signature::Signature::default(),
+            RetryConfig::for_transaction(),
             "Jito TX",
         ).await
     }
@@ -914,7 +906,9 @@ impl Executor {
         &self,
         tx_builder: &TransactionBuilder,
     ) -> Result<solana_sdk::signature::Signature> {
-        Self::retry_with_backoff(
+        use crate::utils::error_helpers::{retry_with_backoff, RetryConfig};
+        
+        retry_with_backoff(
             || async {
                 let blockhash = self.rpc.get_recent_blockhash().await?;
                 let mut tx = tx_builder.build(blockhash);
@@ -922,53 +916,7 @@ impl Executor {
                     .context("Failed to sign transaction - double signing detected")?;
                 send_and_confirm(tx, Arc::clone(&self.rpc)).await
             },
-            |_| false,
-            "RPC TX",
+            RetryConfig::for_transaction(),
         ).await
-    }
-
-    async fn retry_with_backoff<F, Fut, P>(
-        op: F,
-        is_invalid: P,
-        op_name: &str,
-    ) -> Result<solana_sdk::signature::Signature>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<solana_sdk::signature::Signature>>,
-        P: Fn(solana_sdk::signature::Signature) -> bool,
-    {
-        const MAX_TX_RETRIES: u32 = 3;
-
-        for attempt in 1..=MAX_TX_RETRIES {
-            match op().await {
-                Ok(sig) => {
-                    if is_invalid(sig) {
-                        if attempt < MAX_TX_RETRIES {
-                            log::warn!("Invalid signature on attempt {}, retrying...", attempt);
-                            sleep(Duration::from_millis(500 * attempt as u64)).await;
-                            continue;
-                        }
-                        return Err(anyhow::anyhow!("Invalid signature after {} attempts", MAX_TX_RETRIES));
-                    }
-                    if attempt > 1 {
-                        log::info!("{} sent successfully on attempt {}", op_name, attempt);
-                    }
-                    return Ok(sig);
-                }
-                Err(e) => {
-                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
-                    if is_retryable && attempt < MAX_TX_RETRIES {
-                        log::warn!("{} failed (attempt {}/{}), retrying: {}", op_name, attempt, MAX_TX_RETRIES, e);
-                        sleep(Duration::from_millis(500 * attempt as u64)).await;
-                    } else {
-                        if attempt >= MAX_TX_RETRIES {
-                            log::error!("{} failed after {} attempts: {}", op_name, MAX_TX_RETRIES, e);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Err(anyhow::anyhow!("Failed to send transaction after {} attempts", MAX_TX_RETRIES))
     }
 }
