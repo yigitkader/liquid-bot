@@ -21,8 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
-use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub struct Executor {
@@ -297,38 +296,18 @@ impl Executor {
         // Problem: opp.max_liquidatable is in USD×1e6 (micro-USD), but we need token amount
         // Validator reserves using token amount, so Executor must use the same
         // Solution: Use same conversion logic as Validator to ensure consistency
-        use crate::utils::helpers::{read_mint_decimals, usd_to_token_amount};
-        use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
-        
-        let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(&opp.debt_mint, Some(&self.config))
-            .context("Failed to get oracle accounts for debt mint")?;
-        
-        let price_data = read_oracle_price(
-            pyth_oracle.as_ref(),
-            switchboard_oracle.as_ref(),
-            Arc::clone(&self.rpc),
-            Some(&self.config),
+        let max_liquidatable_token_amount = crate::utils::helpers::convert_usd_to_token_amount_for_mint(
+            &opp.debt_mint,
+            opp.max_liquidatable,
+            &self.rpc,
+            &self.config,
         )
         .await
-        .context("Failed to read oracle price for debt mint")?
-        .ok_or_else(|| anyhow::anyhow!("No oracle price data available for debt mint {}", opp.debt_mint))?;
-        
-        let decimals = read_mint_decimals(&opp.debt_mint, &self.rpc)
-            .await
-            .context("Failed to read decimals for debt mint")?;
-        
-        let max_liquidatable_token_amount = usd_to_token_amount(
-            opp.max_liquidatable,
-            price_data.price,
-            decimals,
-        )
         .context("Failed to convert max_liquidatable from USD to token amount")?;
         
         log::debug!(
-            "Executor: Converted max_liquidatable: USD×1e6={}, price={:.6}, decimals={}, token_amount={} for debt_mint={}",
+            "Executor: Converted max_liquidatable: USD×1e6={}, token_amount={} for debt_mint={}",
             opp.max_liquidatable,
-            price_data.price,
-            decimals,
             max_liquidatable_token_amount,
             opp.debt_mint
         );

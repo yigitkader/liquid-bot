@@ -74,7 +74,7 @@ impl Validator {
                                     opportunity_clone.estimated_profit
                                 );
 
-                                let max_liquidatable_token_amount = match Self::convert_usd_to_token_amount_static(
+                                let max_liquidatable_token_amount = match crate::utils::helpers::convert_usd_to_token_amount_for_mint(
                                     &debt_mint,
                                     max_liquidatable,
                                     &rpc,
@@ -155,7 +155,7 @@ impl Validator {
     }
 
     pub async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        let max_liquidatable_token_amount = Self::convert_usd_to_token_amount_static(
+        let max_liquidatable_token_amount = crate::utils::helpers::convert_usd_to_token_amount_for_mint(
             &opp.debt_mint,
             opp.max_liquidatable,
             &self.rpc,
@@ -178,38 +178,6 @@ impl Validator {
         }
     }
     
-    async fn convert_usd_to_token_amount_static(
-        mint: &Pubkey,
-        usd_amount_micro: u64,
-        rpc: &Arc<RpcClient>,
-        config: &Config,
-    ) -> Result<u64> {
-        use crate::utils::helpers::{read_mint_decimals, usd_to_token_amount};
-        use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
-        
-        // Get oracle price for mint
-        let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(mint, Some(config))
-            .context("Failed to get oracle accounts for mint")?;
-        
-        let price_data = read_oracle_price(
-            pyth_oracle.as_ref(),
-            switchboard_oracle.as_ref(),
-            Arc::clone(rpc),
-            Some(config),
-        )
-        .await
-        .context("Failed to read oracle price for mint")?
-        .ok_or_else(|| anyhow::anyhow!("No oracle price data available for mint {}", mint))?;
-        
-        // Get decimals for mint
-        let decimals = read_mint_decimals(mint, rpc)
-            .await
-            .context("Failed to read decimals for mint")?;
-        
-        // Convert USD×1e6 to token amount
-        usd_to_token_amount(usd_amount_micro, price_data.price, decimals)
-            .context("Failed to convert USD amount to token amount")
-    }
 
     async fn validate_static(
         opp: &Opportunity,
@@ -354,16 +322,36 @@ impl Validator {
                 return Err(anyhow::anyhow!("No oracle found for mint {}", mint));
             }
 
-            let price_data = Self::read_oracle_price_data(
-                mint,
+            use crate::protocol::oracle::read_oracle_price;
+            
+            let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
+            let oracle_account = pyth_account.or(switchboard_account).unwrap();
+            
+            let price_data = match read_oracle_price(
                 pyth_account.as_ref(),
                 switchboard_account.as_ref(),
-                rpc,
-                config,
-            ).await?;
+                Arc::clone(rpc),
+                Some(config),
+            ).await {
+                Ok(Some(data)) => data,
+                Ok(None) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to read oracle price data for mint {} ({} oracle={}) - price data is None",
+                        mint, oracle_type, oracle_account
+                    ));
+                }
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("timeout") || error_str.contains("timed out") {
+                        log::error!("Validator: {} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e);
+                        return Err(anyhow::anyhow!("{} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e));
+                    } else {
+                        log::error!("Validator: failed to read {} price for mint {} (oracle={}): {}", oracle_type, mint, oracle_account, e);
+                        return Err(anyhow::anyhow!("Failed to read oracle price data for mint {} ({} oracle={}): {}", mint, oracle_type, oracle_account, e));
+                    }
+                }
+            };
 
-            let oracle_account = pyth_account.or(switchboard_account).unwrap();
-            let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
 
             Self::validate_price_data(mint, &price_data, oracle_type, &oracle_account, config.max_oracle_age_seconds)?;
 
@@ -392,36 +380,6 @@ impl Validator {
         Ok(())
     }
 
-    async fn read_oracle_price_data(
-        mint: &Pubkey,
-        pyth_account: Option<&Pubkey>,
-        switchboard_account: Option<&Pubkey>,
-        rpc: &Arc<RpcClient>,
-        config: &Config,
-    ) -> Result<crate::protocol::oracle::OraclePrice> {
-        use crate::protocol::oracle::read_oracle_price;
-
-        let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
-        let oracle_account = pyth_account.or(switchboard_account).unwrap();
-
-        match read_oracle_price(pyth_account, switchboard_account, Arc::clone(rpc), Some(config)).await {
-            Ok(Some(data)) => Ok(data),
-            Ok(None) => Err(anyhow::anyhow!(
-                "Failed to read oracle price data for mint {} ({} oracle={}) - price data is None",
-                mint, oracle_type, oracle_account
-            )),
-            Err(e) => {
-                let error_str = e.to_string().to_lowercase();
-                if error_str.contains("timeout") || error_str.contains("timed out") {
-                    log::error!("Validator: {} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e);
-                    Err(anyhow::anyhow!("{} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e))
-                } else {
-                    log::error!("Validator: failed to read {} price for mint {} (oracle={}): {}", oracle_type, mint, oracle_account, e);
-                    Err(anyhow::anyhow!("Failed to read oracle price data for mint {} ({} oracle={}): {}", mint, oracle_type, oracle_account, e))
-                }
-            }
-        }
-    }
 
     fn validate_price_data(
         mint: &Pubkey,
@@ -469,7 +427,7 @@ impl Validator {
 
         let estimator = SlippageEstimator::new(config.clone());
 
-        let max_liquidatable_token_amount = Self::convert_usd_to_token_amount_static(
+        let max_liquidatable_token_amount = crate::utils::helpers::convert_usd_to_token_amount_for_mint(
             &opp.debt_mint,
             opp.max_liquidatable,
             rpc,

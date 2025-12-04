@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use crate::blockchain::rpc_client::RpcClient;
+use crate::core::config::Config;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
@@ -97,6 +98,56 @@ pub fn usd_to_token_amount(
     );
     
     Ok(token_amount_u64)
+}
+
+/// Convert USD amount (in micro-USD) to token amount for a given mint
+/// 
+/// This is a convenience function that:
+/// 1. Gets oracle price for the mint
+/// 2. Reads mint decimals
+/// 3. Converts USD×1e6 to token amount
+/// 
+/// This function eliminates code duplication between validator and executor.
+/// 
+/// Parameters:
+/// - mint: Token mint address
+/// - usd_amount_micro: USD amount in micro-USD (USD × 1e6)
+/// - rpc: RPC client for on-chain queries
+/// - config: Configuration (for oracle account resolution)
+/// 
+/// Returns:
+/// - Ok(u64): Token amount in smallest unit
+/// - Err: Network/RPC errors, oracle errors, or conversion errors
+pub async fn convert_usd_to_token_amount_for_mint(
+    mint: &Pubkey,
+    usd_amount_micro: u64,
+    rpc: &Arc<RpcClient>,
+    config: &Config,
+) -> Result<u64> {
+    use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
+    
+    // Get oracle price for mint
+    let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(mint, Some(config))
+        .context("Failed to get oracle accounts for mint")?;
+    
+    let price_data = read_oracle_price(
+        pyth_oracle.as_ref(),
+        switchboard_oracle.as_ref(),
+        Arc::clone(rpc),
+        Some(config),
+    )
+    .await
+    .context("Failed to read oracle price for mint")?
+    .ok_or_else(|| anyhow::anyhow!("No oracle price data available for mint {}", mint))?;
+    
+    // Get decimals for mint
+    let decimals = read_mint_decimals(mint, rpc)
+        .await
+        .context("Failed to read decimals for mint")?;
+    
+    // Convert USD×1e6 to token amount
+    usd_to_token_amount(usd_amount_micro, price_data.price, decimals)
+        .context("Failed to convert USD amount to token amount")
 }
 
 /// Read ATA (Associated Token Account) balance from on-chain account
