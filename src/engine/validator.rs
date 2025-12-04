@@ -102,7 +102,15 @@ impl Validator {
                                     }
                                 }
                                 
-                                match Self::validate_static(&opportunity_clone, &rpc, &config).await {
+                                // Create a temporary validator instance for validation
+                                let temp_validator = Validator {
+                                    event_bus: event_bus.clone(),
+                                    balance_manager: Arc::clone(&balance_manager),
+                                    config: config.clone(),
+                                    rpc: Arc::clone(&rpc),
+                                    metrics: None,
+                                };
+                                match temp_validator.validate_internal(&opportunity_clone).await {
                                     Ok(()) => {
                                         log::info!("Validator: opportunity approved for position {}", position_address);
                                         if let Some(ref metrics) = metrics {
@@ -169,7 +177,7 @@ impl Validator {
             .await
             .context("Insufficient balance - reservation failed")?;
 
-        match Self::validate_static(opp, &self.rpc, &self.config).await {
+        match self.validate_internal(opp).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.balance_manager.release(&opp.debt_mint, max_liquidatable_token_amount).await;
@@ -179,31 +187,27 @@ impl Validator {
     }
     
 
-    async fn validate_static(
-        opp: &Opportunity,
-        rpc: &Arc<RpcClient>,
-        config: &Config,
-    ) -> Result<()> {
+    async fn validate_internal(&self, opp: &Opportunity) -> Result<()> {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
 
         use tokio::time::{Duration, timeout};
-        let rpc_timeout = rpc.request_timeout();
-        let total_oracle_timeout = if config.is_free_rpc_endpoint() {
+        let rpc_timeout = self.rpc.request_timeout();
+        let total_oracle_timeout = if self.config.is_free_rpc_endpoint() {
             rpc_timeout * 2 + Duration::from_secs(5)
         } else {
             rpc_timeout + Duration::from_secs(2)
         };
 
         let (debt_result, collateral_result) = timeout(total_oracle_timeout, async {
-            if config.is_free_rpc_endpoint() {
+            if self.config.is_free_rpc_endpoint() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                let debt = Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, true).await;
-                let collateral = Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, true).await;
+                let debt = self.check_oracle_freshness_internal(&opp.debt_mint, true).await;
+                let collateral = self.check_oracle_freshness_internal(&opp.collateral_mint, true).await;
                 (debt, collateral)
             } else {
                 tokio::join!(
-                    Self::check_oracle_freshness_static(&opp.debt_mint, rpc, config, false),
-                    Self::check_oracle_freshness_static(&opp.collateral_mint, rpc, config, false)
+                    self.check_oracle_freshness_internal(&opp.debt_mint, false),
+                    self.check_oracle_freshness_internal(&opp.collateral_mint, false)
                 )
             }
         }).await.map_err(|_| anyhow::anyhow!(
@@ -220,17 +224,17 @@ impl Validator {
             e
         })?;
 
-        let _ = Self::verify_ata_exists_static(&opp.debt_mint, rpc, config).await;
-        let _ = Self::verify_ata_exists_static(&opp.collateral_mint, rpc, config).await;
+        let _ = self.verify_ata_exists_internal(&opp.debt_mint).await;
+        let _ = self.verify_ata_exists_internal(&opp.collateral_mint).await;
 
-        let slippage = Self::get_realtime_slippage_static(opp, rpc, config).await
+        let slippage = self.get_realtime_slippage_internal(opp).await
             .map_err(|e| {
                 log::debug!("Slippage calculation failed: {}", e);
                 e
             })?;
         
-        if slippage > config.max_slippage_bps {
-            return Err(anyhow::anyhow!("Slippage too high: {} bps (max: {})", slippage, config.max_slippage_bps));
+        if slippage > self.config.max_slippage_bps {
+            return Err(anyhow::anyhow!("Slippage too high: {} bps (max: {})", slippage, self.config.max_slippage_bps));
         }
 
         log::debug!("Validation passed for position: {}", opp.position.address);
@@ -257,22 +261,18 @@ impl Validator {
     }
 
     pub async fn verify_ata_exists(&self, mint: &Pubkey) -> Result<()> {
-        Self::verify_ata_exists_static(mint, &self.rpc, &self.config).await
+        self.verify_ata_exists_internal(mint).await
     }
 
-    async fn verify_ata_exists_static(
-        mint: &Pubkey,
-        rpc: &Arc<RpcClient>,
-        config: &Config,
-    ) -> Result<()> {
-        let wallet_pubkey_str = config.test_wallet_pubkey
+    async fn verify_ata_exists_internal(&self, mint: &Pubkey) -> Result<()> {
+        let wallet_pubkey_str = self.config.test_wallet_pubkey
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or("11111111111111111111111111111111");
         let wallet_pubkey = wallet_pubkey_str.parse::<Pubkey>()
             .map_err(|_| anyhow::anyhow!("Invalid wallet pubkey"))?;
 
-        let ata = get_associated_token_address(&wallet_pubkey, mint, Some(config))
+        let ata = get_associated_token_address(&wallet_pubkey, mint, Some(&self.config))
             .context("Failed to derive ATA address")?;
 
         log::debug!(
@@ -282,7 +282,7 @@ impl Validator {
             ata
         );
 
-            match rpc.get_account(&ata).await {
+            match self.rpc.get_account(&ata).await {
                 Ok(account) => {
                     if account.data.is_empty() {
                         log::warn!("ATA exists but is empty: {}", ata);
@@ -300,22 +300,22 @@ impl Validator {
     }
 
     pub async fn check_oracle_freshness(&self, mint: &Pubkey) -> Result<()> {
-        Self::check_oracle_freshness_static(mint, &self.rpc, &self.config, false).await
+        self.check_oracle_freshness_internal(mint, false).await
     }
 
-    async fn check_oracle_freshness_static(mint: &Pubkey, rpc: &Arc<RpcClient>, config: &Config, skip_delay: bool) -> Result<()> {
+    async fn check_oracle_freshness_internal(&self, mint: &Pubkey, skip_delay: bool) -> Result<()> {
         use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account};
         use tokio::time::{Duration, timeout};
 
-        let oracle_check_timeout = rpc.request_timeout();
+        let oracle_check_timeout = self.rpc.request_timeout();
 
         let timeout_result = timeout(oracle_check_timeout, async {
-            if config.is_free_rpc_endpoint() && !skip_delay {
+            if self.config.is_free_rpc_endpoint() && !skip_delay {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
-            let pyth_account = get_pyth_oracle_account(mint, Some(config)).ok().flatten();
-            let switchboard_account = get_switchboard_oracle_account(mint, Some(config)).ok().flatten();
+            let pyth_account = get_pyth_oracle_account(mint, Some(&self.config)).ok().flatten();
+            let switchboard_account = get_switchboard_oracle_account(mint, Some(&self.config)).ok().flatten();
 
             if pyth_account.is_none() && switchboard_account.is_none() {
                 log::warn!("No oracle found (Pyth or Switchboard) for mint: {}, skipping freshness check", mint);
@@ -330,8 +330,8 @@ impl Validator {
             let price_data = match read_oracle_price(
                 pyth_account.as_ref(),
                 switchboard_account.as_ref(),
-                Arc::clone(rpc),
-                Some(config),
+                Arc::clone(&self.rpc),
+                Some(&self.config),
             ).await {
                 Ok(Some(data)) => data,
                 Ok(None) => {
@@ -353,7 +353,35 @@ impl Validator {
             };
 
 
-            Self::validate_price_data(mint, &price_data, oracle_type, &oracle_account, config.max_oracle_age_seconds)?;
+            // Note: We need to capture self for validate_price_data, but we're in an async closure
+            // So we'll validate inline here
+            const MAX_PRICE: f64 = 1_000_000_000_000.0;
+            const MIN_PRICE: f64 = 0.0001;
+            const MAX_CONF_RATIO: f64 = 0.25;
+
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("Time error: {}", e))?
+                .as_secs() as i64 - price_data.timestamp;
+
+            if age > self.config.max_oracle_age_seconds as i64 {
+                return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, self.config.max_oracle_age_seconds));
+            }
+            if price_data.price <= 0.0 {
+                return Err(anyhow::anyhow!("{} oracle invalid price for {}: {:.4}", oracle_type, mint, price_data.price));
+            }
+            if !(MIN_PRICE..=MAX_PRICE).contains(&price_data.price) {
+                return Err(anyhow::anyhow!("{} oracle price out of range for {}: {:.4}", oracle_type, mint, price_data.price));
+            }
+            if price_data.confidence < 0.0 {
+                return Err(anyhow::anyhow!("{} oracle negative confidence for {}: {:.4}", oracle_type, mint, price_data.confidence));
+            }
+            if price_data.price > 0.0 {
+                let conf_ratio = price_data.confidence / price_data.price;
+                if conf_ratio > MAX_CONF_RATIO {
+                    return Err(anyhow::anyhow!("{} oracle confidence too high for {}: {:.2}% (max: {:.0}%)", oracle_type, mint, conf_ratio * 100.0, MAX_CONF_RATIO * 100.0));
+                }
+            }
 
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -367,7 +395,7 @@ impl Validator {
                 mint,
                 oracle_account,
                 age_seconds,
-                config.max_oracle_age_seconds,
+                self.config.max_oracle_age_seconds,
                 price_data.price,
                 price_data.confidence,
                 if price_data.price > 0.0 { (price_data.confidence / price_data.price) * 100.0 } else { 0.0 }
@@ -382,11 +410,11 @@ impl Validator {
 
 
     fn validate_price_data(
+        &self,
         mint: &Pubkey,
         price_data: &crate::protocol::oracle::OraclePrice,
         oracle_type: &str,
         _oracle_account: &Pubkey,
-        max_age: u64,
     ) -> Result<()> {
         const MAX_PRICE: f64 = 1_000_000_000_000.0;
         const MIN_PRICE: f64 = 0.0001;
@@ -397,8 +425,8 @@ impl Validator {
             .map_err(|e| anyhow::anyhow!("Time error: {}", e))?
             .as_secs() as i64 - price_data.timestamp;
 
-        if age > max_age as i64 {
-            return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, max_age));
+        if age > self.config.max_oracle_age_seconds as i64 {
+            return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, self.config.max_oracle_age_seconds));
         }
         if price_data.price <= 0.0 {
             return Err(anyhow::anyhow!("{} oracle invalid price for {}: {:.4}", oracle_type, mint, price_data.price));
@@ -419,24 +447,24 @@ impl Validator {
     }
 
     pub async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
-        Self::get_realtime_slippage_static(opp, &self.rpc, &self.config).await
+        self.get_realtime_slippage_internal(opp).await
     }
 
-    async fn get_realtime_slippage_static(opp: &Opportunity, rpc: &Arc<RpcClient>, config: &Config) -> Result<u16> {
+    async fn get_realtime_slippage_internal(&self, opp: &Opportunity) -> Result<u16> {
         use crate::strategy::slippage_estimator::SlippageEstimator;
 
-        let estimator = SlippageEstimator::new(config.clone());
+        let estimator = SlippageEstimator::new(self.config.clone());
 
         let max_liquidatable_token_amount = crate::utils::helpers::convert_usd_to_token_amount_for_mint(
             &opp.debt_mint,
             opp.max_liquidatable,
-            rpc,
-            config,
+            &self.rpc,
+            &self.config,
         )
         .await
             .context("Failed to convert max_liquidatable from USD to token amount for slippage estimation")?;
         
-        log::debug!("get_realtime_slippage_static: Converted max_liquidatable for slippage: USD×1e6={}, token_amount={} for debt_mint={}", opp.max_liquidatable, max_liquidatable_token_amount, opp.debt_mint);
+        log::debug!("get_realtime_slippage_internal: Converted max_liquidatable for slippage: USD×1e6={}, token_amount={} for debt_mint={}", opp.max_liquidatable, max_liquidatable_token_amount, opp.debt_mint);
 
         let base_slippage = estimator.estimate_dex_slippage(
             opp.debt_mint,
@@ -459,7 +487,7 @@ impl Validator {
         };
 
         // Cap at max_slippage_bps
-        let final_slippage = total_slippage.min(config.max_slippage_bps);
+        let final_slippage = total_slippage.min(self.config.max_slippage_bps);
 
         log::debug!(
             "Validator: slippage breakdown for position {}: base={} bps, debt_oracle_conf={} bps, collateral_oracle_conf={} bps, total={} bps (max {} bps)",
@@ -468,7 +496,7 @@ impl Validator {
             debt_confidence,
             collateral_confidence,
             final_slippage,
-            config.max_slippage_bps
+            self.config.max_slippage_bps
         );
 
         Ok(final_slippage)

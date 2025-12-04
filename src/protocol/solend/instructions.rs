@@ -247,8 +247,6 @@ pub async fn build_wrap_sol_instruction(
 ) -> Result<Vec<Instruction>> {
     use solana_sdk::system_instruction;
     use spl_token::instruction as token_instruction;
-    use crate::protocol::solend::accounts::get_associated_token_program_id;
-    use crate::utils::ata_manager::get_token_program_for_mint;
     
     if amount == 0 {
         return Err(anyhow::anyhow!("Wrap amount cannot be zero"));
@@ -305,64 +303,19 @@ pub async fn build_wrap_sol_instruction(
     
     // Step 1: Create WSOL ATA if needed
     if needs_ata_creation {
-        let associated_token_program = get_associated_token_program_id(config)
-            .context("Failed to get associated token program ID")?;
+        use crate::utils::ata_manager::create_ata_instruction;
         
-        // Determine token program for WSOL (should be standard SPL Token)
-        let token_program = if let Some(rpc_client) = rpc {
-            get_token_program_for_mint(&wsol_mint, Some(rpc_client))
-                .await
-                .context("Failed to determine token program for WSOL mint")?
-        } else {
-            // Fallback to standard SPL Token if RPC not available
-            spl_token::id()
-        };
-        
-        // Verify ATA derivation matches
-        let (derived_ata, _bump) = Pubkey::try_find_program_address(
-            &[wallet.as_ref(), token_program.as_ref(), wsol_mint.as_ref()],
-            &associated_token_program,
+        // Use centralized ATA creation function
+        let create_ata_ix = create_ata_instruction(
+            wallet,
+            wallet,
+            &wsol_mint,
+            config,
+            rpc,
         )
-        .ok_or_else(|| anyhow::anyhow!("Failed to derive WSOL ATA address"))?;
+        .await
+        .context("Failed to create WSOL ATA instruction")?;
         
-        if derived_ata != *wsol_ata {
-            return Err(anyhow::anyhow!(
-                "WSOL ATA derivation mismatch: provided {}, derived {}",
-                wsol_ata,
-                derived_ata
-            ));
-        }
-        
-        log::info!(
-            "Creating WSOL ATA instruction: payer={}, wallet={}, mint={}, ata={}, token_program={}",
-            wallet,
-            wallet,
-            wsol_mint,
-            wsol_ata,
-            token_program
-        );
-        
-        // Create ATA instruction
-        // Associated Token Program Create instruction format:
-        // Accounts (in order):
-        // 0. Payer (signer, writable) - pays for account creation
-        // 1. ATA account (writable) - the account being created
-        // 2. Owner (readonly) - the wallet that will own the ATA
-        // 3. Mint (readonly) - the token mint
-        // 4. System Program (readonly) - for account creation
-        // 5. Token Program (readonly) - SPL Token or Token-2022 program
-        let create_ata_ix = Instruction {
-            program_id: associated_token_program,
-            accounts: vec![
-                AccountMeta::new(*wallet, true),  // Payer (signer, writable)
-                AccountMeta::new(*wsol_ata, false), // ATA account (writable)
-                AccountMeta::new_readonly(*wallet, false), // Owner (readonly)
-                AccountMeta::new_readonly(wsol_mint, false), // Mint (readonly)
-                AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // System Program (readonly)
-                AccountMeta::new_readonly(token_program, false), // Token Program (readonly)
-            ],
-            data: vec![], // Empty data (discriminator handled by program)
-        };
         instructions.push(create_ata_ix);
     }
     

@@ -376,9 +376,15 @@ impl Executor {
         
         if let Some(entry) = Self::get_cache_entry(&mut cache, &destination_collateral) {
             if !entry.verified {
-                log::warn!("Executor: Adding create_ata instruction as fallback for {} (not verified)", destination_collateral);
-                let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint).await?;
-                tx_builder.add_instruction(create_ata_ix);
+                        log::warn!("Executor: Adding create_ata instruction as fallback for {} (not verified)", destination_collateral);
+                        let create_ata_ix = crate::utils::ata_manager::create_ata_instruction(
+                            &wallet_pubkey,
+                            &wallet_pubkey,
+                            &opp.collateral_mint,
+                            Some(&self.config),
+                            Some(&self.rpc),
+                        ).await?;
+                        tx_builder.add_instruction(create_ata_ix);
             }
         }
 
@@ -469,9 +475,16 @@ impl Executor {
             mint
         );
         
-        let create_ata_ix = self.create_ata_instruction(mint).await?;
         use solana_sdk::signature::Signer;
-        let mut ata_tx_builder = TransactionBuilder::new(self.wallet.pubkey());
+        let wallet_pubkey = self.wallet.pubkey();
+        let create_ata_ix = crate::utils::ata_manager::create_ata_instruction(
+            &wallet_pubkey,
+            &wallet_pubkey,
+            mint,
+            Some(&self.config),
+            Some(&self.rpc),
+        ).await?;
+        let mut ata_tx_builder = TransactionBuilder::new(wallet_pubkey);
         ata_tx_builder.add_compute_budget(200_000, 1_000);
         ata_tx_builder.add_instruction(create_ata_ix);
         
@@ -610,88 +623,6 @@ impl Executor {
         Ok(())
     }
 
-    async fn create_ata_instruction(
-        &self,
-        mint: &Pubkey,
-    ) -> Result<solana_sdk::instruction::Instruction> {
-        use crate::protocol::solend::accounts::get_associated_token_program_id;
-        use crate::utils::ata_manager::get_token_program_for_mint;
-        use solana_sdk::signature::Signer;
-
-        let wallet_pubkey = self.wallet.pubkey();
-        let associated_token_program = get_associated_token_program_id(Some(&self.config))
-            .context("Failed to get associated token program ID")?;
-        
-        // ✅ FIX: Determine correct token program based on mint
-        // Some mints use Token-2022 (Token Extensions), others use standard SPL Token
-        // Check mint account owner on-chain for accurate determination
-        let token_program = get_token_program_for_mint(mint, Some(&self.rpc))
-            .await
-            .context("Failed to determine token program for mint")?;
-
-        // Always use manual construction to ensure correct account order and metadata
-        // SPL library may have compatibility issues with certain Solana SDK versions
-        let (ata, _bump) = Pubkey::try_find_program_address(
-            &[
-                wallet_pubkey.as_ref(),
-                token_program.as_ref(),
-                mint.as_ref(),
-            ],
-            &associated_token_program,
-        )
-        .ok_or_else(|| anyhow::anyhow!("Failed to find program address for ATA"))?;
-
-        log::info!(
-            "🔨 Executor: Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, token_program={}, program={}",
-            wallet_pubkey,
-            wallet_pubkey,
-            mint,
-            ata,
-            token_program,
-            associated_token_program
-        );
-
-        // Associated Token Program Create instruction format:
-        // Accounts (in order):
-        // 0. Payer (signer, writable) - pays for account creation
-        // 1. ATA account (writable) - the account being created
-        // 2. Owner (readonly) - the wallet that will own the ATA
-        // 3. Mint (readonly) - the token mint
-        // 4. System Program (readonly) - for account creation
-        // 5. Token Program (readonly) - SPL Token or Token-2022 program
-        // Data: empty (discriminator is handled by program)
-        let accounts = vec![
-            solana_sdk::instruction::AccountMeta::new(wallet_pubkey, true),
-            solana_sdk::instruction::AccountMeta::new(ata, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(wallet_pubkey, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(
-                solana_sdk::system_program::id(),
-                false,
-            ),
-            solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
-        ];
-        
-        // Log detailed account information
-        log::info!("📋 Executor ATA Instruction Account Details:");
-        for (idx, account_meta) in accounts.iter().enumerate() {
-            log::info!(
-                "   [{}] pubkey={}, is_signer={}, is_writable={}",
-                idx,
-                account_meta.pubkey,
-                account_meta.is_signer,
-                account_meta.is_writable
-            );
-        }
-        log::info!("📋 Instruction data length: {} bytes", 0);
-        log::info!("📋 Program ID: {}", associated_token_program);
-        
-        Ok(solana_sdk::instruction::Instruction {
-            program_id: associated_token_program,
-            accounts,
-            data: vec![],
-        })
-    }
 
     async fn send_via_jito_with_retry(
         &self,

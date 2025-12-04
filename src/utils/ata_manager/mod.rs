@@ -550,7 +550,22 @@ async fn send_ata_batch(
     Ok(sig)
 }
 
-async fn create_ata_instruction(
+/// Create an ATA (Associated Token Account) instruction
+/// 
+/// This function creates the instruction needed to create an ATA for a given mint.
+/// It handles both standard SPL Token and Token-2022 programs automatically.
+/// 
+/// Parameters:
+/// - payer: The account that will pay for the ATA creation (signer)
+/// - wallet: The wallet that will own the ATA
+/// - mint: The token mint address
+/// - config: Optional configuration (for associated token program ID)
+/// - rpc: Optional RPC client (for token program detection)
+/// 
+/// Returns:
+/// - Ok(Instruction): The ATA creation instruction
+/// - Err: If token program detection fails or ATA derivation fails
+pub async fn create_ata_instruction(
     payer: &Pubkey,
     wallet: &Pubkey,
     mint: &Pubkey,
