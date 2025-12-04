@@ -399,7 +399,7 @@ fn get_instruction_discriminator() -> [u8; 8] {
     discriminator
 }
 
-async fn get_reserve_address_from_mint(
+pub async fn get_reserve_address_from_mint(
     mint: &Pubkey,
     rpc: &Arc<RpcClient>,
     config: &Config,
@@ -444,7 +444,7 @@ fn get_reserve_discriminator() -> [u8; 8] {
     RESERVE_DISCRIMINATOR
 }
 
-async fn get_reserve_data(
+pub async fn get_reserve_data(
     reserve: &Pubkey,
     rpc: &Arc<RpcClient>,
 ) -> Result<(Pubkey, Pubkey, Pubkey, f64)> {

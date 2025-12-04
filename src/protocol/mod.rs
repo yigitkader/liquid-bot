@@ -13,7 +13,15 @@ pub trait Protocol: Send + Sync {
     fn id(&self) -> &str;
     fn program_id(&self) -> Pubkey;
     
-    async fn parse_position(&self, account: &solana_sdk::account::Account) -> Option<Position>;
+    /// Parse account data into a Position
+    /// 
+    /// If rpc is provided, additional data (like LTV) can be fetched from on-chain reserves.
+    /// If rpc is None, basic position data is parsed without enrichment.
+    async fn parse_position(
+        &self, 
+        account: &solana_sdk::account::Account,
+        rpc: Option<Arc<RpcClient>>,
+    ) -> Option<Position>;
     fn calculate_health_factor(&self, position: &Position) -> f64;
     async fn build_liquidation_ix(
         &self,

@@ -42,7 +42,7 @@ impl Protocol for SolendProtocol {
         self.program_id
     }
 
-    async fn parse_position(&self, account: &Account) -> Option<Position> {
+    async fn parse_position(&self, account: &Account, rpc: Option<Arc<crate::blockchain::rpc_client::RpcClient>>) -> Option<Position> {
         use crate::core::types::{Asset, Position};
         use crate::protocol::solend::types::SolendObligation;
         use log;
@@ -194,14 +194,32 @@ impl Protocol for SolendProtocol {
         // Useful for risk analysis and understanding position structure
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {
-            // Note: LTV will be 0.0 for now - we would need RPC access to fetch from Reserve
-            // This is a limitation of the current Protocol trait design
-            // TODO: Consider adding RPC parameter to parse_position or enrich Position later
+            // ✅ FIX: Fetch LTV from Reserve if RPC is available
+            let ltv = if let Some(rpc_ref) = &rpc {
+                match instructions::get_reserve_address_from_mint(&deposit.deposit_reserve, rpc_ref, &self.config).await {
+                    Ok(reserve_address) => {
+                        match instructions::get_reserve_data(&reserve_address, rpc_ref).await {
+                            Ok((_, _, _, ltv_value)) => ltv_value,
+                            Err(e) => {
+                                log::debug!("Failed to fetch LTV for reserve {}: {}, using 0.0", deposit.deposit_reserve, e);
+                                0.0
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to find reserve for mint {}: {}, using 0.0", deposit.deposit_reserve, e);
+                        0.0
+                    }
+                }
+            } else {
+                0.0 // No RPC access, cannot fetch LTV
+            };
+            
             collateral_assets.push(Asset {
                 mint: deposit.deposit_reserve,
                 amount: deposit.deposited_amount,
                 amount_usd: deposit.market_value.to_f64(),
-                ltv: 0.0, // TODO: Fetch from Reserve account (requires RPC access)
+                ltv,
             });
         }
 
@@ -210,6 +228,27 @@ impl Protocol for SolendProtocol {
         // borrowed_amount_wads already includes interest (it's cumulative)
         let mut debt_assets = Vec::new();
         for borrow in &obligation.borrows {
+            // ✅ FIX: Fetch LTV from Reserve if RPC is available
+            let ltv = if let Some(rpc_ref) = &rpc {
+                match instructions::get_reserve_address_from_mint(&borrow.borrow_reserve, rpc_ref, &self.config).await {
+                    Ok(reserve_address) => {
+                        match instructions::get_reserve_data(&reserve_address, rpc_ref).await {
+                            Ok((_, _, _, ltv_value)) => ltv_value,
+                            Err(e) => {
+                                log::debug!("Failed to fetch LTV for reserve {}: {}, using 0.0", borrow.borrow_reserve, e);
+                                0.0
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to find reserve for mint {}: {}, using 0.0", borrow.borrow_reserve, e);
+                        0.0
+                    }
+                }
+            } else {
+                0.0 // No RPC access, cannot fetch LTV
+            };
+            
             // ✅ FIX: Use borrowed_amount_wads directly (already includes interest)
             // cumulative_borrow_rate_wads is used on-chain to calculate interest
             // but borrowed_amount_wads is the current amount including all accrued interest
@@ -218,7 +257,7 @@ impl Protocol for SolendProtocol {
                 mint: borrow.borrow_reserve,
                 amount: borrowed_amount,
                 amount_usd: borrow.market_value.to_f64(),
-                ltv: 0.0, // TODO: Fetch from Reserve account (requires RPC access)
+                ltv,
             });
         }
 

@@ -157,7 +157,7 @@ async fn test_liquidation_instruction(config: &Config) -> Result<()> {
 
     let mut found_liquidatable = false;
     for (_pubkey, account) in accounts.iter().take(10) {
-        if let Some(position) = protocol.parse_position(account).await {
+        if let Some(position) = protocol.parse_position(account, Some(Arc::clone(&rpc))).await {
             // Use config threshold (consistent with Analyzer::is_liquidatable_static)
             if position.health_factor < config.hf_liquidation_threshold {
                 found_liquidatable = true;

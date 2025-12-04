@@ -813,7 +813,7 @@ async fn validate_instruction_formats(rpc_client: &Arc<RpcClient>, config: Optio
                 
                 // Find first valid obligation
                 for (pubkey, account) in accounts.iter().take(5) {
-                    if let Some(position) = protocol.parse_position(account).await {
+                    if let Some(position) = protocol.parse_position(account, Some(Arc::clone(&rpc_client))).await {
                         if !position.debt_assets.is_empty() && !position.collateral_assets.is_empty() {
                             // ✅ REAL instruction data from REAL obligation
                             let real_amount = position.debt_assets[0].amount; // Use real debt amount
@@ -1215,7 +1215,7 @@ async fn validate_protocol_integration(rpc_client: &Arc<RpcClient>, config: Opti
                 Ok(accounts) => {
                     let mut found_position = false;
                     for (pubkey, account) in accounts.iter().take(5) {
-                        match protocol_clone.parse_position(account).await {
+                        match protocol_clone.parse_position(account, Some(Arc::clone(&rpc_client))).await {
                             Some(position) => {
                                 found_position = true;
                                 results.push(TestResult::success_with_details(

@@ -141,7 +141,7 @@ impl Scanner {
                     let pubkey = *pubkey;
                     let account = account.clone();
                     async move {
-                        let result = protocol.parse_position(&account).await;
+                        let result = protocol.parse_position(&account, Some(Arc::clone(&self.rpc))).await;
                         let failure_reason = if result.is_none() {
                             Self::categorize_parse_failure(&account)
                         } else {
@@ -404,7 +404,7 @@ impl Scanner {
                         update.slot
                     );
 
-                    match self.protocol.parse_position(&update.account).await {
+                    match self.protocol.parse_position(&update.account, Some(Arc::clone(&self.rpc))).await {
                         Some(position) => {
                             self.cache.update(update.pubkey, position.clone()).await;
                             if let Err(e) = self.event_bus.publish(Event::AccountUpdated {
@@ -474,7 +474,7 @@ impl Scanner {
                         log::debug!("Scanner: RPC polling fetched {} accounts", accounts.len());
 
                         for (pubkey, account) in accounts {
-                            match self.protocol.parse_position(&account).await {
+                            match self.protocol.parse_position(&account, Some(Arc::clone(&self.rpc))).await {
                                 Some(position) => {
                                     let cached = self.cache.get(&pubkey).await;
                                     let should_publish = if let Some(cached_pos) = &cached {
