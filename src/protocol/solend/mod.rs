@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use solana_sdk::{account::Account, instruction::Instruction, pubkey::Pubkey};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct SolendProtocol {
@@ -63,25 +63,35 @@ impl Protocol for SolendProtocol {
             Ok(obl) => obl,
             Err(e) => {
                 static PARSE_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+                static LOGS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
+                // ✅ FIX: Increment counter (may wrap, but we use flag to prevent log spam)
                 let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-
-                // Log first few parse errors with more detail for debugging
-                if count <= 5 {
-                    let discriminator = if data_len >= 8 {
-                        format!("{:02x?}", &account.data[0..8])
-                    } else {
-                        "N/A".to_string()
-                    };
-                    log::debug!(
-                        "SolendProtocol: failed to parse obligation (data_len={}, discriminator={}): {}",
-                        data_len,
-                        discriminator,
-                        e
-                    );
-                } else if count == 6 {
-                    log::debug!("SolendProtocol: Suppressing further parse error logs ({} total errors so far)", count);
+                
+                // ✅ FIX: Check suppression flag FIRST to prevent log spam after wraparound
+                // Even if counter wraps from usize::MAX to 0, flag prevents re-logging
+                let logs_suppressed = LOGS_SUPPRESSED.load(Ordering::Relaxed);
+                
+                if !logs_suppressed {
+                    // Log first few parse errors with more detail for debugging
+                    if count <= 5 {
+                        let discriminator = if data_len >= 8 {
+                            format!("{:02x?}", &account.data[0..8])
+                        } else {
+                            "N/A".to_string()
+                        };
+                        log::debug!(
+                            "SolendProtocol: failed to parse obligation (data_len={}, discriminator={}): {}",
+                            data_len,
+                            discriminator,
+                            e
+                        );
+                    } else if count == 6 {
+                        log::debug!("SolendProtocol: Suppressing further parse error logs ({} total errors so far)", count + 1);
+                        LOGS_SUPPRESSED.store(true, Ordering::Relaxed);
+                    }
                 }
+                // If logs_suppressed is true, skip all logging (even after counter wraparound)
 
                 return None;
             }

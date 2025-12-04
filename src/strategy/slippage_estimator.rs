@@ -134,6 +134,11 @@ impl SlippageEstimator {
         //   - Parse errors → will never succeed
         //   - Missing data errors → will never succeed
         // Solution: Only retry transient errors (5xx, timeouts, network errors, rate limits)
+        // 
+        // ✅ CRITICAL FIX: Explicit loop control to prevent infinite loops
+        // Problem: If is_retryable_error always returns true for unknown errors, and we don't
+        //   explicitly break on the last attempt, the loop could appear to hang or not reach fallback
+        // Solution: Explicitly check if we're on the last attempt and break to ensure fallback is reached
         for attempt in 1..=MAX_RETRIES {
             match self.try_jupiter_quote(&url).await {
                 Ok((slippage, hop_count)) => {
@@ -157,7 +162,19 @@ impl SlippageEstimator {
                         break; // Exit retry loop immediately
                     }
                     
-                    // Retryable error - log and retry if attempts remaining
+                    // Retryable error - check if we should continue or break
+                    if attempt >= MAX_RETRIES {
+                        // Last attempt failed with retryable error - break to reach fallback
+                        log::warn!(
+                            "Jupiter API attempt {}/{} failed with retryable error: {} (max retries reached, falling back)",
+                            attempt,
+                            MAX_RETRIES,
+                            error_msg
+                        );
+                        break; // Explicitly break to ensure fallback is reached
+                    }
+                    
+                    // Not the last attempt - log and retry
                     log::warn!(
                         "Jupiter API attempt {}/{} failed (retrying): {}",
                         attempt,
@@ -165,11 +182,9 @@ impl SlippageEstimator {
                         error_msg
                     );
 
-                    if attempt < MAX_RETRIES {
-                        let backoff = get_backoff(attempt);
-                        tokio::time::sleep(backoff).await;
-                        // continue to next attempt
-                    }
+                    let backoff = get_backoff(attempt);
+                    tokio::time::sleep(backoff).await;
+                    // Loop continues to next attempt
                 }
             }
         }

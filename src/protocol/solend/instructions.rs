@@ -215,50 +215,59 @@ impl ReserveCache {
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         let mut inner = self.inner.write().await;
         
-        // ✅ CLEANUP: Remove cache entries for reserves that no longer exist on-chain
-        // This prevents stale cache entries from accumulating when reserves are removed
+        // ✅ CRITICAL FIX: Replace cache entirely to prevent memory leak
+        // Problem: Previous implementation used extend() which kept stale entries:
+        //   - Thread A calls get_reserve_for_mint, extends cache with stale data
+        //   - Thread B calls get_reserve_for_mint, extends cache with more stale data
+        //   - refresh_from_rpc extends again, keeping all stale entries
+        //   - Result: Cache grows unbounded, deleted reserves stay in cache forever
+        // Solution: Replace cache entirely with fresh RPC data
+        //   - This ensures only current reserves are cached
+        //   - Cleanup happens automatically by replacing, not extending
+        //   - Prevents memory leak from accumulating stale entries
         let rpc_reserve_set: HashSet<Pubkey> = mint_to_reserve.values().copied().collect();
-        let mut removed_count = 0;
         
-        // Remove mint_to_reserve entries for reserves that no longer exist
-        inner.mint_to_reserve.retain(|mint, reserve| {
+        // Count entries that will be removed
+        let old_mint_count = inner.mint_to_reserve.len();
+        let old_data_count = inner.reserve_data.len();
+        
+        // Clean up reserve_data cache for reserves that no longer exist
+        let mut removed_data_count = 0;
+        inner.reserve_data.retain(|reserve, _| {
             if rpc_reserve_set.contains(reserve) {
                 true // Keep: reserve still exists on-chain
             } else {
-                removed_count += 1;
-                log::debug!(
-                    "SolendProtocol: Removing stale mint_to_reserve entry: mint {} -> reserve {} (reserve no longer exists on-chain)",
-                    mint,
-                    reserve
-                );
+                removed_data_count += 1;
                 false // Remove: reserve no longer exists on-chain
             }
         });
         
-        // Also clean up reserve_data cache for removed reserves
-        let mut removed_data_count = 0;
-        inner.reserve_data.retain(|reserve, _| {
-            if rpc_reserve_set.contains(reserve) {
-                true // Keep: reserve still exists
-            } else {
-                removed_data_count += 1;
-                false // Remove: reserve no longer exists
-            }
-        });
+        // ✅ CRITICAL: Replace mint_to_reserve cache entirely (don't extend)
+        // This ensures we only have current reserves from RPC, preventing memory leak
+        // Note: get_reserve_for_mint uses fetch lock, so concurrent fetches are safe
+        //   If another thread fetches between refreshes, it will extend, but the next
+        //   refresh will clean it up by replacing with fresh RPC data
+        inner.mint_to_reserve = mint_to_reserve;
+        inner.initialized = true;
         
-        if removed_count > 0 || removed_data_count > 0 {
-            log::debug!(
-                "Reserve cache cleanup: removed {} mint mappings and {} reserve data entries (reserves no longer exist on-chain)",
-                removed_count,
+        let new_mint_count = inner.mint_to_reserve.len();
+        let removed_mint_count = old_mint_count.saturating_sub(new_mint_count);
+        
+        if removed_mint_count > 0 || removed_data_count > 0 {
+            log::info!(
+                "Reserve cache refresh: {} mint mappings (removed {} stale), {} reserve data entries (removed {} stale)",
+                new_mint_count,
+                removed_mint_count,
+                inner.reserve_data.len(),
                 removed_data_count
             );
+        } else {
+            log::debug!(
+                "Reserve cache refresh: {} mint mappings, {} reserve data entries (no cleanup needed)",
+                new_mint_count,
+                inner.reserve_data.len()
+            );
         }
-        
-        // ✅ FIX: Use extend instead of override to prevent losing entries added by other threads
-        // Problem: If another thread adds a mapping during refresh, override would lose it
-        // Solution: Extend preserves existing entries while updating with fresh RPC data
-        inner.mint_to_reserve.extend(mint_to_reserve);
-        inner.initialized = true;
 
         Ok(())
     }

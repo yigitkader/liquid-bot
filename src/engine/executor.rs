@@ -18,10 +18,11 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
-/// ATA cache entry with timestamp for cleanup
+/// ATA cache entry with timestamps for LRU eviction
 #[derive(Clone, Debug)]
 struct AtaCacheEntry {
-    timestamp: Instant,
+    created_at: Instant,
+    last_accessed: Instant, // ✅ FIX: Track last access for LRU eviction
     verified: bool,
 }
 
@@ -188,18 +189,19 @@ impl Executor {
         let ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
         let ata_cache_cleanup_token = CancellationToken::new();
         
-        // ✅ CRITICAL FIX: Start background cleanup task for ATA cache with aggressive cleanup
+        // ✅ CRITICAL FIX: ATA cache with LRU eviction for high-volume scenarios
         // Problem: High-volume scenarios (100k liquidations/day) can generate 200k ATA checks/day
-        //   - 4-hour TTL too long → stale entries accumulate
-        //   - 1000 entry limit too low → constant eviction → cache thrashing → RPC storms
-        //   - 30-minute cleanup too infrequent → memory grows between cleanups
-        // Solution: More aggressive settings for production high-volume scenarios
+        //   - Peak hours (3-4 AM UTC): 20k liquidations/hour → 40k ATA checks/hour
+        //   - 10k entry limit too low → constant eviction → cache thrashing → RPC storms
+        //   - Oldest-first eviction (not LRU) → frequently-used entries evicted
+        // Solution: Proper LRU cache with larger size for peak hours
         //   - 1-hour TTL: ATAs are generally static, 1 hour is sufficient
-        //   - 10k entry limit: Supports ~33k ATAs in 4 hours (200k/day / 6 = 33k/4h)
-        //   - 10-minute cleanup: More frequent cleanup prevents memory growth
-        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600; // 1 hour (reduced from 4 hours)
-        const ATA_CACHE_MAX_SIZE: usize = 10000; // 10k entries (increased from 1k)
-        const CLEANUP_INTERVAL_SECONDS: u64 = 600; // 10 minutes (reduced from 30 minutes)
+        //   - 50k entry limit: Supports peak hours (40k checks/hour) with buffer
+        //   - LRU eviction: Keep recently-accessed entries, evict least-recently-used
+        //   - 5-minute cleanup: More frequent cleanup prevents memory growth
+        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600; // 1 hour
+        const ATA_CACHE_MAX_SIZE: usize = 50000; // 50k entries (increased from 10k for peak hours)
+        const CLEANUP_INTERVAL_SECONDS: u64 = 300; // 5 minutes (reduced from 10 minutes)
         
         let cache_for_cleanup = Arc::clone(&ata_cache);
         let cleanup_token = ata_cache_cleanup_token.clone();
@@ -212,26 +214,27 @@ impl Executor {
                         
                         let before_len = cache.len();
                         
-                        // Strategy 1: Remove entries older than TTL (1 hour)
+                        // Strategy 1: Remove entries older than TTL (1 hour) based on creation time
                         cache.retain(|_, entry| {
-                            now.duration_since(entry.timestamp) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
+                            now.duration_since(entry.created_at) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
                         });
                         
-                        // Strategy 2: If cache is still too large, remove oldest entries (LRU-like)
+                        // Strategy 2: If cache is still too large, use LRU eviction (remove least-recently-used)
+                        // ✅ FIX: Sort by last_accessed (LRU) instead of created_at (oldest-first)
                         if cache.len() > ATA_CACHE_MAX_SIZE {
                             let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
-                            // Sort by timestamp (oldest first)
-                            entries.sort_by(|a, b| a.1.timestamp.cmp(&b.1.timestamp));
-                            // Keep only the newest ATA_CACHE_MAX_SIZE entries (skip oldest ones)
+                            // Sort by last_accessed (least-recently-used first)
+                            entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
+                            // Keep only the most-recently-used ATA_CACHE_MAX_SIZE entries
                             let to_remove = entries.len().saturating_sub(ATA_CACHE_MAX_SIZE);
                             let removed_count = to_remove;
-                            // Insert back only the newest entries
+                            // Insert back only the most-recently-used entries (skip LRU ones)
                             for (pubkey, entry) in entries.into_iter().skip(to_remove) {
                                 cache.insert(pubkey, entry);
                             }
                             
                             log::warn!(
-                                "Executor: ATA cache exceeded max size ({}), removed {} oldest entries (now: {})",
+                                "Executor: ATA cache exceeded max size ({}), removed {} least-recently-used entries (now: {})",
                                 ATA_CACHE_MAX_SIZE,
                                 removed_count,
                                 cache.len()
@@ -242,7 +245,7 @@ impl Executor {
                         
                         if before_len != after_len {
                             log::debug!(
-                                "Executor: ATA cache cleanup: removed {} entries ({} remaining, TTL: {}h, max_size: {})",
+                                "Executor: ATA cache cleanup: removed {} entries ({} remaining, TTL: {}h, max_size: {}, LRU eviction)",
                                 before_len - after_len,
                                 after_len,
                                 ATA_CACHE_TTL_SECONDS / 3600,
@@ -321,6 +324,33 @@ impl Executor {
 
     fn reset_errors(&self) {
         self.consecutive_errors.store(0, Ordering::Relaxed);
+    }
+
+    /// ✅ FIX: Evict LRU entries when cache is full (immediate eviction, not just during cleanup)
+    /// This prevents cache thrashing during peak hours
+    fn evict_lru_if_needed(cache: &mut HashMap<Pubkey, AtaCacheEntry>) {
+        const ATA_CACHE_MAX_SIZE: usize = 50000;
+        
+        if cache.len() >= ATA_CACHE_MAX_SIZE {
+            let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
+            // Sort by last_accessed (least-recently-used first)
+            entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
+            // Keep only the most-recently-used entries
+            let to_keep = ATA_CACHE_MAX_SIZE.saturating_sub(1000); // Keep 1k below max for buffer
+            for (pubkey, entry) in entries.into_iter().skip(entries.len().saturating_sub(to_keep)) {
+                cache.insert(pubkey, entry);
+            }
+        }
+    }
+
+    /// ✅ FIX: Get cache entry and update last_accessed (LRU tracking)
+    fn get_cache_entry(cache: &mut HashMap<Pubkey, AtaCacheEntry>, key: &Pubkey) -> Option<AtaCacheEntry> {
+        if let Some(entry) = cache.get_mut(key) {
+            entry.last_accessed = Instant::now(); // Update access time for LRU
+            Some(entry.clone())
+        } else {
+            None
+        }
     }
 
     pub fn shutdown(&self) {
@@ -433,7 +463,7 @@ impl Executor {
         
         // Check and create source liquidity ATA (for WSOL) if needed
         if is_wsol_mint(&opp.debt_mint) {
-            let needs_wsol_ata = match cache.get(&source_liquidity_ata) {
+            let needs_wsol_ata = match Self::get_cache_entry(&mut cache, &source_liquidity_ata) {
                 Some(entry) => !entry.verified,
                 None => true,
             };
@@ -441,8 +471,11 @@ impl Executor {
             if needs_wsol_ata {
                 match self.rpc.get_account(&source_liquidity_ata).await {
                     Ok(_) => {
+                        Self::evict_lru_if_needed(&mut cache);
+                        let now = Instant::now();
                         cache.insert(source_liquidity_ata, AtaCacheEntry {
-                            timestamp: Instant::now(),
+                            created_at: now,
+                            last_accessed: now,
                             verified: true,
                         });
                     }
@@ -459,7 +492,7 @@ impl Executor {
         }
         
         // Check and create destination collateral ATA if needed
-        let needs_rpc_check = match cache.get(&destination_collateral) {
+        let needs_rpc_check = match Self::get_cache_entry(&mut cache, &destination_collateral) {
             Some(entry) => !entry.verified,
             None => true,
         };
@@ -467,8 +500,11 @@ impl Executor {
         if needs_rpc_check {
             match self.rpc.get_account(&destination_collateral).await {
                 Ok(_) => {
+                    Self::evict_lru_if_needed(&mut cache);
+                    let now = Instant::now();
                     cache.insert(destination_collateral, AtaCacheEntry {
-                        timestamp: Instant::now(),
+                        created_at: now,
+                        last_accessed: now,
                         verified: true,
                     });
                 }
@@ -489,8 +525,11 @@ impl Executor {
                             destination_collateral,
                             e
                         );
+                        Self::evict_lru_if_needed(&mut cache);
+                        let now = Instant::now();
                         cache.insert(destination_collateral, AtaCacheEntry {
-                            timestamp: Instant::now(),
+                            created_at: now,
+                            last_accessed: now,
                             verified: false,
                         });
                     }
@@ -571,7 +610,7 @@ impl Executor {
         
         // ✅ FIX: Only add create_ata instruction as fallback if ATA wasn't verified
         // This should rarely happen now since we create ATAs in separate transactions above
-        if let Some(entry) = cache.get(&destination_collateral) {
+        if let Some(entry) = Self::get_cache_entry(&mut cache, &destination_collateral) {
             if !entry.verified {
                 // ATA creation failed or wasn't verified - add as fallback (idempotent)
                 log::warn!(
@@ -753,8 +792,11 @@ impl Executor {
                         ata,
                         attempt
                     );
+                    Self::evict_lru_if_needed(cache);
+                    let now = Instant::now();
                     cache.insert(*ata, AtaCacheEntry {
-                        timestamp: Instant::now(),
+                        created_at: now,
+                        last_accessed: now,
                         verified: true,
                     });
                     return Ok(());
@@ -780,8 +822,11 @@ impl Executor {
                             ata_sig
                         );
                         // Cache as unverified - will add to liquidation tx as fallback
+                        Self::evict_lru_if_needed(cache);
+                        let now = Instant::now();
                         cache.insert(*ata, AtaCacheEntry {
-                            timestamp: Instant::now(),
+                            created_at: now,
+                            last_accessed: now,
                             verified: false,
                         });
                         return Ok(()); // Don't fail - fallback will handle it

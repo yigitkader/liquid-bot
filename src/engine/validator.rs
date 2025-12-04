@@ -513,14 +513,18 @@ impl Validator {
                 ));
             }
 
-            // ✅ FIX: Validate confidence-to-price ratio is reasonable
-            // Problem: Previous code allowed 50% confidence ratio, which is too high
-            //   Example: price=$100, confidence=$50 → 50% uncertainty is too high for reliable liquidation
-            //   Pyth oracle can return 50% confidence → price is unreliable → wrong liquidation decisions
-            // Solution: Use stricter threshold (10%) to ensure oracle data is reliable
-            //   Example: price=$100, confidence=$10 → 10% uncertainty is acceptable
-            //   Example: price=$100, confidence=$15 → 15% uncertainty is rejected (too high)
-            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.10; // 10% max uncertainty
+            // ✅ CRITICAL FIX: Adjust confidence-to-price ratio threshold for volatile assets
+            // Problem: Previous 10% threshold was too strict for volatile assets
+            //   - Pyth oracle can give 15-20% confidence for volatile assets (normal)
+            //   - Example: SOL price $150, confidence $20 → 13.3% ratio → REJECT ❌
+            //   - This causes profitable opportunities to be rejected (false negative)
+            // Solution: Increase threshold to 25% to allow normal volatility
+            //   - Volatile assets (SOL, ETH, BTC): 15-20% confidence is normal
+            //   - Stablecoins (USDC, USDT): typically < 1% confidence
+            //   - 25% threshold catches truly unreliable data while allowing normal volatility
+            //   - Example: SOL price $150, confidence $20 → 13.3% ratio → ACCEPT ✅
+            //   - Example: SOL price $100, confidence $30 → 30% ratio → REJECT ❌ (too high)
+            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.25; // 25% max uncertainty (was 10%)
             if price_data.price > 0.0 {
                 let confidence_ratio = price_data.confidence / price_data.price;
                 if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {

@@ -607,60 +607,129 @@ impl BalanceManager {
                 .with_context(|| format!("Failed to derive ATA for mint {}", mint))?
         };
 
-        // ✅ CRITICAL FIX: Read cache WITHOUT holding write locks to avoid lock contention
-        // Problem: Previous implementation dropped locks during RPC call, then re-acquired them
-        //   - Lock order could change during re-acquisition → potential deadlock
-        //   - Another thread could update cache during RPC call → stale data
+        // ✅ CRITICAL FIX: Race condition prevention
+        // Problem: Previous implementation had race condition between balance read and reserve:
+        //   - Thread A reads balance X (no locks)
+        //   - Thread B reads balance X (no locks)  
+        //   - Thread A reserves using X
+        //   - Thread B reserves using X
+        //   - Both pass check even if total reserved exceeds actual balance
         // Solution: 
-        //   1. Read cache with read-only lock (no contention)
-        //   2. If cache miss, do RPC call WITHOUT any locks held
-        //   3. Update cache with short-lived write lock
-        //   4. Then acquire both locks in consistent order for reserve update
-        // 
+        //   1. Quick check cache without locks (optimization)
+        //   2. Acquire BOTH locks in consistent order (balances -> reserved)
+        //   3. Re-read balance from cache (or fetch via RPC if stale) WHILE holding locks
+        //   4. Check and reserve atomically
+        // This ensures balance check and reserve update are atomic - no other thread
+        // can modify balance or reserved amounts between our read and reserve.
+        //
         // ✅ DEADLOCK PREVENTION: Lock order MUST be consistent across all functions
         // Lock order: balances -> reserved (ALWAYS in this order to prevent deadlock)
-        let cached_balance = {
-            let balances = self.balances.read().await; // Read-only lock
-            balances.get(&ata).and_then(|c| {
-                if c.timestamp.elapsed() < CACHE_TTL {
-                    Some(c.amount)
-                } else {
-                    None // Cache stale
-                }
-            })
+        
+        // Step 1: Quick check cache without locks (optimization - not critical for correctness)
+        let needs_rpc = {
+            let balances = self.balances.read().await;
+            balances.get(&ata).map_or(true, |c| c.timestamp.elapsed() >= CACHE_TTL)
         };
 
-        // Fetch actual balance: use cache if available, otherwise RPC call (NO LOCKS HELD)
-        let actual = if let Some(balance) = cached_balance {
-            // Cache hit - use cached value
-            balance
-        } else {
-            // Cache miss or stale - fetch from RPC WITHOUT holding any locks
-            // This prevents lock contention and ensures we get fresh data
+        // Step 2: Acquire BOTH locks in consistent order and read balance
+        if !needs_rpc {
+            // Cache is fresh - acquire locks and read from cache
+            let balances = self.balances.read().await;
+            let mut reserved = self.reserved.write().await;
             
-            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            let actual = balances.get(&ata)
+                .map(|c| c.amount)
+                .ok_or_else(|| anyhow::anyhow!("Cache entry disappeared for ATA {}", ata))?;
+            
+            // Check and reserve atomically (we're holding both locks)
+            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+            let new_reserved = reserved_amount.saturating_add(amount);
+            let available = actual.saturating_sub(new_reserved);
+
+            if available < amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient balance for mint {}: need {}, available {} (balance: {}, reserved: {} -> {})",
+                    mint,
+                    amount,
+                    available,
+                    actual,
+                    reserved_amount,
+                    new_reserved
+                ));
+            }
+
+            // Update reserved
+            reserved.insert(*mint, new_reserved);
+
+            log::debug!(
+                "BalanceManager: Reserved {} for mint {} (balance: {}, reserved: {} -> {}, available: {})",
+                amount,
+                mint,
+                actual,
+                reserved_amount,
+                new_reserved,
+                available
+            );
+
+            // Both locks released here atomically
+            return Ok(());
+        } else {
+            // Cache is stale or missing - need RPC call
+            // ⚠️ CRITICAL: We must drop locks before RPC call to avoid blocking other threads
+            // But we'll re-acquire them in the same order after RPC call
+            
+            // RPC call WITHOUT locks (to avoid blocking)
             use crate::utils::helpers::read_ata_balance;
             let balance = read_ata_balance(&ata, &self.rpc)
                 .await
                 .context("Failed to fetch account balance during reserve")?;
             
-            // Update cache with short-lived write lock (no reserved lock needed yet)
-            {
-                let mut balances = self.balances.write().await;
-                balances.insert(
-                    ata,
-                    CachedBalance {
-                        amount: balance,
-                        timestamp: Instant::now(),
-                    },
-                );
-            }
+            // Re-acquire locks in SAME order (balances -> reserved)
+            let mut balances = self.balances.write().await; // Write lock to update cache
+            let mut reserved = self.reserved.write().await;
             
-            balance
-        };
+            // Update cache
+            balances.insert(
+                ata,
+                CachedBalance {
+                    amount: balance,
+                    timestamp: Instant::now(),
+                },
+            );
+            
+            // Check and reserve atomically (we're holding both locks)
+            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+            let new_reserved = reserved_amount.saturating_add(amount);
+            let available = balance.saturating_sub(new_reserved);
 
-        // Now acquire BOTH locks in consistent order for reserve update
-        self.reserve_with_balance(mint, amount, actual).await
+            if available < amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient balance for mint {}: need {}, available {} (balance: {}, reserved: {} -> {})",
+                    mint,
+                    amount,
+                    available,
+                    balance,
+                    reserved_amount,
+                    new_reserved
+                ));
+            }
+
+            // Update reserved
+            reserved.insert(*mint, new_reserved);
+
+            log::debug!(
+                "BalanceManager: Reserved {} for mint {} (balance: {}, reserved: {} -> {}, available: {})",
+                amount,
+                mint,
+                balance,
+                reserved_amount,
+                new_reserved,
+                available
+            );
+
+            // Both locks released here atomically
+            return Ok(());
+        }
     }
 
     /// Internal helper: Reserve balance assuming we already know the actual balance

@@ -148,36 +148,50 @@ impl ProfitCalculator {
             estimated_hop_count
         };
 
-        // ✅ FIX: Stablecoin DEX fee'si çok düşük (1 bps = 0.01%)
-        // Problem: Jupiter routing kullanılırsa 1 bps yerine 20+ bps fee alınabilir
-        //   Bot kar hesaplamasında 0.01% kullanıyor, gerçek fee 0.2%+ olabilir
-        //   Böylece $100 swap'te $0.19 loss yaşanabilir
-        // Solution: Jupiter API'den actual fee bilgisi al
+        // ✅ CRITICAL FIX: Use Jupiter API for all pairs, not just stablecoin pairs
+        // Problem: 
+        //   1. Stablecoin pairs: Jupiter API fail ederse 5 bps fallback kullanılıyor
+        //      Gerçek fee: Orca direct pool 1 bps × 1 hop = 1 bps
+        //      4 bps overestimation → profit 4 bps azalır ($10k swap'te $4 loss)
+        //   2. Regular pairs: Jupiter API hiç kullanılmıyor, sadece config.dex_fee_bps
+        //      Bu yanlış fee estimate'e yol açabilir
+        // Solution:
+        //   1. Tüm pair'ler için Jupiter API kullan (stablecoin + regular)
+        //   2. Fallback fee'leri düzelt:
+        //      - Stablecoin fallback: 1 bps (Orca direct pool, en yaygın)
+        //      - Regular fallback: config.dex_fee_bps (mevcut config değeri)
         let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
 
-        let base_dex_fee_bps = if is_stablecoin_pair {
-            // ✅ Jupiter API'den route bilgisi al
-            if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
-                // Actual fee'yi route'dan oku
-                // Route plan'daki label'lara göre fee hesapla
-                let actual_fee_bps = self.estimate_fee_from_route(&route_info);
-                log::debug!(
-                    "ProfitCalculator: dex_fee -> stablecoin pair detected, got actual fee from Jupiter API: {} bps per hop",
-                    actual_fee_bps
-                );
-                actual_fee_bps as f64
-            } else {
-                // Fallback: Conservative estimate (5 bps)
-                const STABLECOIN_FEE_CONSERVATIVE: u16 = 5;
-                log::warn!(
-                    "ProfitCalculator: dex_fee -> stablecoin pair detected, Jupiter API failed, using conservative fallback: {} bps per hop",
-                    STABLECOIN_FEE_CONSERVATIVE
-                );
-                STABLECOIN_FEE_CONSERVATIVE as f64
-            }
+        // ✅ Try Jupiter API for all pairs (stablecoin and regular)
+        let base_dex_fee_bps = if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
+            // Got actual fee from Jupiter API route
+            let actual_fee_bps = self.estimate_fee_from_route(&route_info);
+            log::debug!(
+                "ProfitCalculator: dex_fee -> got actual fee from Jupiter API: {} bps per hop (stablecoin_pair: {})",
+                actual_fee_bps,
+                is_stablecoin_pair
+            );
+            actual_fee_bps as f64
         } else {
-            // Regular pairs: Use configured fee
-            self.config.dex_fee_bps as f64
+            // Jupiter API failed - use appropriate fallback
+            if is_stablecoin_pair {
+                // ✅ FIX: Stablecoin fallback should be 1 bps (Orca direct pool), not 5 bps
+                // Orca USDC/USDT direct pool: 1 bps (0.01%) - most common for stablecoin swaps
+                // Previous 5 bps was too high, causing 4 bps overestimation
+                const STABLECOIN_FEE_FALLBACK: u16 = 1;
+                log::warn!(
+                    "ProfitCalculator: dex_fee -> stablecoin pair detected, Jupiter API failed, using fallback: {} bps per hop (Orca direct pool fee)",
+                    STABLECOIN_FEE_FALLBACK
+                );
+                STABLECOIN_FEE_FALLBACK as f64
+            } else {
+                // Regular pairs: Use configured fee as fallback
+                log::warn!(
+                    "ProfitCalculator: dex_fee -> regular pair, Jupiter API failed, using config fallback: {} bps per hop",
+                    self.config.dex_fee_bps
+                );
+                self.config.dex_fee_bps as f64
+            }
         };
 
         // ✅ CRITICAL: Multiply fee by hop count
