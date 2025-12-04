@@ -1,17 +1,19 @@
-// WebSocket client modülleri
-mod connection;
-mod subscription;
-
-pub use connection::ConnectionManager;
-pub use subscription::{SubscriptionManager, build_subscription_params, get_subscription_method};
+// WebSocket client - consolidated module (connection and subscription management merged)
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::{broadcast, Mutex};
-use tokio::time::Duration;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::{sleep, Duration};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::Message,
+    WebSocketStream,
+    MaybeTlsStream,
+};
+use tokio::net::TcpStream;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,180 @@ pub enum SubscriptionType {
     Program(Pubkey),
     Account(Pubkey),
     Slot,
+}
+
+// WebSocket connection and reconnection management
+pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub struct ConnectionManager {
+    url: String,
+    connection: Arc<Mutex<Option<WsStream>>>,
+}
+
+impl ConnectionManager {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn connect(&self) -> Result<()> {
+        let (ws_stream, _) = connect_async(&self.url)
+            .await
+            .context("Failed to connect to WebSocket")?;
+
+        let mut conn = self.connection.lock().await;
+        *conn = Some(ws_stream);
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) {
+        let mut conn = self.connection.lock().await;
+        *conn = None;
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        let conn = self.connection.lock().await;
+        conn.is_some()
+    }
+
+    pub async fn reconnect_with_backoff(&self, max_attempts: usize) -> Result<()> {
+        let mut backoff = Duration::from_secs(1);
+
+        for attempt in 1..=max_attempts {
+            sleep(backoff).await;
+
+            log::info!(
+                "WebSocket reconnect attempt {}/{}",
+                attempt,
+                max_attempts
+            );
+
+            if self.connect().await.is_ok() {
+                log::info!(
+                    "✅ WebSocket reconnected successfully on attempt {}",
+                    attempt
+                );
+                return Ok(());
+            }
+
+            backoff = backoff.min(Duration::from_secs(30));
+            backoff *= 2;
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to reconnect after {} attempts",
+            max_attempts
+        ))
+    }
+
+    pub fn connection(&self) -> Arc<Mutex<Option<WsStream>>> {
+        Arc::clone(&self.connection)
+    }
+}
+
+// WebSocket subscription management
+pub struct SubscriptionManager {
+    subscriptions: Arc<Mutex<HashMap<u64, SubscriptionInfo>>>,
+    failed_subscriptions: Arc<Mutex<Vec<SubscriptionInfo>>>,
+}
+
+impl SubscriptionManager {
+    pub fn new() -> Self {
+        Self {
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            failed_subscriptions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub async fn add(&self, id: u64, info: SubscriptionInfo) {
+        let mut subs = self.subscriptions.lock().await;
+        subs.insert(id, info);
+    }
+
+    pub async fn remove(&self, id: &u64) {
+        let mut subs = self.subscriptions.lock().await;
+        subs.remove(id);
+    }
+
+    pub async fn get_all(&self) -> HashMap<u64, SubscriptionInfo> {
+        let subs = self.subscriptions.lock().await;
+        subs.clone()
+    }
+
+    pub async fn clear(&self) {
+        let mut subs = self.subscriptions.lock().await;
+        subs.clear();
+    }
+
+    pub async fn len(&self) -> usize {
+        let subs = self.subscriptions.lock().await;
+        subs.len()
+    }
+
+    pub async fn add_failed(&self, info: SubscriptionInfo) {
+        let mut failed = self.failed_subscriptions.lock().await;
+        failed.push(info);
+    }
+
+    pub async fn get_failed(&self) -> Vec<SubscriptionInfo> {
+        let failed = self.failed_subscriptions.lock().await;
+        failed.clone()
+    }
+
+    pub async fn clear_failed(&self) {
+        let mut failed = self.failed_subscriptions.lock().await;
+        failed.clear();
+    }
+
+    pub fn subscriptions(&self) -> Arc<Mutex<HashMap<u64, SubscriptionInfo>>> {
+        Arc::clone(&self.subscriptions)
+    }
+
+    pub fn failed_subscriptions(&self) -> Arc<Mutex<Vec<SubscriptionInfo>>> {
+        Arc::clone(&self.failed_subscriptions)
+    }
+}
+
+impl Default for SubscriptionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build subscription parameters for different subscription types
+pub fn build_subscription_params(sub_type: &SubscriptionType) -> serde_json::Value {
+    match sub_type {
+        SubscriptionType::Program(program_id) => {
+            json!([{
+                "account": {
+                    "programId": program_id.to_string()
+                },
+                "encoding": "base64",
+                "commitment": "confirmed"
+            }])
+        }
+        SubscriptionType::Account(pubkey) => {
+            json!([{
+                "account": pubkey.to_string(),
+                "encoding": "base64",
+                "commitment": "confirmed"
+            }])
+        }
+        SubscriptionType::Slot => {
+            json!([])
+        }
+    }
+}
+
+/// Get subscription method name for subscription type
+pub fn get_subscription_method(sub_type: &SubscriptionType) -> &'static str {
+    match sub_type {
+        SubscriptionType::Program(_) => "accountSubscribe",
+        SubscriptionType::Account(_) => "accountSubscribe",
+        SubscriptionType::Slot => "slotSubscribe",
+    }
 }
 
 pub struct WsClient {
