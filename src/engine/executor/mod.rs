@@ -1,3 +1,10 @@
+// Executor modülleri
+pub mod tx_lock;
+pub mod ata_cache;
+
+pub use tx_lock::{TxLock, TxLockGuard};
+pub use ata_cache::{AtaCache, AtaCacheEntry};
+
 use crate::blockchain::jito::{create_jito_client, JitoBundle, JitoClient};
 use crate::blockchain::rpc_client::RpcClient;
 use crate::blockchain::transaction::{send_and_confirm, sign_transaction, TransactionBuilder};
@@ -10,132 +17,13 @@ use crate::utils::error_tracker::ErrorTracker;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-
-#[derive(Clone, Debug)]
-struct AtaCacheEntry {
-    created_at: Instant,
-    last_accessed: Instant,
-    verified: bool,
-}
-
-struct TxLock {
-    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
-    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
-    timeout_seconds: u64,
-    cancel_token: CancellationToken,
-}
-
-impl TxLock {
-    fn new(timeout_seconds: u64) -> Self {
-        TxLock {
-            locked: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            lock_times: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            timeout_seconds,
-            cancel_token: CancellationToken::new(),
-        }
-    }
-
-    fn start_cleanup_task(self: &Arc<Self>) {
-        let locked = Arc::clone(&self.locked);
-        let lock_times = Arc::clone(&self.lock_times);
-        let timeout_seconds = self.timeout_seconds;
-        let cancel = self.cancel_token.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(10)) => {
-                if let Ok(mut locked_guard) = locked.write() {
-                    if let Ok(mut lock_times_guard) = lock_times.write() {
-                        // Remove expired locks
-                        let expired_addresses: Vec<Pubkey> = lock_times_guard
-                            .iter()
-                            .filter_map(|(address, time)| {
-                                if time.elapsed().as_secs() >= timeout_seconds {
-                                    Some(*address)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        for address in &expired_addresses {
-                            locked_guard.remove(address);
-                            lock_times_guard.remove(address);
-                        }
-
-                        if !expired_addresses.is_empty() {
-                            log::debug!("TxLock: cleaned up {} expired lock(s)", expired_addresses.len());
-                        }
-                    } else {
-                        log::warn!("TxLock: lock_times RwLock is poisoned, skipping cleanup cycle");
-                    }
-                } else {
-                    log::warn!("TxLock: locked RwLock is poisoned, skipping cleanup cycle");
-                }
-                    }
-                    _ = cancel.cancelled() => {
-                        log::info!("TxLock cleanup task shutting down gracefully");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn cancel_cleanup(&self) {
-        self.cancel_token.cancel();
-    }
-
-    fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
-        let mut locked = self.locked.write()
-            .map_err(|_| anyhow::anyhow!("Lock is poisoned - cannot acquire lock"))?;
-        let mut lock_times = self.lock_times.write()
-            .map_err(|_| anyhow::anyhow!("Lock times is poisoned - cannot acquire lock"))?;
-
-        if let Some(lock_time) = lock_times.get(address) {
-            if lock_time.elapsed().as_secs() >= self.timeout_seconds {
-                locked.remove(address);
-                lock_times.remove(address);
-            } else {
-                return Err(anyhow::anyhow!("Account already locked"));
-            }
-        }
-
-        locked.insert(*address);
-        lock_times.insert(*address, std::time::Instant::now());
-
-        Ok(TxLockGuard {
-            locked: Arc::clone(&self.locked),
-            lock_times: Arc::clone(&self.lock_times),
-            address: *address,
-        })
-    }
-}
-
-struct TxLockGuard {
-    locked: Arc<std::sync::RwLock<HashSet<Pubkey>>>,
-    lock_times: Arc<std::sync::RwLock<HashMap<Pubkey, Instant>>>,
-    address: Pubkey,
-}
-
-impl Drop for TxLockGuard {
-    fn drop(&mut self) {
-        if let Ok(mut locked) = self.locked.write() {
-            locked.remove(&self.address);
-        }
-        if let Ok(mut lock_times) = self.lock_times.write() {
-            lock_times.remove(&self.address);
-        }
-    }
-}
 
 pub struct Executor {
     event_bus: EventBus,
@@ -148,7 +36,7 @@ pub struct Executor {
     error_tracker: ErrorTracker,
     jito_client: Option<Arc<JitoClient>>,
     use_jito: bool,
-    ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>>,
+    ata_cache: AtaCache,
     ata_cache_cleanup_token: CancellationToken,
 }
 
@@ -187,60 +75,7 @@ impl Executor {
             log::warn!("Without Jito, transactions are vulnerable to front-running");
         }
 
-        let ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
-        let ata_cache_cleanup_token = CancellationToken::new();
-        
-        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600;
-        const ATA_CACHE_MAX_SIZE: usize = 50000;
-        const CLEANUP_INTERVAL_SECONDS: u64 = 300;
-        
-        let cache_for_cleanup = Arc::clone(&ata_cache);
-        let cleanup_token = ata_cache_cleanup_token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(CLEANUP_INTERVAL_SECONDS)) => {
-                        let mut cache = cache_for_cleanup.write().await;
-                        let now = Instant::now();
-                        let before_len = cache.len();
-                        
-                        cache.retain(|_, entry| {
-                            now.duration_since(entry.created_at) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
-                        });
-                        
-                        if cache.len() > ATA_CACHE_MAX_SIZE {
-                            let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
-                            entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
-                            let to_remove = entries.len().saturating_sub(ATA_CACHE_MAX_SIZE);
-                            let removed_count = to_remove;
-                            for (pubkey, entry) in entries.into_iter().skip(to_remove) {
-                                cache.insert(pubkey, entry);
-                            }
-                            
-                            log::warn!(
-                                "Executor: ATA cache exceeded max size ({}), removed {} least-recently-used entries (now: {})",
-                                ATA_CACHE_MAX_SIZE,
-                                removed_count,
-                                cache.len()
-                            );
-                        }
-                        
-                        let after_len = cache.len();
-                        if before_len != after_len {
-                            log::debug!(
-                                "Executor: ATA cache cleanup: removed {} entries ({} remaining)",
-                                before_len - after_len,
-                                after_len
-                            );
-                        }
-                    }
-                    _ = cleanup_token.cancelled() => {
-                        log::info!("Executor ATA cache cleanup task shutting down gracefully");
-                        break;
-                    }
-                }
-            }
-        });
+        let (ata_cache, ata_cache_cleanup_token) = AtaCache::new();
 
         let error_tracker = ErrorTracker::new(
             config.max_consecutive_errors,
@@ -270,6 +105,7 @@ impl Executor {
         self.error_tracker.reset_errors();
     }
 
+    // Helper methods for cache compatibility
     fn evict_lru_if_needed(cache: &mut HashMap<Pubkey, AtaCacheEntry>) {
         const ATA_CACHE_MAX_SIZE: usize = 50000;
         
@@ -299,7 +135,7 @@ impl Executor {
     pub fn shutdown(&self) {
         log::info!("Executor: shutting down gracefully, cancelling background tasks");
         self.tx_lock.cancel_cleanup();
-        self.ata_cache_cleanup_token.cancel();
+        self.ata_cache.cancel_cleanup();
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -378,7 +214,8 @@ impl Executor {
             .context("Failed to derive source liquidity ATA")?;
         let destination_collateral = get_associated_token_address(&wallet_pubkey, &opp.collateral_mint, Some(&self.config))
             .context("Failed to derive destination collateral ATA")?;
-        let mut cache = self.ata_cache.write().await;
+        let cache_arc = self.ata_cache.cache();
+        let mut cache = cache_arc.write().await;
         
         // Check and create source liquidity ATA (for WSOL) if needed
         if is_wsol_mint(&opp.debt_mint) {

@@ -1,3 +1,10 @@
+// ATA Manager modülleri
+mod token_program;
+mod verification;
+
+pub use token_program::get_token_program_for_mint;
+pub use verification::{verify_ata_after_creation, verify_ata_exists};
+
 use crate::blockchain::rpc_client::RpcClient;
 use crate::core::config::Config;
 use crate::protocol::solend::accounts::get_associated_token_address;
@@ -19,116 +26,6 @@ use std::sync::Arc;
 // Note: 7 ATAs would be 105k CU + overhead, which could exceed limits with other instructions
 // This value should be tested in production/mainnet to ensure it doesn't exceed compute limits
 const MAX_ATAS_PER_TX: usize = 5;
-
-// ✅ FIX: Use registry for Token-2022 Program ID instead of hardcoded value
-use crate::core::registry::ProgramIds;
-
-/// Determines the correct token program ID for a given mint
-/// Checks if mint uses Token-2022 (Token Extensions) or standard SPL Token
-/// 
-/// This function checks the mint account's owner on-chain to determine
-/// which token program it uses. This is more reliable than hardcoded lists.
-pub async fn get_token_program_for_mint(
-    mint: &Pubkey,
-    rpc: Option<&Arc<RpcClient>>,
-) -> Result<Pubkey> {
-    // ✅ FIX: Use registry for Token-2022 Program ID
-    let token_2022_program_id = ProgramIds::token_2022()
-        .context("Failed to get Token-2022 program ID from registry")?;
-    let standard_token_program_id = spl_token::id();
-    
-    // If RPC is available, check mint account owner on-chain
-    if let Some(rpc_client) = rpc {
-        log::debug!("🔍 Fetching mint account {} from RPC to determine token program...", mint);
-        match rpc_client.get_account(mint).await {
-            Ok(account) => {
-                let owner = account.owner;
-                let account_data = &account.data;
-                log::info!(
-                    "📊 Mint account {} fetched: owner={}, lamports={}, data_len={}",
-                    mint,
-                    owner,
-                    account.lamports,
-                    account_data.len()
-                );
-                
-                // ✅ FIX 1: Primary check - owner program ID (most reliable method)
-                if owner == token_2022_program_id {
-                    log::info!("✅ Mint {} uses Token-2022 program (owner matches)", mint);
-                    return Ok(token_2022_program_id);
-                } else if owner == standard_token_program_id {
-                    log::info!("✅ Mint {} uses standard SPL Token program (owner matches)", mint);
-                    return Ok(standard_token_program_id);
-                }
-                
-                // ✅ FIX 2: Secondary check - validate account data structure
-                // Token-2022 mints may have extensions, but basic structure is similar
-                // Standard SPL Token mint is 82 bytes (minimum), Token-2022 can be larger due to extensions
-                // However, owner check is the most reliable method, so we primarily trust that
-                log::debug!("🔍 Validating mint account data structure...");
-                
-                // Standard SPL Token mint account is 82 bytes (minimum)
-                // Token-2022 mint account can be larger due to extensions
-                // But we can't reliably distinguish just from size, so we trust owner check
-                if account_data.len() < 82 {
-                    log::warn!(
-                        "⚠️  Mint {} account data too small ({} bytes), expected at least 82 bytes",
-                        mint,
-                        account_data.len()
-                    );
-                }
-                
-                log::warn!(
-                    "⚠️  Mint {} has unexpected owner: {} (expected {} or {}), defaulting to standard SPL Token",
-                    mint,
-                    owner,
-                    standard_token_program_id,
-                    token_2022_program_id
-                );
-                return Ok(standard_token_program_id);
-            }
-            Err(e) => {
-                log::warn!(
-                    "⚠️  Failed to fetch mint account {} from RPC: {}, trying fallback methods",
-                    mint,
-                    e
-                );
-                // ✅ FIX 3: When RPC fails, try known mints list and SPL Token libraries
-                // Note: We don't have account data if RPC fails, so we can't parse it
-                // Fall through to known mints list check below
-            }
-        }
-    } else {
-        log::debug!("⚠️  No RPC client provided, using fallback method for mint {}", mint);
-    }
-    
-    // ✅ FIX 1: Fallback - Check known Token-2022 mints list
-    // Known Token-2022 mints (can be extended as needed)
-    // Note: Token-2022 adoption is still early, so this list may be small initially
-    const TOKEN_2022_MINTS: &[&str] = &[
-        // Add confirmed Token-2022 mints here as they are discovered
-        // Example format (uncomment and add real mints):
-        // "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Example - replace with real Token-2022 mint
-    ];
-    
-    let mint_str = mint.to_string();
-    
-    if TOKEN_2022_MINTS.contains(&mint_str.as_str()) {
-        log::info!("✅ Mint {} found in known Token-2022 mints list", mint);
-        Ok(token_2022_program_id)
-    } else {
-        // ✅ FIX 3: Default to standard SPL Token program
-        // This covers the vast majority of tokens including USDC mainnet
-        // ⚠️ WARNING: If this is actually a Token-2022 mint, ATA creation will fail
-        // The bot should log this clearly so operators can add the mint to TOKEN_2022_MINTS
-        log::warn!(
-            "⚠️  Mint {} not in known Token-2022 list and RPC check unavailable, defaulting to standard SPL Token. \
-             If ATA creation fails with 'Invalid program id', this mint may be Token-2022 and should be added to TOKEN_2022_MINTS.",
-            mint
-        );
-        Ok(standard_token_program_id)
-    }
-}
 
 pub async fn ensure_required_atas(
     rpc: Arc<RpcClient>,
@@ -495,41 +392,11 @@ async fn send_ata_batch(
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     for (name, _mint, ata) in atas {
-        let mut verified = false;
-        for attempt in 1..=3 {
-            match rpc.get_account(ata).await {
-                Ok(_) => {
-                    log::info!("✅ {} ATA verified: {}", name, ata);
-                    verified = true;
-                    break;
-                }
-                Err(e) => {
-                    if attempt < 3 {
-                        log::debug!(
-                            "⚠️  {} ATA verification attempt {} failed, retrying...: {}",
-                            name,
-                            attempt,
-                            e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    } else {
-                        log::warn!(
-                            "⚠️  {} ATA verification failed after 3 attempts: {}",
-                            name,
-                            e
-                        );
-                        log::warn!(
-                            "   Transaction was sent: {}, ATA may still be creating...",
-                            sig
-                        );
-                    }
-                }
-            }
-        }
-        if !verified {
+        if !verify_ata_after_creation(ata, name, &rpc, 3).await {
             log::warn!(
-                "⚠️  {} ATA not found after transaction. It may take longer to confirm.",
-                name
+                "⚠️  {} ATA not found after transaction. It may take longer to confirm. Transaction: {}",
+                name,
+                sig
             );
         }
     }
@@ -549,10 +416,10 @@ async fn create_ata_instruction(
     let associated_token_program = get_associated_token_program_id(config)
         .context("Failed to get associated token program ID")?;
     
-    // ✅ FIX: Determine correct token program based on mint
+    // Determine correct token program based on mint
     // Some mints use Token-2022 (Token Extensions), others use standard SPL Token
     // Check mint account owner on-chain for accurate determination
-    let token_program = get_token_program_for_mint(mint, rpc)
+    let token_program = token_program::get_token_program_for_mint(mint, rpc)
         .await
         .context("Failed to determine token program for mint")?;
 

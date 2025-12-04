@@ -35,6 +35,7 @@ pub mod utils {
     pub mod error_helpers;
     pub mod error_tracker;
     pub mod helpers;
+    pub mod macros;
     pub mod metrics;
 }
 
@@ -43,4 +44,4 @@ pub use core::{config, error, events, types, registry};
 pub use engine::{analyzer, executor, scanner, validator};
 pub use protocol::Protocol;
 pub use strategy::{balance_manager, profit_calculator, slippage_estimator};
-pub use utils::{ata_manager, cache, error_helpers, error_tracker, helpers, metrics};
+pub use utils::{ata_manager, cache, error_helpers, error_tracker, helpers, macros, metrics};

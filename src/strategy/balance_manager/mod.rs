@@ -1,3 +1,10 @@
+// BalanceManager modülleri
+pub mod cache;
+pub mod reservation;
+
+pub use cache::{BalanceCache, CachedBalance, CACHE_TTL};
+pub use reservation::ReservationManager;
+
 use crate::blockchain::rpc_client::RpcClient;
 use crate::blockchain::ws_client::{AccountUpdate, WsClient};
 use crate::core::config::Config;
@@ -5,20 +12,8 @@ use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-
-/// Cached balance with timestamp for freshness checking
-#[derive(Clone, Debug)]
-struct CachedBalance {
-    amount: u64,
-    timestamp: Instant,
-}
-
-/// Cache time-to-live: balances older than this will be considered stale
-/// ✅ FIX: Increased from 30s to 60s to reduce unnecessary RPC calls
-/// WebSocket updates should keep cache fresh, but longer TTL provides buffer
-const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// BalanceManager manages token balances and reservations.
 ///
@@ -42,8 +37,8 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// let balances = self.balances.read().await;
 /// ```
 pub struct BalanceManager {
-    reserved: Arc<RwLock<HashMap<Pubkey, u64>>>, // mint -> reserved amount
-    balances: Arc<RwLock<HashMap<Pubkey, CachedBalance>>>, // ATA pubkey -> cached balance with timestamp
+    reservation: ReservationManager,
+    cache: BalanceCache,
     rpc: Arc<RpcClient>,
     ws: Option<Arc<WsClient>>,
     wallet: Pubkey,
@@ -65,8 +60,8 @@ impl BalanceManager {
 
     pub fn new(rpc: Arc<RpcClient>, wallet: Pubkey) -> Self {
         BalanceManager {
-            reserved: Arc::new(RwLock::new(HashMap::new())),
-            balances: Arc::new(RwLock::new(HashMap::new())),
+            reservation: ReservationManager::new(),
+            cache: BalanceCache::new(),
             rpc,
             ws: None,
             wallet,
@@ -108,11 +103,13 @@ impl BalanceManager {
             
             // Check cache first
             {
-                let balances = self.balances.read().await;
+                let balances_arc = self.cache.balances();
+                let balances = balances_arc.read().await;
                 if let Some(cached) = balances.get(&wsol_ata) {
                     if cached.timestamp.elapsed() < CACHE_TTL {
                         let reserved_amount = {
-                            let reserved = self.reserved.read().await;
+                            let reserved_arc = self.reservation.reserved();
+                            let reserved = reserved_arc.read().await;
                             reserved.get(mint).copied().unwrap_or(0)
                         };
                         let available = cached.amount.saturating_sub(reserved_amount);
@@ -140,22 +137,15 @@ impl BalanceManager {
             // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent order)
             let reserved_amount = {
                 // Acquire both locks in correct order: balances -> reserved
-                let _balances = self.balances.read().await; // Acquire first to maintain lock order
-                let reserved = self.reserved.read().await;
+                let balances_arc = self.cache.balances();
+                let _balances = balances_arc.read().await; // Acquire first to maintain lock order
+                let reserved_arc = self.reservation.reserved();
+                let reserved = reserved_arc.read().await;
                 reserved.get(mint).copied().unwrap_or(0)
             };
             
             // Update cache after releasing locks (short-lived write lock)
-            {
-                let mut balances = self.balances.write().await;
-                balances.insert(
-                    wsol_ata,
-                    CachedBalance {
-                        amount: wsol_balance,
-                        timestamp: Instant::now(),
-                    },
-                );
-            }
+            self.cache.insert(wsol_ata, wsol_balance).await;
             
             let available = wsol_balance.saturating_sub(reserved_amount);
             log::debug!(
@@ -171,13 +161,15 @@ impl BalanceManager {
 
         {
             // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
-            let balances = self.balances.read().await;
+            let balances_arc = self.cache.balances();
+            let balances = balances_arc.read().await;
             if let Some(cached) = balances.get(&ata) {
                 if cached.timestamp.elapsed() < CACHE_TTL {
                     // Read reserved amount without holding it across other locks/RPC calls
                     // Lock order: balances (already held) -> reserved (consistent order)
                     let reserved_amount = {
-                        let reserved = self.reserved.read().await;
+                        let reserved_arc = self.reservation.reserved();
+                        let reserved = reserved_arc.read().await;
                         reserved.get(mint).copied().unwrap_or(0)
                     };
                     let available = cached.amount.saturating_sub(reserved_amount);
@@ -217,22 +209,15 @@ impl BalanceManager {
         let reserved_amount = {
             // Lock order: balances -> reserved (ALWAYS in this order to prevent deadlock)
             // Acquire balances lock first (even if we don't need to modify it here)
-            let _balances = self.balances.read().await;
-            let reserved = self.reserved.read().await;
+            let balances_arc = self.cache.balances();
+            let _balances = balances_arc.read().await;
+            let reserved_arc = self.reservation.reserved();
+            let reserved = reserved_arc.read().await;
             reserved.get(mint).copied().unwrap_or(0)
         };
 
         // Update cache after releasing locks (short-lived write lock)
-        {
-            let mut balances = self.balances.write().await;
-            balances.insert(
-                ata,
-                CachedBalance {
-                    amount: actual,
-                    timestamp: Instant::now(),
-                },
-            );
-        }
+        self.cache.insert(ata, actual).await;
 
         let available = actual.saturating_sub(reserved_amount);
         Ok(available)
@@ -327,14 +312,7 @@ impl BalanceManager {
                                     .try_into()
                                     .map_err(|_| anyhow::anyhow!("Failed to read balance"))?;
                                 let wsol_balance = u64::from_le_bytes(balance_bytes);
-                                let mut balances = self.balances.write().await;
-                                balances.insert(
-                                    wsol_ata,
-                                    CachedBalance {
-                                        amount: wsol_balance,
-                                        timestamp: Instant::now(),
-                                    },
-                                );
+                                self.cache.insert(wsol_ata, wsol_balance).await;
                                 log::debug!(
                                     "BalanceManager: Initial {} WSOL balance cached: {}",
                                     name,
@@ -375,14 +353,7 @@ impl BalanceManager {
                                 .try_into()
                                 .map_err(|_| anyhow::anyhow!("Failed to read balance"))?;
                             let balance = u64::from_le_bytes(balance_bytes);
-                            let mut balances = self.balances.write().await;
-                            balances.insert(
-                                ata,
-                                CachedBalance {
-                                    amount: balance,
-                                    timestamp: Instant::now(),
-                                },
-                            );
+                            self.cache.insert(ata, balance).await;
                             log::debug!(
                                 "BalanceManager: Initial {} balance cached: {}",
                                 name,
@@ -441,19 +412,12 @@ impl BalanceManager {
         };
 
         let balance = u64::from_le_bytes(balance_bytes);
-        let mut balances = self.balances.write().await;
         let subscribed_atas_check = self.subscribed_atas.read().await;
         if subscribed_atas_check
             .values()
             .any(|&ata| ata == update.pubkey)
         {
-            balances.insert(
-                update.pubkey,
-                CachedBalance {
-                    amount: balance,
-                    timestamp: Instant::now(),
-                },
-            );
+            self.cache.update(&update.pubkey, balance).await;
 
             log::debug!(
                 "BalanceManager: Updated balance cache for ATA {}: {}",
@@ -541,15 +505,18 @@ impl BalanceManager {
         
         // Step 1: Quick check cache without locks (optimization - not critical for correctness)
         let needs_rpc = {
-            let balances = self.balances.read().await;
+            let balances_arc = self.cache.balances();
+            let balances = balances_arc.read().await;
             balances.get(&ata).map_or(true, |c| c.timestamp.elapsed() >= CACHE_TTL)
         };
 
         // Step 2: Acquire BOTH locks in consistent order and read balance
         if !needs_rpc {
             // Cache is fresh - acquire locks and read from cache
-            let balances = self.balances.read().await;
-            let mut reserved = self.reserved.write().await;
+            let balances_arc = self.cache.balances();
+            let balances = balances_arc.read().await;
+            let reserved_arc = self.reservation.reserved();
+            let mut reserved = reserved_arc.write().await;
             
             let actual = balances.get(&ata)
                 .map(|c| c.amount)
@@ -599,17 +566,11 @@ impl BalanceManager {
                 .context("Failed to fetch account balance during reserve")?;
             
             // Re-acquire locks in SAME order (balances -> reserved)
-            let mut balances = self.balances.write().await; // Write lock to update cache
-            let mut reserved = self.reserved.write().await;
+            let reserved_arc = self.reservation.reserved();
+            let mut reserved = reserved_arc.write().await;
             
-            // Update cache
-            balances.insert(
-                ata,
-                CachedBalance {
-                    amount: balance,
-                    timestamp: Instant::now(),
-                },
-            );
+            // Update cache (without holding balances lock - cache.insert handles its own lock)
+            self.cache.insert(ata, balance).await;
             
             // Check and reserve atomically (we're holding both locks)
             let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
@@ -654,8 +615,10 @@ impl BalanceManager {
         // Lock order: balances -> reserved (ALWAYS in this order)
         // Note: Using read lock for balances since we don't modify it (cache already updated)
         //       but we still acquire it first to maintain consistent lock ordering
-        let _balances = self.balances.read().await; // Read-only, but acquired first for lock order
-        let mut reserved = self.reserved.write().await;
+        let balances_arc = self.cache.balances();
+        let _balances = balances_arc.read().await; // Read-only, but acquired first for lock order
+        let reserved_arc = self.reservation.reserved();
+        let mut reserved = reserved_arc.write().await;
 
         // Calculate new reserved amount
         let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
@@ -703,24 +666,19 @@ impl BalanceManager {
     /// If you need both locks, use the order: balances -> reserved (consistent with reserve())
     pub async fn release(&self, mint: &Pubkey, amount: u64) {
         // Only lock reserved (no balances lock needed, so no deadlock risk)
-        let mut reserved = self.reserved.write().await;
-        if let Some(reserved_amount) = reserved.get_mut(mint) {
-            *reserved_amount = reserved_amount.saturating_sub(amount);
-            if *reserved_amount == 0 {
-                reserved.remove(mint);
-            }
-        }
+        self.reservation.release(mint, amount).await;
     }
 
     pub async fn stop_monitoring(&self) -> Result<()> {
         let mut subscribed_atas = self.subscribed_atas.write().await;
-        let mut balances = self.balances.write().await; // Hold both locks!
+        let balances = self.cache.balances();
+        let mut balances_guard = balances.write().await;
 
         let subscription_count = subscribed_atas.len();
 
         subscribed_atas.clear();
 
-        balances.clear();
+        balances_guard.clear();
 
         log::info!(
             "BalanceManager: Stopped monitoring (cleared {} subscriptions and cache)",

@@ -1,36 +1,24 @@
+// WebSocket client modülleri
+mod connection;
+mod subscription;
+
+pub use connection::ConnectionManager;
+pub use subscription::{SubscriptionManager, build_subscription_params, get_subscription_method};
+
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use tokio::sync::{broadcast, Mutex};
-use tokio::time::{sleep, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct AccountUpdate {
     pub pubkey: Pubkey,
     pub account: solana_sdk::account::Account,
     pub slot: u64,
-}
-
-pub struct WsClient {
-    url: String,
-    connection: Arc<
-        Mutex<
-            Option<
-                tokio_tungstenite::WebSocketStream<
-                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                >,
-            >,
-        >,
-    >,
-    subscriptions: Arc<Mutex<HashMap<u64, SubscriptionInfo>>>,
-    next_request_id: Arc<Mutex<u64>>,
-    account_update_tx: broadcast::Sender<AccountUpdate>,
-    // ✅ FIX: Persistent list of failed subscriptions to prevent data loss
-    // Scanner can check this list and restart if needed
-    failed_subscriptions: Arc<Mutex<Vec<SubscriptionInfo>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,32 +33,33 @@ pub enum SubscriptionType {
     Slot,
 }
 
-use std::sync::Arc;
+pub struct WsClient {
+    connection_mgr: ConnectionManager,
+    subscription_mgr: SubscriptionManager,
+    next_request_id: Arc<Mutex<u64>>,
+    account_update_tx: broadcast::Sender<AccountUpdate>,
+}
 
 impl WsClient {
     pub fn new(url: String) -> Self {
         let (tx, _) = broadcast::channel(1000);
         WsClient {
-            url,
-            connection: Arc::new(Mutex::new(None)),
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            connection_mgr: ConnectionManager::new(url),
+            subscription_mgr: SubscriptionManager::new(),
             next_request_id: Arc::new(Mutex::new(1)),
             account_update_tx: tx,
-            failed_subscriptions: Arc::new(Mutex::new(Vec::new())),
         }
     }
     
     /// Get list of failed subscriptions that need to be restored
     /// Scanner should check this and restart if subscriptions are lost
     pub async fn get_failed_subscriptions(&self) -> Vec<SubscriptionInfo> {
-        let failed = self.failed_subscriptions.lock().await;
-        failed.clone()
+        self.subscription_mgr.get_failed().await
     }
     
     /// Clear failed subscriptions after they've been restored
     pub async fn clear_failed_subscriptions(&self) {
-        let mut failed = self.failed_subscriptions.lock().await;
-        failed.clear();
+        self.subscription_mgr.clear_failed().await;
     }
 
     pub fn subscribe_account_updates(&self) -> broadcast::Receiver<AccountUpdate> {
@@ -78,13 +67,7 @@ impl WsClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let (ws_stream, _) = connect_async(&self.url)
-            .await
-            .context("Failed to connect to WebSocket")?;
-
-        let mut conn = self.connection.lock().await;
-        *conn = Some(ws_stream);
-        Ok(())
+        self.connection_mgr.connect().await
     }
 
     async fn send_request(&self, method: &str, params: serde_json::Value) -> Result<u64> {
@@ -99,8 +82,9 @@ impl WsClient {
             "params": params
         });
 
-        let mut conn = self.connection.lock().await;
-        if let Some(ref mut stream) = *conn {
+        let conn = self.connection_mgr.connection();
+        let mut conn_guard = conn.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
             let message = Message::Text(serde_json::to_string(&request)?);
             stream
                 .send(message)
@@ -114,8 +98,9 @@ impl WsClient {
     }
 
     async fn wait_for_response(&self, expected_id: u64) -> Result<serde_json::Value> {
-        let mut conn = self.connection.lock().await;
-        if let Some(ref mut stream) = *conn {
+        let conn = self.connection_mgr.connection();
+        let mut conn_guard = conn.lock().await;
+        if let Some(ref mut stream) = *conn_guard {
             loop {
                 if let Some(msg) = stream.next().await {
                     match msg {
@@ -154,84 +139,76 @@ impl WsClient {
     }
 
     pub async fn subscribe_program(&self, program_id: &Pubkey) -> Result<u64> {
-        let params = json!([
-            program_id.to_string(),
-            {
-                "encoding": "base64",
-                "commitment": "confirmed"
-            }
-        ]);
+        let sub_type = SubscriptionType::Program(*program_id);
+        let params = build_subscription_params(&sub_type);
+        let method = get_subscription_method(&sub_type);
 
-        let request_id = self.send_request("programSubscribe", params).await?;
+        let request_id = self.send_request(method, params).await?;
         let result = self.wait_for_response(request_id).await?;
 
         let subscription_id = result
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
-        let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(
+        self.subscription_mgr.add(
             subscription_id,
             SubscriptionInfo {
-                subscription_type: SubscriptionType::Program(*program_id),
+                subscription_type: sub_type,
             },
-        );
+        ).await;
 
         Ok(subscription_id)
     }
 
     pub async fn subscribe_account(&self, pubkey: &Pubkey) -> Result<u64> {
-        let params = json!([
-            pubkey.to_string(),
-            {
-            "encoding": "base64",
-            "commitment": "confirmed"
-            }
-        ]);
+        let sub_type = SubscriptionType::Account(*pubkey);
+        let params = build_subscription_params(&sub_type);
+        let method = get_subscription_method(&sub_type);
 
-        let request_id = self.send_request("accountSubscribe", params).await?;
+        let request_id = self.send_request(method, params).await?;
         let result = self.wait_for_response(request_id).await?;
 
         let subscription_id = result
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
-        let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(
+        self.subscription_mgr.add(
             subscription_id,
             SubscriptionInfo {
-                subscription_type: SubscriptionType::Account(*pubkey),
+                subscription_type: sub_type,
             },
-        );
+        ).await;
 
         Ok(subscription_id)
     }
 
     pub async fn subscribe_slot(&self) -> Result<u64> {
-        let params = json!([]);
+        let sub_type = SubscriptionType::Slot;
+        let params = build_subscription_params(&sub_type);
+        let method = get_subscription_method(&sub_type);
 
-        let request_id = self.send_request("slotSubscribe", params).await?;
+        let request_id = self.send_request(method, params).await?;
         let result = self.wait_for_response(request_id).await?;
 
         let subscription_id = result
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid subscription ID in response"))?;
 
-        let mut subscriptions = self.subscriptions.lock().await;
-        subscriptions.insert(
+        self.subscription_mgr.add(
             subscription_id,
             SubscriptionInfo {
-                subscription_type: SubscriptionType::Slot,
+                subscription_type: sub_type,
             },
-        );
+        ).await;
 
         Ok(subscription_id)
     }
 
     pub async fn listen(&self) -> Option<AccountUpdate> {
         let msg_opt = {
-            let mut conn = self.connection.lock().await;
-            if let Some(ref mut stream) = *conn {
+            let conn = self.connection_mgr.connection();
+            let mut conn_guard = conn.lock().await;
+            if let Some(ref mut stream) = *conn_guard {
                 stream.next().await.map(|r| {
                     r.map_err(|e| {
                         let error_str = e.to_string();
@@ -279,7 +256,8 @@ impl WsClient {
                                     if let Some(value) = account_info {
                                         let pubkey = if method == Some("accountNotification") {
                                             if let Some(sub_id) = subscription_id {
-                                                let subscriptions = self.subscriptions.lock().await;
+                                                let subscriptions_arc = self.subscription_mgr.subscriptions();
+                                                let subscriptions = subscriptions_arc.lock().await;
                                                 subscriptions.get(&sub_id).and_then(|info| {
                                                     if let SubscriptionType::Account(pk) =
                                                         &info.subscription_type
@@ -385,40 +363,25 @@ impl WsClient {
 
     pub async fn reconnect_with_backoff(&self) -> Result<()> {
         const MAX_RECONNECT_ATTEMPTS: usize = 10;
-        let mut backoff = Duration::from_secs(1);
+        
+        self.connection_mgr.reconnect_with_backoff(MAX_RECONNECT_ATTEMPTS).await?;
+        
+        let old_subscriptions = {
+            let old_count = self.subscription_mgr.len().await;
+            let old = self.subscription_mgr.get_all().await;
 
-        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-            sleep(backoff).await;
+            // ✅ CRITICAL: Clear old subscription IDs to prevent memory leak
+            self.subscription_mgr.clear().await;
 
-            log::info!(
-                "WebSocket reconnect attempt {}/{}",
-                attempt,
-                MAX_RECONNECT_ATTEMPTS
-            );
-
-            if self.connect().await.is_ok() {
+            if old_count > 0 {
                 log::info!(
-                    "✅ WebSocket reconnected successfully on attempt {}",
-                    attempt
+                    "Cleared {} stale subscription(s) before resubscribing (preventing memory leak)",
+                    old_count
                 );
+            }
 
-                let old_subscriptions = {
-                    let mut subscriptions = self.subscriptions.lock().await;
-                    let old_count = subscriptions.len();
-                    let old = subscriptions.clone(); // Clone before clearing
-
-                    // ✅ CRITICAL: Clear old subscription IDs to prevent memory leak
-                    subscriptions.clear();
-
-                    if old_count > 0 {
-                        log::info!(
-                            "Cleared {} stale subscription(s) before resubscribing (preventing memory leak)",
-                            old_count
-                        );
-                    }
-
-                    old
-                };
+            old
+        };
 
                 let mut failed_subscriptions = Vec::new();
 
@@ -495,53 +458,12 @@ impl WsClient {
                                 );
                                 // ✅ FIX: Store failed subscription in persistent list
                                 // Scanner can check this list and restart to restore subscriptions
-                                let mut failed = self.failed_subscriptions.lock().await;
-                                // Only add if not already in list (avoid duplicates)
-                                let is_duplicate = failed.iter().any(|f| {
-                                    match (&f.subscription_type, &info.subscription_type) {
-                                        (SubscriptionType::Program(p1), SubscriptionType::Program(p2)) => p1 == p2,
-                                        (SubscriptionType::Account(a1), SubscriptionType::Account(a2)) => a1 == a2,
-                                        (SubscriptionType::Slot, SubscriptionType::Slot) => true,
-                                        _ => false,
-                                    }
-                                });
-                                
-                                if !is_duplicate {
-                                    failed.push(info.clone());
-                                    log::warn!(
-                                        "⚠️  Added failed subscription to persistent list (total: {}). Scanner should restart to restore.",
-                                        failed.len()
-                                    );
-                                }
+                                self.subscription_mgr.add_failed(info.clone()).await;
                             }
                         }
                     }
                 }
 
-                return Ok(());
-            }
-
-            backoff = backoff.saturating_mul(2);
-            if backoff > Duration::from_secs(60) {
-                backoff = Duration::from_secs(60);
-            }
-
-            log::warn!(
-                "WebSocket reconnect attempt {}/{} failed, retrying in {:.1}s...",
-                attempt,
-                MAX_RECONNECT_ATTEMPTS,
-                backoff.as_secs_f64()
-            );
-        }
-
-        log::error!(
-            "❌ WebSocket connection permanently lost after {} attempts. Network may be down or RPC endpoint unreachable.",
-            MAX_RECONNECT_ATTEMPTS
-        );
-        log::warn!("⚠️  Falling back to RPC polling mode to continue operation...");
-        Err(anyhow::anyhow!(
-            "WebSocket connection permanently lost after {} reconnect attempts",
-            MAX_RECONNECT_ATTEMPTS
-        ))
+        Ok(())
     }
 }
