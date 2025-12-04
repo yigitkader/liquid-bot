@@ -220,11 +220,20 @@ impl SlippageEstimator {
             self.client.get(url).send()
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Jupiter API timeout after {:?}", JUPITER_TIMEOUT))?
-        .context("Network error")?;
+        .map_err(|e| {
+            log::debug!("Jupiter API request timeout after {:?}: {}", JUPITER_TIMEOUT, e);
+            anyhow::anyhow!("Jupiter API timeout after {:?}", JUPITER_TIMEOUT)
+        })?
+        .map_err(|e| {
+            log::debug!("Jupiter API network error: {} (url: {})", e, url);
+            anyhow::anyhow!("Network error: {}", e)
+        })?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+            let status = response.status();
+            let status_text = response.status().canonical_reason().unwrap_or("Unknown");
+            log::debug!("Jupiter API HTTP error: {} {} (url: {})", status.as_u16(), status_text, url);
+            return Err(anyhow::anyhow!("HTTP {} {}: {}", status.as_u16(), status_text, status));
         }
 
         // Read response body
@@ -234,8 +243,11 @@ impl SlippageEstimator {
             .context("Failed to read response body")?;
 
         // Parse JSON response
-        let quote: JupiterQuoteResponse =
-            serde_json::from_str(&response_text).context("Failed to parse JSON")?;
+        let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                log::debug!("Jupiter API JSON parse error: {} (response length: {} bytes, url: {})", e, response_text.len(), url);
+                anyhow::anyhow!("Failed to parse JSON: {}", e)
+            })?;
 
         // Extract price impact
         let price_impact_str = quote

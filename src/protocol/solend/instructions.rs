@@ -271,21 +271,51 @@ impl ReserveCache {
             // This prevents race condition where cache is empty for 30s, causing
             // Scanner/Executor to make unnecessary RPC calls (get_program_accounts)
             log::info!("Performing initial reserve cache refresh...");
-            if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
-                log::error!("Initial reserve cache refresh FAILED: {}", e);
-            } else {
-                log::info!("✅ Initial reserve cache populated successfully");
+            
+            // ✅ FIX: Retry mechanism with exponential backoff for initial refresh
+            // This handles transient RPC errors and timeouts
+            const MAX_RETRIES: u32 = 3;
+            const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+            
+            let mut retry_count = 0;
+            let mut retry_delay = INITIAL_RETRY_DELAY;
+            
+            loop {
+                match self.refresh_from_rpc(&rpc, &config).await {
+                    Ok(()) => {
+                        log::info!("✅ Initial reserve cache populated successfully");
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count > MAX_RETRIES {
+                            log::error!("Initial reserve cache refresh FAILED after {} retries: {}", MAX_RETRIES, e);
+                            log::error!("⚠️  Reserve cache will remain empty - Scanner/Executor may make unnecessary RPC calls");
+                            break;
+                        }
+                        log::warn!("Initial reserve cache refresh failed (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                        log::info!("Retrying in {:?}...", retry_delay);
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay * 2; // Exponential backoff
+                    }
+                }
             }
 
             // Now start periodic refresh
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
 
-                log::debug!("Refreshing reserve cache from RPC...");
-                if let Err(e) = self.refresh_from_rpc(&rpc, &config).await {
-                    log::warn!("Reserve cache refresh failed: {}", e);
-                } else {
-                    log::debug!("Reserve cache refreshed successfully");
+                log::info!("🔄 Refreshing reserve cache from RPC...");
+                match self.refresh_from_rpc(&rpc, &config).await {
+                    Ok(()) => {
+                        let inner = self.inner.read().await;
+                        let reserve_count = inner.reserve_data.len();
+                        let mint_count = inner.mint_to_reserve.len();
+                        log::info!("✅ Reserve cache refreshed successfully ({} reserves, {} mints)", reserve_count, mint_count);
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Reserve cache refresh failed: {}", e);
+                    }
                 }
             }
         });
@@ -419,13 +449,30 @@ pub async fn build_liquidate_obligation_ix(
             .await
             .context("Failed to fetch collateral reserve data")?;
 
-    let source_liquidity =
+    // ✅ FIX: Native SOL is handled specially in Solend
+    // For native SOL, use wallet account directly instead of ATA
+    // Solend protocol uses native SOL directly, not wrapped SOL
+    use std::str::FromStr;
+    let sol_mint = Pubkey::from_str(&config.sol_mint)
+        .context("Failed to parse SOL mint address")?;
+    
+    let source_liquidity = if opportunity.debt_mint == sol_mint {
+        // Native SOL: use wallet account directly
+        *liquidator
+    } else {
+        // SPL tokens: use ATA
         get_associated_token_address(liquidator, &opportunity.debt_mint, Some(&config))
-            .context("Failed to derive source liquidity ATA")?;
+            .context("Failed to derive source liquidity ATA")?
+    };
 
-    let destination_collateral =
+    let destination_collateral = if opportunity.collateral_mint == sol_mint {
+        // Native SOL: use wallet account directly
+        *liquidator
+    } else {
+        // SPL tokens: use ATA
         get_associated_token_address(liquidator, &opportunity.collateral_mint, Some(&config))
-            .context("Failed to derive destination collateral ATA")?;
+            .context("Failed to derive destination collateral ATA")?
+    };
 
     let pyth_price = get_pyth_oracle_account(&opportunity.debt_mint, Some(&config))
         .context("Failed to get Pyth oracle account")?

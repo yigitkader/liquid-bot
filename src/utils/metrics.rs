@@ -5,6 +5,8 @@ use tokio::sync::RwLock;
 
 pub struct Metrics {
     opportunities_found: AtomicU64,
+    opportunities_approved: AtomicU64,
+    opportunities_rejected: AtomicU64,
     transactions_sent: AtomicU64,
     transactions_successful: AtomicU64,
     total_profit_usd: Arc<RwLock<f64>>,
@@ -15,6 +17,8 @@ impl Metrics {
     pub fn new() -> Self {
         Metrics {
             opportunities_found: AtomicU64::new(0),
+            opportunities_approved: AtomicU64::new(0),
+            opportunities_rejected: AtomicU64::new(0),
             transactions_sent: AtomicU64::new(0),
             transactions_successful: AtomicU64::new(0),
             total_profit_usd: Arc::new(RwLock::new(0.0)),
@@ -24,6 +28,14 @@ impl Metrics {
 
     pub fn record_opportunity(&self) {
         self.opportunities_found.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_opportunity_approved(&self) {
+        self.opportunities_approved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_opportunity_rejected(&self) {
+        self.opportunities_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn record_transaction(&self, success: bool, profit: f64) {
@@ -40,6 +52,8 @@ impl Metrics {
 
     pub async fn get_summary(&self) -> MetricsSummary {
         let opportunities = self.opportunities_found.load(Ordering::Relaxed);
+        let opportunities_approved = self.opportunities_approved.load(Ordering::Relaxed);
+        let opportunities_rejected = self.opportunities_rejected.load(Ordering::Relaxed);
         let tx_sent = self.transactions_sent.load(Ordering::Relaxed);
         let tx_success = self.transactions_successful.load(Ordering::Relaxed);
         let success_rate = if tx_sent > 0 {
@@ -74,6 +88,8 @@ impl Metrics {
 
         MetricsSummary {
             opportunities,
+            opportunities_approved,
+            opportunities_rejected,
             tx_sent,
             tx_success,
             success_rate,
@@ -86,6 +102,8 @@ impl Metrics {
 
 pub struct MetricsSummary {
     pub opportunities: u64,
+    pub opportunities_approved: u64,
+    pub opportunities_rejected: u64,
     pub tx_sent: u64,
     pub tx_success: u64,
     pub success_rate: f64,

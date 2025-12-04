@@ -14,6 +14,7 @@ pub struct Analyzer {
     config: Config,
     current_workers: Arc<AtomicUsize>,
     max_workers_limit: usize,
+    metrics: Option<Arc<crate::utils::metrics::Metrics>>,
 }
 
 impl Analyzer {
@@ -26,7 +27,13 @@ impl Analyzer {
             config,
             current_workers: Arc::new(AtomicUsize::new(initial_workers)),
             max_workers_limit,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<crate::utils::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -89,13 +96,27 @@ impl Analyzer {
                         // Panics are caught by JoinSet in the cleanup loop below
                         if Self::is_liquidatable_static(&position, &config) {
                             if let Some(opportunity) =
-                                Self::calculate_opportunity_static(position, protocol, config).await
+                                Self::calculate_opportunity_static(position.clone(), protocol, config).await
                             {
                                 log::info!(
-                                    "Analyzer: opportunity found for {}",
-                                    opportunity.position.address
+                                    "Analyzer: ✅ Opportunity found for position {} (HF={:.6}, debt={}, collateral={}, max_liquidatable={}, est_profit=${:.4})",
+                                    opportunity.position.address,
+                                    opportunity.position.health_factor,
+                                    opportunity.debt_mint,
+                                    opportunity.collateral_mint,
+                                    opportunity.max_liquidatable,
+                                    opportunity.estimated_profit
                                 );
+                                if let Some(ref metrics) = self.metrics {
+                                    metrics.record_opportunity();
+                                }
                                 let _ = event_bus.publish(Event::OpportunityFound { opportunity });
+                            } else {
+                                log::debug!(
+                                    "Analyzer: Position {} is liquidatable (HF={:.6}) but no profitable opportunity calculated",
+                                    position.address,
+                                    position.health_factor
+                                );
                             }
                         }
                     });
@@ -425,6 +446,17 @@ impl Analyzer {
         let net_profit = profit_calc.calculate_net_profit(&temp_opp, hop_count);
 
         if net_profit < config.min_profit_usd {
+            let gross = temp_opp.seizable_collateral as f64 / 1_000_000.0
+                - temp_opp.max_liquidatable as f64 / 1_000_000.0;
+            log::debug!(
+                "Analyzer: Position {} rejected due to low profit: net=${:.6} < min=${:.2} (gross=${:.6}, debt_mint={}, collateral_mint={})",
+                position.address,
+                net_profit,
+                config.min_profit_usd,
+                gross,
+                debt_mint,
+                collateral_mint
+            );
             return None;
         }
 

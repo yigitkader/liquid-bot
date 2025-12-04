@@ -33,8 +33,29 @@ async fn main() -> Result<()> {
 
     let log_file_path = format!("logs/bot-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
 
-    fern::Dispatch::new()
+    // ✅ FIX: Filter out noisy HTTP client debug logs (chunked headers, connection details, etc.)
+    // These logs come from hyper/reqwest HTTP client libraries used by solana-client
+    let logger = fern::Dispatch::new()
         .format(|out, message, record| {
+            // Filter out noisy HTTP client debug messages
+            let msg_str = format!("{}", message);
+            if msg_str.contains("incoming chunked header")
+                || msg_str.contains("chunked header")
+                || msg_str.contains("parsed 18 headers")
+                || msg_str.contains("incoming body is chunked encoding")
+                || msg_str.contains("incoming body completed")
+                || msg_str.contains("flushed")
+                || msg_str.contains("pooling idle connection")
+                || msg_str.contains("reuse idle connection")
+                || msg_str.contains("starting new connection")
+                || msg_str.contains("resolving host")
+                || msg_str.contains("connecting to")
+                || msg_str.contains("connected to")
+            {
+                // Skip these noisy logs
+                return;
+            }
+            
             out.finish(format_args!(
                 "{} [{}] {}",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
@@ -43,10 +64,14 @@ async fn main() -> Result<()> {
             ))
         })
         .level(log::LevelFilter::Debug)
+        // Suppress debug logs from HTTP client libraries
+        .level_for("hyper", log::LevelFilter::Info)
+        .level_for("reqwest", log::LevelFilter::Info)
+        .level_for("solana_client", log::LevelFilter::Info)
         .chain(std::io::stdout())
-        .chain(fern::log_file(&log_file_path)?)
-        .apply()
-        .context("Failed to initialize logger")?;
+        .chain(fern::log_file(&log_file_path)?);
+    
+    logger.apply().context("Failed to initialize logger")?;
 
     log::info!("🚀 Starting Solana Liquidation Bot");
     log::info!("📝 Logging to: {}", log_file_path);
@@ -83,7 +108,9 @@ async fn main() -> Result<()> {
     log::info!(
         "⏳ Waiting for reserve cache initial population before starting Scanner and Executor..."
     );
-    let cache_timeout = tokio::time::Duration::from_secs(15); // RPC call timeout + buffer (no initial 30s delay)
+    // ✅ FIX: Increased timeout to account for retry mechanism (3 retries * ~30s timeout + buffer)
+    // get_program_accounts now uses 3x timeout (min 30s), so we need at least 90s + buffer
+    let cache_timeout = tokio::time::Duration::from_secs(120); // 2 minutes to allow for retries
     if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(
         cache_timeout,
     )
@@ -166,13 +193,14 @@ async fn main() -> Result<()> {
         Arc::clone(&cache),
         config.clone(),
     );
-    let analyzer = Analyzer::new(event_bus.clone(), Arc::clone(&protocol), config.clone());
+    let analyzer = Analyzer::new(event_bus.clone(), Arc::clone(&protocol), config.clone())
+        .with_metrics(Arc::clone(&metrics));
     let validator = Validator::new(
         event_bus.clone(),
         Arc::clone(&balance_manager),
         config.clone(),
         Arc::clone(&rpc),
-    );
+    ).with_metrics(Arc::clone(&metrics));
     let executor = Arc::new(Executor::new(
         event_bus.clone(),
         Arc::clone(&rpc),
@@ -219,8 +247,10 @@ async fn main() -> Result<()> {
             // Metrics
             let summary = metrics_clone.get_summary().await;
             log::info!(
-                "📊 Metrics: Opportunities: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
+                "📊 Metrics: Opportunities Found: {}, Approved: {}, Rejected: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
                 summary.opportunities,
+                summary.opportunities_approved,
+                summary.opportunities_rejected,
                 summary.tx_sent,
                 summary.tx_success,
                 summary.success_rate * 100.0,
@@ -264,6 +294,19 @@ async fn main() -> Result<()> {
         .context("Failed to listen for shutdown signal")?;
 
     log::info!("🛑 Shutting down gracefully...");
+
+    // Log final summary before shutdown
+    let final_summary = metrics.get_summary().await;
+    log::info!("📊 Final Summary:");
+    log::info!("  - Opportunities found: {}", final_summary.opportunities);
+    log::info!("  - Opportunities approved: {}", final_summary.opportunities_approved);
+    log::info!("  - Opportunities rejected: {} (insufficient balance, validation failed, etc.)", final_summary.opportunities_rejected);
+    log::info!("  - Transactions sent: {}", final_summary.tx_sent);
+    log::info!("  - Transactions successful: {}", final_summary.tx_success);
+    log::info!("  - Success rate: {:.2}%", final_summary.success_rate * 100.0);
+    log::info!("  - Total profit: ${:.2}", final_summary.total_profit);
+    log::info!("  - Average latency: {}ms", final_summary.avg_latency_ms);
+    log::info!("  - P95 latency: {}ms", final_summary.p95_latency_ms);
 
     // ✅ CRITICAL: Stop balance monitoring FIRST (clear subscriptions)
     // This prevents race conditions where account updates arrive after shutdown

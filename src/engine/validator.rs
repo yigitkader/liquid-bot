@@ -16,6 +16,7 @@ pub struct Validator {
     balance_manager: Arc<BalanceManager>,
     config: Config,
     rpc: Arc<RpcClient>,
+    metrics: Option<Arc<crate::utils::metrics::Metrics>>,
 }
 
 impl Validator {
@@ -30,7 +31,13 @@ impl Validator {
             balance_manager,
             config,
             rpc,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<crate::utils::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -53,6 +60,7 @@ impl Validator {
                             
                             let opportunity_clone = opportunity.clone();
                             let debt_mint = opportunity.debt_mint;
+                            let collateral_mint = opportunity.collateral_mint;
                             let max_liquidatable = opportunity.max_liquidatable;
                             let position_address = opportunity.position.address;
                             
@@ -70,9 +78,12 @@ impl Validator {
                                         // Reserved successfully - proceed with validation
                                     }
                                     Err(e) => {
-                                        log::debug!(
-                                            "Validator: insufficient balance for position {}: {}",
+                                        log::info!(
+                                            "Validator: insufficient balance for position {} (debt={}, need={}, available={}): {}",
                                             position_address,
+                                            debt_mint,
+                                            max_liquidatable,
+                                            "checking...",
                                             e
                                         );
                                         // Don't validate if we can't reserve balance
@@ -89,6 +100,9 @@ impl Validator {
                                             "Validator: opportunity approved for position {}",
                                             position_address
                                         );
+                                        if let Some(ref metrics) = self.metrics {
+                                            metrics.record_opportunity_approved();
+                                        }
                                         if let Err(e) = event_bus.publish(Event::OpportunityApproved {
                                             opportunity: opportunity_clone,
                                         }) {
@@ -105,11 +119,16 @@ impl Validator {
                                     Err(e) => {
                                         // ❌ VALIDATION FAILED: Release reservation
                                         // Executor will never see this opportunity, so we must release
-                                        log::debug!(
-                                            "Validator: opportunity rejected for position {}: {}",
+                                        log::info!(
+                                            "Validator: opportunity rejected for position {} (debt={}, collateral={}): {}",
                                             position_address,
+                                            debt_mint,
+                                            collateral_mint,
                                             e
                                         );
+                                        if let Some(ref metrics) = self.metrics {
+                                            metrics.record_opportunity_rejected();
+                                        }
                                         balance_manager
                                             .release(
                                                 &debt_mint,

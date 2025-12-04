@@ -367,17 +367,28 @@ impl Executor {
                         }
                     };
 
-                    match self.execute(opportunity).await {
+                    match self.execute(opportunity.clone()).await {
                         Ok(signature) => {
                             log::info!(
-                                "Executor: transaction sent for opportunity (position={}): {}",
-                                signature,
-                                "OK"
+                                "Executor: ✅ Transaction sent successfully for position {} (debt={}, collateral={}, est_profit=${:.4}, max_liquidatable={}): signature={}",
+                                opportunity.position.address,
+                                opportunity.debt_mint,
+                                opportunity.collateral_mint,
+                                opportunity.estimated_profit,
+                                opportunity.max_liquidatable,
+                                signature
                             );
                             self.reset_errors();
                         }
                         Err(e) => {
-                            log::error!("Failed to execute liquidation: {}", e);
+                            log::error!(
+                                "Executor: ❌ Failed to execute liquidation for position {} (debt={}, collateral={}, est_profit=${:.4}): {}",
+                                opportunity.position.address,
+                                opportunity.debt_mint,
+                                opportunity.collateral_mint,
+                                opportunity.estimated_profit,
+                                e
+                            );
                             if let Err(panic_err) = self.record_error() {
                                 log::error!("🚨 Executor panic triggered: {}", panic_err);
                                 return Err(panic_err);
@@ -469,7 +480,7 @@ impl Executor {
                             "Executor: ATA {} doesn't exist, adding create_ata instruction",
                             destination_collateral
                         );
-                        let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint)?;
+                        let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint).await?;
                         tx_builder.add_instruction(create_ata_ix);
 
                         cache.insert(destination_collateral, AtaCacheEntry {
@@ -490,7 +501,7 @@ impl Executor {
                                 destination_collateral
                             );
                             let create_ata_ix =
-                                self.create_ata_instruction(&opp.collateral_mint)?;
+                                self.create_ata_instruction(&opp.collateral_mint).await?;
                             tx_builder.add_instruction(create_ata_ix);
                             // Cache pessimistically: assume ATA missing to prevent repeated RPC calls on consecutive timeouts
                             cache.insert(destination_collateral, AtaCacheEntry {
@@ -504,7 +515,7 @@ impl Executor {
                                 e
                             );
                             let create_ata_ix =
-                                self.create_ata_instruction(&opp.collateral_mint)?;
+                                self.create_ata_instruction(&opp.collateral_mint).await?;
                             tx_builder.add_instruction(create_ata_ix);
                             cache.insert(destination_collateral, AtaCacheEntry {
                                 timestamp: Instant::now(),
@@ -547,18 +558,24 @@ impl Executor {
         Ok(signature)
     }
 
-    fn create_ata_instruction(
+    async fn create_ata_instruction(
         &self,
         mint: &Pubkey,
     ) -> Result<solana_sdk::instruction::Instruction> {
         use crate::protocol::solend::accounts::get_associated_token_program_id;
+        use crate::utils::ata_manager::get_token_program_for_mint;
         use solana_sdk::signature::Signer;
-        use std::str::FromStr;
 
         let wallet_pubkey = self.wallet.pubkey();
         let associated_token_program = get_associated_token_program_id(Some(&self.config))
             .context("Failed to get associated token program ID")?;
-        let token_program = spl_token::id();
+        
+        // ✅ FIX: Determine correct token program based on mint
+        // Some mints use Token-2022 (Token Extensions), others use standard SPL Token
+        // Check mint account owner on-chain for accurate determination
+        let token_program = get_token_program_for_mint(mint, Some(&self.rpc))
+            .await
+            .context("Failed to determine token program for mint")?;
 
         // Always use manual construction to ensure correct account order and metadata
         // SPL library may have compatibility issues with certain Solana SDK versions
@@ -572,12 +589,13 @@ impl Executor {
         )
         .ok_or_else(|| anyhow::anyhow!("Failed to find program address for ATA"))?;
 
-        log::debug!(
-            "Executor: Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, program={}",
+        log::info!(
+            "🔨 Executor: Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, token_program={}, program={}",
             wallet_pubkey,
             wallet_pubkey,
             mint,
             ata,
+            token_program,
             associated_token_program
         );
 
@@ -588,21 +606,37 @@ impl Executor {
         // 2. Owner (readonly) - the wallet that will own the ATA
         // 3. Mint (readonly) - the token mint
         // 4. System Program (readonly) - for account creation
-        // 5. Token Program (readonly) - SPL Token program
+        // 5. Token Program (readonly) - SPL Token or Token-2022 program
         // Data: empty (discriminator is handled by program)
+        let accounts = vec![
+            solana_sdk::instruction::AccountMeta::new(wallet_pubkey, true),
+            solana_sdk::instruction::AccountMeta::new(ata, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(wallet_pubkey, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                solana_sdk::system_program::id(),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
+        ];
+        
+        // Log detailed account information
+        log::info!("📋 Executor ATA Instruction Account Details:");
+        for (idx, account_meta) in accounts.iter().enumerate() {
+            log::info!(
+                "   [{}] pubkey={}, is_signer={}, is_writable={}",
+                idx,
+                account_meta.pubkey,
+                account_meta.is_signer,
+                account_meta.is_writable
+            );
+        }
+        log::info!("📋 Instruction data length: {} bytes", 0);
+        log::info!("📋 Program ID: {}", associated_token_program);
+        
         Ok(solana_sdk::instruction::Instruction {
             program_id: associated_token_program,
-            accounts: vec![
-                solana_sdk::instruction::AccountMeta::new(wallet_pubkey, true),
-                solana_sdk::instruction::AccountMeta::new(ata, false),
-                solana_sdk::instruction::AccountMeta::new_readonly(wallet_pubkey, false),
-                solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
-                solana_sdk::instruction::AccountMeta::new_readonly(
-                    solana_sdk::system_program::id(),
-                    false,
-                ),
-                solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
-            ],
+            accounts,
             data: vec![],
         })
     }

@@ -20,6 +20,85 @@ use std::sync::Arc;
 // This value should be tested in production/mainnet to ensure it doesn't exceed compute limits
 const MAX_ATAS_PER_TX: usize = 5;
 
+// Token-2022 Program ID (Token Extensions)
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/// Determines the correct token program ID for a given mint
+/// Checks if mint uses Token-2022 (Token Extensions) or standard SPL Token
+/// 
+/// This function checks the mint account's owner on-chain to determine
+/// which token program it uses. This is more reliable than hardcoded lists.
+pub async fn get_token_program_for_mint(
+    mint: &Pubkey,
+    rpc: Option<&Arc<RpcClient>>,
+) -> Result<Pubkey> {
+    use std::str::FromStr;
+    
+    // Token program IDs
+    let token_2022_program_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID)
+        .map_err(|_| anyhow::anyhow!("Invalid Token-2022 program ID"))?;
+    let standard_token_program_id = spl_token::id();
+    
+    // If RPC is available, check mint account owner on-chain
+    if let Some(rpc_client) = rpc {
+        log::debug!("🔍 Fetching mint account {} from RPC to determine token program...", mint);
+        match rpc_client.get_account(mint).await {
+            Ok(account) => {
+                let owner = account.owner;
+                log::info!(
+                    "📊 Mint account {} fetched: owner={}, lamports={}, data_len={}",
+                    mint,
+                    owner,
+                    account.lamports,
+                    account.data.len()
+                );
+                if owner == token_2022_program_id {
+                    log::info!("✅ Mint {} uses Token-2022 program (owner matches)", mint);
+                    return Ok(token_2022_program_id);
+                } else if owner == standard_token_program_id {
+                    log::info!("✅ Mint {} uses standard SPL Token program (owner matches)", mint);
+                    return Ok(standard_token_program_id);
+                } else {
+                    log::warn!(
+                        "⚠️  Mint {} has unexpected owner: {} (expected {} or {}), defaulting to standard SPL Token",
+                        mint,
+                        owner,
+                        standard_token_program_id,
+                        token_2022_program_id
+                    );
+                    return Ok(standard_token_program_id);
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to fetch mint account {} from RPC: {}, defaulting to standard SPL Token",
+                    mint,
+                    e
+                );
+                // Fall through to default
+            }
+        }
+    } else {
+        log::debug!("⚠️  No RPC client provided, using fallback method for mint {}", mint);
+    }
+    
+    // Fallback: Check known Token-2022 mints list
+    // Known Token-2022 mints (can be extended as needed)
+    const TOKEN_2022_MINTS: &[&str] = &[
+        // Add confirmed Token-2022 mints here if needed
+    ];
+    
+    let mint_str = mint.to_string();
+    
+    if TOKEN_2022_MINTS.contains(&mint_str.as_str()) {
+        Ok(token_2022_program_id)
+    } else {
+        // Default to standard SPL Token program
+        // This covers the vast majority of tokens including USDC mainnet
+        Ok(standard_token_program_id)
+    }
+}
+
 pub async fn ensure_required_atas(
     rpc: Arc<RpcClient>,
     wallet: Arc<Keypair>,
@@ -97,11 +176,12 @@ pub async fn ensure_required_atas(
                     }
                     Err(_) => {
                         log::warn!(
-                            "⚠️  Timeout checking {} ATA ({}), will try to create",
+                            "⚠️  Timeout checking {} ATA ({}), will verify again before creating",
                             name,
                             ata
                         );
-                        Ok((name, mint, ata, false)) // Assume missing and try to create
+                        // Don't assume missing on timeout - send_ata_batch will verify again
+                        Ok((name, mint, ata, false))
                     }
                 }
             }
@@ -143,7 +223,7 @@ pub async fn ensure_required_atas(
 
         for (name, mint, ata) in chunk {
             log::info!("🔨 Creating instruction for {} ATA: {}", name, ata);
-            match create_ata_instruction(&wallet_pubkey, &wallet_pubkey, mint, Some(config)) {
+            match create_ata_instruction(&wallet_pubkey, &wallet_pubkey, mint, Some(config), Some(&rpc)).await {
                 Ok(ix) => {
                     log::info!("✅ Created instruction for {} ATA", name);
                     instructions.push(ix);
@@ -218,6 +298,53 @@ async fn send_ata_batch(
     atas: &[(String, Pubkey, Pubkey)],
 ) -> Result<solana_sdk::signature::Signature> {
     let wallet_pubkey = wallet.pubkey();
+    
+    // First, check if any ATA already exists - if so, we should NOT try to create it
+    for (name, _mint, ata) in atas {
+        log::info!("🔍 Pre-check: Verifying {} ATA {} does not already exist...", name, ata);
+        match rpc.get_account(ata).await {
+            Ok(account) => {
+                // Try to parse as token account to get owner
+                if account.data.len() >= 64 {
+                    use solana_sdk::pubkey::Pubkey;
+                    let owner_bytes = &account.data[32..64];
+                    if let Ok(owner) = Pubkey::try_from(owner_bytes) {
+                        if owner == wallet_pubkey {
+                            log::info!(
+                                "✅ {} ATA {} already exists with correct owner - skipping creation",
+                                name,
+                                ata
+                            );
+                            // Return a special signature to indicate success without transaction
+                            return Ok(solana_sdk::signature::Signature::default());
+                        } else {
+                            log::error!(
+                                "❌ {} ATA {} exists but has different owner: {} (expected: {})",
+                                name,
+                                ata,
+                                owner,
+                                wallet_pubkey
+                            );
+                            return Err(anyhow::anyhow!(
+                                "ATA {} exists but has different owner: {} (expected: {})",
+                                ata,
+                                owner,
+                                wallet_pubkey
+                            ));
+                        }
+                    }
+                }
+                log::warn!(
+                    "⚠️  {} ATA {} exists but could not parse owner - proceeding with caution",
+                    name,
+                    ata
+                );
+            }
+            Err(_) => {
+                log::debug!("   {} ATA {} does not exist - will create", name, ata);
+            }
+        }
+    }
 
     log::debug!("Getting recent blockhash...");
     let recent_blockhash = tokio::time::timeout(
@@ -227,14 +354,105 @@ async fn send_ata_batch(
     .await
     .context("Timeout getting blockhash")??;
 
-    log::debug!(
-        "Building transaction with {} instructions...",
+    log::info!(
+        "🔨 Building transaction with {} instruction(s)...",
         instructions.len()
     );
+    
+    // Log transaction details before building
+    log::info!("📋 Transaction Details:");
+    log::info!("   Payer: {} (will be signer)", wallet_pubkey);
+    log::info!("   Instructions: {}", instructions.len());
+    for (idx, instruction) in instructions.iter().enumerate() {
+        log::info!("   Instruction [{}]: program_id={}, accounts={}, data_len={}",
+            idx,
+            instruction.program_id,
+            instruction.accounts.len(),
+            instruction.data.len()
+        );
+        for (acc_idx, account_meta) in instruction.accounts.iter().enumerate() {
+            log::info!(
+                "      Account [{}]: pubkey={}, is_signer={}, is_writable={}",
+                acc_idx,
+                account_meta.pubkey,
+                account_meta.is_signer,
+                account_meta.is_writable
+            );
+        }
+    }
+    
     let mut tx = Transaction::new_with_payer(&instructions, Some(&wallet_pubkey));
+    
+    // Log transaction message account keys
+    log::info!("📋 Transaction Message Account Keys ({} total):", tx.message.account_keys.len());
+    for (idx, key) in tx.message.account_keys.iter().enumerate() {
+        let is_signer = idx < tx.message.header.num_required_signatures as usize;
+        log::info!("   [{}] pubkey={}, is_signer={}", idx, key, is_signer);
+    }
+    log::info!("📋 Transaction header: num_required_signatures={}, num_readonly_signed_accounts={}, num_readonly_unsigned_accounts={}",
+        tx.message.header.num_required_signatures,
+        tx.message.header.num_readonly_signed_accounts,
+        tx.message.header.num_readonly_unsigned_accounts
+    );
+    
     tx.sign(&[wallet.as_ref()], recent_blockhash);
-
-    log::debug!("Sending transaction...");
+    
+    log::info!("✅ Transaction signed with wallet: {}", wallet_pubkey);
+    
+    // Try to simulate transaction first to get detailed error information
+    log::info!("🔍 Simulating transaction before sending...");
+    match rpc.simulate_transaction(&tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = sim_result.err {
+                log::error!("❌ Transaction simulation failed: {:?}", err);
+                if let Some(logs) = sim_result.logs {
+                    log::error!("📋 Simulation logs:");
+                    for log_line in logs {
+                        log::error!("   {}", log_line);
+                    }
+                }
+                if let Some(accounts) = sim_result.accounts {
+                    log::info!("📋 Simulation returned {} account(s)", accounts.len());
+                }
+            } else {
+                log::info!("✅ Transaction simulation succeeded");
+                if let Some(logs) = sim_result.logs {
+                    log::info!("📋 Simulation logs:");
+                    for log_line in logs {
+                        log::info!("   {}", log_line);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to simulate transaction: {}, proceeding anyway", e);
+        }
+    }
+    
+    // Note: ATA existence check is now done BEFORE building transaction (above)
+    // This check is redundant but kept for additional logging
+    for (name, _mint, ata) in atas {
+        log::debug!("🔍 Post-check: Verifying {} ATA {} status...", name, ata);
+        match rpc.get_account(ata).await {
+            Ok(account) => {
+                log::warn!(
+                    "⚠️  {} ATA {} already exists! owner={}, lamports={}, data_len={}",
+                    name,
+                    ata,
+                    account.owner,
+                    account.lamports,
+                    account.data.len()
+                );
+                // This should not happen if pre-check worked correctly
+                log::warn!("   This should have been caught in pre-check - transaction may fail");
+            }
+            Err(_) => {
+                log::debug!("   {} ATA {} does not exist - proceeding with creation", name, ata);
+            }
+        }
+    }
+    
+    log::info!("📤 Sending transaction...");
     let sig = tokio::time::timeout(
         tokio::time::Duration::from_secs(30),
         rpc.send_transaction(&tx),
@@ -288,32 +506,91 @@ async fn send_ata_batch(
     Ok(sig)
 }
 
-fn create_ata_instruction(
+async fn create_ata_instruction(
     payer: &Pubkey,
     wallet: &Pubkey,
     mint: &Pubkey,
     config: Option<&Config>,
+    rpc: Option<&Arc<RpcClient>>,
 ) -> Result<Instruction> {
     use crate::protocol::solend::accounts::get_associated_token_program_id;
 
     let associated_token_program = get_associated_token_program_id(config)
         .context("Failed to get associated token program ID")?;
-    let token_program = spl_token::id();
+    
+    // ✅ FIX: Determine correct token program based on mint
+    // Some mints use Token-2022 (Token Extensions), others use standard SPL Token
+    // Check mint account owner on-chain for accurate determination
+    let token_program = get_token_program_for_mint(mint, rpc)
+        .await
+        .context("Failed to determine token program for mint")?;
 
     // Always use manual construction to ensure correct account order and metadata
     // SPL library may have compatibility issues with certain Solana SDK versions
-    let (ata, _bump) = Pubkey::try_find_program_address(
-        &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
+    log::info!("🔍 Deriving ATA address...");
+    log::info!("   Wallet: {}", wallet);
+    log::info!("   Token Program: {}", token_program);
+    log::info!("   Mint: {}", mint);
+    log::info!("   Associated Token Program: {}", associated_token_program);
+    
+    let seeds = &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()];
+    log::info!("   Seeds: wallet ({} bytes) + token_program ({} bytes) + mint ({} bytes) = {} total bytes",
+        wallet.as_ref().len(),
+        token_program.as_ref().len(),
+        mint.as_ref().len(),
+        seeds.iter().map(|s| s.len()).sum::<usize>()
+    );
+    
+    let (ata, bump) = Pubkey::try_find_program_address(
+        seeds,
         &associated_token_program,
     )
     .ok_or_else(|| anyhow::anyhow!("Failed to find program address for ATA"))?;
+    
+    log::info!("✅ ATA derived: {} (bump: {})", ata, bump);
+    
+    // Verify ATA derivation using spl_associated_token_account if available
+    // Note: We use manual derivation to ensure compatibility, but we can verify with SPL library
+    let expected_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        wallet,
+        mint,
+        &token_program,
+    );
+    if expected_ata != ata {
+        log::error!(
+            "❌ ATA derivation mismatch! Manual: {}, SPL library: {}",
+            ata,
+            expected_ata
+        );
+        log::error!("   This could cause 'Provided owner is not allowed' error!");
+        log::error!("   Using SPL library derived ATA instead: {}", expected_ata);
+        // Use SPL library derived ATA to ensure compatibility
+        return Ok(Instruction {
+            program_id: associated_token_program,
+            accounts: vec![
+                solana_sdk::instruction::AccountMeta::new(*payer, true),
+                solana_sdk::instruction::AccountMeta::new(expected_ata, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(*wallet, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
+                solana_sdk::instruction::AccountMeta::new_readonly(
+                    solana_sdk::system_program::id(),
+                    false,
+                ),
+                solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
+            ],
+            data: vec![],
+        });
+    } else {
+        log::info!("✅ ATA derivation matches SPL library: {}", ata);
+    }
 
-    log::debug!(
-        "Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, program={}",
+    log::info!(
+        "🔨 Creating ATA instruction: payer={}, wallet={}, mint={}, ata={}, token_program={}, associated_program={}",
         payer,
         wallet,
         mint,
         ata,
+        token_program,
         associated_token_program
     );
 
@@ -324,21 +601,37 @@ fn create_ata_instruction(
     // 2. Owner (readonly) - the wallet that will own the ATA
     // 3. Mint (readonly) - the token mint
     // 4. System Program (readonly) - for account creation
-    // 5. Token Program (readonly) - SPL Token program
+    // 5. Token Program (readonly) - SPL Token or Token-2022 program
     // Data: empty (discriminator is handled by program)
+    let accounts = vec![
+        solana_sdk::instruction::AccountMeta::new(*payer, true),
+        solana_sdk::instruction::AccountMeta::new(ata, false),
+        solana_sdk::instruction::AccountMeta::new_readonly(*wallet, false),
+        solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
+        solana_sdk::instruction::AccountMeta::new_readonly(
+            solana_sdk::system_program::id(),
+            false,
+        ),
+        solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
+    ];
+    
+    // Log detailed account information
+    log::info!("📋 ATA Instruction Account Details:");
+    for (idx, account_meta) in accounts.iter().enumerate() {
+        log::info!(
+            "   [{}] pubkey={}, is_signer={}, is_writable={}",
+            idx,
+            account_meta.pubkey,
+            account_meta.is_signer,
+            account_meta.is_writable
+        );
+    }
+    log::info!("📋 Instruction data length: {} bytes", 0);
+    log::info!("📋 Program ID: {}", associated_token_program);
+    
     Ok(Instruction {
         program_id: associated_token_program,
-        accounts: vec![
-            solana_sdk::instruction::AccountMeta::new(*payer, true),
-            solana_sdk::instruction::AccountMeta::new(ata, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(*wallet, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(*mint, false),
-            solana_sdk::instruction::AccountMeta::new_readonly(
-                solana_sdk::system_program::id(),
-                false,
-            ),
-            solana_sdk::instruction::AccountMeta::new_readonly(token_program, false),
-        ],
+        accounts,
         data: vec![],
     })
 }

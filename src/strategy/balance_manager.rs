@@ -16,7 +16,9 @@ struct CachedBalance {
 }
 
 /// Cache time-to-live: balances older than this will be considered stale
-const CACHE_TTL: Duration = Duration::from_secs(30);
+/// ✅ FIX: Increased from 30s to 60s to reduce unnecessary RPC calls
+/// WebSocket updates should keep cache fresh, but longer TTL provides buffer
+const CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct BalanceManager {
     reserved: Arc<RwLock<HashMap<Pubkey, u64>>>, // mint -> reserved amount
@@ -52,6 +54,47 @@ impl BalanceManager {
     }
 
     pub async fn get_available_balance(&self, mint: &Pubkey) -> Result<u64> {
+        // ✅ FIX: SOL is native, not an SPL token - read balance from wallet account, not ATA
+        // Solend protocol uses native SOL directly, not wrapped SOL
+        // Balance is stored in wallet account lamports, not in ATA
+        let config = self.config.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Config not set for BalanceManager"))?;
+        use std::str::FromStr;
+        let sol_mint = Pubkey::from_str(&config.sol_mint)
+            .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+        
+        if mint == &sol_mint {
+            // Native SOL: read from wallet account lamports
+            let wallet_account = self.rpc.get_account(&self.wallet).await
+                .context("Failed to fetch wallet account for SOL balance")?;
+            let sol_balance = wallet_account.lamports;
+            
+            // Update cache (use wallet pubkey as key for SOL)
+            {
+                let mut balances = self.balances.write().await;
+                balances.insert(
+                    self.wallet, // Use wallet pubkey as cache key for SOL
+                    CachedBalance {
+                        amount: sol_balance,
+                        timestamp: Instant::now(),
+                    },
+                );
+            }
+            
+            let reserved_amount = {
+                let reserved = self.reserved.read().await;
+                reserved.get(mint).copied().unwrap_or(0)
+            };
+            
+            let available = sol_balance.saturating_sub(reserved_amount);
+            log::debug!(
+                "BalanceManager: SOL balance (native): wallet={}, balance={}, reserved={}, available={}",
+                self.wallet, sol_balance, reserved_amount, available
+            );
+            return Ok(available);
+        }
+        
+        // SPL tokens: use ATA
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
 
@@ -160,6 +203,37 @@ impl BalanceManager {
         mint: &Pubkey,
         reserved: &HashMap<Pubkey, u64>,
     ) -> Result<u64> {
+        // ✅ FIX: SOL is native, not an SPL token - read balance from wallet account, not ATA
+        // Solend protocol uses native SOL directly, not wrapped SOL
+        let config = self.config.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Config not set for BalanceManager"))?;
+        use std::str::FromStr;
+        let sol_mint = Pubkey::from_str(&config.sol_mint)
+            .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+        
+        if mint == &sol_mint {
+            // Native SOL: read from wallet account lamports
+            let wallet_account = self.rpc.get_account(&self.wallet).await
+                .context("Failed to fetch wallet account for SOL balance")?;
+            let sol_balance = wallet_account.lamports;
+            
+            // Update cache (use wallet pubkey as key for SOL)
+            {
+                let mut balances = self.balances.write().await;
+                balances.insert(
+                    self.wallet, // Use wallet pubkey as cache key for SOL
+                    CachedBalance {
+                        amount: sol_balance,
+                        timestamp: Instant::now(),
+                    },
+                );
+            }
+            
+            let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
+            return Ok(sol_balance.saturating_sub(reserved_amount));
+        }
+        
+        // SPL tokens: use ATA
         use crate::protocol::solend::accounts::get_associated_token_address;
         let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())?;
 
@@ -260,6 +334,10 @@ impl BalanceManager {
         log::info!("🔍 Subscribing to ATA balances via WebSocket...");
 
         let mut subscribed_count = 0;
+        // ✅ FIX: Read SOL mint from config (Solend uses native SOL, not wrapped SOL)
+        let sol_mint = Pubkey::from_str(&self.config.as_ref().unwrap().sol_mint)
+            .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+        
         for (name, mint_str) in &mints {
             if mint_str.is_empty() {
                 continue;
@@ -268,6 +346,50 @@ impl BalanceManager {
             let mint = Pubkey::from_str(mint_str)
                 .map_err(|e| anyhow::anyhow!("Invalid {} mint: {}", name, e))?;
 
+            // ✅ FIX: SOL is native, not an SPL token - subscribe to wallet account, not ATA
+            if mint == sol_mint {
+                // Native SOL: subscribe to wallet account
+                match ws.subscribe_account(&self.wallet).await {
+                    Ok(subscription_id) => {
+                        log::info!(
+                            "✅ Subscribed to {} wallet account: {} (subscription ID: {})",
+                            name,
+                            self.wallet,
+                            subscription_id
+                        );
+
+                        let mut subscribed_atas = self.subscribed_atas.write().await;
+                        subscribed_atas.insert(mint, self.wallet); // Use wallet pubkey for SOL
+
+                        // Read initial SOL balance from wallet account
+                        if let Ok(account) = self.rpc.get_account(&self.wallet).await {
+                            let sol_balance = account.lamports;
+                            let mut balances = self.balances.write().await;
+                            balances.insert(
+                                self.wallet, // Use wallet pubkey as cache key for SOL
+                                CachedBalance {
+                                    amount: sol_balance,
+                                    timestamp: Instant::now(),
+                                },
+                            );
+                            log::debug!(
+                                "BalanceManager: Initial {} balance cached: {}",
+                                name,
+                                sol_balance
+                            );
+                        }
+
+                        subscribed_count += 1;
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to subscribe to {} wallet account ({}): {}", name, self.wallet, e);
+                        log::warn!("   Balance will be fetched via RPC on demand");
+                    }
+                }
+                continue;
+            }
+
+            // SPL tokens: use ATA
             let ata = get_associated_token_address(&self.wallet, &mint, self.config.as_ref())
                 .map_err(|e| anyhow::anyhow!("Failed to derive ATA for {}: {}", name, e))?;
 
@@ -329,6 +451,27 @@ impl BalanceManager {
             return;
         }
 
+        // ✅ FIX: SOL is native - wallet account balance is in lamports, not in token account data
+        if update.pubkey == self.wallet {
+            // Native SOL: balance is in account lamports
+            let sol_balance = update.account.lamports;
+            let mut balances = self.balances.write().await;
+            balances.insert(
+                self.wallet, // Use wallet pubkey as cache key for SOL
+                CachedBalance {
+                    amount: sol_balance,
+                    timestamp: Instant::now(),
+                },
+            );
+            log::debug!(
+                "BalanceManager: Updated SOL balance cache for wallet {}: {}",
+                update.pubkey,
+                sol_balance
+            );
+            return;
+        }
+
+        // SPL tokens: balance is in token account data
         if update.account.data.len() < 72 {
             log::warn!(
                 "BalanceManager: Invalid account data length for ATA {}: {} bytes",
@@ -408,9 +551,23 @@ impl BalanceManager {
     }
 
     pub async fn reserve(&self, mint: &Pubkey, amount: u64) -> Result<()> {
-        use crate::protocol::solend::accounts::get_associated_token_address;
-        let ata = get_associated_token_address(&self.wallet, mint, self.config.as_ref())
-            .with_context(|| format!("Failed to derive ATA for mint {}", mint))?;
+        // ✅ FIX: SOL is native, not an SPL token - read balance from wallet account, not ATA
+        // Solend protocol uses native SOL directly, not wrapped SOL
+        let config = self.config.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Config not set for BalanceManager"))?;
+        use std::str::FromStr;
+        let sol_mint = Pubkey::from_str(&config.sol_mint)
+            .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+        
+        let ata = if mint == &sol_mint {
+            // Native SOL: use wallet pubkey as "ATA" key
+            self.wallet
+        } else {
+            // SPL tokens: derive ATA
+            use crate::protocol::solend::accounts::get_associated_token_address;
+            get_associated_token_address(&self.wallet, mint, self.config.as_ref())
+                .with_context(|| format!("Failed to derive ATA for mint {}", mint))?
+        };
 
         // ✅ CRITICAL FIX: Read cache WITHOUT holding write locks to avoid lock contention
         // Problem: Previous implementation dropped locks during RPC call, then re-acquired them
@@ -442,6 +599,33 @@ impl BalanceManager {
         } else {
             // Cache miss or stale - fetch from RPC WITHOUT holding any locks
             // This prevents lock contention and ensures we get fresh data
+            
+            // ✅ FIX: SOL is native - read balance from wallet account lamports
+            if mint == &sol_mint {
+                let wallet_account = match self.rpc.get_account(&self.wallet).await {
+                    Ok(acc) => acc,
+                    Err(e) => {
+                        return Err(e).context("Failed to fetch wallet account for SOL balance during reserve");
+                    }
+                };
+                let sol_balance = wallet_account.lamports;
+                
+                // Update cache with short-lived write lock (no reserved lock needed yet)
+                {
+                    let mut balances = self.balances.write().await;
+                    balances.insert(
+                        ata, // Use wallet pubkey (stored in ata variable)
+                        CachedBalance {
+                            amount: sol_balance,
+                            timestamp: Instant::now(),
+                        },
+                    );
+                }
+                
+                return self.reserve_with_balance(mint, amount, sol_balance).await;
+            }
+            
+            // SPL tokens: read from ATA
             let account = match self.rpc.get_account(&ata).await {
                 Ok(acc) => acc,
                 Err(e) => {

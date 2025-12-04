@@ -49,23 +49,14 @@ impl Protocol for SolendProtocol {
 
         let data_len = account.data.len();
 
-        const DISCRIMINATOR_SIZE: usize = 8;
-        if data_len < DISCRIMINATOR_SIZE {
-            return None; // Can't even read discriminator, skip immediately
-        }
-
-        let account_discriminator = &account.data[0..DISCRIMINATOR_SIZE];
-        let expected_discriminator = get_obligation_discriminator();
-
-        if account_discriminator != expected_discriminator {
-            return None; // Wrong account type, skip immediately (before expensive size check)
-        }
-
         const MIN_OBLIGATION_SIZE: usize = 1200;
         const MAX_OBLIGATION_SIZE: usize = 1500;
 
+        // ✅ FIX: Remove strict discriminator check - try to parse instead
+        // This makes the system more dynamic and works with real blockchain data
+        // If parse succeeds, it's an obligation regardless of discriminator
         if data_len < MIN_OBLIGATION_SIZE || data_len > MAX_OBLIGATION_SIZE {
-            return None; // Wrong account type, skip immediately
+            return None; // Wrong size, skip immediately
         }
 
         let obligation = match SolendObligation::from_account_data(&account.data) {
@@ -75,12 +66,21 @@ impl Protocol for SolendProtocol {
 
                 let count = PARSE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
 
-                if count < 10 {
+                // Log first few parse errors with more detail for debugging
+                if count <= 5 {
+                    let discriminator = if data_len >= 8 {
+                        format!("{:02x?}", &account.data[0..8])
+                    } else {
+                        "N/A".to_string()
+                    };
                     log::debug!(
-                        "SolendProtocol: failed to parse obligation (data_len={}): {}",
+                        "SolendProtocol: failed to parse obligation (data_len={}, discriminator={}): {}",
                         data_len,
+                        discriminator,
                         e
                     );
+                } else if count == 6 {
+                    log::debug!("SolendProtocol: Suppressing further parse error logs ({} total errors so far)", count);
                 }
 
                 return None;

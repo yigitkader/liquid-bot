@@ -215,8 +215,23 @@ impl WsClient {
         let msg_opt = {
             let mut conn = self.connection.lock().await;
             if let Some(ref mut stream) = *conn {
-                stream.next().await.map(|r| r.ok())
+                stream.next().await.map(|r| {
+                    r.map_err(|e| {
+                        let error_str = e.to_string();
+                        log::warn!("WebSocket stream error: {} (connection may be lost)", error_str);
+                        // Log additional context for common error types
+                        if error_str.contains("ConnectionClosed") || error_str.contains("connection closed") {
+                            log::debug!("WebSocket: Connection was closed by server or network");
+                        } else if error_str.contains("timeout") || error_str.contains("Timeout") {
+                            log::debug!("WebSocket: Connection timeout detected");
+                        } else if error_str.contains("reset") || error_str.contains("Reset") {
+                            log::debug!("WebSocket: Connection was reset");
+                        }
+                        e
+                    }).ok()
+                })
             } else {
+                log::debug!("WebSocket listen: connection is None (not connected)");
                 None
             }
         };

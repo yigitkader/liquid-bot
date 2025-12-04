@@ -6,6 +6,7 @@ use crate::protocol::Protocol;
 use crate::utils::cache::AccountCache;
 use anyhow::Result;
 use futures_util::future::join_all;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -125,6 +126,13 @@ impl Scanner {
         const BATCH_SIZE: usize = 100;
         let mut parsed = 0usize;
         let mut failed = 0usize;
+        let mut parse_stats = std::collections::HashMap::<String, usize>::new();
+        let mut health_factors = Vec::<f64>::new();
+        let mut sample_discriminators = std::collections::HashSet::<[u8; 8]>::new();
+        let mut sample_failed_pubkeys = Vec::<Pubkey>::new();
+        let mut data_size_distribution = std::collections::HashMap::<usize, usize>::new();
+        let mut sample_failed_sizes = Vec::<usize>::new();
+        
         for chunk in accounts.chunks(BATCH_SIZE) {
             let parse_tasks: Vec<_> = chunk
                 .iter()
@@ -133,20 +141,24 @@ impl Scanner {
                     let pubkey = *pubkey;
                     let account = account.clone();
                     async move {
-                        protocol
-                            .parse_position(&account)
-                            .await
-                            .map(|pos| (pubkey, pos))
+                        let result = protocol.parse_position(&account).await;
+                        let failure_reason = if result.is_none() {
+                            Self::categorize_parse_failure(&account)
+                        } else {
+                            None
+                        };
+                        (result.map(|pos| (pubkey, pos)), failure_reason, pubkey, account)
                     }
                 })
                 .collect();
 
             let results = join_all(parse_tasks).await;
 
-            for result in results {
+            for (result, failure_reason, pubkey, account) in results {
                 match result {
                     Some((pubkey, position)) => {
                         parsed += 1;
+                        health_factors.push(position.health_factor);
                         self.cache.insert(pubkey, position.clone()).await;
                         if let Err(e) = self
                             .event_bus
@@ -157,18 +169,133 @@ impl Scanner {
                     }
                     None => {
                         failed += 1;
+                        let data_size = account.data.len();
+                        *data_size_distribution.entry(data_size).or_insert(0) += 1;
+                        
+                        if let Some(reason) = &failure_reason {
+                            *parse_stats.entry(reason.clone()).or_insert(0) += 1;
+                            
+                            // Collect sample discriminators for parse failures (for debugging)
+                            if reason == "parse_failed_or_empty" && sample_discriminators.len() < 5 && data_size >= 8 {
+                                let disc = [
+                                    account.data[0], account.data[1], account.data[2], account.data[3],
+                                    account.data[4], account.data[5], account.data[6], account.data[7],
+                                ];
+                                sample_discriminators.insert(disc);
+                                if sample_failed_pubkeys.len() < 3 {
+                                    sample_failed_pubkeys.push(pubkey);
+                                }
+                                if sample_failed_sizes.len() < 5 {
+                                    sample_failed_sizes.push(data_size);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // Log parse statistics
         log::info!(
-            "Scanner: initial discovery completed. parsed_positions={}, failed_to_parse={}",
+            "Scanner: initial discovery completed. parsed_positions={}, failed_to_parse={}, total_accounts={}",
             parsed,
-            failed
+            failed,
+            accounts.len()
         );
+        
+        // Warn if no positions were parsed
+        if parsed == 0 && failed > 0 {
+            log::warn!("⚠️  WARNING: No positions were parsed from {} accounts! This may indicate:", failed);
+            log::warn!("   1. Data size filter may be incorrect (currently filtering for exactly {} bytes)", OBLIGATION_DATA_SIZE);
+            log::warn!("   2. Obligation accounts may have different sizes (expected: 1200-1500 bytes)");
+            log::warn!("   3. Account structure may not match expected obligation format");
+            log::warn!("   4. All accounts may be empty (no deposits/borrows) or malformed");
+            log::warn!("   → Check sample discriminators and pubkeys below for on-chain inspection");
+        }
+        
+        // Log data size distribution
+        if !data_size_distribution.is_empty() {
+            log::info!("Scanner: Data size distribution of discovered accounts:");
+            let mut sorted_sizes: Vec<_> = data_size_distribution.iter().collect();
+            sorted_sizes.sort_by(|a, b| b.1.cmp(a.1));
+            for (size, count) in sorted_sizes.iter().take(10) {
+                log::info!("  - {} bytes: {} accounts", size, count);
+            }
+            if sorted_sizes.len() > 10 {
+                log::info!("  ... and {} more size categories", sorted_sizes.len() - 10);
+            }
+        }
+        
+        if !parse_stats.is_empty() {
+            log::info!("Scanner: Parse failure breakdown:");
+            let mut sorted_stats: Vec<_> = parse_stats.iter().collect();
+            sorted_stats.sort_by(|a, b| b.1.cmp(a.1));
+            for (reason, count) in sorted_stats.iter().take(10) {
+                log::info!("  - {}: {} accounts", reason, count);
+            }
+            if sorted_stats.len() > 10 {
+                log::info!("  ... and {} more categories", sorted_stats.len() - 10);
+            }
+        }
+        
+        // Log sample discriminators from failed accounts (helps debug parse issues)
+        if !sample_discriminators.is_empty() {
+            log::info!("Scanner: Sample discriminators from failed accounts (for debugging account types):");
+            for (idx, disc) in sample_discriminators.iter().take(5).enumerate() {
+                log::info!("  Sample {}: {:02x?}", idx + 1, disc);
+            }
+            if !sample_failed_pubkeys.is_empty() {
+                log::info!("Scanner: Sample failed account pubkeys (for on-chain inspection):");
+                for (idx, pubkey) in sample_failed_pubkeys.iter().take(3).enumerate() {
+                    log::info!("  Account {}: {} (check on Solana Explorer)", idx + 1, pubkey);
+                }
+            }
+            if !sample_failed_sizes.is_empty() {
+                log::info!("Scanner: Sample failed account data sizes: {:?}", sample_failed_sizes);
+            }
+        }
+        
+        // Log health factor distribution
+        if !health_factors.is_empty() {
+            health_factors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let count = health_factors.len();
+            let p50 = health_factors[count / 2];
+            let p25 = health_factors[count / 4];
+            let p75 = health_factors[(count * 3) / 4];
+            let min = health_factors[0];
+            let max = health_factors[count - 1];
+            let liquidatable = health_factors.iter().filter(|&&hf| hf < self.config.hf_liquidation_threshold).count();
+            
+            log::info!(
+                "Scanner: Health factor distribution ({} positions): min={:.4}, p25={:.4}, p50={:.4}, p75={:.4}, max={:.4}, liquidatable={} (HF < {})",
+                count, min, p25, p50, p75, max, liquidatable, self.config.hf_liquidation_threshold
+            );
+        }
 
         Ok(parsed)
+    }
+
+    /// Categorize why an account failed to parse
+    fn categorize_parse_failure(account: &solana_sdk::account::Account) -> Option<String> {
+        let data_len = account.data.len();
+        const MIN_OBLIGATION_SIZE: usize = 1200;
+        const MAX_OBLIGATION_SIZE: usize = 1500;
+        
+        if data_len < MIN_OBLIGATION_SIZE {
+            return Some(format!("data_too_small ({} < {})", data_len, MIN_OBLIGATION_SIZE));
+        }
+        
+        if data_len > MAX_OBLIGATION_SIZE {
+            return Some(format!("data_too_large ({} > {})", data_len, MAX_OBLIGATION_SIZE));
+        }
+        
+        // ✅ FIX: Removed discriminator check - now we try to parse all accounts in size range
+        // If parse fails, it's either:
+        // 1. Wrong account structure (not an obligation)
+        // 2. Parse error (malformed data)
+        // 3. Empty position (no deposits/borrows)
+        // We can't distinguish without actually parsing, so return generic
+        Some("parse_failed_or_empty".to_string())
     }
 
     pub async fn start_monitoring(&self) -> Result<()> {
@@ -238,7 +365,8 @@ impl Scanner {
                         }
                     }
                 } else {
-                    log::warn!("WebSocket connection lost, attempting reconnect...");
+                    log::warn!("WebSocket connection lost (listen() returned None), attempting reconnect...");
+                    log::debug!("WebSocket: This may indicate network issues, RPC provider problems, or connection timeout");
                     self.record_error()?;
 
                     match self.ws.reconnect_with_backoff().await {
@@ -250,11 +378,12 @@ impl Scanner {
                                     log::info!("✅ WebSocket resubscribed successfully");
                                     self.reset_errors();
                                 }
-                                Err(e) => {
-                                    log::warn!("⚠️  WebSocket resubscription failed: {}. Falling back to RPC polling.", e);
-                                    use_websocket = false;
-                                    subscription_id = None;
-                                }
+                        Err(e) => {
+                            log::warn!("⚠️  WebSocket resubscription failed: {}. Falling back to RPC polling.", e);
+                            log::info!("📡 Scanner: Switching to RPC polling mode (WebSocket unavailable)");
+                            use_websocket = false;
+                            subscription_id = None;
+                        }
                             }
                         }
                         Err(e) => {
@@ -262,6 +391,7 @@ impl Scanner {
                             log::warn!(
                                 "⚠️  Falling back to RPC polling mode to continue operation..."
                             );
+                            log::info!("📡 Scanner: Switching to RPC polling mode (WebSocket reconnection failed after 10 attempts)");
                             use_websocket = false;
                             subscription_id = None;
                         }

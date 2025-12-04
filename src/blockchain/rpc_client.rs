@@ -107,23 +107,40 @@ impl RpcClient {
     }
 
     async fn should_retry_rate_limit(&self, error_str: &str, retry_count: &mut u32) -> bool {
-        if error_str.contains("429")
+        // ✅ FIX: Also retry on connection errors (connection closed, network errors, etc.)
+        let is_retryable = error_str.contains("429")
             || error_str.contains("Too many requests")
             || error_str.contains("rate limit")
-        {
+            || error_str.contains("connection closed")
+            || error_str.contains("connection reset")
+            || error_str.contains("network")
+            || error_str.contains("timeout")
+            || error_str.contains("ECONNRESET")
+            || error_str.contains("ECONNREFUSED");
+        
+        if is_retryable {
             *retry_count += 1;
             if *retry_count <= 5 {
                 let backoff = Duration::from_millis(500 * (*retry_count as u64));
-                log::warn!(
-                    "⚠️  Rate limit hit (429), backing off for {:?} (attempt {}/{})",
-                    backoff,
-                    *retry_count,
-                    5
-                );
+                if error_str.contains("429") || error_str.contains("rate limit") {
+                    log::warn!(
+                        "⚠️  Rate limit hit (429), backing off for {:?} (attempt {}/{})",
+                        backoff,
+                        *retry_count,
+                        5
+                    );
+                } else {
+                    log::warn!(
+                        "⚠️  Connection/network error, retrying after {:?} (attempt {}/{})",
+                        backoff,
+                        *retry_count,
+                        5
+                    );
+                }
                 sleep(backoff).await;
                 return true;
             } else {
-                log::error!("❌ Rate limit exceeded after 5 retries");
+                log::error!("❌ Retry limit exceeded after 5 retries");
                 return false;
             }
         }
@@ -199,7 +216,10 @@ impl RpcClient {
         loop {
             let client = Arc::clone(&self.client);
             let rpc_url = self.rpc_url.clone();
-            let timeout_duration = self.request_timeout;
+            // ✅ FIX: get_program_accounts is expensive and can take longer than default timeout
+            // Use 3x the default timeout for this operation (min 30s, max 90s)
+            let timeout_duration = self.request_timeout * 3;
+            let timeout_duration = timeout_duration.max(Duration::from_secs(30)).min(Duration::from_secs(90));
             
             let result = timeout(
                 timeout_duration,
@@ -278,7 +298,10 @@ impl RpcClient {
             ..Default::default()
         };
 
-        let timeout_duration = self.request_timeout;
+        // ✅ FIX: get_program_accounts_with_config is expensive and can take longer than default timeout
+        // Use 3x the default timeout for this operation (min 30s, max 90s)
+        let timeout_duration = self.request_timeout * 3;
+        let timeout_duration = timeout_duration.max(Duration::from_secs(30)).min(Duration::from_secs(90));
 
         timeout(
             timeout_duration,
