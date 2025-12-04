@@ -76,19 +76,31 @@ impl ReserveCache {
         // Fetch from RPC (only one thread will do this)
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         
-        // Update cache using extend instead of override to preserve other entries
+        // ✅ FIX: Update cache and check again after extend to avoid race condition
+        // Problem: Thread A fetches reserves (USDC+SOL), Thread B waits on lock
+        //   Thread A extends cache, Thread B acquires lock, but double-check was before extend
+        //   Thread B would fetch again unnecessarily
+        // Solution: After extend, check cache again - if another thread already added our mint,
+        //   we can return immediately without error
         {
             let mut inner = self.inner.write().await;
             // ✅ FIX: Use extend instead of override to prevent losing other thread's entries
             inner.mint_to_reserve.extend(mint_to_reserve);
             inner.initialized = true;
-            
-            inner
-                .mint_to_reserve
-                .get(mint)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("Reserve not found for mint: {}", mint))
         }
+        
+        // ✅ FIX: Check cache again after extend (another thread may have added our mint during RPC call)
+        // This prevents unnecessary RPC calls when multiple threads request different mints
+        // We release the write lock first, then check with a read lock to allow other threads to proceed
+        {
+            let inner = self.inner.read().await;
+            if let Some(reserve) = inner.mint_to_reserve.get(mint) {
+                return Ok(*reserve);
+            }
+        }
+        
+        // If still not found after extend, return error
+        Err(anyhow::anyhow!("Reserve not found for mint: {} (not found in fetched reserves)", mint))
     }
 
     async fn get_reserve_data(
@@ -448,30 +460,22 @@ pub async fn build_liquidate_obligation_ix(
             .await
             .context("Failed to fetch collateral reserve data")?;
 
-    // ✅ FIX: Native SOL is handled specially in Solend
-    // For native SOL, use wallet account directly instead of ATA
-    // Solend protocol uses native SOL directly, not wrapped SOL
-    use std::str::FromStr;
-    let sol_mint = Pubkey::from_str(&config.sol_mint)
-        .context("Failed to parse SOL mint address")?;
+    // ✅ FIX: Solend protocol uses Wrapped SOL (WSOL) for SOL, not native SOL
+    // Problem: Previous code used wallet address directly for SOL, but Solend is an SPL token protocol
+    //   Solend requires SPL token accounts (ATA) for all tokens, including SOL
+    //   SOL must be wrapped as WSOL and stored in an ATA to be used in Solend
+    // Solution: Use WSOL ATA for SOL, same as other SPL tokens
+    //   Config.sol_mint should be WSOL mint: So11111111111111111111111111111111111111112
+    //   All tokens (including SOL/WSOL) require ATA accounts in Solend protocol
     
-    let source_liquidity = if opportunity.debt_mint == sol_mint {
-        // Native SOL: use wallet account directly
-        *liquidator
-    } else {
-        // SPL tokens: use ATA
-        get_associated_token_address(liquidator, &opportunity.debt_mint, Some(&config))
-            .context("Failed to derive source liquidity ATA")?
-    };
+    // ✅ FIX: Always use ATA for all tokens, including SOL (WSOL)
+    // Solend protocol requires SPL token accounts for all operations
+    // SOL must be wrapped as WSOL and stored in ATA
+    let source_liquidity = get_associated_token_address(liquidator, &opportunity.debt_mint, Some(&config))
+        .context("Failed to derive source liquidity ATA")?;
 
-    let destination_collateral = if opportunity.collateral_mint == sol_mint {
-        // Native SOL: use wallet account directly
-        *liquidator
-    } else {
-        // SPL tokens: use ATA
-        get_associated_token_address(liquidator, &opportunity.collateral_mint, Some(&config))
-            .context("Failed to derive destination collateral ATA")?
-    };
+    let destination_collateral = get_associated_token_address(liquidator, &opportunity.collateral_mint, Some(&config))
+        .context("Failed to derive destination collateral ATA")?;
 
     let token_program = spl_token::id();
     

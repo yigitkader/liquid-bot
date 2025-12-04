@@ -440,14 +440,116 @@ impl Validator {
             ));
             }
 
+            // ✅ FIX: Validate price value - reject invalid prices (0, negative, or unreasonably large)
+            // Problem: Oracle freshness check only validates timestamp, not the price itself
+            // If oracle returns 0 or invalid price, validation would pass, causing liquidation failures
+            // Solution: Add price validation to catch invalid oracle data before it causes transaction failures
+            if price_data.price <= 0.0 {
+                log::error!(
+                    "Validator: oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
+                    mint,
+                    oracle_account,
+                    price_data.price
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle price is invalid for mint {} (oracle {}): price={:.4} (must be > 0)",
+                    mint,
+                    oracle_account,
+                    price_data.price
+                ));
+            }
+
+            // ✅ FIX: Validate price is within reasonable bounds (prevent overflow/underflow issues)
+            // Very large prices (> $1 trillion) or very small prices (< $0.0001) are likely errors
+            const MAX_REASONABLE_PRICE: f64 = 1_000_000_000_000.0; // $1 trillion
+            const MIN_REASONABLE_PRICE: f64 = 0.0001; // $0.0001
+            if price_data.price > MAX_REASONABLE_PRICE {
+                log::error!(
+                    "Validator: oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
+                    mint,
+                    oracle_account,
+                    price_data.price,
+                    MAX_REASONABLE_PRICE
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle price is unreasonably large for mint {} (oracle {}): price={:.4} (max: {:.0})",
+                    mint,
+                    oracle_account,
+                    price_data.price,
+                    MAX_REASONABLE_PRICE
+                ));
+            }
+            if price_data.price < MIN_REASONABLE_PRICE {
+                log::error!(
+                    "Validator: oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
+                    mint,
+                    oracle_account,
+                    price_data.price,
+                    MIN_REASONABLE_PRICE
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle price is unreasonably small for mint {} (oracle {}): price={:.4} (min: {:.4})",
+                    mint,
+                    oracle_account,
+                    price_data.price,
+                    MIN_REASONABLE_PRICE
+                ));
+            }
+
+            // ✅ FIX: Validate confidence is reasonable (not negative, not unreasonably large)
+            // Negative confidence is invalid, very high confidence relative to price suggests data corruption
+            if price_data.confidence < 0.0 {
+                log::error!(
+                    "Validator: oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
+                    mint,
+                    oracle_account,
+                    price_data.confidence
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle confidence is negative for mint {} (oracle {}): confidence={:.4}",
+                    mint,
+                    oracle_account,
+                    price_data.confidence
+                ));
+            }
+
+            // ✅ FIX: Validate confidence-to-price ratio is reasonable
+            // If confidence is > 50% of price, it suggests unreliable oracle data
+            // Example: price=$100, confidence=$60 → 60% uncertainty is too high for reliable liquidation
+            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.5; // 50%
+            if price_data.price > 0.0 {
+                let confidence_ratio = price_data.confidence / price_data.price;
+                if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {
+                    log::error!(
+                        "Validator: oracle confidence is too high relative to price for mint {} (oracle {}): price={:.4}, confidence={:.4}, ratio={:.2}% (max: {:.0}%)",
+                        mint,
+                        oracle_account,
+                        price_data.price,
+                        price_data.confidence,
+                        confidence_ratio * 100.0,
+                        MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Oracle confidence is too high relative to price for mint {} (oracle {}): confidence={:.4}, price={:.4}, ratio={:.2}% (max: {:.0}%)",
+                        mint,
+                        oracle_account,
+                        price_data.confidence,
+                        price_data.price,
+                        confidence_ratio * 100.0,
+                        MAX_CONFIDENCE_TO_PRICE_RATIO * 100.0
+                    ));
+                }
+            }
+
             log::debug!(
-                "Validator: oracle price is fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4})",
+                "Validator: oracle price is valid and fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4}, conf_ratio={:.2}%)",
                 mint,
                 oracle_account,
                 age_seconds,
                 max_age,
                 price_data.price,
-                price_data.confidence
+                price_data.confidence,
+                if price_data.price > 0.0 { (price_data.confidence / price_data.price) * 100.0 } else { 0.0 }
             );
 
             Ok(())

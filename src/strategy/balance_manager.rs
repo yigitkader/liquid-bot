@@ -177,6 +177,16 @@ impl BalanceManager {
 
         // Update cache with RPC result
         // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
+        // Must acquire both locks in consistent order, even if balances lock is released between
+        let reserved_amount = {
+            // Lock order: balances -> reserved (ALWAYS in this order to prevent deadlock)
+            // Acquire balances lock first (even if we don't need to modify it here)
+            let _balances = self.balances.read().await;
+            let reserved = self.reserved.read().await;
+            reserved.get(mint).copied().unwrap_or(0)
+        };
+
+        // Update cache after releasing locks (short-lived write lock)
         {
             let mut balances = self.balances.write().await;
             balances.insert(
@@ -187,12 +197,6 @@ impl BalanceManager {
                 },
             );
         }
-
-        let reserved_amount = {
-            // Lock order: balances (not held) -> reserved (consistent order, read-only)
-            let reserved = self.reserved.read().await;
-            reserved.get(mint).copied().unwrap_or(0)
-        };
 
         let available = actual.saturating_sub(reserved_amount);
         Ok(available)

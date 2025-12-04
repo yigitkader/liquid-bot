@@ -156,15 +156,19 @@ impl SlippageEstimator {
             }
         }
 
-        // ✅ All retries exhausted - use fallback
-        log::warn!(
-            "Jupiter API failed after {} attempts (last error: {}), using fallback",
+        // ✅ FIX: Return error instead of fallback to let caller handle hop_count estimation
+        // Problem: Fallback here returns hop_count=1, but analyzer.rs has its own fallback logic
+        //   that uses hop_count=2 for non-stablecoin pairs. This creates inconsistency:
+        //   - slippage_estimator fallback → hop_count=1
+        //   - analyzer fallback → hop_count=2
+        //   This causes profit_calculator to receive conflicting hop_count values
+        // Solution: Return error here, let analyzer.rs handle fallback with consistent logic
+        //   analyzer.rs already has proper fallback that considers pair type (stablecoin vs regular)
+        Err(anyhow::anyhow!(
+            "Jupiter API failed after {} attempts: {}",
             MAX_RETRIES,
             last_error.as_deref().unwrap_or("unknown")
-        );
-
-        let slippage = self.estimate_with_multipliers(amount)?;
-        Ok((slippage, 1))
+        ))
     }
 
     /// Check if an error is retryable
