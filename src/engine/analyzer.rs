@@ -87,6 +87,7 @@ impl Analyzer {
                     let protocol = Arc::clone(&self.protocol);
                     let config = self.config.clone();
                     let position = position.clone();
+                    let metrics = self.metrics.as_ref().map(Arc::clone);
 
                     tasks.spawn(async move {
                         let _permit = permit;
@@ -107,7 +108,7 @@ impl Analyzer {
                                     opportunity.max_liquidatable,
                                     opportunity.estimated_profit
                                 );
-                                if let Some(ref metrics) = self.metrics {
+                                if let Some(ref metrics) = metrics {
                                     metrics.record_opportunity();
                                 }
                                 let _ = event_bus.publish(Event::OpportunityFound { opportunity });

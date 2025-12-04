@@ -1,7 +1,6 @@
 use crate::blockchain::rpc_client::RpcClient;
 use crate::core::config::Config;
 use crate::core::types::Opportunity;
-use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account};
 use crate::protocol::solend::accounts::{
     derive_lending_market_authority, get_associated_token_address,
 };
@@ -434,7 +433,7 @@ pub async fn build_liquidate_obligation_ix(
         .await
         .context("Failed to find debt reserve")?;
 
-    let (debt_reserve_collateral_mint, debt_reserve_liquidity_supply, _) =
+    let (_debt_reserve_collateral_mint, debt_reserve_liquidity_supply, _) =
         get_reserve_data(&debt_reserve, &rpc)
             .await
             .context("Failed to fetch debt reserve data")?;
@@ -444,7 +443,7 @@ pub async fn build_liquidate_obligation_ix(
             .await
             .context("Failed to find collateral reserve")?;
 
-    let (_collateral_reserve_collateral_mint, collateral_reserve_liquidity_supply, _) =
+    let (collateral_reserve_collateral_mint, collateral_reserve_liquidity_supply, _) =
         get_reserve_data(&collateral_reserve, &rpc)
             .await
             .context("Failed to fetch collateral reserve data")?;
@@ -474,36 +473,40 @@ pub async fn build_liquidate_obligation_ix(
             .context("Failed to derive destination collateral ATA")?
     };
 
-    let pyth_price = get_pyth_oracle_account(&opportunity.debt_mint, Some(&config))
-        .context("Failed to get Pyth oracle account")?
-        .ok_or_else(|| anyhow::anyhow!("Pyth oracle not found for debt mint"))?;
-
-    let switchboard_price = get_switchboard_oracle_account(&opportunity.debt_mint, Some(&config))
-        .context("Failed to get Switchboard oracle account")?
-        .or_else(|| {
-            get_switchboard_oracle_account(&opportunity.collateral_mint, Some(&config))
-                .ok()
-                .flatten()
-        });
-
-    let switchboard_price = switchboard_price.unwrap_or(pyth_price);
-
     let token_program = spl_token::id();
+    
+    // ✅ FIX: Add clock sysvar (required by Solend liquidateObligation instruction)
+    let clock_sysvar = solana_sdk::sysvar::clock::id();
 
+    // ✅ FIX: Correct account order for Solend liquidateObligation instruction
+    // According to Solend protocol specification, the accounts must be in this exact order:
+    // 1. source_liquidity (liquidator's token account for debt)
+    // 2. destination_collateral (liquidator's token account for collateral)
+    // 3. repay_reserve (debt reserve - the reserve being repaid)
+    // 4. repay_reserve_liquidity_supply (debt reserve liquidity supply)
+    // 5. withdraw_reserve (collateral reserve - the reserve being withdrawn from)
+    // 6. withdraw_reserve_collateral_mint (collateral reserve collateral mint)
+    // 7. withdraw_reserve_liquidity_supply (collateral reserve liquidity supply)
+    // 8. obligation (the obligation being liquidated)
+    // 9. lending_market
+    // 10. lending_market_authority
+    // 11. transfer_authority (liquidator - signer)
+    // 12. clock_sysvar
+    // 13. token_program
     let accounts = vec![
-        AccountMeta::new(source_liquidity, false),
-        AccountMeta::new(destination_collateral, false),
-        AccountMeta::new(obligation_address, false),
-        AccountMeta::new(debt_reserve, false),
-        AccountMeta::new(debt_reserve_collateral_mint, false),
-        AccountMeta::new(debt_reserve_liquidity_supply, false),
-        AccountMeta::new_readonly(lending_market, false),
-        AccountMeta::new_readonly(lending_market_authority, false),
-        AccountMeta::new(collateral_reserve_liquidity_supply, false),
-        AccountMeta::new_readonly(*liquidator, true),
-        AccountMeta::new_readonly(pyth_price, false),
-        AccountMeta::new_readonly(switchboard_price, false),
-        AccountMeta::new_readonly(token_program, false),
+        AccountMeta::new(source_liquidity, false),                          // 1. source_liquidity
+        AccountMeta::new(destination_collateral, false),                    // 2. destination_collateral
+        AccountMeta::new(debt_reserve, false),                              // 3. repay_reserve
+        AccountMeta::new(debt_reserve_liquidity_supply, false),             // 4. repay_reserve_liquidity_supply
+        AccountMeta::new(collateral_reserve, false),                        // 5. withdraw_reserve
+        AccountMeta::new(collateral_reserve_collateral_mint, false),        // 6. withdraw_reserve_collateral_mint
+        AccountMeta::new(collateral_reserve_liquidity_supply, false),       // 7. withdraw_reserve_liquidity_supply
+        AccountMeta::new(obligation_address, false),                       // 8. obligation
+        AccountMeta::new_readonly(lending_market, false),                   // 9. lending_market
+        AccountMeta::new_readonly(lending_market_authority, false),         // 10. lending_market_authority
+        AccountMeta::new_readonly(*liquidator, true),                       // 11. transfer_authority (liquidator - signer)
+        AccountMeta::new_readonly(clock_sysvar, false),                     // 12. clock_sysvar
+        AccountMeta::new_readonly(token_program, false),                    // 13. token_program
     ];
 
     let discriminator = get_instruction_discriminator();

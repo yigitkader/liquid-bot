@@ -63,6 +63,7 @@ impl Validator {
                             let collateral_mint = opportunity.collateral_mint;
                             let max_liquidatable = opportunity.max_liquidatable;
                             let position_address = opportunity.position.address;
+                            let metrics = self.metrics.as_ref().map(Arc::clone);
                             
                             tasks.spawn(async move {
                                 let _permit = permit;
@@ -100,7 +101,7 @@ impl Validator {
                                             "Validator: opportunity approved for position {}",
                                             position_address
                                         );
-                                        if let Some(ref metrics) = self.metrics {
+                                        if let Some(ref metrics) = metrics {
                                             metrics.record_opportunity_approved();
                                         }
                                         if let Err(e) = event_bus.publish(Event::OpportunityApproved {
@@ -126,7 +127,7 @@ impl Validator {
                                             collateral_mint,
                                             e
                                         );
-                                        if let Some(ref metrics) = self.metrics {
+                                        if let Some(ref metrics) = metrics {
                                             metrics.record_opportunity_rejected();
                                         }
                                         balance_manager

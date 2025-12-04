@@ -16,22 +16,32 @@
           "isSigner": false
         },
         {
+          "name": "repayReserve",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "repayReserveLiquiditySupply",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "withdrawReserve",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "withdrawReserveCollateralMint",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "withdrawReserveLiquiditySupply",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "obligation",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "reserve",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "reserveCollateralMint",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "reserveLiquiditySupply",
           "isMut": true,
           "isSigner": false
         },
@@ -46,24 +56,126 @@
           "isSigner": false
         },
         {
+          "name": "transferAuthority",
+          "isMut": false,
+          "isSigner": true
+        },
+        {
+          "name": "clockSysvar",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "liquidityAmount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "depositReserveLiquidity",
+      "accounts": [
+        {
+          "name": "sourceLiquidity",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "destinationCollateral",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserve",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserveLiquiditySupply",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserveCollateralMint",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarket",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarketAuthority",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "transferAuthority",
+          "isMut": false,
+          "isSigner": true
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "liquidityAmount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "borrowObligationLiquidity",
+      "accounts": [
+        {
+          "name": "sourceLiquidity",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "destinationLiquidity",
           "isMut": true,
           "isSigner": false
         },
         {
-          "name": "liquidator",
+          "name": "reserve",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "reserveLiquidityFeeReceiver",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "obligation",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarket",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "lendingMarketAuthority",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "obligationOwner",
           "isMut": false,
           "isSigner": true
-        },
-        {
-          "name": "pythPrice",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "switchboardPrice",
-          "isMut": false,
-          "isSigner": false
         },
         {
           "name": "tokenProgram",
@@ -199,6 +311,46 @@
           }
         ]
       }
+    },
+    {
+      "name": "Reserve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "lastUpdate",
+            "type": {
+              "defined": "LastUpdate"
+            }
+          },
+          {
+            "name": "lendingMarket",
+            "type": "publicKey"
+          },
+          {
+            "name": "liquidity",
+            "type": {
+              "defined": "ReserveLiquidity"
+            }
+          },
+          {
+            "name": "collateral",
+            "type": {
+              "defined": "ReserveCollateral"
+            }
+          },
+          {
+            "name": "config",
+            "type": {
+              "defined": "ReserveConfig"
+            }
+          }
+        ]
+      }
     }
   ],
   "types": [
@@ -210,6 +362,148 @@
           {
             "name": "value",
             "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LastUpdate",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "stale",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveLiquidity",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mintPubkey",
+            "type": "publicKey"
+          },
+          {
+            "name": "mintDecimals",
+            "type": "u8"
+          },
+          {
+            "name": "supplyPubkey",
+            "type": "publicKey"
+          },
+          {
+            "name": "feeReceiver",
+            "type": "publicKey"
+          },
+          {
+            "name": "oraclePubkey",
+            "type": "publicKey"
+          },
+          {
+            "name": "availableAmount",
+            "type": "u64"
+          },
+          {
+            "name": "borrowedAmountWads",
+            "type": "u128"
+          },
+          {
+            "name": "cumulativeBorrowRateWads",
+            "type": "u128"
+          },
+          {
+            "name": "marketPrice",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveCollateral",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mintPubkey",
+            "type": "publicKey"
+          },
+          {
+            "name": "mintTotalSupply",
+            "type": "u64"
+          },
+          {
+            "name": "supplyPubkey",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "optimalUtilizationRate",
+            "type": "u8"
+          },
+          {
+            "name": "loanToValueRatio",
+            "type": "u8"
+          },
+          {
+            "name": "liquidationBonus",
+            "type": "u8"
+          },
+          {
+            "name": "liquidationThreshold",
+            "type": "u8"
+          },
+          {
+            "name": "minBorrowRate",
+            "type": "u8"
+          },
+          {
+            "name": "optimalBorrowRate",
+            "type": "u8"
+          },
+          {
+            "name": "maxBorrowRate",
+            "type": "u8"
+          },
+          {
+            "name": "fees",
+            "type": {
+              "defined": "Fees"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Fees",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "borrowFeeWad",
+            "type": "u64"
+          },
+          {
+            "name": "flashLoanFeeWad",
+            "type": "u64"
+          },
+          {
+            "name": "hostFeePercentage",
+            "type": "u8"
           }
         ]
       }
