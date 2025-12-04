@@ -18,11 +18,10 @@ use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
-/// ATA cache entry with timestamps for LRU eviction
 #[derive(Clone, Debug)]
 struct AtaCacheEntry {
     created_at: Instant,
-    last_accessed: Instant, // ✅ FIX: Track last access for LRU eviction
+    last_accessed: Instant,
     verified: bool,
 }
 
@@ -53,13 +52,6 @@ impl TxLock {
             loop {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(10)) => {
-                // Run cleanup every 10 seconds
-                // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
-                // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
-                //   Subsequent write().unwrap() calls will panic, crashing the entire executor
-                // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
-                //   - If lock is poisoned, skip cleanup this cycle (self-healing)
-                //   - Log warning but don't crash - allows executor to continue operating
                 if let Ok(mut locked_guard) = locked.write() {
                     if let Ok(mut lock_times_guard) = lock_times.write() {
                         // Remove expired locks
@@ -80,16 +72,13 @@ impl TxLock {
                         }
 
                         if !expired_addresses.is_empty() {
-                            log::debug!(
-                                "TxLock: cleaned up {} expired lock(s)",
-                                expired_addresses.len()
-                            );
+                            log::debug!("TxLock: cleaned up {} expired lock(s)", expired_addresses.len());
                         }
                     } else {
-                        log::warn!("TxLock: lock_times RwLock is poisoned, skipping cleanup cycle (self-healing)");
+                        log::warn!("TxLock: lock_times RwLock is poisoned, skipping cleanup cycle");
                     }
                 } else {
-                    log::warn!("TxLock: locked RwLock is poisoned, skipping cleanup cycle (self-healing)");
+                    log::warn!("TxLock: locked RwLock is poisoned, skipping cleanup cycle");
                 }
                     }
                     _ = cancel.cancelled() => {
@@ -106,16 +95,10 @@ impl TxLock {
     }
 
     fn try_lock(&self, address: &Pubkey) -> Result<TxLockGuard> {
-        // ✅ CRITICAL FIX: Handle poisoned locks gracefully (self-healing)
-        // Problem: If a thread panics while holding the lock, the lock becomes "poisoned"
-        //   Subsequent write().unwrap() calls will panic, crashing the entire executor
-        // Solution: Use if let Ok() pattern to handle poisoned locks gracefully
-        //   - If lock is poisoned, return error instead of panicking
-        //   - This allows caller to handle error gracefully instead of crashing
         let mut locked = self.locked.write()
-            .map_err(|_| anyhow::anyhow!("Lock is poisoned (previous panic detected) - cannot acquire lock"))?;
+            .map_err(|_| anyhow::anyhow!("Lock is poisoned - cannot acquire lock"))?;
         let mut lock_times = self.lock_times.write()
-            .map_err(|_| anyhow::anyhow!("Lock times is poisoned (previous panic detected) - cannot acquire lock"))?;
+            .map_err(|_| anyhow::anyhow!("Lock times is poisoned - cannot acquire lock"))?;
 
         if let Some(lock_time) = lock_times.get(address) {
             if lock_time.elapsed().as_secs() >= self.timeout_seconds {
@@ -165,9 +148,6 @@ pub struct Executor {
     error_tracker: ErrorTracker,
     jito_client: Option<Arc<JitoClient>>,
     use_jito: bool,
-    // Cache of ATAs we've already included create_ata instructions for
-    // This avoids redundant instructions within the same executor instance
-    // ✅ FIX: Use HashMap with timestamp for cleanup to prevent memory leak
     ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>>,
     ata_cache_cleanup_token: CancellationToken,
 }
@@ -198,31 +178,21 @@ impl Executor {
 
         if use_jito {
             if jito_client.is_some() {
-                log::info!("✅ Jito MEV protection enabled");
+                log::info!("Jito MEV protection enabled");
             } else {
-                log::warn!("⚠️  USE_JITO=true but Jito client creation failed - falling back to standard RPC");
+                log::warn!("USE_JITO=true but Jito client creation failed - falling back to standard RPC");
             }
         } else {
-            log::info!("ℹ️  Jito MEV protection disabled (USE_JITO=false or not set)");
-            log::warn!("⚠️  WARNING: Without Jito, transactions are vulnerable to front-running!");
+            log::info!("Jito MEV protection disabled");
+            log::warn!("Without Jito, transactions are vulnerable to front-running");
         }
 
         let ata_cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
         let ata_cache_cleanup_token = CancellationToken::new();
         
-        // ✅ CRITICAL FIX: ATA cache with LRU eviction for high-volume scenarios
-        // Problem: High-volume scenarios (100k liquidations/day) can generate 200k ATA checks/day
-        //   - Peak hours (3-4 AM UTC): 20k liquidations/hour → 40k ATA checks/hour
-        //   - 10k entry limit too low → constant eviction → cache thrashing → RPC storms
-        //   - Oldest-first eviction (not LRU) → frequently-used entries evicted
-        // Solution: Proper LRU cache with larger size for peak hours
-        //   - 1-hour TTL: ATAs are generally static, 1 hour is sufficient
-        //   - 50k entry limit: Supports peak hours (40k checks/hour) with buffer
-        //   - LRU eviction: Keep recently-accessed entries, evict least-recently-used
-        //   - 5-minute cleanup: More frequent cleanup prevents memory growth
-        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600; // 1 hour
-        const ATA_CACHE_MAX_SIZE: usize = 50000; // 50k entries (increased from 10k for peak hours)
-        const CLEANUP_INTERVAL_SECONDS: u64 = 300; // 5 minutes (reduced from 10 minutes)
+        const ATA_CACHE_TTL_SECONDS: u64 = 1 * 3600;
+        const ATA_CACHE_MAX_SIZE: usize = 50000;
+        const CLEANUP_INTERVAL_SECONDS: u64 = 300;
         
         let cache_for_cleanup = Arc::clone(&ata_cache);
         let cleanup_token = ata_cache_cleanup_token.clone();
@@ -232,24 +202,17 @@ impl Executor {
                     _ = sleep(Duration::from_secs(CLEANUP_INTERVAL_SECONDS)) => {
                         let mut cache = cache_for_cleanup.write().await;
                         let now = Instant::now();
-                        
                         let before_len = cache.len();
                         
-                        // Strategy 1: Remove entries older than TTL (1 hour) based on creation time
                         cache.retain(|_, entry| {
                             now.duration_since(entry.created_at) < Duration::from_secs(ATA_CACHE_TTL_SECONDS)
                         });
                         
-                        // Strategy 2: If cache is still too large, use LRU eviction (remove least-recently-used)
-                        // ✅ FIX: Sort by last_accessed (LRU) instead of created_at (oldest-first)
                         if cache.len() > ATA_CACHE_MAX_SIZE {
                             let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
-                            // Sort by last_accessed (least-recently-used first)
                             entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
-                            // Keep only the most-recently-used ATA_CACHE_MAX_SIZE entries
                             let to_remove = entries.len().saturating_sub(ATA_CACHE_MAX_SIZE);
                             let removed_count = to_remove;
-                            // Insert back only the most-recently-used entries (skip LRU ones)
                             for (pubkey, entry) in entries.into_iter().skip(to_remove) {
                                 cache.insert(pubkey, entry);
                             }
@@ -263,14 +226,11 @@ impl Executor {
                         }
                         
                         let after_len = cache.len();
-                        
                         if before_len != after_len {
                             log::debug!(
-                                "Executor: ATA cache cleanup: removed {} entries ({} remaining, TTL: {}h, max_size: {}, LRU eviction)",
+                                "Executor: ATA cache cleanup: removed {} entries ({} remaining)",
                                 before_len - after_len,
-                                after_len,
-                                ATA_CACHE_TTL_SECONDS / 3600,
-                                ATA_CACHE_MAX_SIZE
+                                after_len
                             );
                         }
                     }
@@ -314,8 +274,6 @@ impl Executor {
         self.error_tracker.reset_errors();
     }
 
-    /// ✅ FIX: Evict LRU entries when cache is full (immediate eviction, not just during cleanup)
-    /// This prevents cache thrashing during peak hours
     fn evict_lru_if_needed(cache: &mut HashMap<Pubkey, AtaCacheEntry>) {
         const ATA_CACHE_MAX_SIZE: usize = 50000;
         
@@ -333,10 +291,9 @@ impl Executor {
         }
     }
 
-    /// ✅ FIX: Get cache entry and update last_accessed (LRU tracking)
     fn get_cache_entry(cache: &mut HashMap<Pubkey, AtaCacheEntry>, key: &Pubkey) -> Option<AtaCacheEntry> {
         if let Some(entry) = cache.get_mut(key) {
-            entry.last_accessed = Instant::now(); // Update access time for LRU
+            entry.last_accessed = Instant::now();
             Some(entry.clone())
         } else {
             None
@@ -384,7 +341,7 @@ impl Executor {
                     match self.execute(opportunity.clone()).await {
                         Ok(signature) => {
                             log::info!(
-                                "Executor: ✅ Transaction sent successfully for position {} (debt={}, collateral={}, est_profit=${:.4}, max_liquidatable={}): signature={}",
+                                "Executor: Transaction sent successfully for position {} (debt={}, collateral={}, est_profit=${:.4}, max_liquidatable={}): signature={}",
                                 opportunity.position.address,
                                 opportunity.debt_mint,
                                 opportunity.collateral_mint,
@@ -396,7 +353,7 @@ impl Executor {
                         }
                         Err(e) => {
                     log::error!(
-                        "Executor: ❌ Failed to execute liquidation for position {} (debt={}, collateral={}, est_profit=${:.4}): {}",
+                        "Executor: Failed to execute liquidation for position {} (debt={}, collateral={}, est_profit=${:.4}): {}",
                         opportunity.position.address, opportunity.debt_mint, opportunity.collateral_mint,
                         opportunity.estimated_profit, e
                     );
@@ -510,29 +467,19 @@ impl Executor {
             }
         }
         
-        // Now build liquidation transaction (without ATA creation instructions)
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
-        // ✅ FIX: WSOL wrap mechanism - if debt_mint is WSOL, wrap native SOL to WSOL
-        // Note: WSOL ATA should already be created above in separate transaction
         if is_wsol_mint(&opp.debt_mint) {
-            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
-            // This ensures consistent error handling and avoids code duplication
             use crate::utils::helpers::read_ata_balance;
             let wsol_balance = read_ata_balance(&source_liquidity_ata, &self.rpc)
                 .await
-                .unwrap_or(0); // If error (not AccountNotFound), assume 0 balance for safety
+                .unwrap_or(0);
             
-            // Check if we need to wrap more SOL
             let needed_wsol = opp.max_liquidatable;
             if wsol_balance < needed_wsol {
                 let wrap_amount = needed_wsol.saturating_sub(wsol_balance);
                 
-                // ✅ FIX: Check native SOL balance before wrapping
-                // Problem: Bot doesn't check if there's enough native SOL for wrapping
-                //   If insufficient, transaction fails but bot doesn't know until after sending
-                // Solution: Check native SOL balance early and return error if insufficient
                 let wallet_account = self.rpc.get_account(&wallet_pubkey).await
                     .context("Failed to fetch wallet account for native SOL balance check")?;
                 let native_sol_balance = wallet_account.lamports;
@@ -551,7 +498,6 @@ impl Executor {
                     )).context("Cannot wrap SOL to WSOL - insufficient native SOL balance");
                 }
                 
-                // ✅ FIX: Sufficient native SOL available, proceed with wrap
                 log::info!(
                     "Executor: Wrapping {} lamports of native SOL to WSOL (current WSOL balance: {}, needed: {}, native SOL: {})",
                     wrap_amount,
@@ -560,7 +506,6 @@ impl Executor {
                     native_sol_balance
                 );
                 
-                // Add WSOL wrap instructions (create_ata if needed + transfer + sync_native)
                 let wrap_instructions = build_wrap_sol_instruction(
                     &wallet_pubkey,
                     &source_liquidity_ata,
@@ -574,39 +519,24 @@ impl Executor {
                     tx_builder.add_instruction(wrap_ix);
                 }
             } else {
-                log::debug!(
-                    "Executor: Sufficient WSOL balance ({} >= {}), no wrap needed",
-                    wsol_balance,
-                    needed_wsol
-                );
+                log::debug!("Executor: Sufficient WSOL balance ({} >= {}), no wrap needed", wsol_balance, needed_wsol);
             }
         }
         
-        // Build liquidation instruction
         let liq_ix = self
             .protocol
             .build_liquidation_ix(&opp, &wallet_pubkey, Some(Arc::clone(&self.rpc)))
             .await?;
         
-        // ✅ FIX: Only add create_ata instruction as fallback if ATA wasn't verified
-        // This should rarely happen now since we create ATAs in separate transactions above
         if let Some(entry) = Self::get_cache_entry(&mut cache, &destination_collateral) {
             if !entry.verified {
-                // ATA creation failed or wasn't verified - add as fallback (idempotent)
-                log::warn!(
-                    "Executor: Adding create_ata instruction as fallback for {} (not verified)",
-                    destination_collateral
-                );
+                log::warn!("Executor: Adding create_ata instruction as fallback for {} (not verified)", destination_collateral);
                 let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint).await?;
                 tx_builder.add_instruction(create_ata_ix);
             }
         }
 
         tx_builder.add_instruction(liq_ix);
-        
-        // ✅ FIX: Don't add unwrap instruction to liquidation transaction
-        // Unwrap will be handled separately after checking ATA balance post-liquidation
-        // This prevents unwrap failures from affecting liquidation success
 
         let signature = self.send_transaction(&tx_builder).await?;
 
@@ -618,42 +548,22 @@ impl Executor {
             signature: signature.to_string(),
         })?;
 
-        // ✅ FIX: WSOL unwrap mechanism after liquidation - check balance first
-        // If debt_mint is WSOL and unwrap_wsol_after_liquidation is enabled,
-        // check ATA balance after liquidation and only unwrap if balance is 0
-        // This prevents unwrap failures when WSOL remains in ATA
         if self.config.unwrap_wsol_after_liquidation && is_wsol_mint(&opp.debt_mint) {
-            // Wait a bit for transaction to be confirmed before checking balance
-            // This ensures we read the post-liquidation balance
             tokio::time::sleep(Duration::from_millis(500)).await;
             
-            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
-            // This ensures consistent error handling and avoids code duplication
             use crate::utils::helpers::read_ata_balance;
             let wsol_balance = match read_ata_balance(&source_liquidity_ata, &self.rpc).await {
                 Ok(balance) => balance,
                 Err(e) => {
-                    // RPC error (not AccountNotFound) - log and skip unwrap
-                    log::warn!(
-                        "Executor: Failed to read WSOL ATA balance for unwrap check: {}. Skipping unwrap.",
-                        e
-                    );
+                    log::warn!("Executor: Failed to read WSOL ATA balance for unwrap check: {}. Skipping unwrap.", e);
                     return Ok(signature);
                 }
             };
             
             if wsol_balance > 0 {
-                log::warn!(
-                    "Executor: WSOL ATA has remaining balance: {} lamports, cannot unwrap. WSOL will remain in ATA for future liquidations.",
-                    wsol_balance
-                );
-                // Don't unwrap - WSOL will be available for next liquidation
+                log::warn!("Executor: WSOL ATA has remaining balance: {} lamports, cannot unwrap", wsol_balance);
             } else {
-                // Balance is 0 - safe to unwrap
-                log::debug!(
-                    "Executor: WSOL ATA balance is 0, attempting unwrap (WSOL ATA: {})",
-                    source_liquidity_ata
-                );
+                log::debug!("Executor: WSOL ATA balance is 0, attempting unwrap (WSOL ATA: {})", source_liquidity_ata);
                 
                 use crate::protocol::solend::instructions::build_unwrap_sol_instruction;
                 match build_unwrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata) {
@@ -672,11 +582,7 @@ impl Executor {
                         }
                     }
                     Err(e) => {
-                        // Log warning but don't fail - unwrap is optional
-                        log::warn!(
-                            "Executor: Failed to build WSOL unwrap instruction (optional): {}",
-                            e
-                        );
+                        log::warn!("Executor: Failed to build WSOL unwrap instruction (optional): {}", e);
                     }
                 }
             }
@@ -702,8 +608,6 @@ impl Executor {
         }
     }
 
-    /// Create ATA in a separate transaction to avoid compute unit limit issues
-    /// This ensures liquidation transaction stays within 200k CU limit
     async fn create_ata_separate_tx(
         &self,
         mint: &Pubkey,
@@ -734,18 +638,13 @@ impl Executor {
             ata_sig
         );
         
-        // Wait for ATA to be created (with retries)
         const MAX_VERIFICATION_ATTEMPTS: u32 = 10;
         const VERIFICATION_DELAY_MS: u64 = 500;
         
         for attempt in 1..=MAX_VERIFICATION_ATTEMPTS {
             match self.rpc.get_account(ata).await {
                 Ok(_) => {
-                    log::info!(
-                        "Executor: ATA {} verified after {} attempt(s)",
-                        ata,
-                        attempt
-                    );
+                    log::info!("Executor: ATA {} verified after {} attempt(s)", ata, attempt);
                     Self::evict_lru_if_needed(cache);
                     let now = Instant::now();
                     cache.insert(*ata, AtaCacheEntry {
@@ -757,51 +656,22 @@ impl Executor {
                 }
                 Err(e) => {
                     if attempt < MAX_VERIFICATION_ATTEMPTS {
-                        log::debug!(
-                            "Executor: ATA {} verification attempt {} failed, retrying...: {}",
-                            ata,
-                            attempt,
-                            e
-                        );
+                        log::debug!("Executor: ATA {} verification attempt {} failed, retrying...: {}", ata, attempt, e);
                         tokio::time::sleep(Duration::from_millis(VERIFICATION_DELAY_MS)).await;
                     } else {
-                        // ✅ CRITICAL FIX: Check transaction signature status before fallback
-                        // Problem: Verification timeout doesn't mean transaction failed
-                        //   - Transaction may be confirmed but ATA not yet visible (network delay)
-                        //   - If we fallback and add create_ata to liquidation tx, we get duplicate error
-                        // Solution: Check transaction signature status:
-                        //   1. If confirmed (no error) → wait longer (transaction succeeded, ATA will appear)
-                        //   2. If failed (error) → return error (don't fallback, transaction failed)
-                        //   3. If not found → wait longer (transaction may still be processing)
-                        log::warn!(
-                            "Executor: ATA {} verification failed after {} attempts: {}",
-                            ata,
-                            MAX_VERIFICATION_ATTEMPTS,
-                            e
-                        );
-                        log::info!(
-                            "Executor: Checking transaction signature status for {}...",
-                            ata_sig
-                        );
+                        log::warn!("Executor: ATA {} verification failed after {} attempts: {}", ata, MAX_VERIFICATION_ATTEMPTS, e);
+                        log::info!("Executor: Checking transaction signature status for {}...", ata_sig);
                         
                         match self.rpc.get_signature_status(&ata_sig).await {
                             Ok(Some(true)) => {
-                                // Transaction confirmed successfully - wait longer for ATA to appear
-                                log::info!(
-                                    "Executor: ATA creation transaction {} confirmed successfully, waiting longer for ATA to appear...",
-                                    ata_sig
-                                );
+                                log::info!("Executor: ATA creation transaction {} confirmed successfully, waiting longer for ATA to appear...", ata_sig);
                                 const EXTENDED_WAIT_ATTEMPTS: u32 = 10;
-                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000; // 1 second
+                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000;
                                 
                                 for extended_attempt in 1..=EXTENDED_WAIT_ATTEMPTS {
                                     match self.rpc.get_account(ata).await {
                                         Ok(_) => {
-                                            log::info!(
-                                                "Executor: ATA {} verified after extended wait (attempt {})",
-                                                ata,
-                                                extended_attempt
-                                            );
+                                            log::info!("Executor: ATA {} verified after extended wait (attempt {})", ata, extended_attempt);
                                             Self::evict_lru_if_needed(cache);
                                             let now = Instant::now();
                                             cache.insert(*ata, AtaCacheEntry {
@@ -813,27 +683,16 @@ impl Executor {
                                         }
                                         Err(e) => {
                                             if extended_attempt < EXTENDED_WAIT_ATTEMPTS {
-                                                log::debug!(
-                                                    "Executor: ATA {} extended wait attempt {} failed, retrying...: {}",
-                                                    ata,
-                                                    extended_attempt,
-                                                    e
-                                                );
+                                                log::debug!("Executor: ATA {} extended wait attempt {} failed, retrying...: {}", ata, extended_attempt, e);
                                                 tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
                                             } else {
-                                                log::warn!(
-                                                    "Executor: ATA {} still not found after extended wait ({} attempts), but transaction confirmed. ATA may have been created but not yet visible.",
-                                                    ata,
-                                                    EXTENDED_WAIT_ATTEMPTS
-                                                );
-                                                // Transaction confirmed but ATA not visible - mark as verified anyway
-                                                // This prevents duplicate create_ata in liquidation tx
+                                                log::warn!("Executor: ATA {} still not found after extended wait ({} attempts), but transaction confirmed", ata, EXTENDED_WAIT_ATTEMPTS);
                                                 Self::evict_lru_if_needed(cache);
                                                 let now = Instant::now();
                                                 cache.insert(*ata, AtaCacheEntry {
                                                     created_at: now,
                                                     last_accessed: now,
-                                                    verified: true, // Mark as verified since transaction succeeded
+                                                    verified: true,
                                                 });
                                                 return Ok(());
                                             }
@@ -842,34 +701,18 @@ impl Executor {
                                 }
                             }
                             Ok(Some(false)) => {
-                                // Transaction failed - return error (don't fallback)
-                                log::error!(
-                                    "Executor: ATA creation transaction {} FAILED. Will NOT add to liquidation transaction as fallback.",
-                                    ata_sig
-                                );
-                                return Err(anyhow::anyhow!(
-                                    "ATA creation transaction {} failed. ATA {} was not created.",
-                                    ata_sig,
-                                    ata
-                                ));
+                                log::error!("Executor: ATA creation transaction {} FAILED", ata_sig);
+                                return Err(anyhow::anyhow!("ATA creation transaction {} failed. ATA {} was not created.", ata_sig, ata));
                             }
                             Ok(None) => {
-                                // Transaction not found (may still be processing) - wait longer
-                                log::warn!(
-                                    "Executor: ATA creation transaction {} not found in history (may still be processing). Waiting longer...",
-                                    ata_sig
-                                );
+                                log::warn!("Executor: ATA creation transaction {} not found in history (may still be processing)", ata_sig);
                                 const EXTENDED_WAIT_ATTEMPTS: u32 = 10;
-                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000; // 1 second
+                                const EXTENDED_WAIT_DELAY_MS: u64 = 1000;
                                 
                                 for extended_attempt in 1..=EXTENDED_WAIT_ATTEMPTS {
                                     match self.rpc.get_account(ata).await {
                                         Ok(_) => {
-                                            log::info!(
-                                                "Executor: ATA {} verified after extended wait (attempt {})",
-                                                ata,
-                                                extended_attempt
-                                            );
+                                            log::info!("Executor: ATA {} verified after extended wait (attempt {})", ata, extended_attempt);
                                             Self::evict_lru_if_needed(cache);
                                             let now = Instant::now();
                                             cache.insert(*ata, AtaCacheEntry {
@@ -881,21 +724,10 @@ impl Executor {
                                         }
                                         Err(e) => {
                                             if extended_attempt < EXTENDED_WAIT_ATTEMPTS {
-                                                log::debug!(
-                                                    "Executor: ATA {} extended wait attempt {} failed, retrying...: {}",
-                                                    ata,
-                                                    extended_attempt,
-                                                    e
-                                                );
+                                                log::debug!("Executor: ATA {} extended wait attempt {} failed, retrying...: {}", ata, extended_attempt, e);
                                                 tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
                                             } else {
-                                                log::warn!(
-                                                    "Executor: ATA {} still not found after extended wait ({} attempts). Transaction {} may still be processing. Will add to liquidation transaction as fallback.",
-                                                    ata,
-                                                    EXTENDED_WAIT_ATTEMPTS,
-                                                    ata_sig
-                                                );
-                                                // Transaction may still be processing - fallback to liquidation tx
+                                                log::warn!("Executor: ATA {} still not found after extended wait ({} attempts). Will add to liquidation transaction as fallback.", ata, EXTENDED_WAIT_ATTEMPTS);
                                                 Self::evict_lru_if_needed(cache);
                                                 let now = Instant::now();
                                                 cache.insert(*ata, AtaCacheEntry {
@@ -903,19 +735,14 @@ impl Executor {
                                                     last_accessed: now,
                                                     verified: false,
                                                 });
-                                                return Ok(()); // Fallback will handle it
+                                                return Ok(());
                                             }
                                         }
                                     }
                                 }
                             }
                             Err(status_err) => {
-                                // Error checking signature status - log warning but proceed with fallback
-                                log::warn!(
-                                    "Executor: Failed to check transaction signature status for {}: {}. Will add to liquidation transaction as fallback.",
-                                    ata_sig,
-                                    status_err
-                                );
+                                log::warn!("Executor: Failed to check transaction signature status for {}: {}. Will add to liquidation transaction as fallback.", ata_sig, status_err);
                                 Self::evict_lru_if_needed(cache);
                                 let now = Instant::now();
                                 cache.insert(*ata, AtaCacheEntry {
@@ -923,7 +750,7 @@ impl Executor {
                                     last_accessed: now,
                                     verified: false,
                                 });
-                                return Ok(()); // Fallback will handle it
+                                return Ok(());
                             }
                         }
                     }
@@ -1116,16 +943,15 @@ impl Executor {
             match op().await {
                 Ok(sig) => {
                     if is_invalid(sig) {
-                        log::error!("Invalid signature returned (all zeros) on attempt {}", attempt);
                         if attempt < MAX_TX_RETRIES {
-                            log::warn!("Retrying due to invalid signature...");
+                            log::warn!("Invalid signature on attempt {}, retrying...", attempt);
                             sleep(Duration::from_millis(500 * attempt as u64)).await;
                             continue;
                         }
-                        return Err(anyhow::anyhow!("Invalid signature returned (all zeros) after {} attempts", MAX_TX_RETRIES));
+                        return Err(anyhow::anyhow!("Invalid signature after {} attempts", MAX_TX_RETRIES));
                     }
                     if attempt > 1 {
-                        log::info!("✅ {} sent successfully on attempt {}", op_name, attempt);
+                        log::info!("{} sent successfully on attempt {}", op_name, attempt);
                     }
                     return Ok(sig);
                 }

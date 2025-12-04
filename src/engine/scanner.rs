@@ -159,7 +159,7 @@ impl Scanner {
         log::info!("Scanner: initial discovery completed. parsed_positions={}, failed_to_parse={}, total_accounts={}", parsed, failed, accounts.len());
         
         if parsed == 0 && failed > 0 {
-            log::warn!("⚠️  WARNING: No positions were parsed from {} accounts! Data size filter may be incorrect (filtering for {} bytes)", failed, OBLIGATION_DATA_SIZE);
+            log::warn!("WARNING: No positions were parsed from {} accounts! Data size filter may be incorrect (filtering for {} bytes)", failed, OBLIGATION_DATA_SIZE);
         }
         
         Self::log_distribution("Data size distribution", &data_size_distribution, 10);
@@ -234,35 +234,23 @@ impl Scanner {
 
         let mut subscription_id = match self.ws.subscribe_program(&program_id).await {
             Ok(id) => {
-                log::info!(
-                    "✅ WebSocket subscribed to program {} with subscription ID: {}",
-                    program_id,
-                    id
-                );
+                log::info!("WebSocket subscribed to program {} with subscription ID: {}", program_id, id);
                 self.reset_errors();
                 Some(id)
             }
             Err(e) => {
-                log::warn!(
-                    "⚠️  WebSocket subscription failed: {}. Falling back to RPC polling mode.",
-                    e
-                );
+                log::warn!("WebSocket subscription failed: {}. Falling back to RPC polling mode.", e);
                 use_websocket = false;
                 None
             }
         };
 
-        loop {
-            // ✅ FIX: Periodically check for failed subscriptions and restart if needed
-            // This prevents data loss when subscriptions fail during WebSocket reconnect
+            loop {
             if last_failed_subscription_check.elapsed() >= FAILED_SUBSCRIPTION_CHECK_INTERVAL {
                 last_failed_subscription_check = Instant::now();
                 let failed_subscriptions = self.ws.get_failed_subscriptions().await;
                 if !failed_subscriptions.is_empty() {
-                    log::warn!(
-                        "⚠️  Found {} failed subscription(s) - restarting scanner to restore subscriptions",
-                        failed_subscriptions.len()
-                    );
+                    log::warn!("Found {} failed subscription(s) - restarting scanner to restore subscriptions", failed_subscriptions.len());
                     
                     let mut restored = 0;
                     for info in &failed_subscriptions {
@@ -278,9 +266,9 @@ impl Scanner {
                     
                     if restored == failed_subscriptions.len() {
                         self.ws.clear_failed_subscriptions().await;
-                        log::info!("✅ All {} subscription(s) restored", restored);
+                        log::info!("All {} subscription(s) restored", restored);
                     } else {
-                        log::warn!("⚠️  Only {}/{} subscription(s) restored", restored, failed_subscriptions.len());
+                        log::warn!("Only {}/{} subscription(s) restored", restored, failed_subscriptions.len());
                         let _ = self.event_bus.publish(Event::SubscriptionLost {
                             count: failed_subscriptions.len() - restored,
                         });
@@ -318,18 +306,18 @@ impl Scanner {
                             match self.ws.subscribe_program(&program_id).await {
                                 Ok(id) => {
                                     subscription_id = Some(id);
-                                    log::info!("✅ WebSocket reconnected and resubscribed");
+                                    log::info!("WebSocket reconnected and resubscribed");
                                     self.reset_errors();
                                 }
                                 Err(e) => {
-                                    log::warn!("⚠️  WebSocket resubscription failed: {}, falling back to RPC polling", e);
+                                    log::warn!("WebSocket resubscription failed: {}, falling back to RPC polling", e);
                                     use_websocket = false;
                                     subscription_id = None;
                                 }
                             }
                         }
                         Err(e) => {
-                            log::error!("❌ WebSocket reconnection failed: {}, falling back to RPC polling", e);
+                            log::error!("WebSocket reconnection failed: {}, falling back to RPC polling", e);
                             use_websocket = false;
                             subscription_id = None;
                         }
@@ -373,7 +361,7 @@ impl Scanner {
                             match self.ws.reconnect_with_backoff().await {
                                 Ok(()) => match self.ws.subscribe_program(&program_id).await {
                                     Ok(id) => {
-                                        log::info!("✅ WebSocket reconnected! Switching back to WebSocket mode.");
+                                        log::info!("WebSocket reconnected! Switching back to WebSocket mode.");
                                         subscription_id = Some(id);
                                         use_websocket = true;
                                         self.reset_errors();
@@ -402,54 +390,35 @@ impl Scanner {
                     Err(e) => {
                         let error_str = e.to_string().to_lowercase();
                         
-                        // ✅ CRITICAL FIX: Rate limit errors (429) are expected on free RPC
-                        // Problem: 30 consecutive 429 errors → bot panic (crash)
-                        // Solution: Don't count rate limit errors as fatal, apply backoff instead
                         if error_str.contains("429") 
                             || error_str.contains("rate limit")
                             || error_str.contains("too many requests")
                         {
-                            // Rate limit: expected for free RPC, don't count as fatal error
-                            log::warn!(
-                                "Scanner: Rate limit hit (429), applying exponential backoff (not counting as fatal error)"
-                            );
+                            log::warn!("Scanner: Rate limit hit (429), applying exponential backoff");
                             
-                            // Calculate adjusted interval first
                             let base_interval = if self.config.is_free_rpc_endpoint() {
-                                let min_interval = Duration::from_millis(120_000); // 2 minutes
+                                let min_interval = Duration::from_millis(120_000);
                                 poll_interval.max(min_interval)
                             } else {
                                 poll_interval
                             };
                             
-                            // Exponential backoff for rate limits: 2x base interval (capped at 10 minutes)
-                            // This gives RPC time to recover from rate limit
                             let backoff_interval = base_interval * 2;
-                            let max_backoff = Duration::from_millis(600_000); // 10 minutes max
+                            let max_backoff = Duration::from_millis(600_000);
                             let backoff_interval = backoff_interval.min(max_backoff);
                             
-                            log::info!(
-                                "Scanner: Rate limit backoff: waiting {:?} before next poll (base: {:?}, 2x backoff)",
-                                backoff_interval,
-                                base_interval
-                            );
-                            
+                            log::info!("Scanner: Rate limit backoff: waiting {:?} before next poll (base: {:?}, 2x backoff)", backoff_interval, base_interval);
                             sleep(backoff_interval).await;
-                            continue; // Don't call record_error(), just retry after backoff
+                            continue;
                         }
                         
-                        // Other errors: count as fatal (network errors, server errors, etc.)
                         log::error!("Scanner: RPC polling failed: {}", e);
                         self.record_error()?;
                     }
                 }
 
-                // Wait before next RPC poll
-                // ✅ FIX: For free RPC endpoints, use longer interval to avoid rate limits
-                // get_program_accounts is expensive (rate limit = 40 req/10s)
                 let adjusted_interval = if self.config.is_free_rpc_endpoint() {
-                    // Free RPC: minimum 2 minutes to avoid rate limit issues
-                    let min_interval = Duration::from_millis(120_000); // 2 minutes
+                    let min_interval = Duration::from_millis(120_000);
                     poll_interval.max(min_interval)
                 } else {
                     poll_interval
