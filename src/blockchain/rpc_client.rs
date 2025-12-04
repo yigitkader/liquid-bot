@@ -71,10 +71,7 @@ impl RpcClient {
         let request_timeout = Duration::from_secs(request_timeout_seconds);
 
         if request_timeout_seconds > 30 {
-            log::warn!(
-                "⚠️  RPC_TIMEOUT_SECONDS={} is very high (>30s) - this may cause validation to block for too long",
-                request_timeout_seconds
-            );
+            log::warn!("RPC_TIMEOUT_SECONDS={} is very high (>30s) - this may cause validation to block for too long", request_timeout_seconds);
         }
 
         log::info!(
@@ -107,14 +104,11 @@ impl RpcClient {
     }
 
     async fn should_retry_rate_limit(&self, error_str: &str, retry_count: &mut u32) -> bool {
-        // ✅ FIX: Also retry on connection errors (connection closed, network errors, etc.)
-        let is_retryable = error_str.contains("429")
-            || error_str.contains("Too many requests")
-            || error_str.contains("rate limit")
+        use crate::utils::error_helpers;
+        let dummy_error = anyhow::anyhow!("{}", error_str);
+        let is_retryable = error_helpers::is_retryable_error(&dummy_error)
             || error_str.contains("connection closed")
             || error_str.contains("connection reset")
-            || error_str.contains("network")
-            || error_str.contains("timeout")
             || error_str.contains("ECONNRESET")
             || error_str.contains("ECONNREFUSED");
         
@@ -123,24 +117,14 @@ impl RpcClient {
             if *retry_count <= 5 {
                 let backoff = Duration::from_millis(500 * (*retry_count as u64));
                 if error_str.contains("429") || error_str.contains("rate limit") {
-                    log::warn!(
-                        "⚠️  Rate limit hit (429), backing off for {:?} (attempt {}/{})",
-                        backoff,
-                        *retry_count,
-                        5
-                    );
+                    log::warn!("Rate limit hit (429), backing off for {:?} (attempt {}/{})", backoff, *retry_count, 5);
                 } else {
-                    log::warn!(
-                        "⚠️  Connection/network error, retrying after {:?} (attempt {}/{})",
-                        backoff,
-                        *retry_count,
-                        5
-                    );
+                    log::warn!("Connection/network error, retrying after {:?} (attempt {}/{})", backoff, *retry_count, 5);
                 }
                 sleep(backoff).await;
                 return true;
             } else {
-                log::error!("❌ Retry limit exceeded after 5 retries");
+                log::error!("Retry limit exceeded after 5 retries");
                 return false;
             }
         }

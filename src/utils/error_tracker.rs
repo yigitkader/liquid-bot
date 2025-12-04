@@ -36,12 +36,12 @@ impl ErrorTracker {
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
         if errors >= self.max_consecutive_errors {
             log::error!(
-                "🚨 CRITICAL: {} exceeded max consecutive errors ({} >= {})",
+                "CRITICAL: {} exceeded max consecutive errors ({} >= {})",
                 self.component_name,
                 errors,
                 self.max_consecutive_errors
             );
-            log::error!("🚨 {} entering panic mode - shutting down", self.component_name);
+            log::error!("{} entering panic mode - shutting down", self.component_name);
             return Err(anyhow::anyhow!(
                 "{} exceeded max consecutive errors: {} >= {}",
                 self.component_name,
@@ -59,20 +59,16 @@ impl ErrorTracker {
     pub fn record_error(&self) -> Result<()> {
         let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
         
-        // Overflow protection: reset before overflow
         if previous_value >= u32::MAX - 10 {
-            // Safety margin: reset to threshold - 5 to prevent immediate panic
-            // This gives buffer for temporary network issues without causing bot restart
             let reset_value = self.max_consecutive_errors.saturating_sub(5);
             log::error!(
-                "🚨 CRITICAL: {} error counter near overflow ({}), resetting to {} (threshold: {}, buffer: 5 errors)",
+                "CRITICAL: {} error counter near overflow ({}), resetting to {} (threshold: {}, buffer: 5 errors)",
                 self.component_name,
                 previous_value,
                 reset_value,
                 self.max_consecutive_errors
             );
             self.consecutive_errors.store(reset_value, Ordering::Relaxed);
-            // Don't check threshold after reset - we're below threshold now
             return Ok(());
         }
 
