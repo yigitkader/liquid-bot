@@ -4,10 +4,10 @@ use crate::core::config::Config;
 use crate::core::events::{Event, EventBus};
 use crate::protocol::Protocol;
 use crate::utils::cache::AccountCache;
+use crate::utils::error_tracker::ErrorTracker;
 use anyhow::Result;
 use futures_util::future::join_all;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -18,7 +18,7 @@ pub struct Scanner {
     event_bus: EventBus,
     cache: Arc<AccountCache>,
     config: Config,
-    consecutive_errors: Arc<AtomicU32>,
+    error_tracker: ErrorTracker,
 }
 
 impl Scanner {
@@ -30,6 +30,10 @@ impl Scanner {
         cache: Arc<AccountCache>,
         config: Config,
     ) -> Self {
+        let error_tracker = ErrorTracker::new(
+            config.max_consecutive_errors,
+            "Scanner",
+        );
         Scanner {
             rpc,
             ws,
@@ -37,64 +41,21 @@ impl Scanner {
             event_bus,
             cache,
             config,
-            consecutive_errors: Arc::new(AtomicU32::new(0)),
+            error_tracker,
         }
     }
 
     /// Check if we've exceeded max consecutive errors and panic if so
     fn check_error_threshold(&self) -> Result<()> {
-        let errors = self.consecutive_errors.load(Ordering::Relaxed);
-        if errors >= self.config.max_consecutive_errors {
-            log::error!(
-                "🚨 CRITICAL: Scanner exceeded max consecutive errors ({} >= {})",
-                errors,
-                self.config.max_consecutive_errors
-            );
-            log::error!("🚨 Scanner entering panic mode - shutting down");
-            return Err(anyhow::anyhow!(
-                "Scanner exceeded max consecutive errors: {} >= {}",
-                errors,
-                self.config.max_consecutive_errors
-            ));
-        }
-        Ok(())
+        self.error_tracker.check_error_threshold()
     }
 
     fn record_error(&self) -> Result<()> {
-        // ✅ FIX: Check for overflow BEFORE incrementing to prevent wraparound
-        // If we're near u32::MAX, reset to a safe value below threshold to prevent immediate panic
-        let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
-        
-        if previous_value >= u32::MAX - 10 {
-            // Safety margin: reset before overflow to prevent wraparound
-            // ✅ CRITICAL FIX: Reset to threshold - 5 instead of threshold to prevent immediate panic
-            // This gives buffer for temporary network issues without causing bot restart
-            let reset_value = self.config.max_consecutive_errors.saturating_sub(5);
-            log::error!(
-                "🚨 CRITICAL: Scanner error counter near overflow ({}), resetting to {} (threshold: {}, buffer: 5 errors)",
-                previous_value,
-                reset_value,
-                self.config.max_consecutive_errors
-            );
-            self.consecutive_errors.store(reset_value, Ordering::Relaxed);
-            // Don't check threshold after reset - we're below threshold now
-            // This prevents immediate panic on overflow protection
-            return Ok(());
-        }
-
-        // Now safely increment
-        let errors = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-
-        log::warn!(
-            "Scanner: consecutive errors: {}/{}",
-            errors,
-            self.config.max_consecutive_errors
-        );
-        self.check_error_threshold()
+        self.error_tracker.record_error()
     }
 
     fn reset_errors(&self) {
-        self.consecutive_errors.store(0, Ordering::Relaxed);
+        self.error_tracker.reset_errors();
     }
 
     pub async fn discover_accounts(&self) -> Result<usize> {

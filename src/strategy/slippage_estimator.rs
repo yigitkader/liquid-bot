@@ -161,7 +161,7 @@ impl SlippageEstimator {
                 }
                 Err(e) => {
                     // Check if error is retryable BEFORE storing
-                    let is_retryable = Self::is_retryable_error(&e);
+                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
                     let error_msg = e.to_string();
                     last_error = Some(error_msg.clone());
                     
@@ -240,39 +240,13 @@ impl SlippageEstimator {
     /// Check if an error is retryable
     /// ✅ FIX: Only retry transient errors, not permanent client errors
     /// Retryable: 5xx server errors, timeouts, network errors, rate limits (429)
-    /// Non-retryable: 4xx client errors, parse errors, missing data
+    /// Check if error is retryable (delegates to shared utility)
+    /// 
+    /// Note: This method is kept for backward compatibility but delegates to
+    /// the shared `error_helpers::is_retryable_error` function.
+    #[allow(dead_code)] // Keep for backward compatibility
     fn is_retryable_error(error: &anyhow::Error) -> bool {
-        let error_str = error.to_string().to_lowercase();
-
-        // ✅ Retry: Server errors, network errors, timeouts, rate limits
-        // Note: Check specific retryable errors first (429 rate limit is 4xx but retryable)
-        if error_str.contains("timeout")
-            || error_str.contains("network error")
-            || error_str.contains("connection")
-            || error_str.contains("http error: 429") // Rate limit (4xx but retryable with backoff)
-            || error_str.contains("http error: 5") // 5xx server errors
-            || error_str.contains("http error: 503") // Service unavailable
-            || error_str.contains("http error: 502") // Bad gateway
-            || error_str.contains("http error: 504") // Gateway timeout
-        {
-            return true;
-        }
-
-        // ❌ Don't retry: Client errors (except 429), parse errors, missing data
-        // Note: Check for 4xx AFTER checking 429 (to avoid matching 429)
-        if error_str.contains("http error: 4") // 4xx client errors (400, 401, 403, 404, etc., but NOT 429)
-            || error_str.contains("failed to parse json")
-            || error_str.contains("failed to parse")
-            || error_str.contains("no price impact in response")
-            || error_str.contains("negative price impact")
-            || error_str.contains("suspiciously high price impact")
-        {
-            return false;
-        }
-
-        // Default: retry (conservative approach for unknown errors)
-        // This ensures we don't miss transient errors that might not be clearly categorized
-        true
+        crate::utils::error_helpers::is_retryable_error(error)
     }
 
     /// Try to get a quote from Jupiter API (single attempt, no retries)

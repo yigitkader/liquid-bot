@@ -390,7 +390,11 @@ pub async fn wait_for_reserve_cache_initialization(timeout: Duration) -> bool {
         .await
 }
 
-fn get_instruction_discriminator() -> [u8; 8] {
+/// Get instruction discriminator for liquidateObligation
+/// 
+/// Calculates SHA256("global:liquidateObligation")[..8]
+/// This matches Anchor's instruction discriminator calculation.
+pub fn get_instruction_discriminator() -> [u8; 8] {
     let mut hasher = Sha256::new();
     hasher.update(b"global:liquidateObligation");
     let hash = hasher.finalize();

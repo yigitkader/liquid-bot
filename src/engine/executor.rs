@@ -6,11 +6,11 @@ use crate::core::events::{Event, EventBus};
 use crate::core::types::Opportunity;
 use crate::protocol::Protocol;
 use crate::strategy::balance_manager::BalanceManager;
+use crate::utils::error_tracker::ErrorTracker;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -174,7 +174,7 @@ pub struct Executor {
     balance_manager: Arc<BalanceManager>,
     tx_lock: Arc<TxLock>,
     config: Config,
-    consecutive_errors: Arc<AtomicU32>,
+    error_tracker: ErrorTracker,
     jito_client: Option<Arc<JitoClient>>,
     use_jito: bool,
     // Cache of ATAs we've already included create_ata instructions for
@@ -294,6 +294,10 @@ impl Executor {
             }
         });
 
+        let error_tracker = ErrorTracker::new(
+            config.max_consecutive_errors,
+            "Executor",
+        );
         Executor {
             event_bus,
             rpc,
@@ -302,7 +306,7 @@ impl Executor {
             balance_manager,
             tx_lock,
             config,
-            consecutive_errors: Arc::new(AtomicU32::new(0)),
+            error_tracker,
             jito_client,
             use_jito,
             ata_cache,
@@ -311,52 +315,15 @@ impl Executor {
     }
 
     fn check_error_threshold(&self) -> Result<()> {
-        let errors = self.consecutive_errors.load(Ordering::Relaxed);
-        if errors >= self.config.max_consecutive_errors {
-            log::error!(
-                "🚨 CRITICAL: Executor exceeded max consecutive errors ({} >= {})",
-                errors,
-                self.config.max_consecutive_errors
-            );
-            log::error!("🚨 Executor entering panic mode - shutting down");
-            return Err(anyhow::anyhow!(
-                "Executor exceeded max consecutive errors: {} >= {}",
-                errors,
-                self.config.max_consecutive_errors
-            ));
-        }
-        Ok(())
+        self.error_tracker.check_error_threshold()
     }
 
     fn record_error(&self) -> Result<()> {
-        // ✅ FIX: Check for overflow BEFORE incrementing to prevent wraparound
-        // If we're near u32::MAX, reset to max_consecutive_errors to keep threshold check working
-        let previous_value = self.consecutive_errors.load(Ordering::Relaxed);
-        
-        if previous_value >= u32::MAX - 10 {
-            // Safety margin: reset before overflow to prevent wraparound
-            log::error!(
-                "🚨 CRITICAL: Executor error counter near overflow ({}), resetting to max_consecutive_errors ({})",
-                previous_value,
-                self.config.max_consecutive_errors
-            );
-            self.consecutive_errors.store(self.config.max_consecutive_errors, Ordering::Relaxed);
-            // Still check threshold after reset
-            return self.check_error_threshold();
-        }
-
-        // Now safely increment
-        let errors = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        log::warn!(
-            "Executor: consecutive errors: {}/{}",
-            errors,
-            self.config.max_consecutive_errors
-        );
-        self.check_error_threshold()
+        self.error_tracker.record_error()
     }
 
     fn reset_errors(&self) {
-        self.consecutive_errors.store(0, Ordering::Relaxed);
+        self.error_tracker.reset_errors();
     }
 
     /// ✅ FIX: Evict LRU entries when cache is full (immediate eviction, not just during cleanup)
@@ -394,17 +361,11 @@ impl Executor {
         self.ata_cache_cleanup_token.cancel();
     }
 
+    /// Check if error is retryable (delegates to shared utility)
+    /// 
+    /// Note: This method delegates to the shared `error_helpers::is_retryable_error` function.
     fn is_retryable_error(&self, error: &anyhow::Error) -> bool {
-        let error_str = error.to_string().to_lowercase();
-        error_str.contains("timeout")
-            || error_str.contains("network")
-            || error_str.contains("connection")
-            || error_str.contains("rpc")
-            || error_str.contains("failed to send")
-            || error_str.contains("request failed")
-            || error_str.contains("temporarily unavailable")
-            || error_str.contains("rate limit")
-            || error_str.contains("too many requests")
+        crate::utils::error_helpers::is_retryable_error(error)
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -1136,7 +1097,7 @@ impl Executor {
                     return Ok(sig);
                 }
                 Err(e) => {
-                    let is_retryable = self.is_retryable_error(&e);
+                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
 
                     if is_retryable && attempt < MAX_TX_RETRIES {
                         log::warn!(
@@ -1237,7 +1198,7 @@ impl Executor {
                     return Ok(sig);
                 }
                 Err(e) => {
-                    let is_retryable = self.is_retryable_error(&e);
+                    let is_retryable = crate::utils::error_helpers::is_retryable_error(&e);
 
                     if is_retryable && attempt < MAX_TX_RETRIES {
                         log::warn!(

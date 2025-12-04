@@ -1,5 +1,6 @@
 pub mod core {
     pub mod config;
+    pub mod config_groups;
     pub mod error;
     pub mod events;
     pub mod types;
@@ -31,6 +32,9 @@ pub mod strategy {
 pub mod utils {
     pub mod ata_manager;
     pub mod cache;
+    pub mod dependency_validator;
+    pub mod error_helpers;
+    pub mod error_tracker;
     pub mod helpers;
     pub mod metrics;
 }
@@ -40,4 +44,4 @@ pub use core::{config, error, events, types, registry};
 pub use engine::{analyzer, executor, scanner, validator};
 pub use protocol::Protocol;
 pub use strategy::{balance_manager, profit_calculator, slippage_estimator};
-pub use utils::{ata_manager, cache, helpers, metrics};
+pub use utils::{ata_manager, cache, dependency_validator, error_helpers, error_tracker, helpers, metrics};
