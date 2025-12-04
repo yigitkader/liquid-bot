@@ -543,13 +543,23 @@ pub fn is_wsol_mint(mint: &Pubkey) -> bool {
 }
 
 /// Build instruction to wrap native SOL to WSOL
-/// This creates a WSOL ATA (if needed) and transfers native SOL to it, then syncs it
+/// This transfers native SOL to WSOL ATA and syncs it to WSOL tokens
 /// 
 /// Steps:
-/// 1. Transfer native SOL to WSOL ATA (System Program transfer)
-/// 2. Sync native SOL in WSOL ATA to WSOL tokens (SPL Token SyncNative)
+/// 1. Ensure WSOL ATA exists (should be handled separately if needed)
+/// 2. Transfer native SOL directly to WSOL ATA address using system_instruction::transfer
+/// 3. Sync native SOL in WSOL ATA to WSOL tokens using token_instruction::sync_native
 /// 
 /// Note: ATA creation should be handled separately if needed
+/// 
+/// ✅ CORRECT APPROACH (per Solana documentation):
+/// - Transfer native SOL directly to WSOL ATA address (not to owner)
+/// - WSOL token accounts can receive native SOL directly via system_instruction::transfer
+/// - Then call sync_native to convert native SOL (lamports) to WSOL tokens
+/// 
+/// References:
+/// - Solana docs: https://solana.com/docs/tokens/basics/sync-native
+/// - QuickNode guide: Native SOL should be sent to the associated token account for NATIVE_MINT
 pub fn build_wrap_sol_instruction(
     wallet: &Pubkey,
     wsol_ata: &Pubkey,
@@ -558,16 +568,47 @@ pub fn build_wrap_sol_instruction(
     use solana_sdk::system_instruction;
     use spl_token::instruction as token_instruction;
     
+    // ✅ VALIDATION: Amount must be greater than 0
+    if amount == 0 {
+        return Err(anyhow::anyhow!("Wrap amount cannot be zero"));
+    }
+    
     let mut instructions = Vec::new();
     
-    // Step 1: Transfer native SOL to WSOL ATA
-    // This deposits native SOL into the WSOL token account
+    // ✅ CORRECT: Transfer native SOL directly to WSOL ATA address
+    // Per Solana documentation, native SOL should be sent directly to the WSOL token account
+    // (associated token account for NATIVE_MINT), then sync_native is called to convert
+    // the lamports to WSOL tokens.
+    // 
+    // This is the standard and correct way to wrap SOL in Solana:
+    // 1. system_instruction::transfer(wallet, wsol_ata, amount) - sends native SOL to WSOL ATA
+    // 2. token_instruction::sync_native() - syncs lamports to WSOL token amount
+    // 
+    // ⚠️ CRITICAL REQUIREMENTS:
+    // - The wallet must already have sufficient native SOL balance
+    // - The WSOL ATA must be created and initialized BEFORE calling this function
+    //   (handled separately by executor via create_associated_token_account)
+    // - The WSOL ATA account must be writable in the transaction
+    // - The wallet must be a signer in the transaction
+    // 
+    // Step 1: Transfer native SOL directly to WSOL ATA address
+    // WSOL token accounts are special SPL token accounts that can hold native SOL (lamports).
+    // When you send native SOL to a WSOL token account via system_instruction::transfer,
+    // the lamports are deposited into that account, but the token amount field is not
+    // automatically updated. That's why sync_native is needed.
     let transfer_ix = system_instruction::transfer(wallet, wsol_ata, amount);
     instructions.push(transfer_ix);
     
-    // Step 2: Sync native SOL to WSOL tokens
-    // SPL Token SyncNative instruction converts native SOL in the account to WSOL tokens
+    // Step 2: Sync native SOL (lamports) to WSOL tokens
+    // SPL Token SyncNative instruction reads the native SOL balance (lamports) in the
+    // WSOL ATA and updates the token account's amount field accordingly.
+    // This converts the native SOL (lamports) that was transferred in step 1 to WSOL tokens.
     // Instruction discriminator: 17 (SyncNative)
+    // 
+    // ⚠️ IMPORTANT: sync_native does NOT transfer SOL - it only syncs the token amount
+    // field with the lamports already in the account. If the WSOL ATA has no lamports
+    // (no native SOL was transferred), sync_native will result in 0 WSOL tokens.
+    // Both the transfer AND sync_native are required for wrapping to work.
     let sync_native_ix = token_instruction::sync_native(
         &spl_token::id(),
         wsol_ata,
