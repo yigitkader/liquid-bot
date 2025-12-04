@@ -87,26 +87,28 @@ impl ProfitCalculator {
 
         let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
         
-        // ✅ FIX: Use reasonable estimate when hop_count is None
-        // Problem: Previous code used 3 hops for non-stablecoin pairs, which is too conservative
-        //   This overestimates DEX fees (0.2% × 3 = 0.6%) and causes profitable opportunities to be rejected
-        //   Example: USDC → SOL swap is typically 1 hop, but 3 hop assumption adds $60 unnecessary cost on $10k
-        // Solution: Use more realistic estimate based on pair type
-        //   - Stablecoin pairs: 1 hop (direct swap)
-        //   - Regular pairs: 2 hops (most swaps are 1-2 hops, 3+ hops are rare)
+        // ✅ FIX: Use conservative estimate when hop_count is None (Jupiter API failed)
+        // Problem: Previous code used 2 hops for non-stablecoin pairs, but 3-hop swaps exist (e.g., ETH → SOL → USDC)
+        //   This underestimates DEX fees (2 hop × 0.2% = 0.4% vs actual 3 hop × 0.2% = 0.6%)
+        //   Example: $10,000 swap with 3 hops but estimated as 2 hops = $20 fee underestimation
+        // Solution: Use conservative estimate to avoid fee underestimation
+        //   - Stablecoin pairs: 1 hop (direct swap, very reliable)
+        //   - Regular pairs: 3 hops (conservative - covers most cases including 3-hop swaps)
+        //   Note: This may slightly overestimate fees for 1-2 hop swaps, but prevents losses from 3-hop swaps
         let hop_count = if let Some(count) = hop_count {
             count
         } else {
-            // Realistic estimate: stablecoin pairs typically 1 hop, regular pairs typically 1-2 hops
+            // Conservative estimate: stablecoin pairs typically 1 hop, regular pairs use 3 hops (safe default)
             let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
             let estimated_hop_count = if is_stablecoin_pair {
-                1 // Stablecoin pairs usually direct swap (USDC ↔ USDT)
+                1 // Stablecoin pairs usually direct swap (USDC ↔ USDT) - very reliable
             } else {
-                2 // Regular pairs: Most swaps are 1-2 hops (e.g., USDC → SOL, SOL → ETH)
-                  // 3+ hops are rare and would be caught by slippage validation
+                3 // Regular pairs: Use 3 hops as conservative default to cover multi-hop swaps
+                  // Examples: ETH → SOL → USDC (2 hops), ETH → SOL → USDC → USDT (3 hops)
+                  // This prevents fee underestimation which could cause losses
             };
             log::warn!(
-                "ProfitCalculator: hop_count is None for {} -> {}, using realistic estimate: {} hops (stablecoin_pair: {})",
+                "ProfitCalculator: hop_count is None for {} -> {}, using conservative estimate: {} hops (stablecoin_pair: {})",
                 opp.debt_mint,
                 opp.collateral_mint,
                 estimated_hop_count,

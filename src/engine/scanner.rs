@@ -307,7 +307,9 @@ impl Scanner {
         let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
         let mut use_websocket = true;
         let mut last_reconnect_attempt = Instant::now();
+        let mut last_failed_subscription_check = Instant::now();
         const RECONNECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+        const FAILED_SUBSCRIPTION_CHECK_INTERVAL: Duration = Duration::from_secs(30); // Check every 30 seconds
 
         log::info!(
             "Starting monitoring for program: {} (WebSocket mode)",
@@ -335,6 +337,64 @@ impl Scanner {
         };
 
         loop {
+            // ✅ FIX: Periodically check for failed subscriptions and restart if needed
+            // This prevents data loss when subscriptions fail during WebSocket reconnect
+            if last_failed_subscription_check.elapsed() >= FAILED_SUBSCRIPTION_CHECK_INTERVAL {
+                last_failed_subscription_check = Instant::now();
+                let failed_subscriptions = self.ws.get_failed_subscriptions().await;
+                if !failed_subscriptions.is_empty() {
+                    log::warn!(
+                        "⚠️  Found {} failed subscription(s) - restarting scanner to restore subscriptions",
+                        failed_subscriptions.len()
+                    );
+                    
+                    // Try to restore failed subscriptions
+                    let mut restored_count = 0;
+                    for info in &failed_subscriptions {
+                        let restore_result = match &info.subscription_type {
+                            crate::blockchain::ws_client::SubscriptionType::Program(program_id) => {
+                                self.ws.subscribe_program(program_id).await
+                            }
+                            crate::blockchain::ws_client::SubscriptionType::Account(pubkey) => {
+                                self.ws.subscribe_account(pubkey).await
+                            }
+                            crate::blockchain::ws_client::SubscriptionType::Slot => {
+                                self.ws.subscribe_slot().await
+                            }
+                        };
+                        
+                        match restore_result {
+                            Ok(new_id) => {
+                                restored_count += 1;
+                                log::info!("✅ Restored failed subscription: new_id={}", new_id);
+                            }
+                            Err(e) => {
+                                log::warn!("⚠️  Failed to restore subscription: {}", e);
+                            }
+                        }
+                    }
+                    
+                    if restored_count == failed_subscriptions.len() {
+                        // All subscriptions restored - clear failed list
+                        self.ws.clear_failed_subscriptions().await;
+                        log::info!("✅ All {} failed subscription(s) restored successfully", restored_count);
+                    } else {
+                        log::warn!(
+                            "⚠️  Only {}/{} subscription(s) restored. {} still failed.",
+                            restored_count,
+                            failed_subscriptions.len(),
+                            failed_subscriptions.len() - restored_count
+                        );
+                        // Publish event to notify other components
+                        if let Err(e) = self.event_bus.publish(Event::SubscriptionLost {
+                            count: failed_subscriptions.len() - restored_count,
+                        }) {
+                            log::error!("Scanner: Failed to publish SubscriptionLost event: {}", e);
+                        }
+                    }
+                }
+            }
+            
             if use_websocket {
                 // WebSocket mode: Real-time updates
                 if let Some(update) = self.ws.listen().await {

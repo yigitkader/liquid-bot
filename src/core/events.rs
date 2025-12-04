@@ -13,6 +13,10 @@ pub enum Event {
 
     TransactionSent { signature: String },
     TransactionConfirmed { signature: String, success: bool },
+    
+    // ✅ FIX: Subscription lost event to notify scanner to restart
+    // This prevents data loss when WebSocket subscriptions fail during reconnect
+    SubscriptionLost { count: usize },
 }
 
 #[derive(Clone)]

@@ -67,6 +67,7 @@ pub struct Config {
     pub btc_mint: Option<String>,
     pub default_pyth_oracle_mappings_json: Option<String>,
     pub default_switchboard_oracle_mappings_json: Option<String>,
+    pub unwrap_wsol_after_liquidation: bool, // Optional: Unwrap WSOL to native SOL after liquidation
 }
 
 impl Config {
@@ -296,6 +297,10 @@ impl Config {
                 "DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON",
             )
             .ok(),
+            unwrap_wsol_after_liquidation: env::var("UNWRAP_WSOL_AFTER_LIQUIDATION")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false), // Default: false (optional feature)
         };
 
         config.validate()?;

@@ -67,6 +67,12 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
     // ✅ CRITICAL FIX: Check if already signed - if valid signature exists, skip signing
     // This prevents double-signing which can cause signature mismatch errors
     // Early return guarantees that code after this block will NOT execute if already signed
+    //
+    // SAFETY FOR JITO BUNDLES:
+    // - Jito bundles contain multiple transactions (tip tx + main tx)
+    // - Each transaction is signed separately - this is CORRECT and SAFE
+    // - The early return here prevents accidentally signing the SAME transaction twice
+    // - Different transactions in a bundle are different Transaction objects, so no conflict
     if signer_index < tx.signatures.len() {
         let existing_sig = &tx.signatures[signer_index];
         let is_signed = *existing_sig != solana_sdk::signature::Signature::default();
@@ -82,6 +88,10 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
             );
             // ✅ EARLY RETURN: Code after this point will NOT execute
             // This guarantees that tx.sign() will NOT be called if transaction is already signed
+            // This is SAFE for Jito bundles because:
+            //   1. Each transaction in bundle is signed once (tip tx, main tx)
+            //   2. They are different Transaction objects, so signing each once is correct
+            //   3. This check prevents accidentally signing the SAME transaction object twice
             return Ok(());
         }
     }

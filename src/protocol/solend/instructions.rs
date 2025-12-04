@@ -71,9 +71,20 @@ impl ReserveCache {
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
                 return Ok(*reserve);
             }
+            
+            // ✅ FIX: If cache is already initialized, all reserves have been fetched
+            // If mint is not in cache, it doesn't exist - return error immediately
+            // This prevents duplicate RPC calls when cache is already populated
+            if inner.initialized {
+                return Err(anyhow::anyhow!(
+                    "Reserve not found for mint: {} (cache is initialized, mint does not exist)",
+                    mint
+                ));
+            }
         }
 
         // Fetch from RPC (only one thread will do this)
+        // Only reach here if cache is not initialized yet
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         
         // ✅ FIX: Update cache and check again after extend to avoid race condition
@@ -482,35 +493,35 @@ pub async fn build_liquidate_obligation_ix(
     // ✅ FIX: Add clock sysvar (required by Solend liquidateObligation instruction)
     let clock_sysvar = solana_sdk::sysvar::clock::id();
 
-    // ✅ FIX: Correct account order for Solend liquidateObligation instruction
-    // According to Solend protocol specification, the accounts must be in this exact order:
-    // 1. source_liquidity (liquidator's token account for debt)
-    // 2. destination_collateral (liquidator's token account for collateral)
-    // 3. repay_reserve (debt reserve - the reserve being repaid)
-    // 4. repay_reserve_liquidity_supply (debt reserve liquidity supply)
-    // 5. withdraw_reserve (collateral reserve - the reserve being withdrawn from)
-    // 6. withdraw_reserve_collateral_mint (collateral reserve collateral mint)
-    // 7. withdraw_reserve_liquidity_supply (collateral reserve liquidity supply)
-    // 8. obligation (the obligation being liquidated)
-    // 9. lending_market
-    // 10. lending_market_authority
-    // 11. transfer_authority (liquidator - signer)
-    // 12. clock_sysvar
-    // 13. token_program
+    // ✅ FIX: Account order matches IDL exactly (idl/solend.json)
+    // IDL order for liquidateObligation instruction:
+    // 1. sourceLiquidity (isMut: true, isSigner: false)
+    // 2. destinationCollateral (isMut: true, isSigner: false)
+    // 3. repayReserve (isMut: true, isSigner: false)
+    // 4. repayReserveLiquiditySupply (isMut: true, isSigner: false)
+    // 5. withdrawReserve (isMut: true, isSigner: false)
+    // 6. withdrawReserveCollateralMint (isMut: true, isSigner: false)
+    // 7. withdrawReserveLiquiditySupply (isMut: true, isSigner: false)
+    // 8. obligation (isMut: true, isSigner: false)
+    // 9. lendingMarket (isMut: false, isSigner: false)
+    // 10. lendingMarketAuthority (isMut: false, isSigner: false)
+    // 11. transferAuthority (isMut: false, isSigner: true)
+    // 12. clockSysvar (isMut: false, isSigner: false)
+    // 13. tokenProgram (isMut: false, isSigner: false)
     let accounts = vec![
-        AccountMeta::new(source_liquidity, false),                          // 1. source_liquidity
-        AccountMeta::new(destination_collateral, false),                    // 2. destination_collateral
-        AccountMeta::new(debt_reserve, false),                              // 3. repay_reserve
-        AccountMeta::new(debt_reserve_liquidity_supply, false),             // 4. repay_reserve_liquidity_supply
-        AccountMeta::new(collateral_reserve, false),                        // 5. withdraw_reserve
-        AccountMeta::new(collateral_reserve_collateral_mint, false),        // 6. withdraw_reserve_collateral_mint
-        AccountMeta::new(collateral_reserve_liquidity_supply, false),       // 7. withdraw_reserve_liquidity_supply
-        AccountMeta::new(obligation_address, false),                       // 8. obligation
-        AccountMeta::new_readonly(lending_market, false),                   // 9. lending_market
-        AccountMeta::new_readonly(lending_market_authority, false),         // 10. lending_market_authority
-        AccountMeta::new_readonly(*liquidator, true),                       // 11. transfer_authority (liquidator - signer)
-        AccountMeta::new_readonly(clock_sysvar, false),                     // 12. clock_sysvar
-        AccountMeta::new_readonly(token_program, false),                    // 13. token_program
+        AccountMeta::new(source_liquidity, false),                          // 1. sourceLiquidity
+        AccountMeta::new(destination_collateral, false),                    // 2. destinationCollateral
+        AccountMeta::new(debt_reserve, false),                              // 3. repayReserve
+        AccountMeta::new(debt_reserve_liquidity_supply, false),             // 4. repayReserveLiquiditySupply
+        AccountMeta::new(collateral_reserve, false),                        // 5. withdrawReserve
+        AccountMeta::new(collateral_reserve_collateral_mint, false),        // 6. withdrawReserveCollateralMint
+        AccountMeta::new(collateral_reserve_liquidity_supply, false),       // 7. withdrawReserveLiquiditySupply
+        AccountMeta::new(obligation_address, false),                        // 8. obligation
+        AccountMeta::new_readonly(lending_market, false),                   // 9. lendingMarket
+        AccountMeta::new_readonly(lending_market_authority, false),         // 10. lendingMarketAuthority
+        AccountMeta::new_readonly(*liquidator, true),                        // 11. transferAuthority (signer)
+        AccountMeta::new_readonly(clock_sysvar, false),                     // 12. clockSysvar
+        AccountMeta::new_readonly(token_program, false),                     // 13. tokenProgram
     ];
 
     let discriminator = get_instruction_discriminator();
@@ -523,4 +534,73 @@ pub async fn build_liquidate_obligation_ix(
         accounts,
         data,
     })
+}
+
+/// WSOL mint address (So11111111111111111111111111111111111111112)
+pub fn get_wsol_mint() -> Pubkey {
+    Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .expect("Invalid WSOL mint address")
+}
+
+/// Check if a mint is WSOL
+pub fn is_wsol_mint(mint: &Pubkey) -> bool {
+    *mint == get_wsol_mint()
+}
+
+/// Build instruction to wrap native SOL to WSOL
+/// This creates a WSOL ATA (if needed) and transfers native SOL to it, then syncs it
+/// 
+/// Steps:
+/// 1. Transfer native SOL to WSOL ATA (System Program transfer)
+/// 2. Sync native SOL in WSOL ATA to WSOL tokens (SPL Token SyncNative)
+/// 
+/// Note: ATA creation should be handled separately if needed
+pub fn build_wrap_sol_instruction(
+    wallet: &Pubkey,
+    wsol_ata: &Pubkey,
+    amount: u64,
+) -> Result<Vec<Instruction>> {
+    use solana_sdk::system_instruction;
+    use spl_token::instruction as token_instruction;
+    
+    let mut instructions = Vec::new();
+    
+    // Step 1: Transfer native SOL to WSOL ATA
+    // This deposits native SOL into the WSOL token account
+    let transfer_ix = system_instruction::transfer(wallet, wsol_ata, amount);
+    instructions.push(transfer_ix);
+    
+    // Step 2: Sync native SOL to WSOL tokens
+    // SPL Token SyncNative instruction converts native SOL in the account to WSOL tokens
+    // Instruction discriminator: 17 (SyncNative)
+    let sync_native_ix = token_instruction::sync_native(
+        &spl_token::id(),
+        wsol_ata,
+    )?;
+    instructions.push(sync_native_ix);
+    
+    Ok(instructions)
+}
+
+/// Build instruction to unwrap WSOL to native SOL
+/// This closes the WSOL ATA and returns native SOL to the wallet
+/// 
+/// Note: This will fail if the ATA has a balance > 0 (must transfer out first)
+pub fn build_unwrap_sol_instruction(
+    wallet: &Pubkey,
+    wsol_ata: &Pubkey,
+) -> Result<Instruction> {
+    use spl_token::instruction as token_instruction;
+    
+    // CloseAccount instruction closes the WSOL ATA and returns native SOL to the wallet
+    // Instruction discriminator: 9 (CloseAccount)
+    let close_ix = token_instruction::close_account(
+        &spl_token::id(),
+        wsol_ata,      // Account to close
+        wallet,        // Destination for remaining lamports
+        wallet,        // Owner/authority
+        &[],           // Signers (wallet is already a signer)
+    )?;
+    
+    Ok(close_ix)
 }

@@ -514,9 +514,13 @@ impl Validator {
             }
 
             // ✅ FIX: Validate confidence-to-price ratio is reasonable
-            // If confidence is > 50% of price, it suggests unreliable oracle data
-            // Example: price=$100, confidence=$60 → 60% uncertainty is too high for reliable liquidation
-            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.5; // 50%
+            // Problem: Previous code allowed 50% confidence ratio, which is too high
+            //   Example: price=$100, confidence=$50 → 50% uncertainty is too high for reliable liquidation
+            //   Pyth oracle can return 50% confidence → price is unreliable → wrong liquidation decisions
+            // Solution: Use stricter threshold (10%) to ensure oracle data is reliable
+            //   Example: price=$100, confidence=$10 → 10% uncertainty is acceptable
+            //   Example: price=$100, confidence=$15 → 15% uncertainty is rejected (too high)
+            const MAX_CONFIDENCE_TO_PRICE_RATIO: f64 = 0.10; // 10% max uncertainty
             if price_data.price > 0.0 {
                 let confidence_ratio = price_data.confidence / price_data.price;
                 if confidence_ratio > MAX_CONFIDENCE_TO_PRICE_RATIO {

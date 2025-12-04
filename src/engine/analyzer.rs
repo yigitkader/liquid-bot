@@ -386,58 +386,48 @@ impl Analyzer {
             collateral_mint,
         };
 
-        // ✅ FIX: Determine hop_count with conservative fallback
-        // If Jupiter API fails or is disabled, use conservative estimate based on pair type
+        // ✅ FIX: Get hop_count from slippage estimator (handles fallback internally)
+        // SlippageEstimator now handles all fallback logic consistently:
+        //   - If Jupiter API succeeds: returns actual hop_count from route
+        //   - If Jupiter API fails: uses conservative fallback (1 hop for stablecoin pairs, 3 hops for regular pairs)
+        //   - If Jupiter API disabled: uses conservative fallback
+        // This ensures single source of truth for fallback logic
         let hop_count = if debt_mint != collateral_mint {
-            if config.use_jupiter_api {
-                use crate::strategy::slippage_estimator::SlippageEstimator;
-                let estimator = SlippageEstimator::new(config.clone());
-                // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
-                let amount = 1_000_000u64;
-                match estimator
-                    .estimate_dex_slippage_with_route(debt_mint, collateral_mint, amount)
-                    .await
-                {
-                    Ok((_slippage, hop_count)) => {
-                        log::debug!(
-                            "Analyzer: Got hop_count={} from Jupiter API for swap {} -> {}",
-                            hop_count,
-                            debt_mint,
-                            collateral_mint
-                        );
-                        Some(hop_count)
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Analyzer: Failed to get hop count from Jupiter API: {} - using conservative estimate",
-                            e
-                        );
-                        // ✅ Fallback: Conservative estimate based on pair type
-                        // Stablecoin pairs typically need 1 hop, others may need 2+ hops
-                        let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&debt_mint, &collateral_mint);
-                        let estimated_hop_count = if is_stablecoin_pair { 1 } else { 2 };
-                        log::debug!(
-                            "Analyzer: Using conservative hop_count={} for {} -> {} (stablecoin_pair={})",
-                            estimated_hop_count,
-                            debt_mint,
-                            collateral_mint,
-                            is_stablecoin_pair
-                        );
-                        Some(estimated_hop_count)
-                    }
+            use crate::strategy::slippage_estimator::SlippageEstimator;
+            let estimator = SlippageEstimator::new(config.clone());
+            // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
+            let amount = 1_000_000u64;
+            match estimator
+                .estimate_dex_slippage_with_route(debt_mint, collateral_mint, amount)
+                .await
+            {
+                Ok((_slippage, hop_count)) => {
+                    log::debug!(
+                        "Analyzer: Got hop_count={} for swap {} -> {}",
+                        hop_count,
+                        debt_mint,
+                        collateral_mint
+                    );
+                    Some(hop_count)
                 }
-            } else {
-                // ✅ Jupiter API disabled - use conservative estimate
-                let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&debt_mint, &collateral_mint);
-                let estimated_hop_count = if is_stablecoin_pair { 1 } else { 2 };
-                log::debug!(
-                    "Analyzer: Jupiter API disabled, using conservative hop_count={} for {} -> {} (stablecoin_pair={})",
-                    estimated_hop_count,
-                    debt_mint,
-                    collateral_mint,
-                    is_stablecoin_pair
-                );
-                Some(estimated_hop_count)
+                Err(e) => {
+                    // This should rarely happen now since slippage_estimator handles fallback
+                    // But if it does, log error and use conservative default
+                    log::error!(
+                        "Analyzer: Failed to get hop count from slippage estimator: {} - using conservative default",
+                        e
+                    );
+                    let is_stablecoin_pair = profit_calc.is_stablecoin_pair(&debt_mint, &collateral_mint);
+                    let estimated_hop_count = if is_stablecoin_pair { 1 } else { 3 };
+                    log::debug!(
+                        "Analyzer: Using emergency fallback hop_count={} for {} -> {} (stablecoin_pair={})",
+                        estimated_hop_count,
+                        debt_mint,
+                        collateral_mint,
+                        is_stablecoin_pair
+                    );
+                    Some(estimated_hop_count)
+                }
             }
         } else {
             // No swap needed (same mint)

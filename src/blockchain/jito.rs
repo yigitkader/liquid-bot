@@ -10,6 +10,8 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 
+use crate::blockchain::transaction::sign_transaction;
+
 #[derive(Debug, Clone)]
 pub struct JitoBundle {
     transactions: Vec<Transaction>,
@@ -153,7 +155,12 @@ impl JitoClient {
 
         let mut tip_tx = Transaction::new_with_payer(&[tip_ix], Some(&wallet_pubkey));
         tip_tx.message.recent_blockhash = blockhash;
-        tip_tx.sign(&[wallet.as_ref()], blockhash);
+        
+        // ✅ FIX: Use sign_transaction instead of direct tx.sign() to prevent double-signing
+        // This ensures consistent signing behavior and prevents accidental double-signing
+        // sign_transaction checks if transaction is already signed and skips if so
+        sign_transaction(&mut tip_tx, wallet.as_ref())
+            .context("Failed to sign Jito tip transaction")?;
 
         bundle.transactions.insert(0, tip_tx);
 

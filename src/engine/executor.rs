@@ -415,49 +415,55 @@ impl Executor {
         use solana_sdk::signature::Signer;
 
         let wallet_pubkey = self.wallet.pubkey();
-        let liq_ix = self
-            .protocol
-            .build_liquidation_ix(&opp, &wallet_pubkey, Some(Arc::clone(&self.rpc)))
-            .await?;
-
+        
+        // ✅ FIX: Check if debt_mint is WSOL - if so, we need to wrap native SOL to WSOL
+        use crate::protocol::solend::instructions::{is_wsol_mint, build_wrap_sol_instruction};
+        let source_liquidity_ata = get_associated_token_address(&wallet_pubkey, &opp.debt_mint, Some(&self.config))
+            .context("Failed to derive source liquidity ATA")?;
+        
         let destination_collateral =
             get_associated_token_address(&wallet_pubkey, &opp.collateral_mint, Some(&self.config))
                 .context("Failed to derive destination collateral ATA")?;
-
-        let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
-        tx_builder.add_compute_budget(200_000, 1_000);
+        
+        // ✅ FIX: Create ATAs in separate transactions to avoid compute unit limit
+        // Problem: ATA creation (~15k CU each) + liquidation instruction can exceed 200k CU limit
+        // Solution: Create ATAs first in separate transaction(s), then send liquidation transaction
+        // This ensures liquidation transaction stays within compute unit limits
         let mut cache = self.ata_cache.write().await;
-
-        // Check cache: if entry exists and is verified, skip RPC check
-        let needs_rpc_check = match cache.get(&destination_collateral) {
-            Some(entry) => {
-                // Entry exists - check if it's verified
-                if entry.verified {
-                    // ✅ Verified entry: ATA exists on-chain, skip create_ata instruction
-                    log::debug!(
-                        "Executor: ATA {} found in cache (verified: true), skipping create_ata instruction",
-                        destination_collateral
-                    );
-                    false // No RPC check needed
-                } else {
-                    // ✅ Unverified entry: previous check failed (timeout/error), retry RPC check
-                    log::debug!(
-                        "Executor: ATA {} found in cache but not verified (verified: false), re-checking on-chain existence...",
-                        destination_collateral
-                    );
-                    true // Need RPC check to verify
+        
+        // Check and create source liquidity ATA (for WSOL) if needed
+        if is_wsol_mint(&opp.debt_mint) {
+            let needs_wsol_ata = match cache.get(&source_liquidity_ata) {
+                Some(entry) => !entry.verified,
+                None => true,
+            };
+            
+            if needs_wsol_ata {
+                match self.rpc.get_account(&source_liquidity_ata).await {
+                    Ok(_) => {
+                        cache.insert(source_liquidity_ata, AtaCacheEntry {
+                            timestamp: Instant::now(),
+                            verified: true,
+                        });
+                    }
+                    Err(_) => {
+                        // WSOL ATA doesn't exist - create in separate transaction
+                        log::info!(
+                            "Executor: WSOL ATA {} doesn't exist, creating in separate transaction",
+                            source_liquidity_ata
+                        );
+                        self.create_ata_separate_tx(&opp.debt_mint, &source_liquidity_ata, &mut cache).await?;
+                    }
                 }
             }
-            None => {
-                // Cache miss - check RPC to see if ATA actually exists
-                log::debug!(
-                    "Executor: Cache miss for ATA {}, checking on-chain existence...",
-                    destination_collateral
-                );
-                true // Need RPC check
-            }
+        }
+        
+        // Check and create destination collateral ATA if needed
+        let needs_rpc_check = match cache.get(&destination_collateral) {
+            Some(entry) => !entry.verified,
+            None => true,
         };
-
+        
         if needs_rpc_check {
             match self.rpc.get_account(&destination_collateral).await {
                 Ok(_) => {
@@ -465,69 +471,131 @@ impl Executor {
                         timestamp: Instant::now(),
                         verified: true,
                     });
-                    log::debug!(
-                        "Executor: ATA {} exists on-chain, added to cache (verified: true), skipping create_ata instruction",
-                        destination_collateral
-                    );
                 }
                 Err(e) => {
                     let error_str = e.to_string().to_lowercase();
-                    if error_str.contains("accountnotfound")
-                        || error_str.contains("account not found")
-                    {
-                        // ✅ ATA doesn't exist - add instruction
-                        log::debug!(
-                            "Executor: ATA {} doesn't exist, adding create_ata instruction",
+                    if error_str.contains("accountnotfound") || error_str.contains("account not found") {
+                        // ATA doesn't exist - create in separate transaction
+                        log::info!(
+                            "Executor: Destination collateral ATA {} doesn't exist, creating in separate transaction",
                             destination_collateral
                         );
-                        let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint).await?;
-                        tx_builder.add_instruction(create_ata_ix);
-
+                        self.create_ata_separate_tx(&opp.collateral_mint, &destination_collateral, &mut cache).await?;
+                    } else {
+                        // For other errors (timeout, etc.), add to liquidation tx as fallback
+                        // This is safe because create_ata is idempotent
+                        log::warn!(
+                            "Executor: Failed to check ATA {} existence: {}. Will add to liquidation transaction as fallback",
+                            destination_collateral,
+                            e
+                        );
                         cache.insert(destination_collateral, AtaCacheEntry {
                             timestamp: Instant::now(),
-                            verified: false, // Not verified yet, will be verified after transaction
+                            verified: false,
                         });
-                    } else {
-                        let error_str = e.to_string().to_lowercase();
-                        let is_timeout =
-                            error_str.contains("timeout") || error_str.contains("timed out");
-
-                        if is_timeout {
-                            // ✅ FIX: Cache pessimistically on timeout to prevent repeated timeouts
-                            // Problem: Without caching, next opportunity will retry RPC → same timeout → double instruction → transaction failure
-                            // Solution: Cache as missing (verified: false) to prevent repeated RPC calls
-                            log::warn!(
-                                "Executor: RPC timeout checking ATA existence for {}. Adding create_ata instruction and caching pessimistically (assuming ATA missing to prevent repeated timeouts)",
-                                destination_collateral
-                            );
-                            let create_ata_ix =
-                                self.create_ata_instruction(&opp.collateral_mint).await?;
-                            tx_builder.add_instruction(create_ata_ix);
-                            // Cache pessimistically: assume ATA missing to prevent repeated RPC calls on consecutive timeouts
-                            cache.insert(destination_collateral, AtaCacheEntry {
-                                timestamp: Instant::now(),
-                                verified: false, // Not verified (timeout), but cached to prevent retry
-                            });
-                        } else {
-                            log::warn!(
-                                "Executor: Failed to check ATA existence for {}: {}. Adding create_ata instruction anyway (idempotent)",
-                                destination_collateral,
-                                e
-                            );
-                            let create_ata_ix =
-                                self.create_ata_instruction(&opp.collateral_mint).await?;
-                            tx_builder.add_instruction(create_ata_ix);
-                            cache.insert(destination_collateral, AtaCacheEntry {
-                                timestamp: Instant::now(),
-                                verified: false,
-                            });
-                        }
                     }
                 }
             }
         }
+        
+        // Now build liquidation transaction (without ATA creation instructions)
+        let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
+        tx_builder.add_compute_budget(200_000, 1_000);
+        
+        // ✅ FIX: WSOL wrap mechanism - if debt_mint is WSOL, wrap native SOL to WSOL
+        // Note: WSOL ATA should already be created above in separate transaction
+        if is_wsol_mint(&opp.debt_mint) {
+            // Check if WSOL ATA exists and has sufficient balance
+            let wsol_balance = match self.rpc.get_account(&source_liquidity_ata).await {
+                Ok(acc) => {
+                    if acc.data.len() >= 72 {
+                        let balance_bytes: [u8; 8] = acc.data[64..72]
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance"))?;
+                        u64::from_le_bytes(balance_bytes)
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0, // ATA doesn't exist or error - assume 0 balance
+            };
+            
+            // Check if we need to wrap more SOL
+            let needed_wsol = opp.max_liquidatable;
+            if wsol_balance < needed_wsol {
+                let wrap_amount = needed_wsol.saturating_sub(wsol_balance);
+                
+                // Add WSOL wrap instructions (transfer + sync_native)
+                let wrap_instructions = build_wrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata, wrap_amount)
+                    .context("Failed to build WSOL wrap instructions")?;
+                for wrap_ix in wrap_instructions {
+                    tx_builder.add_instruction(wrap_ix);
+                }
+                
+                log::info!(
+                    "Executor: Wrapping {} lamports of native SOL to WSOL (current WSOL balance: {}, needed: {})",
+                    wrap_amount,
+                    wsol_balance,
+                    needed_wsol
+                );
+            } else {
+                log::debug!(
+                    "Executor: Sufficient WSOL balance ({} >= {}), no wrap needed",
+                    wsol_balance,
+                    needed_wsol
+                );
+            }
+        }
+        
+        // Build liquidation instruction
+        let liq_ix = self
+            .protocol
+            .build_liquidation_ix(&opp, &wallet_pubkey, Some(Arc::clone(&self.rpc)))
+            .await?;
+        
+        // ✅ FIX: Only add create_ata instruction as fallback if ATA wasn't verified
+        // This should rarely happen now since we create ATAs in separate transactions above
+        if let Some(entry) = cache.get(&destination_collateral) {
+            if !entry.verified {
+                // ATA creation failed or wasn't verified - add as fallback (idempotent)
+                log::warn!(
+                    "Executor: Adding create_ata instruction as fallback for {} (not verified)",
+                    destination_collateral
+                );
+                let create_ata_ix = self.create_ata_instruction(&opp.collateral_mint).await?;
+                tx_builder.add_instruction(create_ata_ix);
+            }
+        }
 
         tx_builder.add_instruction(liq_ix);
+        
+        // ✅ OPTIONAL: WSOL unwrap mechanism after liquidation
+        // If debt_mint is WSOL and unwrap_wsol_after_liquidation is enabled,
+        // add unwrap instruction to convert remaining WSOL back to native SOL
+        // Note: This is optional - if unwrap fails, liquidation still succeeds
+        if self.config.unwrap_wsol_after_liquidation && is_wsol_mint(&opp.debt_mint) {
+            use crate::protocol::solend::instructions::build_unwrap_sol_instruction;
+            
+            // Add unwrap instruction to close WSOL ATA and return native SOL to wallet
+            // This will only succeed if WSOL ATA has zero token balance after liquidation
+            // If WSOL balance > 0, unwrap will fail but liquidation still succeeds
+            match build_unwrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata) {
+                Ok(unwrap_ix) => {
+                    tx_builder.add_instruction(unwrap_ix);
+                    log::debug!(
+                        "Executor: Added WSOL unwrap instruction after liquidation (WSOL ATA: {})",
+                        source_liquidity_ata
+                    );
+                }
+                Err(e) => {
+                    // Log warning but don't fail - unwrap is optional
+                    log::warn!(
+                        "Executor: Failed to build WSOL unwrap instruction (optional): {}",
+                        e
+                    );
+                }
+            }
+        }
 
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
@@ -556,6 +624,96 @@ impl Executor {
         })?;
 
         Ok(signature)
+    }
+
+    /// Create ATA in a separate transaction to avoid compute unit limit issues
+    /// This ensures liquidation transaction stays within 200k CU limit
+    async fn create_ata_separate_tx(
+        &self,
+        mint: &Pubkey,
+        ata: &Pubkey,
+        cache: &mut HashMap<Pubkey, AtaCacheEntry>,
+    ) -> Result<()> {
+        log::info!(
+            "Executor: Creating ATA {} for mint {} in separate transaction",
+            ata,
+            mint
+        );
+        
+        let create_ata_ix = self.create_ata_instruction(mint).await?;
+        let mut ata_tx_builder = TransactionBuilder::new(self.wallet.pubkey());
+        ata_tx_builder.add_compute_budget(200_000, 1_000);
+        ata_tx_builder.add_instruction(create_ata_ix);
+        
+        // Send ATA creation transaction
+        let ata_sig = if self.config.dry_run {
+            log::info!("DRY RUN: Would send ATA creation transaction");
+            return Ok(()); // Skip in dry run mode
+        } else if self.use_jito {
+            if let Some(ref jito) = self.jito_client {
+                self.send_via_jito_with_retry(&ata_tx_builder, jito).await?
+            } else {
+                self.send_with_retry(&ata_tx_builder).await?
+            }
+        } else {
+            self.send_with_retry(&ata_tx_builder).await?
+        };
+        
+        log::info!(
+            "Executor: ATA creation transaction sent: {} (waiting for confirmation...)",
+            ata_sig
+        );
+        
+        // Wait for ATA to be created (with retries)
+        const MAX_VERIFICATION_ATTEMPTS: u32 = 10;
+        const VERIFICATION_DELAY_MS: u64 = 500;
+        
+        for attempt in 1..=MAX_VERIFICATION_ATTEMPTS {
+            match self.rpc.get_account(ata).await {
+                Ok(_) => {
+                    log::info!(
+                        "Executor: ATA {} verified after {} attempt(s)",
+                        ata,
+                        attempt
+                    );
+                    cache.insert(*ata, AtaCacheEntry {
+                        timestamp: Instant::now(),
+                        verified: true,
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt < MAX_VERIFICATION_ATTEMPTS {
+                        log::debug!(
+                            "Executor: ATA {} verification attempt {} failed, retrying...: {}",
+                            ata,
+                            attempt,
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_millis(VERIFICATION_DELAY_MS)).await;
+                    } else {
+                        log::warn!(
+                            "Executor: ATA {} verification failed after {} attempts: {}",
+                            ata,
+                            MAX_VERIFICATION_ATTEMPTS,
+                            e
+                        );
+                        log::warn!(
+                            "   Transaction was sent: {}, ATA may still be creating. Will add to liquidation transaction as fallback.",
+                            ata_sig
+                        );
+                        // Cache as unverified - will add to liquidation tx as fallback
+                        cache.insert(*ata, AtaCacheEntry {
+                            timestamp: Instant::now(),
+                            verified: false,
+                        });
+                        return Ok(()); // Don't fail - fallback will handle it
+                    }
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     async fn create_ata_instruction(

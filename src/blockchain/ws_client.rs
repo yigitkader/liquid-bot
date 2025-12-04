@@ -28,15 +28,18 @@ pub struct WsClient {
     subscriptions: Arc<Mutex<HashMap<u64, SubscriptionInfo>>>,
     next_request_id: Arc<Mutex<u64>>,
     account_update_tx: broadcast::Sender<AccountUpdate>,
+    // ✅ FIX: Persistent list of failed subscriptions to prevent data loss
+    // Scanner can check this list and restart if needed
+    failed_subscriptions: Arc<Mutex<Vec<SubscriptionInfo>>>,
 }
 
 #[derive(Debug, Clone)]
-struct SubscriptionInfo {
-    subscription_type: SubscriptionType,
+pub struct SubscriptionInfo {
+    pub subscription_type: SubscriptionType,
 }
 
 #[derive(Debug, Clone)]
-enum SubscriptionType {
+pub enum SubscriptionType {
     Program(Pubkey),
     Account(Pubkey),
     Slot,
@@ -53,7 +56,21 @@ impl WsClient {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: Arc::new(Mutex::new(1)),
             account_update_tx: tx,
+            failed_subscriptions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+    
+    /// Get list of failed subscriptions that need to be restored
+    /// Scanner should check this and restart if subscriptions are lost
+    pub async fn get_failed_subscriptions(&self) -> Vec<SubscriptionInfo> {
+        let failed = self.failed_subscriptions.lock().await;
+        failed.clone()
+    }
+    
+    /// Clear failed subscriptions after they've been restored
+    pub async fn clear_failed_subscriptions(&self) {
+        let mut failed = self.failed_subscriptions.lock().await;
+        failed.clear();
     }
 
     pub fn subscribe_account_updates(&self) -> broadcast::Receiver<AccountUpdate> {
@@ -472,13 +489,30 @@ impl WsClient {
                             }
                             Err(e) => {
                                 log::error!(
-                                    "❌ Retry failed for {}: {} - subscription lost, will need manual resubscription",
+                                    "❌ Retry failed for {}: {} - subscription lost, adding to failed list",
                                     old_id,
                                     e
                                 );
-                                // ✅ FIX: Don't restore old subscription - it's invalid
-                                // This prevents silent data loss where we think we're subscribed but aren't
-                                // Scanner/other components should handle missing subscriptions
+                                // ✅ FIX: Store failed subscription in persistent list
+                                // Scanner can check this list and restart to restore subscriptions
+                                let mut failed = self.failed_subscriptions.lock().await;
+                                // Only add if not already in list (avoid duplicates)
+                                let is_duplicate = failed.iter().any(|f| {
+                                    match (&f.subscription_type, &info.subscription_type) {
+                                        (SubscriptionType::Program(p1), SubscriptionType::Program(p2)) => p1 == p2,
+                                        (SubscriptionType::Account(a1), SubscriptionType::Account(a2)) => a1 == a2,
+                                        (SubscriptionType::Slot, SubscriptionType::Slot) => true,
+                                        _ => false,
+                                    }
+                                });
+                                
+                                if !is_duplicate {
+                                    failed.push(info.clone());
+                                    log::warn!(
+                                        "⚠️  Added failed subscription to persistent list (total: {}). Scanner should restart to restore.",
+                                        failed.len()
+                                    );
+                                }
                             }
                         }
                     }
