@@ -1,3 +1,7 @@
+pub mod validation_helpers;
+
+pub use validation_helpers::ValidationHelpers;
+
 use crate::core::events::{Event, EventBus};
 use crate::core::types::Opportunity;
 use crate::core::config::Config;
@@ -304,147 +308,10 @@ impl Validator {
     }
 
     async fn check_oracle_freshness_internal(&self, mint: &Pubkey, skip_delay: bool) -> Result<()> {
-        use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account};
-        use tokio::time::{Duration, timeout};
-
-        let oracle_check_timeout = self.rpc.request_timeout();
-
-        let timeout_result = timeout(oracle_check_timeout, async {
-            if self.config.is_free_rpc_endpoint() && !skip_delay {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-
-            let pyth_account = get_pyth_oracle_account(mint, Some(&self.config)).ok().flatten();
-            let switchboard_account = get_switchboard_oracle_account(mint, Some(&self.config)).ok().flatten();
-
-            if pyth_account.is_none() && switchboard_account.is_none() {
-                log::warn!("No oracle found (Pyth or Switchboard) for mint: {}, skipping freshness check", mint);
-                return Err(anyhow::anyhow!("No oracle found for mint {}", mint));
-            }
-
-            use crate::protocol::oracle::read_oracle_price;
-            
-            let oracle_type = if pyth_account.is_some() { "Pyth" } else { "Switchboard" };
-            let oracle_account = pyth_account.or(switchboard_account).unwrap();
-            
-            let price_data = match read_oracle_price(
-                pyth_account.as_ref(),
-                switchboard_account.as_ref(),
-                Arc::clone(&self.rpc),
-                Some(&self.config),
-            ).await {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to read oracle price data for mint {} ({} oracle={}) - price data is None",
-                        mint, oracle_type, oracle_account
-                    ));
-                }
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    if error_str.contains("timeout") || error_str.contains("timed out") {
-                        log::error!("Validator: {} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e);
-                        return Err(anyhow::anyhow!("{} oracle read timeout for mint {} (oracle={}) - RPC may be slow or unresponsive: {}", oracle_type, mint, oracle_account, e));
-                    } else {
-                        log::error!("Validator: failed to read {} price for mint {} (oracle={}): {}", oracle_type, mint, oracle_account, e);
-                        return Err(anyhow::anyhow!("Failed to read oracle price data for mint {} ({} oracle={}): {}", mint, oracle_type, oracle_account, e));
-                    }
-                }
-            };
-
-
-            // Note: We need to capture self for validate_price_data, but we're in an async closure
-            // So we'll validate inline here
-            const MAX_PRICE: f64 = 1_000_000_000_000.0;
-            const MIN_PRICE: f64 = 0.0001;
-            const MAX_CONF_RATIO: f64 = 0.25;
-
-            let age = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| anyhow::anyhow!("Time error: {}", e))?
-                .as_secs() as i64 - price_data.timestamp;
-
-            if age > self.config.max_oracle_age_seconds as i64 {
-                return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, self.config.max_oracle_age_seconds));
-            }
-            if price_data.price <= 0.0 {
-                return Err(anyhow::anyhow!("{} oracle invalid price for {}: {:.4}", oracle_type, mint, price_data.price));
-            }
-            if !(MIN_PRICE..=MAX_PRICE).contains(&price_data.price) {
-                return Err(anyhow::anyhow!("{} oracle price out of range for {}: {:.4}", oracle_type, mint, price_data.price));
-            }
-            if price_data.confidence < 0.0 {
-                return Err(anyhow::anyhow!("{} oracle negative confidence for {}: {:.4}", oracle_type, mint, price_data.confidence));
-            }
-            if price_data.price > 0.0 {
-                let conf_ratio = price_data.confidence / price_data.price;
-                if conf_ratio > MAX_CONF_RATIO {
-                    return Err(anyhow::anyhow!("{} oracle confidence too high for {}: {:.2}% (max: {:.0}%)", oracle_type, mint, conf_ratio * 100.0, MAX_CONF_RATIO * 100.0));
-                }
-            }
-
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| anyhow::anyhow!("Failed to get current time: {}", e))?
-                .as_secs() as i64;
-            let age_seconds = current_time - price_data.timestamp;
-
-            log::debug!(
-                "Validator: {} oracle price is valid and fresh for mint {} (oracle={}, age={}s, max_age={}s, price={:.4}, confidence={:.4}, conf_ratio={:.2}%)",
-                oracle_type,
-                mint,
-                oracle_account,
-                age_seconds,
-                self.config.max_oracle_age_seconds,
-                price_data.price,
-                price_data.confidence,
-                if price_data.price > 0.0 { (price_data.confidence / price_data.price) * 100.0 } else { 0.0 }
-            );
-
-            Ok(())
-        }).await;
-
-        timeout_result.map_err(|_| anyhow::anyhow!("Oracle check timeout after {:?} for mint {}", oracle_check_timeout, mint))??;
-        Ok(())
+        ValidationHelpers::check_oracle_freshness(mint, &self.rpc, &self.config, skip_delay).await
     }
 
 
-    fn validate_price_data(
-        &self,
-        mint: &Pubkey,
-        price_data: &crate::protocol::oracle::OraclePrice,
-        oracle_type: &str,
-        _oracle_account: &Pubkey,
-    ) -> Result<()> {
-        const MAX_PRICE: f64 = 1_000_000_000_000.0;
-        const MIN_PRICE: f64 = 0.0001;
-        const MAX_CONF_RATIO: f64 = 0.25;
-
-        let age = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Time error: {}", e))?
-            .as_secs() as i64 - price_data.timestamp;
-
-        if age > self.config.max_oracle_age_seconds as i64 {
-            return Err(anyhow::anyhow!("{} oracle stale for {}: {}s old (max: {}s)", oracle_type, mint, age, self.config.max_oracle_age_seconds));
-        }
-        if price_data.price <= 0.0 {
-            return Err(anyhow::anyhow!("{} oracle invalid price for {}: {:.4}", oracle_type, mint, price_data.price));
-        }
-        if !(MIN_PRICE..=MAX_PRICE).contains(&price_data.price) {
-            return Err(anyhow::anyhow!("{} oracle price out of range for {}: {:.4}", oracle_type, mint, price_data.price));
-        }
-        if price_data.confidence < 0.0 {
-            return Err(anyhow::anyhow!("{} oracle negative confidence for {}: {:.4}", oracle_type, mint, price_data.confidence));
-        }
-        if price_data.price > 0.0 {
-            let conf_ratio = price_data.confidence / price_data.price;
-            if conf_ratio > MAX_CONF_RATIO {
-                return Err(anyhow::anyhow!("{} oracle confidence too high for {}: {:.2}% (max: {:.0}%)", oracle_type, mint, conf_ratio * 100.0, MAX_CONF_RATIO * 100.0));
-            }
-        }
-        Ok(())
-    }
 
     pub async fn get_realtime_slippage(&self, opp: &Opportunity) -> Result<u16> {
         self.get_realtime_slippage_internal(opp).await

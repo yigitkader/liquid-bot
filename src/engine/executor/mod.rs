@@ -1,9 +1,11 @@
 // Executor modülleri
 pub mod tx_lock;
 pub mod ata_cache;
+pub mod wsol_handler;
 
 pub use tx_lock::{TxLock, TxLockGuard};
 pub use ata_cache::{AtaCache, AtaCacheEntry};
+pub use wsol_handler::WsolHandler;
 
 use crate::blockchain::jito::{create_jito_client, JitoBundle, JitoClient};
 use crate::blockchain::rpc_client::RpcClient;
@@ -208,7 +210,7 @@ impl Executor {
 
         let wallet_pubkey = self.wallet.pubkey();
         
-        use crate::protocol::solend::instructions::{is_wsol_mint, build_wrap_sol_instruction};
+        use crate::protocol::solend::instructions::is_wsol_mint;
         let source_liquidity_ata = get_associated_token_address(&wallet_pubkey, &opp.debt_mint, Some(&self.config))
             .context("Failed to derive source liquidity ATA")?;
         let destination_collateral = get_associated_token_address(&wallet_pubkey, &opp.collateral_mint, Some(&self.config))
@@ -316,57 +318,16 @@ impl Executor {
         tx_builder.add_compute_budget(200_000, 1_000);
         
         if is_wsol_mint(&opp.debt_mint) {
-            use crate::utils::helpers::read_ata_balance;
-            let wsol_balance = read_ata_balance(&source_liquidity_ata, &self.rpc)
-                .await
-                .unwrap_or(0);
-            
-            // ✅ CRITICAL FIX: Use token amount, not USD amount
-            let needed_wsol = max_liquidatable_token_amount;
-            if wsol_balance < needed_wsol {
-                let wrap_amount = needed_wsol.saturating_sub(wsol_balance);
-                
-                let wallet_account = self.rpc.get_account(&wallet_pubkey).await
-                    .context("Failed to fetch wallet account for native SOL balance check")?;
-                let native_sol_balance = wallet_account.lamports;
-                let min_reserve = self.config.min_reserve_lamports;
-                let required_sol = wrap_amount
-                    .checked_add(min_reserve)
-                    .ok_or_else(|| anyhow::anyhow!("Wrap amount + reserve overflow"))?;
-                
-                if native_sol_balance < required_sol {
-                    return Err(anyhow::anyhow!(
-                        "Insufficient native SOL for WSOL wrap: need {} lamports (wrap: {} + reserve: {}), have {} lamports",
-                        required_sol,
-                        wrap_amount,
-                        min_reserve,
-                        native_sol_balance
-                    )).context("Cannot wrap SOL to WSOL - insufficient native SOL balance");
-                }
-                
-                log::info!(
-                    "Executor: Wrapping {} lamports of native SOL to WSOL (current WSOL balance: {}, needed: {}, native SOL: {})",
-                    wrap_amount,
-                    wsol_balance,
-                    needed_wsol,
-                    native_sol_balance
-                );
-                
-                let wrap_instructions = build_wrap_sol_instruction(
-                    &wallet_pubkey,
-                    &source_liquidity_ata,
-                    wrap_amount,
-                    Some(&self.rpc),
-                    Some(&self.config),
-                )
-                .await
-                .context("Failed to build WSOL wrap instructions")?;
-                for wrap_ix in wrap_instructions {
-                    tx_builder.add_instruction(wrap_ix);
-                }
-            } else {
-                log::debug!("Executor: Sufficient WSOL balance ({} >= {}), no wrap needed", wsol_balance, needed_wsol);
-            }
+            WsolHandler::add_wrap_instructions_if_needed(
+                &wallet_pubkey,
+                &source_liquidity_ata,
+                max_liquidatable_token_amount,
+                &self.rpc,
+                &self.config,
+                &mut tx_builder,
+            )
+            .await
+            .context("Failed to add WSOL wrap instructions")?;
         }
         
         let liq_ix = self
