@@ -74,17 +74,46 @@ impl Validator {
                                     opportunity_clone.estimated_profit
                                 );
 
-                                match balance_manager.reserve(&debt_mint, max_liquidatable).await {
+                                // ✅ CRITICAL FIX: Convert max_liquidatable from USD×1e6 to token amount
+                                // Problem: opportunity.max_liquidatable is stored as USD×1e6 (micro-USD)
+                                //   But balance_manager.reserve expects token amount in smallest unit
+                                // Solution: Convert USD amount to token amount using oracle price and decimals
+                                let max_liquidatable_token_amount = match Self::convert_usd_to_token_amount_static(
+                                    &debt_mint,
+                                    max_liquidatable,
+                                    &rpc,
+                                    &config,
+                                ).await {
+                                    Ok(amount) => amount,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Validator: Failed to convert max_liquidatable from USD to token amount for position {}: {}",
+                                            position_address,
+                                            e
+                                        );
+                                        // Don't validate if conversion fails
+                                        return;
+                                    }
+                                };
+                                
+                                log::debug!(
+                                    "Validator: Converted max_liquidatable: USD×1e6={}, token_amount={} for debt_mint={}",
+                                    max_liquidatable,
+                                    max_liquidatable_token_amount,
+                                    debt_mint
+                                );
+
+                                match balance_manager.reserve(&debt_mint, max_liquidatable_token_amount).await {
                                     Ok(()) => {
                                         // Reserved successfully - proceed with validation
                                     }
                                     Err(e) => {
                                         log::info!(
-                                            "Validator: insufficient balance for position {} (debt={}, need={}, available={}): {}",
+                                            "Validator: insufficient balance for position {} (debt={}, need_token={}, need_usd={}): {}",
                                             position_address,
                                             debt_mint,
+                                            max_liquidatable_token_amount,
                                             max_liquidatable,
-                                            "checking...",
                                             e
                                         );
                                         // Don't validate if we can't reserve balance
@@ -112,7 +141,7 @@ impl Validator {
                                             balance_manager
                                                 .release(
                                                     &debt_mint,
-                                                    max_liquidatable,
+                                                    max_liquidatable_token_amount,
                                                 )
                                                 .await;
                                         }
@@ -133,7 +162,7 @@ impl Validator {
                                         balance_manager
                                             .release(
                                                 &debt_mint,
-                                                max_liquidatable,
+                                                max_liquidatable_token_amount,
                                             )
                                             .await;
                                     }
@@ -173,9 +202,19 @@ impl Validator {
     /// This is the public API for validation - can be used by external code
     /// Note: For parallel processing in run(), validate_static is used instead
     pub async fn validate(&self, opp: &Opportunity) -> Result<()> {
-        // Reserve balance first
+        // ✅ CRITICAL FIX: Convert max_liquidatable from USD×1e6 to token amount
+        let max_liquidatable_token_amount = Self::convert_usd_to_token_amount_static(
+            &opp.debt_mint,
+            opp.max_liquidatable,
+            &self.rpc,
+            &self.config,
+        )
+        .await
+        .context("Failed to convert max_liquidatable from USD to token amount")?;
+        
+        // Reserve balance first (using converted token amount)
         self.balance_manager
-            .reserve(&opp.debt_mint, opp.max_liquidatable)
+            .reserve(&opp.debt_mint, max_liquidatable_token_amount)
             .await
             .context("Insufficient balance - reservation failed")?;
 
@@ -183,13 +222,48 @@ impl Validator {
         match Self::validate_static(opp, &self.rpc, &self.config).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Release reservation on validation failure
+                // Release reservation on validation failure (using converted token amount)
                 self.balance_manager
-                    .release(&opp.debt_mint, opp.max_liquidatable)
+                    .release(&opp.debt_mint, max_liquidatable_token_amount)
                     .await;
                 Err(e)
             }
         }
+    }
+    
+    /// Convert USD amount (in micro-USD, i.e., USD × 1e6) to token amount
+    /// Helper function used by validate() and run() to convert before reserving balance
+    async fn convert_usd_to_token_amount_static(
+        mint: &Pubkey,
+        usd_amount_micro: u64,
+        rpc: &Arc<RpcClient>,
+        config: &Config,
+    ) -> Result<u64> {
+        use crate::utils::helpers::{read_mint_decimals, usd_to_token_amount};
+        use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
+        
+        // Get oracle price for mint
+        let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(mint, Some(config))
+            .context("Failed to get oracle accounts for mint")?;
+        
+        let price_data = read_oracle_price(
+            pyth_oracle.as_ref(),
+            switchboard_oracle.as_ref(),
+            Arc::clone(rpc),
+            Some(config),
+        )
+        .await
+        .context("Failed to read oracle price for mint")?
+        .ok_or_else(|| anyhow::anyhow!("No oracle price data available for mint {}", mint))?;
+        
+        // Get decimals for mint
+        let decimals = read_mint_decimals(mint, rpc)
+            .await
+            .context("Failed to read decimals for mint")?;
+        
+        // Convert USD×1e6 to token amount
+        usd_to_token_amount(usd_amount_micro, price_data.price, decimals)
+            .context("Failed to convert USD amount to token amount")
     }
 
     async fn validate_static(
@@ -608,15 +682,38 @@ impl Validator {
         Self::get_realtime_slippage_static(opp, &self.rpc, &self.config).await
     }
 
-    async fn get_realtime_slippage_static(opp: &Opportunity, _rpc: &Arc<RpcClient>, config: &Config) -> Result<u16> {
+    async fn get_realtime_slippage_static(opp: &Opportunity, rpc: &Arc<RpcClient>, config: &Config) -> Result<u16> {
         use crate::strategy::slippage_estimator::SlippageEstimator;
 
         let estimator = SlippageEstimator::new(config.clone());
 
+        // ✅ CRITICAL FIX: Convert max_liquidatable from USD×1e6 to token amount for slippage estimation
+        // Problem: opp.max_liquidatable is stored as USD×1e6 (micro-USD)
+        //   But slippage estimator (Jupiter API) expects input token amount in smallest unit
+        //   In liquidation: we repay debt tokens (input), receive collateral tokens (output)
+        //   Jupiter API needs input amount (debt tokens we're swapping), not output amount
+        //   So we need to convert max_liquidatable (debt USD) to debt token amount
+        // Solution: Convert USD amount to token amount using debt_mint oracle price and decimals
+        let max_liquidatable_token_amount = Self::convert_usd_to_token_amount_static(
+            &opp.debt_mint,
+            opp.max_liquidatable,
+            rpc,
+            config,
+        )
+        .await
+        .context("Failed to convert max_liquidatable from USD to token amount for slippage estimation")?;
+        
+        log::debug!(
+            "get_realtime_slippage_static: Converted max_liquidatable for slippage: USD×1e6={}, token_amount={} for debt_mint={}",
+            opp.max_liquidatable,
+            max_liquidatable_token_amount,
+            opp.debt_mint
+        );
+
         let base_slippage = estimator.estimate_dex_slippage(
             opp.debt_mint,
             opp.collateral_mint,
-            opp.seizable_collateral,
+            max_liquidatable_token_amount,
         ).await
             .context("Failed to estimate real-time slippage")?;
 

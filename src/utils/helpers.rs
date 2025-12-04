@@ -12,6 +12,93 @@ pub fn parse_pubkey_opt(s: &str) -> Option<solana_sdk::pubkey::Pubkey> {
     s.parse().ok()
 }
 
+/// Read mint decimals from mint account
+/// 
+/// SPL Token mint account layout:
+/// - bytes 0-36: mint_authority (Option<Pubkey>)
+/// - bytes 36-44: supply (u64)
+/// - bytes 44-45: decimals (u8)
+/// - bytes 45-46: is_initialized (bool)
+/// - bytes 46-78: freeze_authority (Option<Pubkey>)
+/// 
+/// Returns:
+/// - Ok(u8): Token decimals (0-255)
+/// - Err: Network/RPC errors or invalid account data
+pub async fn read_mint_decimals(
+    mint: &Pubkey,
+    rpc: &Arc<RpcClient>,
+) -> Result<u8> {
+    let account = rpc.get_account(mint).await
+        .context("Failed to fetch mint account")?;
+    
+    if account.data.len() < 45 {
+        return Err(anyhow::anyhow!(
+            "Invalid mint account data: expected at least 45 bytes, got {} bytes for mint {}",
+            account.data.len(),
+            mint
+        ));
+    }
+    
+    // Decimals is at offset 44 (after mint_authority: 36 bytes + supply: 8 bytes)
+    let decimals = account.data[44];
+    
+    log::debug!(
+        "read_mint_decimals: mint {} has {} decimals",
+        mint,
+        decimals
+    );
+    
+    Ok(decimals)
+}
+
+/// Convert USD amount (in micro-USD, i.e., USD × 1e6) to token amount
+/// 
+/// Formula: token_amount = (usd_amount_micro / 1e6 / price) * 10^decimals
+/// 
+/// Parameters:
+/// - usd_amount_micro: USD amount in micro-USD (USD × 1e6)
+/// - price: Token price in USD (from oracle)
+/// - decimals: Token decimals (from mint account)
+/// 
+/// Returns:
+/// - Ok(u64): Token amount in smallest unit (lamports/token units)
+/// - Err: Invalid parameters (price <= 0, etc.)
+pub fn usd_to_token_amount(
+    usd_amount_micro: u64,
+    price: f64,
+    decimals: u8,
+) -> Result<u64> {
+    if price <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "Invalid price: {} (must be > 0)",
+            price
+        ));
+    }
+    
+    // Convert micro-USD to USD
+    let usd_amount = usd_amount_micro as f64 / 1_000_000.0;
+    
+    // Calculate token amount: USD / price
+    let token_amount = usd_amount / price;
+    
+    // Convert to smallest unit: multiply by 10^decimals
+    let token_amount_smallest_unit = token_amount * 10_f64.powi(decimals as i32);
+    
+    // Round to u64 (truncate fractional part)
+    let token_amount_u64 = token_amount_smallest_unit as u64;
+    
+    log::debug!(
+        "usd_to_token_amount: usd_amount_micro={}, price={:.6}, decimals={}, token_amount={:.6}, token_amount_u64={}",
+        usd_amount_micro,
+        price,
+        decimals,
+        token_amount,
+        token_amount_u64
+    );
+    
+    Ok(token_amount_u64)
+}
+
 /// Read ATA (Associated Token Account) balance from on-chain account
 /// 
 /// This helper function encapsulates the common pattern of:

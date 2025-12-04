@@ -557,10 +557,56 @@ pub async fn build_liquidate_obligation_ix(
         AccountMeta::new_readonly(token_program, false),                     // 13. tokenProgram
     ];
 
+    // ✅ CRITICAL FIX: Convert max_liquidatable from USD×1e6 to token amount
+    // Problem: opportunity.max_liquidatable is stored as USD×1e6 (micro-USD)
+    //   But Solend liquidateObligation instruction expects token amount in smallest unit (lamports/decimals)
+    //   Example: SOL = 100 USD, max_liquidatable_usd = 100 → max_liquidatable = 100 * 1e6 = 100_000_000
+    //   But 1 SOL (9 decimals) = 1_000_000_000 lamports
+    //   So we need: (100 / 100) * 10^9 = 1_000_000_000 lamports (1 SOL), not 100_000_000
+    // Solution: Convert USD amount to token amount using oracle price and token decimals
+    use crate::utils::helpers::{read_mint_decimals, usd_to_token_amount};
+    use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
+    use std::sync::Arc;
+    
+    // Get oracle price for debt mint
+    let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(&opportunity.debt_mint, Some(&config))
+        .context("Failed to get oracle accounts for debt mint")?;
+    
+    let price_data = read_oracle_price(
+        pyth_oracle.as_ref(),
+        switchboard_oracle.as_ref(),
+        Arc::clone(&rpc),
+        Some(&config),
+    )
+    .await
+    .context("Failed to read oracle price for debt mint")?
+    .ok_or_else(|| anyhow::anyhow!("No oracle price data available for debt mint {}", opportunity.debt_mint))?;
+    
+    // Get decimals for debt mint
+    let decimals = read_mint_decimals(&opportunity.debt_mint, &rpc)
+        .await
+        .context("Failed to read decimals for debt mint")?;
+    
+    // Convert USD×1e6 to token amount
+    let max_liquidatable_token_amount = usd_to_token_amount(
+        opportunity.max_liquidatable,
+        price_data.price,
+        decimals,
+    )
+    .context("Failed to convert max_liquidatable from USD to token amount")?;
+    
+    log::info!(
+        "build_liquidate_obligation_ix: Converted max_liquidatable: USD×1e6={}, price={:.6}, decimals={}, token_amount={}",
+        opportunity.max_liquidatable,
+        price_data.price,
+        decimals,
+        max_liquidatable_token_amount
+    );
+
     let discriminator = get_instruction_discriminator();
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&discriminator);
-    data.extend_from_slice(&opportunity.max_liquidatable.to_le_bytes());
+    data.extend_from_slice(&max_liquidatable_token_amount.to_le_bytes());
 
     Ok(Instruction {
         program_id,
