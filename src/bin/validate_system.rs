@@ -6,7 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
 use liquid_bot::core::config::Config;
-use liquid_bot::core::registry::{ProgramIds, ReserveAddresses, LendingMarketAddresses};
+// Registry types artık validation modüllerinde kullanılıyor
 use liquid_bot::blockchain::rpc_client::RpcClient;
 use liquid_bot::protocol::solend::accounts::{derive_lending_market_authority, derive_obligation_address};
 use liquid_bot::protocol::solend::types::SolendObligation;
@@ -21,6 +21,13 @@ use liquid_bot::strategy::slippage_estimator::SlippageEstimator;
 use liquid_bot::core::types::Opportunity;
 use std::str::FromStr;
 use sha2::{Digest, Sha256};
+
+// Validation framework
+mod validation;
+use validation::TestResult;
+use validation::config as validate_config_mod;
+use validation::addresses as validate_addresses_mod;
+use validation::rpc as validate_rpc_mod;
 
 /// Load wallet pubkey from config
 /// Returns None if wallet cannot be loaded (file doesn't exist, invalid format, etc.)
@@ -66,51 +73,7 @@ struct Args {
     verbose: bool,
 }
 
-#[derive(Debug, Clone)]
-struct TestResult {
-    name: String,
-    success: bool,
-    message: String,
-    details: Option<String>,
-}
-
-impl TestResult {
-    fn success(name: &str, message: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            success: true,
-            message: message.to_string(),
-            details: None,
-        }
-    }
-
-    fn success_with_details(name: &str, message: &str, details: String) -> Self {
-        Self {
-            name: name.to_string(),
-            success: true,
-            message: message.to_string(),
-            details: Some(details),
-        }
-    }
-
-    fn failure(name: &str, message: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            success: false,
-            message: message.to_string(),
-            details: None,
-        }
-    }
-
-    fn failure_with_details(name: &str, message: &str, details: String) -> Self {
-        Self {
-            name: name.to_string(),
-            success: false,
-            message: message.to_string(),
-            details: Some(details),
-        }
-    }
-}
+// TestResult artık validation modülünde tanımlı
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -162,12 +125,12 @@ async fn main() -> Result<()> {
     println!("1️⃣  Validating Configuration...");
     println!("{}", "-".repeat(80));
     let config = Config::from_env().ok();
-    results.extend(validate_config(&args, config.as_ref()).await?);
+    results.extend(validate_config_mod::validate_config(config.as_ref()).await?);
     println!();
 
     println!("2️⃣  Validating Addresses...");
     println!("{}", "-".repeat(80));
-    results.extend(validate_addresses(config.as_ref()).await?);
+    results.extend(validate_addresses_mod::validate_addresses(config.as_ref()).await?);
     println!();
 
     println!("3️⃣  Testing RPC Connection...");
@@ -181,7 +144,7 @@ async fn main() -> Result<()> {
     // Log which RPC URL is being used
     if args.rpc_url.is_some() {
         log::info!("Using RPC URL from command line argument: {}", rpc_url);
-    } else if let Some(cfg) = config.as_ref() {
+    } else if let Some(_cfg) = config.as_ref() {
         log::info!("Using RPC URL from config (.env): {}", rpc_url);
     } else {
         log::warn!("Using default RPC URL (no config found): {}", rpc_url);
@@ -191,7 +154,7 @@ async fn main() -> Result<()> {
         RpcClient::new(rpc_url.to_string())
             .context("Failed to create RPC client")?
     );
-    results.extend(validate_rpc_connection(&rpc_client, config.as_ref()).await?);
+    results.extend(validate_rpc_mod::validate_rpc_connection(&rpc_client, config.as_ref()).await?);
     println!();
 
     println!("4️⃣  Validating Reserve Account Structure...");
@@ -300,242 +263,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn validate_config(_args: &Args, config: Option<&Config>) -> Result<Vec<TestResult>> {
-    let mut results = Vec::new();
-
-    match config {
-        Some(config) => {
-            results.push(TestResult::success(
-                "Config Loading",
-                "Configuration loaded successfully"
-            ));
-
-            if config.rpc_http_url.starts_with("http://") || config.rpc_http_url.starts_with("https://") {
-                results.push(TestResult::success(
-                    "RPC HTTP URL",
-                    &format!("Valid: {}", config.rpc_http_url)
-                ));
-            } else {
-                results.push(TestResult::failure(
-                    "RPC HTTP URL",
-                    &format!("Invalid format: {}", config.rpc_http_url)
-                ));
-            }
-
-            if config.rpc_ws_url.starts_with("ws://") || config.rpc_ws_url.starts_with("wss://") {
-                results.push(TestResult::success(
-                    "RPC WS URL",
-                    &format!("Valid: {}", config.rpc_ws_url)
-                ));
-            } else {
-                results.push(TestResult::failure(
-                    "RPC WS URL",
-                    &format!("Invalid format: {}", config.rpc_ws_url)
-                ));
-            }
-
-            if config.min_profit_usd >= 0.0 {
-                results.push(TestResult::success(
-                    "MIN_PROFIT_USD",
-                    &format!("Valid: ${}", config.min_profit_usd)
-                ));
-            } else {
-                results.push(TestResult::failure(
-                    "MIN_PROFIT_USD",
-                    &format!("Invalid: ${}", config.min_profit_usd)
-                ));
-            }
-
-            if config.hf_liquidation_threshold > 0.0 && config.hf_liquidation_threshold <= 10.0 {
-                results.push(TestResult::success(
-                    "HF_LIQUIDATION_THRESHOLD",
-                    &format!("Valid: {}", config.hf_liquidation_threshold)
-                ));
-            } else {
-                results.push(TestResult::failure(
-                    "HF_LIQUIDATION_THRESHOLD",
-                    &format!("Invalid: {}", config.hf_liquidation_threshold)
-                ));
-            }
-
-            if let Err(e) = config.solend_program_id.parse::<Pubkey>() {
-                results.push(TestResult::failure(
-                    "SOLEND_PROGRAM_ID",
-                    &format!("Invalid Pubkey: {}", e)
-                ));
-            } else {
-                results.push(TestResult::success(
-                    "SOLEND_PROGRAM_ID",
-                    &format!("Valid: {}", config.solend_program_id)
-                ));
-            }
-
-            if std::path::Path::new(&config.wallet_path).exists() {
-                results.push(TestResult::success(
-                    "Wallet Path",
-                    &format!("Exists: {}", config.wallet_path)
-                ));
-            } else {
-                results.push(TestResult::failure(
-                    "Wallet Path",
-                    &format!("Not found: {}", config.wallet_path)
-                ));
-            }
-        }
-        None => {
-            results.push(TestResult::failure(
-                "Config Loading",
-                "Failed to load configuration from environment"
-            ));
-        }
-    }
-
-    Ok(results)
-}
-
-async fn validate_addresses(config: Option<&Config>) -> Result<Vec<TestResult>> {
-    let mut results = Vec::new();
-
-    let solend_program_id_str = config
-        .map(|c| c.solend_program_id.as_str())
-        .unwrap_or(ProgramIds::SOLEND);
-    match Pubkey::try_from(solend_program_id_str) {
-        Ok(pid) => {
-            results.push(TestResult::success_with_details(
-                "Solend Program ID",
-                "Valid",
-                format!("Address: {}", pid)
-            ));
-        }
-        Err(e) => {
-            results.push(TestResult::failure(
-                "Solend Program ID",
-                &format!("Invalid: {}", e)
-            ));
-        }
-    }
-
-    let main_market_str = config
-        .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or(LendingMarketAddresses::MAIN);
-    match main_market_str.parse::<Pubkey>() {
-        Ok(market) => {
-            results.push(TestResult::success_with_details(
-                "Main Lending Market",
-                "Valid",
-                format!("Address: {}", market)
-            ));
-        }
-        Err(e) => {
-            results.push(TestResult::failure(
-                "Main Lending Market",
-                &format!("Invalid: {}", e)
-            ));
-        }
-    }
-
-    let usdc_reserve_str = config
-        .and_then(|c| c.usdc_reserve_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or(ReserveAddresses::USDC);
-    let sol_reserve_str = config
-        .and_then(|c| c.sol_reserve_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or(ReserveAddresses::SOL);
-    
-    let known_reserves = vec![
-        ("USDC Reserve", usdc_reserve_str),
-        ("SOL Reserve", sol_reserve_str),
-    ];
-
-    for (name, addr_str) in known_reserves {
-        match addr_str.parse::<Pubkey>() {
-            Ok(addr) => {
-                results.push(TestResult::success(
-                    name,
-                    &format!("Valid: {}", addr)
-                ));
-            }
-            Err(e) => {
-                results.push(TestResult::failure(
-                    name,
-                    &format!("Invalid: {}", e)
-                ));
-            }
-        }
-    }
-
-    Ok(results)
-}
-
-async fn validate_rpc_connection(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
-    let mut results = Vec::new();
-
-    match rpc_client.get_slot().await {
-        Ok(slot) => {
-            results.push(TestResult::success_with_details(
-                "RPC Connection",
-                "Connected successfully",
-                format!("Current slot: {}", slot)
-            ));
-        }
-        Err(e) => {
-            let error_str = e.to_string();
-            let error_lower = error_str.to_lowercase();
-            
-            // ✅ FIX: Provide more specific error messages based on error type
-            let error_msg = if error_lower.contains("timeout") {
-                format!("RPC timeout - endpoint may be slow or unreachable. Error: {}", e)
-            } else if error_lower.contains("connection") || error_lower.contains("econn") {
-                format!("RPC connection error - check network and endpoint URL. Error: {}", e)
-            } else if error_lower.contains("429") || error_lower.contains("rate limit") {
-                format!("RPC rate limit exceeded - consider using premium RPC. Error: {}", e)
-            } else {
-                format!("RPC connection failed: {}", e)
-            };
-            
-            results.push(TestResult::failure(
-                "RPC Connection",
-                &error_msg
-            ));
-        }
-    }
-
-    let sol_mint_str = config
-        .map(|c| c.sol_mint.as_str())
-        .unwrap_or("So11111111111111111111111111111111111111112");
-    let test_pubkey = sol_mint_str.parse::<Pubkey>()
-        .context("Invalid test pubkey")?;
-    match rpc_client.get_account(&test_pubkey).await {
-        Ok(account) => {
-            results.push(TestResult::success_with_details(
-                "RPC Account Fetch",
-                "Successfully fetched account",
-                format!("Account data size: {} bytes", account.data.len())
-            ));
-        }
-        Err(e) => {
-            let error_str = e.to_string();
-            let error_lower = error_str.to_lowercase();
-            
-            // ✅ FIX: Provide more specific error messages
-            let error_msg = if error_lower.contains("accountnotfound") || error_lower.contains("account not found") {
-                format!("Account not found (this is expected for some accounts). Error: {}", e)
-            } else if error_lower.contains("timeout") {
-                format!("RPC timeout when fetching account. Error: {}", e)
-            } else if error_lower.contains("connection") {
-                format!("RPC connection error when fetching account. Error: {}", e)
-            } else {
-                format!("Failed to fetch account: {}", e)
-            };
-            
-            results.push(TestResult::failure(
-                "RPC Account Fetch",
-                &error_msg
-            ));
-        }
-    }
-
-    Ok(results)
-}
+// Validation fonksiyonları artık validation modüllerinde tanımlı
 
 async fn validate_reserve_accounts(rpc_client: &Arc<RpcClient>, config: Option<&Config>) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
