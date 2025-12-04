@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 struct ReserveData {
     pub collateral_mint: Pubkey,
     pub liquidity_supply: Pubkey,
+    pub loan_to_value_ratio: f64, // LTV as percentage (0.0-1.0)
 }
 
 struct ReserveCacheInner {
@@ -151,9 +152,26 @@ impl ReserveCache {
         let liquidity_supply = Pubkey::try_from(liquidity_supply_bytes)
             .map_err(|_| anyhow::anyhow!("Invalid liquidity supply"))?;
 
+        // Parse ReserveConfig to get loanToValueRatio
+        // Reserve structure: version(1) + lastUpdate(9) + lendingMarket(32) + liquidity(185) + collateral(72) + config
+        // ReserveConfig: optimalUtilizationRate(1) + loanToValueRatio(1) + ...
+        const RESERVE_CONFIG_OFFSET: usize = 1 + 9 + 32 + 185 + 72; // 299 bytes
+        const LOAN_TO_VALUE_OFFSET: usize = RESERVE_CONFIG_OFFSET + 1; // After optimalUtilizationRate
+        
+        let loan_to_value_ratio = if account.data.len() > LOAN_TO_VALUE_OFFSET {
+            // LTV is stored as u8 (0-100), convert to f64 (0.0-1.0)
+            let ltv_u8 = account.data[LOAN_TO_VALUE_OFFSET];
+            ltv_u8 as f64 / 100.0
+        } else {
+            // Fallback: use default LTV if config not available
+            log::warn!("Reserve account data too small to read LTV, using default 0.75");
+            0.75
+        };
+
         let data = ReserveData {
             collateral_mint,
             liquidity_supply,
+            loan_to_value_ratio,
         };
 
         let mut inner = self.inner.write().await;
@@ -429,13 +447,13 @@ fn get_reserve_discriminator() -> [u8; 8] {
 async fn get_reserve_data(
     reserve: &Pubkey,
     rpc: &Arc<RpcClient>,
-) -> Result<(Pubkey, Pubkey, Pubkey)> {
+) -> Result<(Pubkey, Pubkey, Pubkey, f64)> {
     let data = RESERVE_CACHE
         .as_ref()
         .get_reserve_data(reserve, rpc)
         .await?;
 
-    Ok((data.collateral_mint, data.liquidity_supply, *reserve))
+    Ok((data.collateral_mint, data.liquidity_supply, *reserve, data.loan_to_value_ratio))
 }
 
 pub async fn build_liquidate_obligation_ix(
@@ -471,7 +489,7 @@ pub async fn build_liquidate_obligation_ix(
         .await
         .context("Failed to find debt reserve")?;
 
-    let (_debt_reserve_collateral_mint, debt_reserve_liquidity_supply, _) =
+    let (_debt_reserve_collateral_mint, debt_reserve_liquidity_supply, _, _debt_reserve_ltv) =
         get_reserve_data(&debt_reserve, &rpc)
             .await
             .context("Failed to fetch debt reserve data")?;
@@ -481,7 +499,7 @@ pub async fn build_liquidate_obligation_ix(
             .await
             .context("Failed to find collateral reserve")?;
 
-    let (collateral_reserve_collateral_mint, collateral_reserve_liquidity_supply, _) =
+    let (collateral_reserve_collateral_mint, collateral_reserve_liquidity_supply, _, _collateral_reserve_ltv) =
         get_reserve_data(&collateral_reserve, &rpc)
             .await
             .context("Failed to fetch collateral reserve data")?;

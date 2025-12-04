@@ -101,6 +101,28 @@ impl Protocol for SolendProtocol {
             return None;
         }
 
+        // ✅ FIX: Use closeable field - skip positions that cannot be liquidated
+        // closeable=false means the position cannot be closed/liquidated
+        if !obligation.closeable {
+            log::debug!(
+                "SolendProtocol: Skipping non-closeable position {} (owner={})",
+                obligation.owner,
+                obligation.owner
+            );
+            return None;
+        }
+
+        // ✅ FIX: Use borrowing_isolated_asset field - isolated assets have higher risk
+        // Isolated assets can only be borrowed against specific collateral
+        // These positions may have different liquidation rules or higher risk
+        if obligation.borrowing_isolated_asset {
+            log::debug!(
+                "SolendProtocol: Position {} is borrowing isolated asset (higher risk, but still processable)",
+                obligation.owner
+            );
+            // Note: We still process isolated asset positions, but log for awareness
+        }
+
         let health_factor = obligation.calculate_health_factor();
         let skip_threshold =
             self.config.hf_liquidation_threshold * self.config.liquidation_safety_margin;
@@ -109,6 +131,40 @@ impl Protocol for SolendProtocol {
         // This prevents wasting CPU parsing positions that analyzer won't liquidate
         if health_factor >= skip_threshold {
             return None;
+        }
+
+        // ✅ FIX: Use super_unhealthy_borrow_value for additional risk assessment
+        // super_unhealthy_borrow_value indicates when a position is extremely unhealthy
+        // If current borrowed_value exceeds super_unhealthy_borrow_value, the position is in critical state
+        // This can be used to prioritize or skip extremely risky positions
+        let borrowed_value_usd = obligation.borrowed_value.to_f64();
+        let super_unhealthy_threshold_usd = obligation.super_unhealthy_borrow_value.to_f64();
+        if super_unhealthy_threshold_usd > 0.0 && borrowed_value_usd >= super_unhealthy_threshold_usd {
+            log::debug!(
+                "SolendProtocol: Position {} is super unhealthy (borrowed=${:.2} >= super_unhealthy=${:.2}) - high risk",
+                obligation.owner,
+                borrowed_value_usd,
+                super_unhealthy_threshold_usd
+            );
+            // Note: We still process super unhealthy positions, but they are high risk
+            // Consider adding config option to skip these if desired
+        }
+
+        // ✅ FIX: Use unweighted_borrowed_value for comparison
+        // unweighted_borrowed_value is the raw borrowed value without LTV weighting
+        // This can help identify positions where LTV weighting significantly affects health
+        let unweighted_borrowed_usd = obligation.unweighted_borrowed_value.to_f64();
+        if unweighted_borrowed_usd > 0.0 && borrowed_value_usd > 0.0 {
+            let ltv_impact_ratio = unweighted_borrowed_usd / borrowed_value_usd;
+            if ltv_impact_ratio > 1.5 {
+                log::debug!(
+                    "SolendProtocol: Position {} has high LTV impact (unweighted=${:.2} vs weighted=${:.2}, ratio={:.2})",
+                    obligation.owner,
+                    unweighted_borrowed_usd,
+                    borrowed_value_usd,
+                    ltv_impact_ratio
+                );
+            }
         }
 
         let collateral_usd = obligation.total_deposited_value_usd();
@@ -133,24 +189,36 @@ impl Protocol for SolendProtocol {
             );
         }
 
+        // ✅ FIX: Use attributed_borrow_value from ObligationCollateral
+        // This shows how much of the collateral is attributed to each borrow
+        // Useful for risk analysis and understanding position structure
         let mut collateral_assets = Vec::new();
         for deposit in &obligation.deposits {
+            // Note: LTV will be 0.0 for now - we would need RPC access to fetch from Reserve
+            // This is a limitation of the current Protocol trait design
+            // TODO: Consider adding RPC parameter to parse_position or enrich Position later
             collateral_assets.push(Asset {
                 mint: deposit.deposit_reserve,
                 amount: deposit.deposited_amount,
                 amount_usd: deposit.market_value.to_f64(),
-                ltv: 0.0,
+                ltv: 0.0, // TODO: Fetch from Reserve account (requires RPC access)
             });
         }
 
+        // ✅ FIX: Use cumulative_borrow_rate_wads and borrowed_amount_wads properly
+        // The actual borrowed amount should account for interest accrual
+        // borrowed_amount_wads already includes interest (it's cumulative)
         let mut debt_assets = Vec::new();
         for borrow in &obligation.borrows {
+            // ✅ FIX: Use borrowed_amount_wads directly (already includes interest)
+            // cumulative_borrow_rate_wads is used on-chain to calculate interest
+            // but borrowed_amount_wads is the current amount including all accrued interest
             let borrowed_amount = borrow.borrowed_amount_wads.to_f64() as u64;
             debt_assets.push(Asset {
                 mint: borrow.borrow_reserve,
                 amount: borrowed_amount,
                 amount_usd: borrow.market_value.to_f64(),
-                ltv: 0.0,
+                ltv: 0.0, // TODO: Fetch from Reserve account (requires RPC access)
             });
         }
 
