@@ -1,26 +1,57 @@
 use crate::core::config::Config;
 use crate::core::types::Opportunity;
+use anyhow::Result;
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::time::Duration;
 
 pub struct ProfitCalculator {
     config: Config,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapInfo {
+    #[serde(rename = "ammKey")]
+    amm_key: Option<String>,
+    label: Option<String>,
+    #[serde(rename = "inputMint")]
+    input_mint: Option<String>,
+    #[serde(rename = "outputMint")]
+    output_mint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutePlan {
+    #[serde(rename = "swapInfo")]
+    swap_info: Option<SwapInfo>,
+    percent: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JupiterRouteInfo {
+    #[serde(rename = "routePlan")]
+    route_plan: Option<Vec<RoutePlan>>,
 }
 
 impl ProfitCalculator {
     pub fn new(config: Config) -> Self {
-        ProfitCalculator { config }
+        ProfitCalculator {
+            config,
+            client: reqwest::Client::new(),
+        }
     }
 
-    pub fn calculate_net_profit(&self, opportunity: &Opportunity, hop_count: Option<u8>) -> f64 {
+    pub async fn calculate_net_profit(&self, opportunity: &Opportunity, hop_count: Option<u8>) -> f64 {
         let gross = opportunity.seizable_collateral as f64 / 1_000_000.0
             - opportunity.max_liquidatable as f64 / 1_000_000.0;
 
         let tx_fee = self.calculate_tx_fee();
         let slippage_cost = self.calculate_slippage_cost(opportunity);
-        let dex_fee = self.calculate_dex_fee(opportunity, hop_count);
+        let dex_fee = self.calculate_dex_fee(opportunity, hop_count).await;
 
         let net = gross - tx_fee - slippage_cost - dex_fee;
 
@@ -75,7 +106,7 @@ impl ProfitCalculator {
         cost
     }
 
-    fn calculate_dex_fee(&self, opp: &Opportunity, hop_count: Option<u8>) -> f64 {
+    async fn calculate_dex_fee(&self, opp: &Opportunity, hop_count: Option<u8>) -> f64 {
         let needs_swap = opp.debt_mint != opp.collateral_mint;
 
         if !needs_swap {
@@ -117,19 +148,33 @@ impl ProfitCalculator {
             estimated_hop_count
         };
 
-        // CRITICAL FIX: Detect stablecoin pairs and apply lower fee
-        // Stablecoin pairs (USDC/USDT) typically have much lower DEX fees (~0.01% vs 0.2%)
+        // ✅ FIX: Stablecoin DEX fee'si çok düşük (1 bps = 0.01%)
+        // Problem: Jupiter routing kullanılırsa 1 bps yerine 20+ bps fee alınabilir
+        //   Bot kar hesaplamasında 0.01% kullanıyor, gerçek fee 0.2%+ olabilir
+        //   Böylece $100 swap'te $0.19 loss yaşanabilir
+        // Solution: Jupiter API'den actual fee bilgisi al
         let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
 
         let base_dex_fee_bps = if is_stablecoin_pair {
-            // Stablecoin pairs: Use much lower fee (0.01% = 1 bps)
-            // This is typical for stablecoin swaps on most DEXes
-            const STABLECOIN_DEX_FEE_BPS: u16 = 1; // 0.01%
-            log::debug!(
-                "ProfitCalculator: dex_fee -> stablecoin pair detected, using lower fee ({} bps per hop)",
-                STABLECOIN_DEX_FEE_BPS
-            );
-            STABLECOIN_DEX_FEE_BPS as f64
+            // ✅ Jupiter API'den route bilgisi al
+            if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
+                // Actual fee'yi route'dan oku
+                // Route plan'daki label'lara göre fee hesapla
+                let actual_fee_bps = self.estimate_fee_from_route(&route_info);
+                log::debug!(
+                    "ProfitCalculator: dex_fee -> stablecoin pair detected, got actual fee from Jupiter API: {} bps per hop",
+                    actual_fee_bps
+                );
+                actual_fee_bps as f64
+            } else {
+                // Fallback: Conservative estimate (5 bps)
+                const STABLECOIN_FEE_CONSERVATIVE: u16 = 5;
+                log::warn!(
+                    "ProfitCalculator: dex_fee -> stablecoin pair detected, Jupiter API failed, using conservative fallback: {} bps per hop",
+                    STABLECOIN_FEE_CONSERVATIVE
+                );
+                STABLECOIN_FEE_CONSERVATIVE as f64
+            }
         } else {
             // Regular pairs: Use configured fee
             self.config.dex_fee_bps as f64
@@ -151,6 +196,113 @@ impl ProfitCalculator {
             is_stablecoin_pair
         );
         fee
+    }
+
+    /// Get Jupiter route information for fee estimation
+    async fn get_jupiter_route_info(&self, input_mint: Pubkey, output_mint: Pubkey) -> Result<JupiterRouteInfo> {
+        use anyhow::Context;
+        use tokio::time::timeout;
+
+        if !self.config.use_jupiter_api {
+            return Err(anyhow::anyhow!("Jupiter API is disabled"));
+        }
+
+        // Use a reasonable amount for quote (1M = 1 token with 6 decimals)
+        let amount = 1_000_000u64;
+        let url = format!(
+            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
+            input_mint, output_mint, amount
+        );
+
+        const JUPITER_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let response = timeout(
+            JUPITER_TIMEOUT,
+            self.client.get(&url).send()
+        )
+        .await
+        .map_err(|e| {
+            log::debug!("Jupiter API request timeout for fee info: {}", e);
+            anyhow::anyhow!("Jupiter API timeout")
+        })?
+        .map_err(|e| {
+            log::debug!("Jupiter API network error for fee info: {}", e);
+            anyhow::anyhow!("Network error: {}", e)
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            log::debug!("Jupiter API HTTP error for fee info: {} {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"));
+            return Err(anyhow::anyhow!("HTTP {} {}", status.as_u16(), status));
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
+
+        let route_info: JupiterRouteInfo = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                log::debug!("Jupiter API JSON parse error for fee info: {}", e);
+                anyhow::anyhow!("Failed to parse JSON: {}", e)
+            })?;
+
+        Ok(route_info)
+    }
+
+    /// Estimate fee in bps from Jupiter route information
+    /// Based on DEX labels in the route plan
+    fn estimate_fee_from_route(&self, route_info: &JupiterRouteInfo) -> u16 {
+        // Default fee if we can't determine from route
+        const DEFAULT_STABLECOIN_FEE_BPS: u16 = 5;
+
+        let route_plan = match &route_info.route_plan {
+            Some(plan) if !plan.is_empty() => plan,
+            _ => {
+                log::debug!("ProfitCalculator: No route plan in Jupiter response, using default fee");
+                return DEFAULT_STABLECOIN_FEE_BPS;
+            }
+        };
+
+        // Check each hop's DEX to determine fee
+        // Known stablecoin pool fees:
+        // - Orca USDC/USDT: 1 bps (0.01%)
+        // - Raydium stable pool: 4 bps (0.04%)
+        // - Jupiter multi-hop: 20+ bps (0.2%+)
+        let mut max_fee_bps = 1u16; // Start with minimum (Orca direct pool)
+
+        for hop in route_plan {
+            if let Some(swap_info) = &hop.swap_info {
+                if let Some(label) = &swap_info.label {
+                    let label_lower = label.to_lowercase();
+                    // Check for known DEX labels and their typical fees
+                    let hop_fee_bps = if label_lower.contains("orca") {
+                        1 // Orca stablecoin pools: 1 bps
+                    } else if label_lower.contains("raydium") {
+                        4 // Raydium stable pools: 4 bps
+                    } else if label_lower.contains("jupiter") || label_lower.contains("route") {
+                        20 // Jupiter routing/multi-hop: 20+ bps
+                    } else {
+                        // Unknown DEX, use conservative estimate
+                        5
+                    };
+                    max_fee_bps = max_fee_bps.max(hop_fee_bps);
+                    log::debug!(
+                        "ProfitCalculator: Route hop DEX '{}' estimated fee: {} bps",
+                        label,
+                        hop_fee_bps
+                    );
+                }
+            }
+        }
+
+        log::debug!(
+            "ProfitCalculator: Estimated fee from route: {} bps (from {} hop(s))",
+            max_fee_bps,
+            route_plan.len()
+        );
+
+        max_fee_bps
     }
 
     pub fn is_stablecoin_pair(&self, mint1: &Pubkey, mint2: &Pubkey) -> bool {

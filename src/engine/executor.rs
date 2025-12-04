@@ -525,19 +525,43 @@ impl Executor {
             if wsol_balance < needed_wsol {
                 let wrap_amount = needed_wsol.saturating_sub(wsol_balance);
                 
+                // ✅ FIX: Check native SOL balance before wrapping
+                // Problem: Bot doesn't check if there's enough native SOL for wrapping
+                //   If insufficient, transaction fails but bot doesn't know until after sending
+                // Solution: Check native SOL balance early and return error if insufficient
+                let wallet_account = self.rpc.get_account(&wallet_pubkey).await
+                    .context("Failed to fetch wallet account for native SOL balance check")?;
+                let native_sol_balance = wallet_account.lamports;
+                let min_reserve = self.config.min_reserve_lamports;
+                let required_sol = wrap_amount
+                    .checked_add(min_reserve)
+                    .ok_or_else(|| anyhow::anyhow!("Wrap amount + reserve overflow"))?;
+                
+                if native_sol_balance < required_sol {
+                    return Err(anyhow::anyhow!(
+                        "Insufficient native SOL for WSOL wrap: need {} lamports (wrap: {} + reserve: {}), have {} lamports",
+                        required_sol,
+                        wrap_amount,
+                        min_reserve,
+                        native_sol_balance
+                    )).context("Cannot wrap SOL to WSOL - insufficient native SOL balance");
+                }
+                
+                // ✅ FIX: Sufficient native SOL available, proceed with wrap
+                log::info!(
+                    "Executor: Wrapping {} lamports of native SOL to WSOL (current WSOL balance: {}, needed: {}, native SOL: {})",
+                    wrap_amount,
+                    wsol_balance,
+                    needed_wsol,
+                    native_sol_balance
+                );
+                
                 // Add WSOL wrap instructions (transfer + sync_native)
                 let wrap_instructions = build_wrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata, wrap_amount)
                     .context("Failed to build WSOL wrap instructions")?;
                 for wrap_ix in wrap_instructions {
                     tx_builder.add_instruction(wrap_ix);
                 }
-                
-                log::info!(
-                    "Executor: Wrapping {} lamports of native SOL to WSOL (current WSOL balance: {}, needed: {})",
-                    wrap_amount,
-                    wsol_balance,
-                    needed_wsol
-                );
             } else {
                 log::debug!(
                     "Executor: Sufficient WSOL balance ({} >= {}), no wrap needed",
@@ -569,33 +593,9 @@ impl Executor {
 
         tx_builder.add_instruction(liq_ix);
         
-        // ✅ OPTIONAL: WSOL unwrap mechanism after liquidation
-        // If debt_mint is WSOL and unwrap_wsol_after_liquidation is enabled,
-        // add unwrap instruction to convert remaining WSOL back to native SOL
-        // Note: This is optional - if unwrap fails, liquidation still succeeds
-        if self.config.unwrap_wsol_after_liquidation && is_wsol_mint(&opp.debt_mint) {
-            use crate::protocol::solend::instructions::build_unwrap_sol_instruction;
-            
-            // Add unwrap instruction to close WSOL ATA and return native SOL to wallet
-            // This will only succeed if WSOL ATA has zero token balance after liquidation
-            // If WSOL balance > 0, unwrap will fail but liquidation still succeeds
-            match build_unwrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata) {
-                Ok(unwrap_ix) => {
-                    tx_builder.add_instruction(unwrap_ix);
-                    log::debug!(
-                        "Executor: Added WSOL unwrap instruction after liquidation (WSOL ATA: {})",
-                        source_liquidity_ata
-                    );
-                }
-                Err(e) => {
-                    // Log warning but don't fail - unwrap is optional
-                    log::warn!(
-                        "Executor: Failed to build WSOL unwrap instruction (optional): {}",
-                        e
-                    );
-                }
-            }
-        }
+        // ✅ FIX: Don't add unwrap instruction to liquidation transaction
+        // Unwrap will be handled separately after checking ATA balance post-liquidation
+        // This prevents unwrap failures from affecting liquidation success
 
         let signature = if self.config.dry_run {
             log::info!("DRY RUN: Would send transaction (not sending to blockchain)");
@@ -622,6 +622,97 @@ impl Executor {
         self.event_bus.publish(Event::TransactionSent {
             signature: signature.to_string(),
         })?;
+
+        // ✅ FIX: WSOL unwrap mechanism after liquidation - check balance first
+        // If debt_mint is WSOL and unwrap_wsol_after_liquidation is enabled,
+        // check ATA balance after liquidation and only unwrap if balance is 0
+        // This prevents unwrap failures when WSOL remains in ATA
+        if self.config.unwrap_wsol_after_liquidation && is_wsol_mint(&opp.debt_mint) {
+            // Wait a bit for transaction to be confirmed before checking balance
+            // This ensures we read the post-liquidation balance
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            // Read ATA balance after liquidation
+            let wsol_balance = match self.rpc.get_account(&source_liquidity_ata).await {
+                Ok(acc) => {
+                    if acc.data.len() >= 72 {
+                        let balance_bytes: [u8; 8] = acc.data[64..72]
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance from ATA"))?;
+                        u64::from_le_bytes(balance_bytes)
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    // ATA doesn't exist or error - log and skip unwrap
+                    log::warn!(
+                        "Executor: Failed to read WSOL ATA balance for unwrap check: {}. Skipping unwrap.",
+                        e
+                    );
+                    return Ok(signature);
+                }
+            };
+            
+            if wsol_balance > 0 {
+                log::warn!(
+                    "Executor: WSOL ATA has remaining balance: {} lamports, cannot unwrap. WSOL will remain in ATA for future liquidations.",
+                    wsol_balance
+                );
+                // Don't unwrap - WSOL will be available for next liquidation
+            } else {
+                // Balance is 0 - safe to unwrap
+                log::debug!(
+                    "Executor: WSOL ATA balance is 0, attempting unwrap (WSOL ATA: {})",
+                    source_liquidity_ata
+                );
+                
+                use crate::protocol::solend::instructions::build_unwrap_sol_instruction;
+                match build_unwrap_sol_instruction(&wallet_pubkey, &source_liquidity_ata) {
+                    Ok(unwrap_ix) => {
+                        let mut unwrap_tx_builder = TransactionBuilder::new(wallet_pubkey);
+                        unwrap_tx_builder.add_compute_budget(200_000, 1_000);
+                        unwrap_tx_builder.add_instruction(unwrap_ix);
+                        
+                        // Send unwrap transaction
+                        if self.config.dry_run {
+                            log::info!("DRY RUN: Would send unwrap transaction (not sending to blockchain)");
+                        } else {
+                            match if self.use_jito {
+                                if let Some(ref jito) = self.jito_client {
+                                    self.send_via_jito_with_retry(&unwrap_tx_builder, jito).await
+                                } else {
+                                    self.send_with_retry(&unwrap_tx_builder).await
+                                }
+                            } else {
+                                self.send_with_retry(&unwrap_tx_builder).await
+                            } {
+                                Ok(unwrap_sig) => {
+                                    log::info!(
+                                        "Executor: Successfully unwrapped WSOL to native SOL (signature: {})",
+                                        unwrap_sig
+                                    );
+                                }
+                                Err(e) => {
+                                    // Log warning but don't fail - unwrap is optional
+                                    log::warn!(
+                                        "Executor: Failed to send WSOL unwrap transaction (optional): {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log warning but don't fail - unwrap is optional
+                        log::warn!(
+                            "Executor: Failed to build WSOL unwrap instruction (optional): {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(signature)
     }

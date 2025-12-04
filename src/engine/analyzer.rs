@@ -434,7 +434,7 @@ impl Analyzer {
             Some(0)
         };
 
-        let net_profit = profit_calc.calculate_net_profit(&temp_opp, hop_count);
+        let net_profit = profit_calc.calculate_net_profit(&temp_opp, hop_count).await;
 
         if net_profit < config.min_profit_usd {
             let gross = temp_opp.seizable_collateral as f64 / 1_000_000.0
@@ -503,7 +503,7 @@ impl Analyzer {
                     collateral_mint: collateral_asset.mint,
                 };
 
-                let net_profit = profit_calc.calculate_net_profit(&temp_opp, None);
+                let net_profit = profit_calc.calculate_net_profit(&temp_opp, None).await;
 
                 if net_profit > best_profit {
                     best_profit = net_profit;

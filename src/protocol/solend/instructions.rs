@@ -71,38 +71,33 @@ impl ReserveCache {
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
                 return Ok(*reserve);
             }
-            
-            // ✅ FIX: If cache is already initialized, all reserves have been fetched
-            // If mint is not in cache, it doesn't exist - return error immediately
-            // This prevents duplicate RPC calls when cache is already populated
-            if inner.initialized {
-                return Err(anyhow::anyhow!(
-                    "Reserve not found for mint: {} (cache is initialized, mint does not exist)",
-                    mint
-                ));
-            }
         }
 
-        // Fetch from RPC (only one thread will do this)
-        // Only reach here if cache is not initialized yet
+        // ✅ FIX: Don't check initialized before fetch - race condition risk
+        // Problem: Thread A fetches reserves, extends cache, sets initialized=true
+        //   Thread B acquires lock, sees initialized=true, returns error immediately
+        //   But Thread A might have just added Thread B's mint in the extend!
+        // Solution: Always fetch if mint not found (fetch lock prevents duplicate fetches)
+        //   Check again after extend to see if mint was added
+
+        // Fetch from RPC (only one thread will do this due to fetch lock)
         let mint_to_reserve = self.fetch_reserve_mapping_from_rpc(rpc, config).await?;
         
-        // ✅ FIX: Update cache and check again after extend to avoid race condition
-        // Problem: Thread A fetches reserves (USDC+SOL), Thread B waits on lock
-        //   Thread A extends cache, Thread B acquires lock, but double-check was before extend
-        //   Thread B would fetch again unnecessarily
-        // Solution: After extend, check cache again - if another thread already added our mint,
-        //   we can return immediately without error
+        // ✅ FIX: Extend cache (don't override) to prevent losing other thread's entries
+        // Problem: Thread A fetches USDC+SOL, Thread B fetches USDT
+        //   If Thread B overrides instead of extends, Thread A's data is lost
+        // Solution: Always use extend to merge new data with existing cache
         {
             let mut inner = self.inner.write().await;
-            // ✅ FIX: Use extend instead of override to prevent losing other thread's entries
             inner.mint_to_reserve.extend(mint_to_reserve);
             inner.initialized = true;
         }
         
-        // ✅ FIX: Check cache again after extend (another thread may have added our mint during RPC call)
-        // This prevents unnecessary RPC calls when multiple threads request different mints
-        // We release the write lock first, then check with a read lock to allow other threads to proceed
+        // ✅ FIX: Check cache again AFTER extend - another thread may have added our mint
+        // This is the correct place to check if mint exists, not before extend
+        // Problem: Early initialized check (removed above) could return error even if
+        //   another thread just added the mint in extend
+        // Solution: Always check after extend, only return error if still not found
         {
             let inner = self.inner.read().await;
             if let Some(reserve) = inner.mint_to_reserve.get(mint) {
