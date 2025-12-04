@@ -20,8 +20,8 @@ use std::sync::Arc;
 // This value should be tested in production/mainnet to ensure it doesn't exceed compute limits
 const MAX_ATAS_PER_TX: usize = 5;
 
-// Token-2022 Program ID (Token Extensions)
-const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+// ✅ FIX: Use registry for Token-2022 Program ID instead of hardcoded value
+use crate::core::registry::ProgramIds;
 
 /// Determines the correct token program ID for a given mint
 /// Checks if mint uses Token-2022 (Token Extensions) or standard SPL Token
@@ -32,11 +32,9 @@ pub async fn get_token_program_for_mint(
     mint: &Pubkey,
     rpc: Option<&Arc<RpcClient>>,
 ) -> Result<Pubkey> {
-    use std::str::FromStr;
-    
-    // Token program IDs
-    let token_2022_program_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID)
-        .map_err(|_| anyhow::anyhow!("Invalid Token-2022 program ID"))?;
+    // ✅ FIX: Use registry for Token-2022 Program ID
+    let token_2022_program_id = ProgramIds::token_2022()
+        .context("Failed to get Token-2022 program ID from registry")?;
     let standard_token_program_id = spl_token::id();
     
     // If RPC is available, check mint account owner on-chain

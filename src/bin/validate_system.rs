@@ -5,6 +5,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
 use liquid_bot::core::config::Config;
+use liquid_bot::core::registry::{ProgramIds, ReserveAddresses, LendingMarketAddresses};
 use liquid_bot::blockchain::rpc_client::RpcClient;
 use liquid_bot::protocol::solend::accounts::{derive_lending_market_authority, derive_obligation_address};
 use liquid_bot::protocol::solend::types::SolendObligation;
@@ -321,7 +322,7 @@ async fn validate_addresses(config: Option<&Config>) -> Result<Vec<TestResult>> 
 
     let solend_program_id_str = config
         .map(|c| c.solend_program_id.as_str())
-        .unwrap_or("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo");
+        .unwrap_or(ProgramIds::SOLEND);
     match Pubkey::try_from(solend_program_id_str) {
         Ok(pid) => {
             results.push(TestResult::success_with_details(
@@ -340,7 +341,7 @@ async fn validate_addresses(config: Option<&Config>) -> Result<Vec<TestResult>> 
 
     let main_market_str = config
         .and_then(|c| c.main_lending_market_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+        .unwrap_or(LendingMarketAddresses::MAIN);
     match main_market_str.parse::<Pubkey>() {
         Ok(market) => {
             results.push(TestResult::success_with_details(
@@ -359,10 +360,10 @@ async fn validate_addresses(config: Option<&Config>) -> Result<Vec<TestResult>> 
 
     let usdc_reserve_str = config
         .and_then(|c| c.usdc_reserve_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw");
+        .unwrap_or(ReserveAddresses::USDC);
     let sol_reserve_str = config
         .and_then(|c| c.sol_reserve_address.as_ref().map(|s| s.as_str()))
-        .unwrap_or("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36");
+        .unwrap_or(ReserveAddresses::SOL);
     
     let known_reserves = vec![
         ("USDC Reserve", usdc_reserve_str),

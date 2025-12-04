@@ -57,3 +57,7 @@ path = "src/bin/test_production_features.rs"
 [[bin]]
 name = "create_atas"
 path = "src/bin/create_atas.rs"
+
+[[bin]]
+name = "update_idls"
+path = "src/bin/update_idls.rs"

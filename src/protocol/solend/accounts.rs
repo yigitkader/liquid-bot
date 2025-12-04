@@ -1,17 +1,14 @@
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
-
-const EXPECTED_SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+use crate::core::registry::ProgramIds;
 
 fn validate_solend_program_id(program_id: &Pubkey) -> Result<()> {
-    let expected_program_id = Pubkey::from_str(EXPECTED_SOLEND_PROGRAM_ID)
-        .map_err(|_| anyhow::anyhow!("Failed to parse expected Solend program ID"))?;
+    let expected_program_id = ProgramIds::solend()?;
 
     if program_id != &expected_program_id {
         return Err(anyhow::anyhow!(
             "Invalid Solend program ID: expected {}, got {}",
-            EXPECTED_SOLEND_PROGRAM_ID,
+            ProgramIds::SOLEND,
             program_id
         ));
     }
@@ -20,12 +17,13 @@ fn validate_solend_program_id(program_id: &Pubkey) -> Result<()> {
 }
 
 pub fn get_associated_token_program_id(config: Option<&crate::config::Config>) -> Result<Pubkey> {
-    let program_id_str = config
-        .map(|c| c.associated_token_program_id.as_str())
-        .unwrap_or("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-
-    Pubkey::from_str(program_id_str)
-        .map_err(|_| anyhow::anyhow!("Invalid associated token program ID: {}", program_id_str))
+    // Önce config'den al, yoksa registry'den kullan
+    if let Some(cfg) = config {
+        cfg.associated_token_program_id.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid associated token program ID in config: {}", cfg.associated_token_program_id))
+    } else {
+        ProgramIds::associated_token()
+    }
 }
 
 pub fn get_associated_token_address(

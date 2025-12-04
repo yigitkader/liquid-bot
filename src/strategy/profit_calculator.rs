@@ -5,7 +5,6 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashSet;
-use std::str::FromStr;
 use std::time::Duration;
 
 pub struct ProfitCalculator {
@@ -405,36 +404,21 @@ impl ProfitCalculator {
 //   - main.rs calls this at startup and exits gracefully on error
 //   - Runtime access uses unwrap_or_else with empty set fallback (should never happen if init succeeded)
 static STABLECOIN_SET: Lazy<Result<HashSet<Pubkey>, String>> = Lazy::new(|| {
-    let mints = vec![
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
-        "EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCWNWqxWV4J6o", // DAI
-        "FR87nWEUxVgerFGhZM8Y4AggKGLnaXswr1Pd8wZ4kZcp", // FRAX
-        "9vMJfxuKxXBoEa7rM12mYLMwTacLMLDJqHozw96WQL8i", // UST (TerraUSD)
-        "AZsHEMXd36Bj1EMNXhowJajpUXzrKcK57wW4ZGXVa7yR", // BUSD
-        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", // TUSD
-        "EchesyfXePKdLbiHRbgTbYq4qP8zF8LzF6S9X5YJ7KzN", // USDP (Pax Dollar)
-    ];
-
-    let mut set = HashSet::new();
-    for s in mints {
-        match Pubkey::from_str(s) {
-            Ok(pk) => {
-                set.insert(pk);
-            }
-            Err(e) => {
-                // ✅ FIX: Return error instead of panic
-                // This allows main.rs to handle error gracefully at startup
-                let error_msg = format!(
-                    "Stablecoin configuration error: Failed to parse mint '{}': {}",
-                    s, e
-                );
-                log::error!("{}", error_msg);
-                return Err(error_msg);
-            }
+    // ✅ FIX: Use registry for stablecoin mints instead of hardcoded values
+    // This ensures consistency across the codebase and makes updates easier
+    use crate::core::registry::MintAddresses;
+    
+    match MintAddresses::stablecoins_as_pubkeys() {
+        Ok(set) => Ok(set),
+        Err(e) => {
+            let error_msg = format!(
+                "Stablecoin configuration error: Failed to load stablecoins from registry: {}",
+                e
+            );
+            log::error!("{}", error_msg);
+            Err(error_msg)
         }
     }
-    Ok(set)
 });
 
 static STABLECOIN_PAIRS: Lazy<Result<HashSet<(Pubkey, Pubkey)>, String>> = Lazy::new(|| {

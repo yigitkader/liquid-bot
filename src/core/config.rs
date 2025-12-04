@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::path::Path;
+use crate::core::registry::{ProgramIds, MintAddresses, ReserveAddresses, LendingMarketAddresses};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -104,11 +105,11 @@ impl Config {
                 .parse()
                 .context("Invalid DRY_RUN value (must be 'true' or 'false')")?,
             solend_program_id: env::var("SOLEND_PROGRAM_ID")
-                .unwrap_or_else(|_| "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo".to_string()),
+                .unwrap_or_else(|_| ProgramIds::SOLEND.to_string()),
             pyth_program_id: env::var("PYTH_PROGRAM_ID")
-                .unwrap_or_else(|_| "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH".to_string()),
+                .unwrap_or_else(|_| ProgramIds::PYTH.to_string()),
             switchboard_program_id: env::var("SWITCHBOARD_PROGRAM_ID")
-                .unwrap_or_else(|_| "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f".to_string()),
+                .unwrap_or_else(|_| ProgramIds::SWITCHBOARD.to_string()),
             priority_fee_per_cu: env::var("PRIORITY_FEE_PER_CU")
                 .unwrap_or_else(|_| "1000".to_string()) // 1000 micro-lamports per CU
                 .parse()
@@ -141,12 +142,12 @@ impl Config {
                 .context("Invalid MIN_RESERVE_LAMPORTS value")?,
             usdc_reserve_address: env::var("USDC_RESERVE_ADDRESS")
                 .ok()
-                .or_else(|| Some("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw".to_string())),
+                .or_else(|| Some(ReserveAddresses::USDC.to_string())),
             sol_reserve_address: env::var("SOL_RESERVE_ADDRESS")
                 .ok()
-                .or_else(|| Some("8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36".to_string())),
+                .or_else(|| Some(ReserveAddresses::SOL.to_string())),
             associated_token_program_id: env::var("ASSOCIATED_TOKEN_PROGRAM_ID")
-                .unwrap_or_else(|_| "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".to_string()),
+                .unwrap_or_else(|_| ProgramIds::ASSOCIATED_TOKEN.to_string()),
             sol_price_fallback_usd: env::var("SOL_PRICE_FALLBACK_USD")
                 .unwrap_or_else(|_| "150.0".to_string())
                 .parse()
@@ -275,23 +276,23 @@ impl Config {
             .context("Invalid SLIPPAGE_MIN_MEASUREMENTS_PER_CATEGORY value")?,
             main_lending_market_address: env::var("MAIN_LENDING_MARKET_ADDRESS")
                 .ok()
-                .or_else(|| Some("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY".to_string())),
+                .or_else(|| Some(LendingMarketAddresses::MAIN.to_string())),
             test_wallet_pubkey: env::var("TEST_WALLET_PUBKEY")
                 .ok()
                 .or_else(|| Some("11111111111111111111111111111111".to_string())),
             usdc_mint: env::var("USDC_MINT")
-                .unwrap_or_else(|_| "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+                .unwrap_or_else(|_| MintAddresses::USDC.to_string()),
             sol_mint: env::var("SOL_MINT")
-                .unwrap_or_else(|_| "So11111111111111111111111111111111111111112".to_string()),
+                .unwrap_or_else(|_| MintAddresses::SOL.to_string()),
             usdt_mint: env::var("USDT_MINT")
                 .ok()
-                .or_else(|| Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string())),
+                .or_else(|| Some(MintAddresses::USDT.to_string())),
             eth_mint: env::var("ETH_MINT")
                 .ok()
-                .or_else(|| Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs".to_string())),
+                .or_else(|| Some(MintAddresses::ETH.to_string())),
             btc_mint: env::var("BTC_MINT")
                 .ok()
-                .or_else(|| Some("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E".to_string())),
+                .or_else(|| Some(MintAddresses::BTC.to_string())),
             default_pyth_oracle_mappings_json: env::var("DEFAULT_PYTH_ORACLE_MAPPINGS_JSON").ok(),
             default_switchboard_oracle_mappings_json: env::var(
                 "DEFAULT_SWITCHBOARD_ORACLE_MAPPINGS_JSON",
