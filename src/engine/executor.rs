@@ -505,20 +505,12 @@ impl Executor {
         // ✅ FIX: WSOL wrap mechanism - if debt_mint is WSOL, wrap native SOL to WSOL
         // Note: WSOL ATA should already be created above in separate transaction
         if is_wsol_mint(&opp.debt_mint) {
-            // Check if WSOL ATA exists and has sufficient balance
-            let wsol_balance = match self.rpc.get_account(&source_liquidity_ata).await {
-                Ok(acc) => {
-                    if acc.data.len() >= 72 {
-                        let balance_bytes: [u8; 8] = acc.data[64..72]
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance"))?;
-                        u64::from_le_bytes(balance_bytes)
-                    } else {
-                        0
-                    }
-                }
-                Err(_) => 0, // ATA doesn't exist or error - assume 0 balance
-            };
+            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            // This ensures consistent error handling and avoids code duplication
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_balance = read_ata_balance(&source_liquidity_ata, &self.rpc)
+                .await
+                .unwrap_or(0); // If error (not AccountNotFound), assume 0 balance for safety
             
             // Check if we need to wrap more SOL
             let needed_wsol = opp.max_liquidatable;
@@ -632,20 +624,13 @@ impl Executor {
             // This ensures we read the post-liquidation balance
             tokio::time::sleep(Duration::from_millis(500)).await;
             
-            // Read ATA balance after liquidation
-            let wsol_balance = match self.rpc.get_account(&source_liquidity_ata).await {
-                Ok(acc) => {
-                    if acc.data.len() >= 72 {
-                        let balance_bytes: [u8; 8] = acc.data[64..72]
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance from ATA"))?;
-                        u64::from_le_bytes(balance_bytes)
-                    } else {
-                        0
-                    }
-                }
+            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            // This ensures consistent error handling and avoids code duplication
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_balance = match read_ata_balance(&source_liquidity_ata, &self.rpc).await {
+                Ok(balance) => balance,
                 Err(e) => {
-                    // ATA doesn't exist or error - log and skip unwrap
+                    // RPC error (not AccountNotFound) - log and skip unwrap
                     log::warn!(
                         "Executor: Failed to read WSOL ATA balance for unwrap check: {}. Skipping unwrap.",
                         e
@@ -732,6 +717,7 @@ impl Executor {
         );
         
         let create_ata_ix = self.create_ata_instruction(mint).await?;
+        use solana_sdk::signature::Signer;
         let mut ata_tx_builder = TransactionBuilder::new(self.wallet.pubkey());
         ata_tx_builder.add_compute_budget(200_000, 1_000);
         ata_tx_builder.add_instruction(create_ata_ix);

@@ -125,45 +125,16 @@ impl BalanceManager {
                 }
             }
             
-            // Cache miss or stale - fetch from RPC
-            let account = match self.rpc.get_account(&wsol_ata).await {
-                Ok(acc) => acc,
+            // Cache miss or stale - fetch from RPC using helper function
+            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_balance = match read_ata_balance(&wsol_ata, &self.rpc).await {
+                Ok(balance) => balance,
                 Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
-                        // WSOL ATA doesn't exist - balance is 0
-                        // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent order)
-                        let mut balances = self.balances.write().await;
-                        balances.insert(
-                            wsol_ata,
-                            CachedBalance {
-                                amount: 0,
-                                timestamp: Instant::now(),
-                            },
-                        );
-                        // Keep balances lock held while acquiring reserved to maintain lock order
-                        let reserved_amount = {
-                            let reserved = self.reserved.read().await;
-                            reserved.get(mint).copied().unwrap_or(0)
-                        };
-                        log::debug!(
-                            "BalanceManager: WSOL ATA not found: ata={}, balance=0, reserved={}, available=0",
-                            wsol_ata, reserved_amount
-                        );
-                        return Ok(0u64.saturating_sub(reserved_amount));
-                    }
+                    // RPC error (not AccountNotFound) - propagate error
                     return Err(e).context("Failed to fetch WSOL ATA account");
                 }
             };
-            
-            if account.data.len() < 72 {
-                return Err(anyhow::anyhow!("Invalid WSOL token account data"));
-            }
-            
-            let balance_bytes: [u8; 8] = account.data[64..72]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance from token account"))?;
-            let wsol_balance = u64::from_le_bytes(balance_bytes);
             
             // Update cache
             // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent order)
@@ -230,50 +201,15 @@ impl BalanceManager {
             ata
         );
 
-        let account = match self.rpc.get_account(&ata).await {
-            Ok(acc) => acc,
+        // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+        use crate::utils::helpers::read_ata_balance;
+        let actual = match read_ata_balance(&ata, &self.rpc).await {
+            Ok(balance) => balance,
             Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
-                {
-                    log::debug!(
-                        "BalanceManager: ATA not found for mint {} (ata={}), wallet={}. Returning 0 balance (ATA will be auto-created during transaction if needed)",
-                        mint,
-                        ata,
-                        self.wallet
-                    );
-
-                    // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
-                    let mut balances = self.balances.write().await;
-                    balances.insert(
-                        ata,
-                        CachedBalance {
-                            amount: 0,
-                            timestamp: Instant::now(),
-                        },
-                    );
-
-                    let reserved_amount = {
-                        // Lock order: balances (already held) -> reserved (consistent order)
-                        let reserved = self.reserved.read().await;
-                        reserved.get(mint).copied().unwrap_or(0)
-                    };
-
-                    return Ok(0u64.saturating_sub(reserved_amount));
-                }
-                // Other errors (network issues, RPC errors, etc.) should be propagated
-                return Err(e);
+                // RPC error (not AccountNotFound) - propagate error
+                return Err(e).context("Failed to fetch token account balance");
             }
         };
-
-        if account.data.len() < 72 {
-            return Err(anyhow::anyhow!("Invalid token account data"));
-        }
-
-        let balance_bytes: [u8; 8] = account.data[64..72]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
-        let actual = u64::from_le_bytes(balance_bytes);
 
         // Update cache with RPC result
         // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
@@ -334,36 +270,16 @@ impl BalanceManager {
                 }
             }
             
-            // Cache miss or stale - fetch from RPC
-            let account = match self.rpc.get_account(&wsol_ata).await {
-                Ok(acc) => acc,
+            // Cache miss or stale - fetch from RPC using helper function
+            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_balance = match read_ata_balance(&wsol_ata, &self.rpc).await {
+                Ok(balance) => balance,
                 Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
-                        // WSOL ATA doesn't exist - balance is 0
-                        let mut balances = self.balances.write().await;
-                        balances.insert(
-                            wsol_ata,
-                            CachedBalance {
-                                amount: 0,
-                                timestamp: Instant::now(),
-                            },
-                        );
-                        let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                        return Ok(0u64.saturating_sub(reserved_amount));
-                    }
+                    // RPC error (not AccountNotFound) - propagate error
                     return Err(e).context("Failed to fetch WSOL ATA account");
                 }
             };
-            
-            if account.data.len() < 72 {
-                return Err(anyhow::anyhow!("Invalid WSOL token account data"));
-            }
-            
-            let balance_bytes: [u8; 8] = account.data[64..72]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance from token account"))?;
-            let wsol_balance = u64::from_le_bytes(balance_bytes);
             
             // Update cache
             {
@@ -398,38 +314,15 @@ impl BalanceManager {
             }
         }
 
-        let account = match self.rpc.get_account(&ata).await {
-            Ok(acc) => acc,
+        // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+        use crate::utils::helpers::read_ata_balance;
+        let actual = match read_ata_balance(&ata, &self.rpc).await {
+            Ok(balance) => balance,
             Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
-                {
-                    // Cache zero balance
-                    // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
-                    // Note: reserved is passed as parameter (already locked by caller), so we only lock balances
-                    let mut balances = self.balances.write().await;
-                    balances.insert(
-                        ata,
-                        CachedBalance {
-                            amount: 0,
-                            timestamp: Instant::now(),
-                        },
-                    );
-                    let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
-                    return Ok(0u64.saturating_sub(reserved_amount));
-                }
-                return Err(e);
+                // RPC error (not AccountNotFound) - propagate error
+                return Err(e).context("Failed to fetch token account balance");
             }
         };
-
-        if account.data.len() < 72 {
-            return Err(anyhow::anyhow!("Invalid token account data"));
-        }
-
-        let balance_bytes: [u8; 8] = account.data[64..72]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
-        let actual = u64::from_le_bytes(balance_bytes);
 
         // Update cache
         // ✅ DEADLOCK PREVENTION: Lock order balances -> reserved (consistent with reserve())
@@ -745,88 +638,11 @@ impl BalanceManager {
             // Cache miss or stale - fetch from RPC WITHOUT holding any locks
             // This prevents lock contention and ensures we get fresh data
             
-            // ✅ FIX: WSOL - read balance from WSOL ATA
-            if mint == &sol_mint || is_wsol_mint(mint) {
-                let account = match self.rpc.get_account(&ata).await {
-                    Ok(acc) => acc,
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        if error_msg.contains("AccountNotFound") || error_msg.contains("account not found") {
-                            // WSOL ATA doesn't exist - balance is 0
-                            {
-                                let mut balances = self.balances.write().await;
-                                balances.insert(
-                                    ata,
-                                    CachedBalance {
-                                        amount: 0,
-                                        timestamp: Instant::now(),
-                                    },
-                                );
-                            }
-                            return self.reserve_with_balance(mint, amount, 0).await;
-                        }
-                        return Err(e).context("Failed to fetch WSOL ATA account during reserve");
-                    }
-                };
-                
-                if account.data.len() < 72 {
-                    return Err(anyhow::anyhow!("Invalid WSOL token account data"));
-                }
-                
-                let balance_bytes: [u8; 8] = account.data[64..72]
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to read WSOL balance from token account"))?;
-                let wsol_balance = u64::from_le_bytes(balance_bytes);
-                
-                // Update cache with short-lived write lock (no reserved lock needed yet)
-                {
-                    let mut balances = self.balances.write().await;
-                    balances.insert(
-                        ata,
-                        CachedBalance {
-                            amount: wsol_balance,
-                            timestamp: Instant::now(),
-                        },
-                    );
-                }
-                
-                return self.reserve_with_balance(mint, amount, wsol_balance).await;
-            }
-            
-            // SPL tokens: read from ATA
-            let account = match self.rpc.get_account(&ata).await {
-                Ok(acc) => acc,
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("AccountNotFound") || error_msg.contains("account not found")
-                    {
-                        // ATA doesn't exist - balance is 0
-                        // Update cache with short-lived write lock
-                        {
-                            let mut balances = self.balances.write().await;
-                            balances.insert(
-                                ata,
-                                CachedBalance {
-                                    amount: 0,
-                                    timestamp: Instant::now(),
-                                },
-                            );
-                        }
-                        return self.reserve_with_balance(mint, amount, 0).await;
-                    } else {
-                        return Err(e).context("Failed to fetch account balance during reserve");
-                    }
-                }
-            };
-
-            if account.data.len() < 72 {
-                return Err(anyhow::anyhow!("Invalid token account data"));
-            }
-
-            let balance_bytes: [u8; 8] = account.data[64..72]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to read balance from token account"))?;
-            let balance = u64::from_le_bytes(balance_bytes);
+            // ✅ FIX: Use helper function to read ATA balance (Problems.md recommendation)
+            use crate::utils::helpers::read_ata_balance;
+            let balance = read_ata_balance(&ata, &self.rpc)
+                .await
+                .context("Failed to fetch account balance during reserve")?;
             
             // Update cache with short-lived write lock (no reserved lock needed yet)
             {
