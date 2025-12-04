@@ -8,6 +8,7 @@ pub mod macros;
 pub mod config;
 pub mod addresses;
 pub mod rpc;
+pub mod accounts;
 
 pub use builder::ValidationBuilder;
 pub use result::TestResult;

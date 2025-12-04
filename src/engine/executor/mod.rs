@@ -293,6 +293,46 @@ impl Executor {
             }
         }
         
+        // ✅ CRITICAL FIX: Convert max_liquidatable from USD×1e6 to token amount
+        // Problem: opp.max_liquidatable is in USD×1e6 (micro-USD), but we need token amount
+        // Validator reserves using token amount, so Executor must use the same
+        // Solution: Use same conversion logic as Validator to ensure consistency
+        use crate::utils::helpers::{read_mint_decimals, usd_to_token_amount};
+        use crate::protocol::oracle::{get_oracle_accounts_from_mint, read_oracle_price};
+        
+        let (pyth_oracle, switchboard_oracle) = get_oracle_accounts_from_mint(&opp.debt_mint, Some(&self.config))
+            .context("Failed to get oracle accounts for debt mint")?;
+        
+        let price_data = read_oracle_price(
+            pyth_oracle.as_ref(),
+            switchboard_oracle.as_ref(),
+            Arc::clone(&self.rpc),
+            Some(&self.config),
+        )
+        .await
+        .context("Failed to read oracle price for debt mint")?
+        .ok_or_else(|| anyhow::anyhow!("No oracle price data available for debt mint {}", opp.debt_mint))?;
+        
+        let decimals = read_mint_decimals(&opp.debt_mint, &self.rpc)
+            .await
+            .context("Failed to read decimals for debt mint")?;
+        
+        let max_liquidatable_token_amount = usd_to_token_amount(
+            opp.max_liquidatable,
+            price_data.price,
+            decimals,
+        )
+        .context("Failed to convert max_liquidatable from USD to token amount")?;
+        
+        log::debug!(
+            "Executor: Converted max_liquidatable: USD×1e6={}, price={:.6}, decimals={}, token_amount={} for debt_mint={}",
+            opp.max_liquidatable,
+            price_data.price,
+            decimals,
+            max_liquidatable_token_amount,
+            opp.debt_mint
+        );
+        
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
@@ -302,7 +342,8 @@ impl Executor {
                 .await
                 .unwrap_or(0);
             
-            let needed_wsol = opp.max_liquidatable;
+            // ✅ CRITICAL FIX: Use token amount, not USD amount
+            let needed_wsol = max_liquidatable_token_amount;
             if wsol_balance < needed_wsol {
                 let wrap_amount = needed_wsol.saturating_sub(wsol_balance);
                 
@@ -366,8 +407,11 @@ impl Executor {
 
         let signature = self.send_transaction(&tx_builder).await?;
 
+        // ✅ CRITICAL FIX: Release using token amount, not USD amount
+        // Validator reserves using token amount (max_liquidatable_token_amount),
+        // so we must release the same amount to maintain consistency
         self.balance_manager
-            .release(&opp.debt_mint, opp.max_liquidatable)
+            .release(&opp.debt_mint, max_liquidatable_token_amount)
             .await;
 
         self.event_bus.publish(Event::TransactionSent {

@@ -1,9 +1,137 @@
-// BalanceManager modülleri
-pub mod cache;
-pub mod reservation;
+// BalanceManager - consolidated module (cache and reservation merged)
 
-pub use cache::{BalanceCache, CachedBalance, CACHE_TTL};
-pub use reservation::ReservationManager;
+// Balance cache module - caches token balances with TTL
+use std::time::Instant;
+
+/// Cached balance with timestamp for freshness checking
+#[derive(Clone, Debug)]
+pub struct CachedBalance {
+    pub amount: u64,
+    pub timestamp: Instant,
+}
+
+/// Cache time-to-live: balances older than this will be considered stale
+pub const CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Balance cache for storing token balances with TTL
+pub struct BalanceCache {
+    balances: Arc<RwLock<HashMap<Pubkey, CachedBalance>>>,
+}
+
+impl BalanceCache {
+    pub fn new() -> Self {
+        Self {
+            balances: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get(&self, ata: &Pubkey) -> Option<CachedBalance> {
+        let balances = self.balances.read().await;
+        balances.get(ata).cloned()
+    }
+
+    pub async fn get_fresh(&self, ata: &Pubkey) -> Option<u64> {
+        let balances = self.balances.read().await;
+        if let Some(cached) = balances.get(ata) {
+            if cached.timestamp.elapsed() < CACHE_TTL {
+                return Some(cached.amount);
+            }
+        }
+        None
+    }
+
+    pub async fn insert(&self, ata: Pubkey, amount: u64) {
+        let mut balances = self.balances.write().await;
+        balances.insert(
+            ata,
+            CachedBalance {
+                amount,
+                timestamp: Instant::now(),
+            },
+        );
+    }
+
+    pub async fn update(&self, ata: &Pubkey, amount: u64) {
+        let mut balances = self.balances.write().await;
+        if let Some(cached) = balances.get_mut(ata) {
+            cached.amount = amount;
+            cached.timestamp = Instant::now();
+        } else {
+            balances.insert(
+                *ata,
+                CachedBalance {
+                    amount,
+                    timestamp: Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub fn balances(&self) -> Arc<RwLock<HashMap<Pubkey, CachedBalance>>> {
+        Arc::clone(&self.balances)
+    }
+}
+
+impl Default for BalanceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Reservation module - manages reserved balances to prevent double-spending
+
+/// Reservation manager for tracking reserved token amounts
+pub struct ReservationManager {
+    reserved: Arc<RwLock<HashMap<Pubkey, u64>>>, // mint -> reserved amount
+}
+
+impl ReservationManager {
+    pub fn new() -> Self {
+        Self {
+            reserved: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get(&self, mint: &Pubkey) -> u64 {
+        let reserved = self.reserved.read().await;
+        reserved.get(mint).copied().unwrap_or(0)
+    }
+
+    pub async fn reserve(&self, mint: &Pubkey, amount: u64) {
+        let mut reserved = self.reserved.write().await;
+        let current = reserved.get(mint).copied().unwrap_or(0);
+        reserved.insert(*mint, current.saturating_add(amount));
+    }
+
+    pub async fn release(&self, mint: &Pubkey, amount: u64) {
+        let mut reserved = self.reserved.write().await;
+        if let Some(current) = reserved.get_mut(mint) {
+            *current = current.saturating_sub(amount);
+            if *current == 0 {
+                reserved.remove(mint);
+            }
+        }
+    }
+
+    pub async fn set(&self, mint: &Pubkey, amount: u64) {
+        let mut reserved = self.reserved.write().await;
+        if amount == 0 {
+            reserved.remove(mint);
+        } else {
+            reserved.insert(*mint, amount);
+        }
+    }
+
+    pub fn reserved(&self) -> Arc<RwLock<HashMap<Pubkey, u64>>> {
+        Arc::clone(&self.reserved)
+    }
+}
+
+impl Default for ReservationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 use crate::blockchain::rpc_client::RpcClient;
 use crate::blockchain::ws_client::{AccountUpdate, WsClient};
@@ -565,14 +693,18 @@ impl BalanceManager {
                 .await
                 .context("Failed to fetch account balance during reserve")?;
             
-            // Re-acquire locks in SAME order (balances -> reserved)
+            // ✅ CRITICAL FIX: Re-acquire locks in SAME order (balances -> reserved)
+            // Problem: Previous code only acquired reserved lock, violating lock ordering
+            // Solution: Acquire balances lock first, then reserved lock (consistent with other code paths)
+            let balances_arc = self.cache.balances();
+            let _balances = balances_arc.read().await; // Acquire first for lock order consistency
             let reserved_arc = self.reservation.reserved();
             let mut reserved = reserved_arc.write().await;
             
-            // Update cache (without holding balances lock - cache.insert handles its own lock)
+            // Update cache (cache.insert handles its own lock, but we've already acquired balances lock for consistency)
             self.cache.insert(ata, balance).await;
             
-            // Check and reserve atomically (we're holding both locks)
+            // Check and reserve atomically (we're holding both locks in correct order)
             let reserved_amount = reserved.get(mint).copied().unwrap_or(0);
             let new_reserved = reserved_amount.saturating_add(amount);
             let available = balance.saturating_sub(new_reserved);

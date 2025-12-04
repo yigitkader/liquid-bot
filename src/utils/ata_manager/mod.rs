@@ -1,9 +1,155 @@
-// ATA Manager modülleri
-mod token_program;
-mod verification;
+// ATA Manager - consolidated module (token_program and verification merged)
 
-pub use token_program::get_token_program_for_mint;
-pub use verification::{verify_ata_after_creation, verify_ata_exists};
+// Token program detection module
+use crate::core::registry::ProgramIds;
+
+/// Determines the correct token program ID for a given mint
+/// Checks if mint uses Token-2022 (Token Extensions) or standard SPL Token
+pub async fn get_token_program_for_mint(
+    mint: &solana_sdk::pubkey::Pubkey,
+    rpc: Option<&std::sync::Arc<crate::blockchain::rpc_client::RpcClient>>,
+) -> anyhow::Result<solana_sdk::pubkey::Pubkey> {
+    let token_2022_program_id = ProgramIds::token_2022()
+        .with_context(|| "Failed to get Token-2022 program ID from registry")?;
+    let standard_token_program_id = spl_token::id();
+    
+    // If RPC is available, check mint account owner on-chain
+    if let Some(rpc_client) = rpc {
+        log::debug!("🔍 Fetching mint account {} from RPC to determine token program...", mint);
+        match rpc_client.get_account(mint).await {
+            Ok(account) => {
+                let owner = account.owner;
+                log::info!(
+                    "📊 Mint account {} fetched: owner={}, lamports={}, data_len={}",
+                    mint,
+                    owner,
+                    account.lamports,
+                    account.data.len()
+                );
+                
+                if owner == token_2022_program_id {
+                    log::info!("✅ Mint {} uses Token-2022 program (owner matches)", mint);
+                    return Ok(token_2022_program_id);
+                } else if owner == standard_token_program_id {
+                    log::info!("✅ Mint {} uses standard SPL Token program (owner matches)", mint);
+                    return Ok(standard_token_program_id);
+                }
+                
+                if account.data.len() < 82 {
+                    log::warn!(
+                        "⚠️  Mint {} account data too small ({} bytes), expected at least 82 bytes",
+                        mint,
+                        account.data.len()
+                    );
+                }
+                
+                log::warn!(
+                    "⚠️  Mint {} has unexpected owner: {} (expected {} or {}), defaulting to standard SPL Token",
+                    mint,
+                    owner,
+                    standard_token_program_id,
+                    token_2022_program_id
+                );
+                return Ok(standard_token_program_id);
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to fetch mint account {} from RPC: {}, trying fallback methods",
+                    mint,
+                    e
+                );
+            }
+        }
+    } else {
+        log::debug!("⚠️  No RPC client provided, using fallback method for mint {}", mint);
+    }
+    
+    // Fallback - Check known Token-2022 mints list
+    const TOKEN_2022_MINTS: &[&str] = &[
+        // Add confirmed Token-2022 mints here as they are discovered
+    ];
+    
+    let mint_str = mint.to_string();
+    
+    if TOKEN_2022_MINTS.contains(&mint_str.as_str()) {
+        log::info!("✅ Mint {} found in known Token-2022 mints list", mint);
+        Ok(token_2022_program_id)
+    } else {
+        log::warn!(
+            "⚠️  Mint {} not in known Token-2022 list and RPC check unavailable, defaulting to standard SPL Token. \
+             If ATA creation fails with 'Invalid program id', this mint may be Token-2022 and should be added to TOKEN_2022_MINTS.",
+            mint
+        );
+        Ok(standard_token_program_id)
+    }
+}
+
+// ATA verification module
+
+/// Check if an ATA exists and verify its owner
+pub async fn verify_ata_exists(
+    ata: &solana_sdk::pubkey::Pubkey,
+    expected_owner: &solana_sdk::pubkey::Pubkey,
+    rpc: &std::sync::Arc<crate::blockchain::rpc_client::RpcClient>,
+) -> anyhow::Result<bool> {
+    match rpc.get_account(ata).await {
+        Ok(account) => {
+            if account.data.len() >= 64 {
+                let owner_bytes = &account.data[32..64];
+                if let Ok(owner) = solana_sdk::pubkey::Pubkey::try_from(owner_bytes) {
+                    if owner == *expected_owner {
+                        return Ok(true);
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "ATA {} exists but has different owner: {} (expected: {})",
+                            ata,
+                            owner,
+                            expected_owner
+                        ));
+                    }
+                }
+            }
+            Ok(true) // Account exists but couldn't parse owner
+        }
+        Err(_) => Ok(false), // Account doesn't exist
+    }
+}
+
+/// Verify ATA after creation with retries
+pub async fn verify_ata_after_creation(
+    ata: &solana_sdk::pubkey::Pubkey,
+    name: &str,
+    rpc: &std::sync::Arc<crate::blockchain::rpc_client::RpcClient>,
+    max_attempts: u32,
+) -> bool {
+    for attempt in 1..=max_attempts {
+        match rpc.get_account(ata).await {
+            Ok(_) => {
+                log::info!("✅ {} ATA verified: {}", name, ata);
+                return true;
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    log::debug!(
+                        "⚠️  {} ATA verification attempt {} failed, retrying...: {}",
+                        name,
+                        attempt,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                } else {
+                    log::warn!(
+                        "⚠️  {} ATA verification failed after {} attempts: {}",
+                        name,
+                        max_attempts,
+                        e
+                    );
+                }
+            }
+        }
+    }
+    false
+}
 
 use crate::blockchain::rpc_client::RpcClient;
 use crate::core::config::Config;
@@ -236,7 +382,7 @@ async fn send_ata_batch(
                 if account.data.len() >= 64 {
                     use solana_sdk::pubkey::Pubkey;
                     let owner_bytes = &account.data[32..64];
-                    if let Ok(owner) = Pubkey::try_from(owner_bytes) {
+                    if let Ok(owner) = solana_sdk::pubkey::Pubkey::try_from(owner_bytes) {
                         if owner == wallet_pubkey {
                             log::info!(
                                 "✅ {} ATA {} already exists with correct owner - skipping creation",
@@ -419,7 +565,7 @@ async fn create_ata_instruction(
     // Determine correct token program based on mint
     // Some mints use Token-2022 (Token Extensions), others use standard SPL Token
     // Check mint account owner on-chain for accurate determination
-    let token_program = token_program::get_token_program_for_mint(mint, rpc)
+    let token_program = get_token_program_for_mint(mint, rpc)
         .await
         .context("Failed to determine token program for mint")?;
 
