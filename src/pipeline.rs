@@ -407,7 +407,7 @@ async fn validate_oracles(
 async fn validate_switchboard_oracle_if_available(
     rpc: &Arc<RpcClient>,
     reserve: &Reserve,
-    current_slot: u64,
+    _current_slot: u64, // Reserved for future slot-based validation
 ) -> Result<Option<f64>> {
     // 1. Get switchboard_oracle_pubkey from reserve.config
     // Note: ReserveConfig may not have this field in all versions
@@ -768,7 +768,7 @@ async fn get_liquidation_quote(
     }
 
     let borrow = &ctx.obligation.borrows[0];
-    let deposit = &ctx.obligation.deposits[0];
+    // Note: deposit is available but we use deposit_reserve directly for mint address
 
     // Get mint addresses from reserve accounts
     let collateral_mint = ctx
