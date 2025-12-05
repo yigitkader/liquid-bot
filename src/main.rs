@@ -1,348 +1,241 @@
+mod solend;
+mod pipeline;
+mod jup;
+mod utils;
+
 use anyhow::{Context, Result};
 use dotenv::dotenv;
-use fern;
-use log;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
+use spl_associated_token_account::get_associated_token_address;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::signal;
-use tokio::time::{sleep, Duration};
 
-use liquid_bot::blockchain::rpc_client::RpcClient;
-use liquid_bot::blockchain::ws_client::WsClient;
-use liquid_bot::core::config::Config;
-use liquid_bot::core::events::EventBus;
-use liquid_bot::engine::analyzer::Analyzer;
-use liquid_bot::engine::executor::Executor;
-use liquid_bot::engine::scanner::Scanner;
-use liquid_bot::engine::validator::Validator;
-use liquid_bot::protocol::solend::SolendProtocol;
-use liquid_bot::protocol::Protocol;
-use liquid_bot::strategy::balance_manager::BalanceManager;
-use liquid_bot::utils::cache::AccountCache;
-use liquid_bot::utils::metrics::Metrics;
-
-use solana_sdk::signature::{Keypair, Signer};
+use pipeline::{run_liquidation_loop, Config, LiquidationMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    std::fs::create_dir_all("logs").context("Failed to create logs directory")?;
-
-    let log_file_path = format!("logs/bot-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
-
-    // ✅ FIX: Filter out noisy HTTP client debug logs (chunked headers, connection details, etc.)
-    // These logs come from hyper/reqwest HTTP client libraries used by solana-client
-    let logger = fern::Dispatch::new()
-        .format(|out, message, record| {
-            // Filter out noisy HTTP client debug messages
-            let msg_str = format!("{}", message);
-            if msg_str.contains("incoming chunked header")
-                || msg_str.contains("chunked header")
-                || msg_str.contains("parsed 18 headers")
-                || msg_str.contains("incoming body is chunked encoding")
-                || msg_str.contains("incoming body completed")
-                || msg_str.contains("flushed")
-                || msg_str.contains("pooling idle connection")
-                || msg_str.contains("reuse idle connection")
-                || msg_str.contains("starting new connection")
-                || msg_str.contains("resolving host")
-                || msg_str.contains("connecting to")
-                || msg_str.contains("connected to")
-            {
-                // Skip these noisy logs
-                return;
-            }
-            
-            out.finish(format_args!(
-                "{} [{}] {}",
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                record.level(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Debug)
-        // Suppress debug logs from HTTP client libraries
-        .level_for("hyper", log::LevelFilter::Info)
-        .level_for("reqwest", log::LevelFilter::Info)
-        .level_for("solana_client", log::LevelFilter::Info)
-        .chain(std::io::stdout())
-        .chain(fern::log_file(&log_file_path)?);
-    
-    logger.apply().context("Failed to initialize logger")?;
+    // Initialize logger
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     log::info!("🚀 Starting Solana Liquidation Bot");
-    log::info!("📝 Logging to: {}", log_file_path);
 
-    let config = Config::from_env().context("Failed to load configuration")?;
-    config
-        .validate()
-        .context("Configuration validation failed")?;
-
+    // Load config
+    let app_config = load_config().context("Failed to load configuration")?;
     log::info!("✅ Configuration loaded");
 
-    // ✅ CRITICAL FIX: Initialize stablecoin sets at startup (fail-fast on config errors)
-    // Problem: Previous code used panic! when stablecoin mint parsing failed
-    //   This causes entire bot to crash, even if error occurs during runtime
-    // Solution: Validate stablecoin configuration at startup and exit gracefully on error
-    //   - init_stablecoin_sets() validates all stablecoin mint addresses
-    //   - If validation fails, bot exits with error code (fail-fast)
-    //   - This prevents runtime panics and allows graceful error handling
-    liquid_bot::strategy::profit_calculator::init_stablecoin_sets()
-        .map_err(|e| anyhow::anyhow!("Stablecoin configuration error: {}", e))
-        .context("Failed to initialize stablecoin sets - check stablecoin mint addresses in code")?;
+    // Runtime layout validation per Structure.md section 11.6
+    let rpc = Arc::new(RpcClient::new(app_config.rpc_url.clone()));
+    validate_solend_layouts(&rpc)
+        .await
+        .context("Solend layout validation failed - please rebuild the bot")?;
 
-    let rpc = Arc::new(
-        RpcClient::new(config.rpc_http_url.clone()).context("Failed to create RPC client")?,
-    );
-    log::info!("✅ RPC client initialized");
-
-    // ✅ CRITICAL: Start reserve cache FIRST (initial refresh happens immediately)
-    // This prevents RPC storm on startup when both reserve cache and scanner call get_program_accounts
-    liquid_bot::protocol::solend::instructions::start_reserve_cache_refresh(
-        Arc::clone(&rpc),
-        config.clone(),
-    );
-    log::info!("✅ Reserve cache background refresh started (initial refresh in progress)");
-
-    // ✅ CRITICAL FIX: ALWAYS wait for reserve cache initialization, regardless of RPC type
-    // Both Scanner and Executor need reserve cache to avoid unnecessary get_program_accounts() calls
-    // Problem:
-    //   - Free RPC: Was waiting ✅
-    //   - Premium RPC: Was NOT waiting ❌ → Scanner immediately calls get_program_accounts() → unnecessary RPC call
-    // Solution: Wait for cache initialization for BOTH RPC types before starting Scanner
-    // This prevents:
-    //   1. Scanner calling get_program_accounts() when cache is not ready (unnecessary RPC call)
-    //   2. Executor calling get_program_accounts() on first opportunity (rate limit risk)
-    log::info!(
-        "⏳ Waiting for reserve cache initial population before starting Scanner and Executor..."
-    );
-    // ✅ FIX: Increased timeout to account for retry mechanism (3 retries * ~30s timeout + buffer)
-    // get_program_accounts now uses 3x timeout (min 30s), so we need at least 90s + buffer
-    let cache_timeout = tokio::time::Duration::from_secs(120); // 2 minutes to allow for retries
-    if liquid_bot::protocol::solend::instructions::wait_for_reserve_cache_initialization(
-        cache_timeout,
-    )
-    .await
-    {
-        log::info!("✅ Reserve cache populated, ready for Scanner and Executor");
-    } else {
-        log::warn!(
-            "⚠️  Reserve cache initialization timeout - Scanner and Executor will start anyway"
-        );
-        log::warn!(
-            "   This may cause unnecessary RPC calls (get_program_accounts) if cache is not ready"
-        );
-        log::warn!("   Monitor for rate limit errors, especially on first opportunity");
-    }
-
-    log::info!("⏳ Starting account discovery...");
-
-    let ws = Arc::new(WsClient::new(config.rpc_ws_url.clone()));
-    ws.connect().await.context("Failed to connect WebSocket")?;
-    log::info!("✅ WebSocket client initialized");
-
-    let wallet_keypair = load_wallet(&config.wallet_path).context("Failed to load wallet")?;
-    let wallet = Arc::new(wallet_keypair);
+    // Load wallet - per Structure.md section 6.1: secret/main.json
+    let keypair_path = std::path::PathBuf::from("secret/main.json");
+    let wallet = load_keypair(&keypair_path).context("Failed to load wallet")?;
     let wallet_pubkey = wallet.pubkey();
     log::info!("✅ Wallet loaded: {}", wallet_pubkey);
 
-    // Ensure required ATAs exist (simple on-chain check, no cache needed)
-    use liquid_bot::utils::ata_manager;
-    ata_manager::ensure_required_atas(Arc::clone(&rpc), Arc::clone(&wallet), &config)
+    // Startup safety checks - per Structure.md section 6.3
+    validate_wallet_balances(&rpc, &wallet_pubkey)
         .await
-        .context("Failed to ensure required ATAs exist")?;
-    log::info!("✅ ATA setup completed");
+        .context("Wallet balance validation failed")?;
 
-    let event_bus = EventBus::new(config.event_bus_buffer_size);
-    log::info!("✅ Event bus initialized");
+    // Create pipeline config per Structure.md section 6.2
+    let pipeline_config = Config {
+        rpc_url: app_config.rpc_url,
+        jito_url: app_config.jito_url,
+        jupiter_url: app_config.jupiter_url,
+        keypair_path,
+        liquidation_mode: app_config.liquidation_mode,
+        min_profit_usdc: app_config.min_profit_usdc,
+        max_position_pct: app_config.max_position_pct,
+        wallet: Arc::new(wallet),
+    };
 
-    let balance_manager = Arc::new(
-        BalanceManager::new(Arc::clone(&rpc), wallet_pubkey)
-            .with_config(config.clone())
-            .with_websocket(Arc::clone(&ws)),
-    );
-    log::info!("✅ Balance manager initialized");
+    // Start liquidation loop
+    run_liquidation_loop(rpc, pipeline_config).await
+}
 
-    // Start balance monitoring via WebSocket
-    let balance_manager_monitor = Arc::clone(&balance_manager);
-    tokio::spawn(async move {
-        // Subscribe to ATA accounts
-        if let Err(e) = balance_manager_monitor.start_monitoring().await {
-            log::error!("BalanceManager: Failed to start monitoring: {}", e);
-            log::warn!("BalanceManager: Will fall back to RPC-only mode");
-        } else {
-            // Start listening for account updates
-            if let Err(e) = balance_manager_monitor.listen_account_updates().await {
-                log::error!("BalanceManager: Account update listener error: {}", e);
+/// Runtime layout validation per Structure.md section 11.6
+async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
+    let program_id = solend::solend_program_id()?;
+
+    // Get a few sample accounts to validate sizes
+    let accounts = rpc
+        .get_program_accounts(&program_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
+
+    if accounts.is_empty() {
+        log::warn!("No Solend accounts found - skipping layout validation");
+        return Ok(());
+    }
+
+    // Check first few accounts for size validation
+    // Expected sizes (from Solend SDK constants, approximate):
+    // OBLIGATION_SIZE ~ 1300 bytes
+    // RESERVE_SIZE ~ 600 bytes
+    // LENDING_MARKET_SIZE ~ 300 bytes
+
+    let mut obligation_count = 0;
+    let mut reserve_count = 0;
+
+    for (_pubkey, account) in accounts.iter().take(10) {
+        let size = account.data.len();
+
+        // Obligation accounts are typically larger
+        if size > 1000 {
+            obligation_count += 1;
+            // Try to parse as Obligation to validate
+            if solend::Obligation::from_account_data(&account.data).is_err() {
+                return Err(anyhow::anyhow!(
+                    "Solend account size mismatch. Found account with size {} bytes that doesn't match expected Obligation layout. \
+                     Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.",
+                    size
+                ));
+            }
+        } else if size > 500 {
+            reserve_count += 1;
+            // Try to parse as Reserve to validate
+            if solend::Reserve::from_account_data(&account.data).is_err() {
+                return Err(anyhow::anyhow!(
+                    "Solend account size mismatch. Found account with size {} bytes that doesn't match expected Reserve layout. \
+                     Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.",
+                    size
+                ));
             }
         }
-    });
-    log::info!("✅ Balance manager monitoring started");
+    }
 
-    let metrics = Arc::new(Metrics::new());
-    log::info!("✅ Metrics initialized");
+    if obligation_count == 0 && reserve_count == 0 {
+        log::warn!("Could not identify Solend account types - layout validation skipped");
+    } else {
+        log::info!(
+            "✅ Solend layout validation passed (found {} obligations, {} reserves)",
+            obligation_count,
+            reserve_count
+        );
+    }
 
-    let cache = Arc::new(AccountCache::new());
-    log::info!("✅ Account cache initialized");
-
-    let protocol: Arc<dyn Protocol> =
-        Arc::new(SolendProtocol::new(&config).context("Failed to initialize Solend protocol")?);
-    log::info!(
-        "✅ Protocol initialized: {} (program: {})",
-        protocol.id(),
-        protocol.program_id()
-    );
-
-    let scanner = Scanner::new(
-        Arc::clone(&rpc),
-        Arc::clone(&ws),
-        Arc::clone(&protocol),
-        event_bus.clone(),
-        Arc::clone(&cache),
-        config.clone(),
-    );
-    let analyzer = Analyzer::new(event_bus.clone(), Arc::clone(&protocol), config.clone())
-        .with_metrics(Arc::clone(&metrics));
-    let validator = Validator::new(
-        event_bus.clone(),
-        Arc::clone(&balance_manager),
-        config.clone(),
-        Arc::clone(&rpc),
-    ).with_metrics(Arc::clone(&metrics));
-    let executor = Arc::new(Executor::new(
-        event_bus.clone(),
-        Arc::clone(&rpc),
-        Arc::clone(&wallet),
-        Arc::clone(&protocol),
-        Arc::clone(&balance_manager),
-        config.clone(),
-    ));
-
-    // Keep reference to executor for graceful shutdown
-    let executor_shutdown = Arc::clone(&executor);
-
-    tokio::spawn(async move {
-        if let Err(e) = scanner.run().await {
-            log::error!("Scanner error: {}", e);
-        }
-    });
-    tokio::spawn(async move {
-        if let Err(e) = analyzer.run().await {
-            log::error!("Analyzer error: {}", e);
-        }
-    });
-    tokio::spawn(async move {
-        if let Err(e) = validator.run().await {
-            log::error!("Validator error: {}", e);
-        }
-    });
-    let executor_run = Arc::clone(&executor);
-    tokio::spawn(async move {
-        if let Err(e) = executor_run.run().await {
-            log::error!("Executor error: {}", e);
-        }
-    });
-
-    log::info!("✅ All workers started");
-
-    let metrics_clone = Arc::clone(&metrics);
-    let balance_manager_clone = Arc::clone(&balance_manager);
-    let usdc_mint_str = config.usdc_mint.clone();
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(60)).await;
-
-            // Metrics
-            let summary = metrics_clone.get_summary().await;
-            log::info!(
-                "📊 Metrics: Opportunities Found: {}, Approved: {}, Rejected: {}, TX Sent: {}, TX Success: {}, Success Rate: {:.2}%, Total Profit: ${:.2}, Avg Latency: {}ms, P95 Latency: {}ms",
-                summary.opportunities,
-                summary.opportunities_approved,
-                summary.opportunities_rejected,
-                summary.tx_sent,
-                summary.tx_success,
-                summary.success_rate * 100.0,
-                summary.total_profit,
-                summary.avg_latency_ms,
-                summary.p95_latency_ms
-            );
-
-            // Wallet USDC balance (available, reserved-aware)
-            if let Ok(usdc_mint) = solana_sdk::pubkey::Pubkey::from_str(&usdc_mint_str) {
-                match balance_manager_clone
-                    .get_available_balance(&usdc_mint)
-                    .await
-                {
-                    Ok(available) => {
-                        let available_usdc = available as f64 / 1_000_000.0; // USDC: 6 decimals
-                        log::info!(
-                            "💰 Wallet available USDC balance: {} ({} USDC)",
-                            available,
-                            available_usdc
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️ Failed to read available USDC balance for wallet: {}", e);
-                    }
-                }
-            } else {
-                log::warn!(
-                    "⚠️ Invalid USDC mint in config, cannot log wallet USDC balance: {}",
-                    usdc_mint_str
-                );
-            }
-        }
-    });
-
-    log::info!("✅ All components initialized");
-    log::info!("⏳ Waiting for shutdown signal (Ctrl+C)...");
-
-    signal::ctrl_c()
-        .await
-        .context("Failed to listen for shutdown signal")?;
-
-    log::info!("🛑 Shutting down gracefully...");
-
-    // Log final summary before shutdown
-    let final_summary = metrics.get_summary().await;
-    log::info!("📊 Final Summary:");
-    log::info!("  - Opportunities found: {}", final_summary.opportunities);
-    log::info!("  - Opportunities approved: {}", final_summary.opportunities_approved);
-    log::info!("  - Opportunities rejected: {} (insufficient balance, validation failed, etc.)", final_summary.opportunities_rejected);
-    log::info!("  - Transactions sent: {}", final_summary.tx_sent);
-    log::info!("  - Transactions successful: {}", final_summary.tx_success);
-    log::info!("  - Success rate: {:.2}%", final_summary.success_rate * 100.0);
-    log::info!("  - Total profit: ${:.2}", final_summary.total_profit);
-    log::info!("  - Average latency: {}ms", final_summary.avg_latency_ms);
-    log::info!("  - P95 latency: {}ms", final_summary.p95_latency_ms);
-
-    // ✅ CRITICAL: Stop balance monitoring FIRST (clear subscriptions)
-    // This prevents race conditions where account updates arrive after shutdown
-    balance_manager
-        .stop_monitoring()
-        .await
-        .context("Failed to stop balance monitoring")?;
-
-    // Then shutdown other components...
-    // Note: Executor has its own shutdown() method that cancels background tasks
-    executor_shutdown.shutdown();
-
-    log::info!("✅ Graceful shutdown completed");
     Ok(())
 }
 
-fn load_wallet(path: &str) -> Result<Keypair> {
+/// Startup safety checks per Structure.md section 6.3
+async fn validate_wallet_balances(
+    rpc: &Arc<RpcClient>,
+    wallet_pubkey: &Pubkey,
+) -> Result<()> {
+    // Get SOL balance
+    let sol_balance = rpc
+        .get_balance(wallet_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
+
+    // Minimum SOL for fees + Jito tip (0.01 SOL = 10_000_000 lamports)
+    const MIN_SOL_LAMPORTS: u64 = 10_000_000;
+    if sol_balance < MIN_SOL_LAMPORTS {
+        panic!("Insufficient SOL balance. Required: {} lamports, Available: {} lamports", 
+            MIN_SOL_LAMPORTS, sol_balance);
+    }
+
+    log::info!("✅ SOL balance: {} lamports", sol_balance);
+
+    // Get USDC ATA balance
+    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        .map_err(|e| anyhow::anyhow!("Invalid USDC mint: {}", e))?;
+    let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+
+    // Check USDC balance
+    let usdc_balance = match rpc.get_token_account(&usdc_ata) {
+        Ok(Some(account)) => {
+            // Parse token amount from UI account
+            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+        }
+        Ok(None) => 0, // ATA doesn't exist
+        Err(_) => 0,   // Error getting account, assume 0
+    };
+
+    // Minimum USDC for strategy (default: 10 USDC = 10_000_000 with 6 decimals)
+    const MIN_USDC_AMOUNT: u64 = 10_000_000;
+    if usdc_balance < MIN_USDC_AMOUNT {
+        panic!("Insufficient USDC balance. Required: {} (10 USDC), Available: {}", 
+            MIN_USDC_AMOUNT, usdc_balance);
+    }
+
+    log::info!("✅ USDC balance: {} ({} USDC)", usdc_balance, usdc_balance / 1_000_000);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    rpc_url: String,
+    jito_url: String,
+    jupiter_url: String,
+    liquidation_mode: LiquidationMode,
+    min_profit_usdc: f64,
+    max_position_pct: f64,
+}
+
+fn load_config() -> Result<AppConfig> {
+    use std::env;
+
+    fn env_str(key: &str, default: &str) -> String {
+        env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+
+    fn env_parse<T: FromStr + std::fmt::Display>(key: &str, default: T) -> Result<T>
+    where
+        T::Err: std::fmt::Display,
+    {
+        env::var(key)
+            .unwrap_or_else(|_| format!("{}", default))
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e))
+    }
+
+    let dry_run_str = env_str("DRY_RUN", "true");
+    let liquidation_mode = if dry_run_str.parse::<bool>().unwrap_or(true) {
+        LiquidationMode::DryRun
+    } else {
+        LiquidationMode::Live
+    };
+
+    Ok(AppConfig {
+        rpc_url: env_str("RPC_URL", "https://api.mainnet-beta.solana.com"),
+        jito_url: env_str(
+            "JITO_URL",
+            "https://mainnet.block-engine.jito.wtf",
+        ),
+        jupiter_url: env_str(
+            "JUPITER_URL",
+            "https://quote-api.jup.ag",
+        ),
+        liquidation_mode,
+        min_profit_usdc: env_parse("MIN_PROFIT_USDC", 5.0f64)?,
+        max_position_pct: env_parse("MAX_POSITION_PCT", 0.05f64)?, // 5% default
+    })
+}
+
+/// Load keypair from file per Structure.md section 6.1
+fn load_keypair(path: &std::path::Path) -> Result<Keypair> {
     let wallet_path = Path::new(path);
 
     if !wallet_path.exists() {
-        return Err(anyhow::anyhow!("Wallet file not found: {}", path));
+        return Err(anyhow::anyhow!("Wallet file not found: {}", path.display()));
     }
 
     let keypair_bytes = fs::read(wallet_path).context("Failed to read wallet file")?;
 
+    // Try JSON array format (standard Solana keypair format)
     if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
         if keypair.len() == 64 {
             return Keypair::from_bytes(&keypair)
@@ -350,11 +243,13 @@ fn load_wallet(path: &str) -> Result<Keypair> {
         }
     }
 
+    // Try raw 64 bytes
     if keypair_bytes.len() == 64 {
         return Keypair::from_bytes(&keypair_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
     }
 
+    // Try base58 string
     if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
         if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim()).into_vec() {
             if keypair_bytes_decoded.len() == 64 {

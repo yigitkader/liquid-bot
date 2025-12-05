@@ -3,64 +3,28 @@ name = "liquid-bot"
 version = "0.1.0"
 edition = "2021"
 
+[build-dependencies]
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 [dependencies]
-tokio = { version = "1.35", features = ["full"] }
-tokio-util = { version = "0.7" }
+tokio = { version = "1.0", features = ["full"] }
 solana-client = "1.18"
 solana-sdk = "1.18"
 solana-program = "1.18"
-once_cell = "1.19"
+borsh = "1.0"
+borsh-derive = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenv = "0.15"
-anyhow = "1.0"
-thiserror = "1.0"
-log = "0.4"
-env_logger = "0.11"
-fern = "0.6"
-async-trait = "0.1"
 bs58 = "0.5"
-solana-account-decoder = "1.18"
 bincode = "1.3"
-borsh = "1.5"
-tokio-stream = "0.1"
-anchor-lang = "0.29"
-anchor-client = "0.29"
-sha2 = "0.10"
-spl-token = "4.0"
-spl-token-2022 = "1.0"
-spl-associated-token-account = "2.3"
-bytemuck = "1.14"
-clap = { version = "4.4", features = ["derive"] }
-pyth-sdk-solana = "0.10"
-solana-account = "2.2"
-solana-pubkey = "2.4"
-switchboard-on-demand = "0.11"
-rand = "0.8"
-reqwest = { version = "0.11", features = ["json"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-futures-util = "0.3"
 base64 = "0.21"
+spl-token = "4.0"
+spl-associated-token-account = "2.3"
 chrono = "0.4"
-lru = "0.12"
-
-# validate_reserve binary removed - not in Structure.md
-# [[bin]]
-# name = "validate_reserve"
-# path = "src/bin/validate_reserve.rs"
-
-[[bin]]
-name = "validate_system"
-path = "src/bin/validate_system.rs"
-
-[[bin]]
-name = "create_atas"
-path = "src/bin/create_atas.rs"
-
-[[bin]]
-name = "update_idls"
-path = "src/bin/update_idls.rs"
-
-[[bin]]
-name = "find_real_obligations"
-path = "src/bin/find_real_obligations.rs"

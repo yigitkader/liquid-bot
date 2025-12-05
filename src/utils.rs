@@ -10,8 +10,6 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 
-use crate::blockchain::transaction::sign_transaction;
-
 #[derive(Debug, Clone)]
 pub struct JitoBundle {
     transactions: Vec<Transaction>,
@@ -52,12 +50,6 @@ struct BundleResponse {
 }
 
 impl JitoClient {
-    /// Create a new Jito client
-    ///
-    /// # Arguments
-    /// * `url` - Jito block engine URL (e.g., "https://mainnet.block-engine.jito.wtf")
-    /// * `tip_account` - Jito tip account (e.g., "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3")
-    /// * `default_tip_amount` - Default tip amount in lamports (e.g., 10_000_000 = 0.01 SOL)
     pub fn new(url: String, tip_account: Pubkey, default_tip_amount: u64) -> Self {
         JitoClient {
             url,
@@ -66,23 +58,18 @@ impl JitoClient {
         }
     }
 
-    /// Note: Tip transaction should be added separately using add_tip_transaction
     pub async fn send_bundle(&self, bundle: &JitoBundle) -> Result<String> {
-        use reqwest::Client;
-
         let serialized_txs: Vec<String> = bundle
             .transactions
             .iter()
             .map(|tx| {
-                use bincode::serialize;
-                let bytes = serialize(tx)
+                let bytes = bincode::serialize(tx)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
-                use base64::{engine::general_purpose, Engine as _};
-                Ok(general_purpose::STANDARD.encode(&bytes))
+                use base64::Engine;
+                Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        // Prepare bundle payload
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -96,7 +83,7 @@ impl JitoClient {
             bundle.tip_amount
         );
 
-        let client = Client::new();
+        let client = reqwest::Client::new();
         let response = client
             .post(&self.url)
             .json(&payload)
@@ -155,10 +142,7 @@ impl JitoClient {
 
         let mut tip_tx = Transaction::new_with_payer(&[tip_ix], Some(&wallet_pubkey));
         tip_tx.message.recent_blockhash = blockhash;
-        
-        // ✅ FIX: Use sign_transaction instead of direct tx.sign() to prevent double-signing
-        // This ensures consistent signing behavior and prevents accidental double-signing
-        // sign_transaction checks if transaction is already signed and skips if so
+
         sign_transaction(&mut tip_tx, wallet.as_ref())
             .context("Failed to sign Jito tip transaction")?;
 
@@ -176,25 +160,97 @@ impl JitoClient {
     pub fn tip_account(&self) -> &Pubkey {
         &self.tip_account
     }
+
     pub fn default_tip_amount(&self) -> u64 {
         self.default_tip_amount
     }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
 }
 
-pub fn create_jito_client(_config: &crate::core::config::Config) -> Option<JitoClient> {
-    // Check if Jito is enabled in config
-    // For now, we'll use default Jito mainnet settings
-    let jito_url = std::env::var("JITO_BLOCK_ENGINE_URL")
-        .unwrap_or_else(|_| "https://mainnet.block-engine.jito.wtf".to_string());
+/// Sign a transaction with a keypair
+pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
+    let signer_pubkey = keypair.pubkey();
 
-    let tip_account_str = std::env::var("JITO_TIP_ACCOUNT")
-        .unwrap_or_else(|_| "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3".to_string());
+    let signer_index = tx
+        .message
+        .account_keys
+        .iter()
+        .position(|&pk| pk == signer_pubkey)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Transaction signing failed: signer {} not found in account_keys",
+                signer_pubkey
+            )
+        })?;
 
-    let tip_account = tip_account_str.parse::<Pubkey>().ok()?;
-    let tip_amount = std::env::var("JITO_TIP_AMOUNT_LAMPORTS")
-        .unwrap_or_else(|_| "10000000".to_string()) // 0.01 SOL
-        .parse::<u64>()
-        .ok()?;
+    let num_required_signatures = tx.message.header.num_required_signatures as usize;
+    if tx.signatures.len() != num_required_signatures {
+        tx.signatures
+            .resize(num_required_signatures, solana_sdk::signature::Signature::default());
+    }
 
-    Some(JitoClient::new(jito_url, tip_account, tip_amount))
+    if signer_index >= num_required_signatures {
+        return Err(anyhow::anyhow!(
+            "Transaction signing failed: signer {} at index {} is not in required signatures range (0..{})",
+            signer_pubkey,
+            signer_index,
+            num_required_signatures
+        ));
+    }
+
+    if signer_index < tx.signatures.len() {
+        let existing_sig = &tx.signatures[signer_index];
+        if *existing_sig != solana_sdk::signature::Signature::default() {
+            log::debug!(
+                "Transaction already signed at index {} - skipping re-signing",
+                signer_index
+            );
+            return Ok(());
+        }
+    }
+
+    let message_bytes = tx.message.serialize();
+    let signature = keypair.sign_message(&message_bytes);
+
+    if signer_index >= tx.signatures.len() {
+        return Err(anyhow::anyhow!(
+            "Transaction signing failed: signer index {} out of bounds (signatures.len()={})",
+            signer_index,
+            tx.signatures.len()
+        ));
+    }
+    tx.signatures[signer_index] = signature;
+
+    Ok(())
 }
+
+/// Send Jito bundle with tip transaction
+pub async fn send_jito_bundle(
+    mut tx: Transaction,
+    jito_client: &JitoClient,
+    wallet: &Arc<Keypair>,
+    blockhash: Hash,
+) -> Result<String> {
+    let mut bundle = JitoBundle::new(
+        *jito_client.tip_account(),
+        jito_client.default_tip_amount(),
+    );
+
+    jito_client
+        .add_tip_transaction(&mut bundle, wallet, blockhash)
+        .context("Failed to add tip transaction")?;
+
+    sign_transaction(&mut tx, wallet.as_ref())
+        .context("Failed to sign main transaction")?;
+
+    bundle.add_transaction(tx);
+
+    jito_client
+        .send_bundle(&bundle)
+        .await
+        .context("Failed to send Jito bundle")
+}
+

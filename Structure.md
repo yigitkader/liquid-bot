@@ -1,886 +1,746 @@
-# Liquidation Bot Analizi ve Yeni Yapı Tasarımı
+# 🚀 Solana Liquidation Bot – MASTER DESIGN DOCUMENT (Final)
 
-Mevcut kodu detaylı inceledim. Şimdi size:
-1. Gerekli API'ler ve fonksiyonlar
-2. Yeni yapı tasarımı (pseudo-kod ile)
-3. Daha temiz bir sistem önerisi
-
-sunacağım.
+Minimal ama eksiksiz, Google/Microsoft seviyesinde, production-grade bir Solana **Solend liquidation botu** tasarımı.
 
 ---
 
-## 1. GEREKLİ API'LER VE FONKSİYONLAR
+## 1. Amaç ve Vizyon
 
-### A) Solana RPC API'leri
-```
-CORE RPC CALLS:
-- getAccountInfo(pubkey) → account data
-- getProgramAccounts(programId, filters?) → [(pubkey, account)]
-- getRecentBlockhash() → blockhash
-- sendTransaction(tx) → signature
-- getSlot() → current slot
+Hedef:
 
-OPTIONAL (for optimization):
-- getMultipleAccounts([pubkeys]) → [account]
-- simulateTransaction(tx) → simulation result
-```
+* Mevcut over-engineered botu:
 
-### B) Solana WebSocket API'leri
-```
-SUBSCRIPTIONS:
-- programSubscribe(programId, options) → subscription_id
-  → notifications: {pubkey, account, slot}
-- accountSubscribe(pubkey, options) → subscription_id
-  → notifications: {account, slot}
-- slotSubscribe() → subscription_id
-  → notifications: {slot, parent, root}
-```
+    * **Minimal**
+    * **Hızlı**
+    * **Doğru**
+    * **Güvenilir**
+    * **Tam otomatik şema uyumlu**
+    * **Data-oriented**
+      hale getirmek.
+* Bot:
 
-### C) Oracle API'leri
-```
-PYTH:
-- Read from account data → {price, confidence, expo, timestamp}
-- Parse SolanaPriceAccount struct
-
-SWITCHBOARD:
-- Read from account data → {price, confidence, timestamp}
-```
-
-### D) Jupiter Swap API
-```
-GET /quote:
-  params: {inputMint, outputMint, amount, slippageBps}
-  returns: {priceImpactPct, route, ...}
-
-Used for: Real-time slippage estimation
-```
-
-### E) Protocol-Specific (Solend)
-```
-ACCOUNT PARSING:
-- Obligation: borsh deserialize → {deposits, borrows, health}
-- Reserve: borsh deserialize → {liquidity, collateral, config}
-
-PDA DERIVATION:
-- derive_lending_market_authority(market, program)
-- derive_obligation_address(wallet, market, program)
-- get_associated_token_address(wallet, mint)
-
-INSTRUCTION BUILDING:
-- liquidateObligation(discriminator, amount, accounts[12])
-```
+    * Solend **Obligation** hesaplarını tarar.
+    * **HF < 1.0** olanları bulur.
+    * Jupiter ile kârlı mı check eder.
+    * Jito bundle ile güvenli liquidation gönderir.
+* Tüm Solend layout’ları **otomatik** üretilir; manuel struct yasak.
 
 ---
 
-## 2. YENİ YAPI TASARIMI (Pseudo-Kod)
+## 2. Mimarinin Özeti
 
-### Dizin Yapısı
-```
+### 2.1. Minimal Dosya Yapısı
+
+```text
 src/
-├── core/                    # Temel yapı taşları
-│   ├── config.rs
-│   ├── events.rs
-│   ├── types.rs
-│   └── error.rs
-│
-├── blockchain/              # Blockchain etkileşimi
-│   ├── rpc_client.rs
-│   ├── ws_client.rs
-│   └── transaction.rs
-│
-├── protocol/                # Protocol abstraction
-│   ├── mod.rs              # Protocol trait
-│   ├── solend/
-│   │   ├── mod.rs
-│   │   ├── accounts.rs     # Account parsing
-│   │   ├── instructions.rs # Instruction building
-│   │   └── types.rs        # Solend-specific types
-│   └── oracle/
-│       ├── mod.rs
-│       ├── pyth.rs
-│       └── switchboard.rs
-│
-├── engine/                  # Core liquidation engine
-│   ├── scanner.rs          # Account discovery & monitoring
-│   ├── analyzer.rs         # Opportunity detection
-│   ├── validator.rs        # Opportunity validation
-│   └── executor.rs         # Transaction execution
-│
-├── strategy/                # Trading logic
-│   ├── profit_calculator.rs
-│   ├── slippage_estimator.rs
-│   └── balance_manager.rs
-│
-├── utils/                   # Utilities
-│   ├── cache.rs
-│   ├── metrics.rs
-│   └── helpers.rs
-│
-└── main.rs                  # Entry point
+  main.rs          # Giriş, config yükleme, runtime doğrulama, loop başlatma
+  pipeline.rs      # Ana liquidation loop (tek async loop)
+  solend.rs        # Otomatik üretilen layout + HF helper'ları
+  jup.rs           # Jupiter quote entegrasyonu
+  utils.rs         # Wallet, Jito, logging, helper'lar
+
+build.rs           # Solend layout codegen (IDL JSON -> Rust struct)
+idl/               # TS SDK'den dump edilen layout JSON'ları
+secret/            # Wallet keypair (main.json)
+Cargo.toml
 ```
+
+### 2.2. Tasarım Prensipleri
+
+* **Over-engineering yok**:
+
+    * EventBus, Scanner, Analyzer, Executor, custom WS client → **yok**.
+* **Tek loop**:
+
+    * `run_liquidation_loop` her şeyi yönetir.
+* **Şema otomatik**:
+
+    * Solend account layout’ları `build.rs` ile generate edilir.
+* **Manual byte parsing yok**:
+
+    * `data[offset..]` yazmak yasak.
+* **Güvenlik gömülü**:
+
+    * Wallet risk limitleri, oracle guard, kârlılık kontrolü, Jito bundle.
 
 ---
 
-## 3. HER DOSYANIN İÇERİĞİ (Pseudo-Kod)
+## 3. Solana ve Solend – Minimal Zorunlu Bilgi
 
-### `core/config.rs`
+### 3.1. Solana Temelleri
+
+* **Account**: On-chain veri depolayan yapılar.
+* **Program Account**: Programın kodu.
+* **PDA**: Program tarafından türetilen adresler.
+* **SPL Token**: Token transferleri için standart program.
+* **RPC**:
+
+    * `getProgramAccounts(program_id)` → programın tüm hesaplarını getirir.
+
+### 3.2. Solend Ana Hesap Türleri
+
+* `LendingMarket`:
+
+    * Global konfig (ör. quote currency).
+* `Reserve`:
+
+    * Her token için likidite havuzu + risk parametreleri.
+* `Obligation`:
+
+    * Bir kullanıcının tüm deposit/borrow pozisyonları.
+* `LastUpdate`:
+
+    * Güncelleme slot/stale bilgisi.
+
+Bunların **binary layout’u** Solend TypeScript SDK’da `*Layout` değişkenleri olarak export edilir (BufferLayout). ([sdk.solend.fi][1])
+
+---
+
+## 4. Obligation ve Health Factor
+
+### 4.1. Obligation Hesabı – Özet Alanlar
+
+(Struct isimleri `build.rs` ile generate edilecek, burada mantığı anlatıyoruz.)
+
+* `version: u8`
+* `last_update: LastUpdate`
+* `lending_market: Pubkey`
+* `owner: Pubkey`
+* `deposits: [ObligationCollateral; N]`
+* `borrows: [ObligationLiquidity; N]`
+* Ek risk/istatistik alanları (Solend layout’a göre).
+
+**ObligationCollateral** (örnek alanlar):
+
+* `deposit_reserve: Pubkey`
+* `deposited_amount: u64`
+* `market_value: u128`
+
+**ObligationLiquidity** (örnek alanlar):
+
+* `borrow_reserve: Pubkey`
+* `borrowed_amount_wads: u128`
+* `market_value: u128`
+* `cumulative_borrow_rate_wads: u128`
+
+### 4.2. Health Factor (HF) Mantığı
+
+**Temel prensip**:
+
+```text
+HF = (Toplam Collateral Değeri * Liquidation Threshold) / Toplam Borrow Değeri
+HF < 1.0 → liquidation mümkün
+```
+
+Bot:
+
+1. Obligation içinden:
+
+    * Toplam collateral market değerini,
+    * Toplam borrow market değerini okur.
+2. Reserve.config.liquidation_threshold ile çarpar.
+3. HF hesaplar.
+4. HF < 1.0 ise → candidate liquidation.
+
+---
+
+## 5. Reserve ve Oracle Yapısı
+
+### 5.1. Reserve
+
+Üst seviye alanlar:
+
+* `liquidity`:
+
+    * `available_amount: u64`
+    * `mint_pubkey: Pubkey`
+* `collateral`:
+
+    * collateral mint/supply bilgileri.
+* `config`:
+
+    * `loan_to_value_ratio`
+    * `liquidation_threshold`
+    * `liquidation_bonus`
+    * `reserve_factor`
+    * `pyth_oracle_pubkey`
+    * `switchboard_oracle_pubkey`
+
+### 5.2. Oracle Katmanı: Pyth + Switchboard
+
+* Reserve, primary ve backup oracle adreslerini tutar.
+* Bot şu kontrolleri yapar:
+
+    * Pyth fiyatı geçerli mi? (confidence, stale, slot farkı)
+    * Switchboard varsa, Pyth ile sapma fazla mı?
+    * Oracle hesapları expected program id’ye mi ait?
+
+**Oracle guard geçmezse liquidation yapılmaz.**
+
+---
+
+## 6. Wallet ve Güvenlik
+
+### 6.1. Secret Yönetimi
+
+* `secret/main.json`:
+
+    * Standart Solana keypair JSON.
+* **Kesin kurallar**:
+
+    * `secret/` **.gitignore** içinde olmalı.
+    * Keypair hiçbir zaman repo’da commit edilmez.
+    * Prod ortamda environment vault (örn. KMS) kullanılması tercih edilir.
+
+### 6.2. Config Yapısı
+
 ```rust
-struct Config {
-    // RPC endpoints
-    rpc_http: String
-    rpc_ws: String
-    
-    // Wallet
-    wallet_path: String
-    
-    // Thresholds
-    min_profit_usd: f64
-    health_factor_threshold: f64
-    max_slippage_bps: u16
-    
-    // Protocol
-    protocol_id: String
-    program_id: Pubkey
-    
-    // Features
-    use_jupiter_api: bool
-    dry_run: bool
+pub struct Config {
+    pub rpc_url: String,
+    pub jito_url: String,
+    pub jupiter_url: String,
+    pub keypair_path: std::path::PathBuf, // "secret/main.json"
+    pub liquidation_mode: LiquidationMode,
+    pub min_profit_usdc: f64,
+    pub max_position_pct: f64, // Örn: 0.05 => cüzdanın %5'i max risk
 }
 
-impl Config {
-    fn from_env() -> Result<Self>
-    fn validate(&self) -> Result<()>
+pub enum LiquidationMode {
+    DryRun,
+    Live,
 }
 ```
 
-### `core/events.rs`
-```rust
-enum Event {
-    // Discovery
-    AccountDiscovered { pubkey, data }
-    AccountUpdated { pubkey, data }
-    
-    // Analysis
-    OpportunityFound { opportunity }
-    
-    // Execution
-    TransactionSent { signature }
-    TransactionConfirmed { signature, success }
-}
+### 6.3. Startup Safety Checks
 
-struct EventBus {
-    sender: Sender<Event>
-    
-    fn publish(event: Event)
-    fn subscribe() -> Receiver<Event>
-}
+Uygulama başlarken:
+
+1. Keypair dosyası okunur.
+2. RPC üzerinden:
+
+    * Wallet SOL balance
+    * USDC ATA balance
+      alınır.
+3. Eğer:
+
+    * SOL fee + Jito tip için yetersizse, **panic**:
+
+        * `"Insufficient SOL balance."`
+    * USDC strateji için yetersizse, **panic**:
+
+        * `"Insufficient USDC balance."`
+
+### 6.4. Hard Risk Limit
+
+* Her liquidation’da kullanılacak tutar:
+
+    * `max_position_pct * current_wallet_value`’ı aşamaz.
+* Tek blok içinde kullanılan toplam risk de aynı limit ile sınırlıdır.
+
+---
+
+## 7. Jupiter – Kârlılık Hesabı
+
+Likidasyon öncesi:
+
+1. Obligation’dan:
+
+    * Hangi token borçlanmış (debt mint),
+    * Hangi collateral seize edilecek (collateral mint)
+      belirlenir.
+
+2. Bot:
+
+   ```text
+   collateral_amount → Jupiter → debt token amount
+   ```
+
+3. Jupiter Quote API’den:
+
+    * `out_amount`
+    * `route_plan`
+    * `slippage_bps`
+      vs. alınır.
+
+**Net profit formülü**:
+
+```text
+profit = collateral_value_usd
+       - debt_repaid_value_usd
+       - swap_fee_usd
+       - jito_fee_usd
+       - tx_fee_usd
 ```
 
-### `core/types.rs`
-```rust
-struct Position {
-    address: Pubkey
-    health_factor: f64
-    collateral_usd: f64
-    debt_usd: f64
-    collateral_assets: Vec<Asset>
-    debt_assets: Vec<Asset>
-}
+Koşul:
 
-struct Asset {
-    mint: Pubkey
-    amount: u64
-    amount_usd: f64
-    ltv: f64
-}
-
-struct Opportunity {
-    position: Position
-    max_liquidatable: u64
-    seizable_collateral: u64
-    estimated_profit: f64
-    debt_mint: Pubkey
-    collateral_mint: Pubkey
-}
+```text
+profit >= min_profit_usdc
 ```
 
-### `blockchain/rpc_client.rs`
+sağlanmıyorsa liquidation yapılmaz.
+
+---
+
+## 8. Jito – MEV Koruması
+
+* Likidasyon normal `send_transaction` ile gönderilmez.
+* Tüm liquidation tx'leri **Jito Block Engine**’e bundle olarak gönderilir.
+
+Bot:
+
+1. Liquidation tx inşa eder.
+2. Compute budget instruction ekler.
+3. Priority fee / tip belirler.
+4. Bir bundle içine tek liquidation ekler.
+5. Aynı obligation address, aynı blokta birden fazla kez hedeflenmez.
+
+Bu sayede:
+
+* Front-run
+* Back-run
+* MEV sızdırma
+
+riskleri minimize edilir.
+
+---
+
+## 9. Ana Pipeline (run_liquidation_loop)
+
 ```rust
-struct RpcClient {
-    client: solana_client::RpcClient
-    rate_limiter: RateLimiter
-    
-    async fn get_account(pubkey) -> Account
-    async fn get_program_accounts(program_id) -> Vec<(Pubkey, Account)>
-    async fn send_transaction(tx) -> Signature
-    async fn get_recent_blockhash() -> Hash
-    
-    // Retry logic with exponential backoff
-    async fn retry<F>(operation: F, max_retries: u32) -> Result<T>
-}
-```
+pub async fn run_liquidation_loop(
+    rpc: std::sync::Arc<solana_client::rpc_client::RpcClient>,
+    config: Config,
+) -> anyhow::Result<()> {
+    let keypair = load_keypair(&config.keypair_path)?;
+    let wallet = keypair.pubkey();
 
-### `blockchain/ws_client.rs`
-```rust
-struct WsClient {
-    url: String
-    connection: WebSocket
-    subscriptions: HashMap<u64, Subscription>
-    
-    async fn connect() -> Result<()>
-    async fn subscribe_program(program_id) -> Result<SubscriptionId>
-    async fn subscribe_account(pubkey) -> Result<SubscriptionId>
-    async fn listen() -> Stream<Notification>
-    
-    // Reconnection logic
-    async fn reconnect_with_backoff()
-}
-```
+    loop {
+        // 1. Solend obligation account'larını çek
+        let accounts = rpc.get_program_accounts(&SOLEND_PROGRAM_ID)?;
 
-### `blockchain/transaction.rs`
-```rust
-struct TransactionBuilder {
-    instructions: Vec<Instruction>
-    payer: Pubkey
-    
-    fn add_compute_budget(units: u32, price: u64) -> &mut Self
-    fn add_instruction(ix: Instruction) -> &mut Self
-    fn build(blockhash: Hash) -> Transaction
-}
-
-fn sign_transaction(tx: &mut Transaction, keypair: &Keypair)
-async fn send_and_confirm(tx: Transaction, rpc: &RpcClient) -> Result<Signature>
-```
-
-### `protocol/mod.rs`
-```rust
-trait Protocol {
-    fn id() -> &str
-    fn program_id() -> Pubkey
-    
-    async fn parse_position(account) -> Option<Position>
-    fn calculate_health_factor(position: &Position) -> f64
-    async fn build_liquidation_ix(opportunity, liquidator) -> Instruction
-    
-    fn liquidation_params() -> LiquidationParams
-}
-
-struct LiquidationParams {
-    bonus: f64
-    close_factor: f64
-    max_slippage: f64
-}
-```
-
-### `protocol/solend/accounts.rs`
-```rust
-// Borsh deserialization structs
-struct SolendObligation {
-    deposits: Vec<Deposit>
-    borrows: Vec<Borrow>
-    deposited_value: u128
-    borrowed_value: u128
-    
-    fn from_bytes(data: &[u8]) -> Result<Self>
-    fn to_position() -> Position
-}
-
-struct SolendReserve {
-    liquidity_mint: Pubkey
-    collateral_mint: Pubkey
-    ltv: u8
-    liquidation_threshold: u8
-    oracle: OracleInfo
-    
-    fn from_bytes(data: &[u8]) -> Result<Self>
-}
-
-// PDA derivations
-fn derive_lending_market_authority(market, program) -> Pubkey
-fn derive_obligation(wallet, market, program) -> Pubkey
-fn get_associated_token_address(wallet, mint) -> Pubkey
-```
-
-### `protocol/solend/instructions.rs`
-```rust
-fn build_liquidate_obligation_ix(
-    opportunity: &Opportunity,
-    liquidator: &Pubkey,
-    rpc: &RpcClient
-) -> Result<Instruction> {
-    
-    // 1. Fetch obligation account
-    obligation_account = fetch_obligation()
-    
-    // 2. Fetch reserve accounts
-    repay_reserve = fetch_reserve(debt_mint)
-    withdraw_reserve = fetch_reserve(collateral_mint)
-    
-    // 3. Derive PDAs
-    lending_market_authority = derive_pda()
-    source_liquidity_ata = get_ata(liquidator, debt_mint)
-    destination_collateral_ata = get_ata(liquidator, collateral_mint)
-    
-    // 4. Build instruction data
-    discriminator = sha256("global:liquidateObligation")[0..8]
-    data = [discriminator, amount_le_bytes]
-    
-    // 5. Build accounts array (12 accounts)
-    accounts = [
-        source_liquidity,
-        destination_collateral,
-        repay_reserve,
-        repay_liquidity_supply,
-        withdraw_reserve,
-        withdraw_collateral_supply,
-        obligation,
-        lending_market,
-        lending_market_authority,
-        liquidator (signer),
-        clock_sysvar,
-        token_program
-    ]
-    
-    return Instruction { program_id, accounts, data }
-}
-```
-
-### `protocol/oracle/pyth.rs`
-```rust
-struct PythOracle {
-    async fn read_price(account: &Pubkey, rpc) -> Result<PriceData>
-}
-
-struct PriceData {
-    price: f64
-    confidence: f64
-    expo: i32
-    timestamp: i64
-}
-
-fn parse_pyth_account(data: &[u8]) -> Result<PriceData> {
-    // Use pyth-sdk-solana
-    feed = SolanaPriceAccount::parse(data)
-    price_data = feed.get_price_no_older_than(now, max_age)
-    return PriceData::from(price_data)
-}
-```
-
-### `engine/scanner.rs`
-```rust
-struct Scanner {
-    rpc: Arc<RpcClient>
-    ws: Arc<WsClient>
-    protocol: Arc<dyn Protocol>
-    event_bus: EventBus
-    cache: AccountCache
-    
-    // Initial discovery via RPC
-    async fn discover_accounts() -> Result<usize> {
-        accounts = rpc.get_program_accounts(program_id)
-        
-        for (pubkey, account) in accounts {
-            if let Some(position) = protocol.parse_position(account) {
-                cache.insert(pubkey, position)
-                event_bus.publish(AccountDiscovered { pubkey, position })
-            }
-        }
-    }
-    
-    // Real-time monitoring via WebSocket
-    async fn start_monitoring() {
-        subscription_id = ws.subscribe_program(program_id)
-        
-        loop {
-            notification = ws.listen().await
-            
-            if let Some(position) = protocol.parse_position(notification.account) {
-                cache.update(notification.pubkey, position)
-                event_bus.publish(AccountUpdated { pubkey, position })
-            }
-        }
-    }
-    
-    async fn run() {
-        discover_accounts().await
-        start_monitoring().await
-    }
-}
-```
-
-### `engine/analyzer.rs`
-```rust
-struct Analyzer {
-    event_bus: EventBus
-    protocol: Arc<dyn Protocol>
-    config: Config
-    
-    async fn run() {
-        receiver = event_bus.subscribe()
-        
-        loop {
-            event = receiver.recv()
-            
-            match event {
-                AccountUpdated { position } => {
-                    if is_liquidatable(position) {
-                        opportunity = calculate_opportunity(position)
-                        event_bus.publish(OpportunityFound { opportunity })
-                    }
+        // 2. HF < 1.0 olanları bul
+        let mut candidates = Vec::new();
+        for (pk, acc) in accounts {
+            if let Ok(obligation) = Obligation::try_from_slice(&acc.data) {
+                let hf = obligation.health_factor();
+                if hf < 1.0 {
+                    candidates.push((pk, obligation));
                 }
             }
         }
-    }
-    
-    fn is_liquidatable(position: &Position) -> bool {
-        position.health_factor < config.health_factor_threshold
-    }
-    
-    async fn calculate_opportunity(position: Position) -> Option<Opportunity> {
-        params = protocol.liquidation_params()
-        
-        // 1. Calculate liquidatable amount
-        max_liquidatable = position.debt_usd * params.close_factor
-        seizable_collateral = max_liquidatable * (1 + params.bonus)
-        
-        // 2. Select best debt/collateral pair
-        (debt_mint, collateral_mint) = select_best_pair(position)
-        
-        // 3. Calculate profit
-        gross_profit = seizable_collateral - max_liquidatable
-        tx_fee = estimate_tx_fee()
-        slippage = estimate_slippage(seizable_collateral)
-        net_profit = gross_profit - tx_fee - slippage
-        
-        if net_profit < config.min_profit_usd {
-            return None
-        }
-        
-        return Some(Opportunity { ... })
-    }
-}
-```
 
-### `engine/validator.rs`
-```rust
-struct Validator {
-    event_bus: EventBus
-    balance_manager: BalanceManager
-    config: Config
-    rpc: Arc<RpcClient>
-    
-    async fn run() {
-        receiver = event_bus.subscribe()
-        
-        loop {
-            event = receiver.recv()
-            
-            match event {
-                OpportunityFound { opportunity } => {
-                    if validate(opportunity).await.is_ok() {
-                        event_bus.publish(OpportunityApproved { opportunity })
-                    }
-                }
+        // 3. Her candidate için liquidation denemesi
+        for (obl_pubkey, obligation) in candidates {
+            // a) Oracle + reserve load + HF confirm
+            let ctx = build_liquidation_context(&rpc, &obligation).await?;
+            if !ctx.oracle_ok {
+                continue;
             }
-        }
-    }
-    
-    async fn validate(opp: &Opportunity) -> Result<()> {
-        // 1. Check balance
-        has_sufficient_balance(opp.debt_mint, opp.max_liquidatable)?
-        
-        // 2. Check oracle price
-        check_oracle_freshness(opp.debt_mint)?
-        check_oracle_freshness(opp.collateral_mint)?
-        
-        // 3. Verify token accounts exist
-        verify_ata_exists(debt_mint)?
-        verify_ata_exists(collateral_mint)?
-        
-        // 4. Re-check slippage
-        slippage = get_realtime_slippage(opp)?
-        if slippage > config.max_slippage_bps {
-            return Err("Slippage too high")
-        }
-        
-        // 5. Lock balance (prevent double-spending)
-        balance_manager.reserve(opp.debt_mint, opp.max_liquidatable)?
-        
-        Ok(())
-    }
-}
-```
 
-### `engine/executor.rs`
-```rust
-struct Executor {
-    event_bus: EventBus
-    rpc: Arc<RpcClient>
-    wallet: Keypair
-    protocol: Arc<dyn Protocol>
-    balance_manager: BalanceManager
-    tx_lock: TxLock
-    
-    async fn run() {
-        receiver = event_bus.subscribe()
-        
-        loop {
-            event = receiver.recv()
-            
-            match event {
-                OpportunityApproved { opportunity } => {
-                    // Lock to prevent duplicate execution
-                    guard = tx_lock.try_lock(opportunity.position.address)?
-                    
-                    execute(opportunity).await
-                    
-                    // Guard auto-releases lock on drop
-                }
+            // b) Jupiter'den kârlılık kontrolü
+            let quote = get_jupiter_quote(&ctx).await?;
+            if quote.profit_usdc < config.min_profit_usdc {
+                continue;
             }
-        }
-    }
-    
-    async fn execute(opp: Opportunity) -> Result<Signature> {
-        // 1. Build liquidation instruction
-        liq_ix = protocol.build_liquidation_ix(opp, wallet.pubkey(), rpc)
-        
-        // 2. Build transaction
-        tx = TransactionBuilder::new()
-            .add_compute_budget(200_000, 1_000)
-            .add_instruction(liq_ix)
-            .build(rpc.get_recent_blockhash())
-        
-        // 3. Sign transaction
-        sign_transaction(&mut tx, &wallet)
-        
-        // 4. Send transaction
-        signature = if config.dry_run {
-            "DRY_RUN_SIGNATURE"
-        } else {
-            rpc.send_transaction(tx).await?
-        }
-        
-        // 5. Release balance reservation
-        balance_manager.release(opp.debt_mint, opp.max_liquidatable)
-        
-        event_bus.publish(TransactionSent { signature })
-        
-        Ok(signature)
-    }
-}
-```
 
-### `strategy/profit_calculator.rs`
-```rust
-struct ProfitCalculator {
-    config: Config
-    
-    fn calculate_net_profit(opportunity: &Opportunity) -> f64 {
-        gross = opportunity.seizable_collateral - opportunity.max_liquidatable
-        
-        tx_fee = calculate_tx_fee()
-        slippage_cost = calculate_slippage_cost(opportunity)
-        dex_fee = if needs_swap { calculate_dex_fee() } else { 0 }
-        
-        net = gross - tx_fee - slippage_cost - dex_fee
-        
-        return net
-    }
-    
-    fn calculate_tx_fee() -> f64 {
-        base_fee = 5_000 lamports
-        priority_fee = compute_units * priority_fee_per_cu / 1_000_000
-        total_lamports = base_fee + priority_fee
-        total_usd = total_lamports * sol_price_usd / 1e9
-        
-        return total_usd
-    }
-    
-    fn calculate_slippage_cost(opp: &Opportunity) -> f64 {
-        size_usd = opp.seizable_collateral_usd
-        
-        dex_slippage = estimate_dex_slippage(size_usd)
-        oracle_confidence = read_oracle_confidence(opp.collateral_mint)
-        
-        total_slippage_bps = dex_slippage + oracle_confidence
-        final_slippage_bps = total_slippage_bps * config.slippage_multiplier
-        
-        cost = size_usd * (final_slippage_bps / 10_000)
-        
-        return cost
-    }
-}
-```
+            // c) Wallet risk limiti
+            if !is_within_risk_limits(&rpc, &wallet, &quote, &config).await? {
+                continue;
+            }
 
-### `strategy/slippage_estimator.rs`
-```rust
-struct SlippageEstimator {
-    config: Config
-    
-    async fn estimate_dex_slippage(
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-        amount: u64
-    ) -> u16 {
-        
-        if config.use_jupiter_api {
-            // Real-time slippage from Jupiter
-            quote = jupiter_api.get_quote(input_mint, output_mint, amount)
-            return quote.price_impact_bps
-        } else {
-            // Size-based estimation
-            size_usd = amount_to_usd(amount)
-            
-            multiplier = if size_usd < 10_000 {
-                config.slippage_multiplier_small
-            } else if size_usd > 100_000 {
-                config.slippage_multiplier_large
+            // d) Jito bundle ile gönder
+            if matches!(config.liquidation_mode, LiquidationMode::Live) {
+                let tx = build_liquidation_tx(&keypair, &ctx, &quote)?;
+                send_jito_bundle(&tx, &config).await?;
             } else {
-                config.slippage_multiplier_medium
+                log::info!(
+                    "DryRun: would liquidate obligation {} with profit ~{} USDC",
+                    obl_pubkey,
+                    quote.profit_usdc
+                );
             }
-            
-            estimated = config.max_slippage_bps * multiplier
-            
-            return estimated
         }
-    }
-    
-    async fn read_oracle_confidence(mint: Pubkey) -> u16 {
-        oracle_account = get_oracle_account(mint)
-        price_data = read_oracle_price(oracle_account)
-        
-        confidence_ratio = price_data.confidence / price_data.price
-        confidence_bps = (confidence_ratio * 10_000) as u16
-        
-        return confidence_bps
-    }
-}
-```
 
-### `strategy/balance_manager.rs`
-```rust
-struct BalanceManager {
-    reserved: RwLock<HashMap<Pubkey, u64>>
-    rpc: Arc<RpcClient>
-    wallet: Pubkey
-    
-    async fn get_available_balance(mint: Pubkey) -> u64 {
-        actual = get_token_balance(mint)
-        reserved = self.reserved.read().get(mint).copied().unwrap_or(0)
-        available = actual.saturating_sub(reserved)
-        
-        return available
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    
-    async fn reserve(mint: Pubkey, amount: u64) -> Result<Guard> {
-        available = get_available_balance(mint)
-        
-        if available < amount {
-            return Err("Insufficient balance")
-        }
-        
-        reserved.write().insert(mint, amount)
-        
-        return Ok(Guard { mint, amount })
-    }
-    
-    async fn release(mint: Pubkey, amount: u64) {
-        reserved.write().entry(mint).and_modify(|v| *v -= amount)
-    }
-}
-
-struct Guard {
-    mint: Pubkey
-    amount: u64
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        // Auto-release on drop
-        tokio::spawn(release(self.mint, self.amount))
-    }
-}
-```
-
-### `utils/cache.rs`
-```rust
-struct AccountCache {
-    positions: RwLock<HashMap<Pubkey, Position>>
-    
-    async fn insert(pubkey: Pubkey, position: Position)
-    async fn get(pubkey: &Pubkey) -> Option<Position>
-    async fn update(pubkey: Pubkey, position: Position)
-    async fn remove(pubkey: &Pubkey)
-    
-    async fn get_all_liquidatable(threshold: f64) -> Vec<Position> {
-        positions.read()
-            .values()
-            .filter(|p| p.health_factor < threshold)
-            .cloned()
-            .collect()
-    }
-}
-```
-
-### `utils/metrics.rs`
-```rust
-struct Metrics {
-    opportunities_found: AtomicU64
-    transactions_sent: AtomicU64
-    transactions_successful: AtomicU64
-    total_profit_usd: AtomicF64
-    
-    latency: RwLock<Vec<Duration>>
-    
-    fn record_opportunity()
-    fn record_transaction(success: bool, profit: f64)
-    fn record_latency(duration: Duration)
-    
-    fn get_summary() -> MetricsSummary
-}
-
-struct MetricsSummary {
-    opportunities: u64
-    tx_sent: u64
-    tx_success: u64
-    success_rate: f64
-    total_profit: f64
-    avg_latency_ms: u64
-    p95_latency_ms: u64
-}
-```
-
-### `main.rs`
-```rust
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. Load config
-    config = Config::from_env()?
-    config.validate()?
-    
-    // 2. Initialize components
-    rpc = Arc::new(RpcClient::new(config.rpc_http))
-    ws = Arc::new(WsClient::new(config.rpc_ws))
-    wallet = load_wallet(config.wallet_path)?
-    protocol = Arc::new(SolendProtocol::new(config))
-    
-    // 3. Create event bus
-    event_bus = EventBus::new()
-    
-    // 4. Create managers
-    balance_manager = Arc::new(BalanceManager::new(rpc, wallet.pubkey()))
-    metrics = Arc::new(Metrics::new())
-    cache = Arc::new(AccountCache::new())
-    
-    // 5. Spawn workers
-    scanner = Scanner::new(rpc, ws, protocol, event_bus, cache)
-    analyzer = Analyzer::new(event_bus, protocol, config)
-    validator = Validator::new(event_bus, balance_manager, config, rpc)
-    executor = Executor::new(event_bus, rpc, wallet, protocol, balance_manager)
-    
-    tokio::spawn(scanner.run())
-    tokio::spawn(analyzer.run())
-    tokio::spawn(validator.run())
-    tokio::spawn(executor.run())
-    
-    // 6. Metrics logger
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(60))
-            summary = metrics.get_summary()
-            log::info!("Metrics: {:#?}", summary)
-        }
-    })
-    
-    // 7. Wait for shutdown signal
-    signal::ctrl_c().await?
-    
-    log::info!("Shutting down gracefully...")
-    Ok(())
 }
 ```
 
 ---
 
-## 4. DAHA TEMİZ SİSTEM İÇİN ÖNERİLER
+## 10. Solend Layout – Strateji
 
-### A) Separation of Concerns
-```
-Scanner    → Sadece account'ları bul ve izle
-Analyzer   → Sadece opportunity'leri hesapla
-Validator  → Sadece fırsat doğrula (balance, oracle, slippage)
-Executor   → Sadece transaction gönder
-```
+### 10.1. Neden Otomatik Layout?
 
-### B) Event-Driven Architecture
-```
-Event Bus kullanarak worker'lar arasında gevşek bağlantı:
-- Her worker kendi sorumluluğunu yapar
-- Worker'lar birbirinden bağımsız çalışır
-- Test edilebilirlik artar
-```
+* Solend lending programı **Anchor değil**, bu yüzden klasik Anchor IDL JSON’u yok.
+* Layout’lar Solend TS SDK’da `*Layout` değişkenleriyle tanımlı (BufferLayout). ([sdk.solend.fi][1])
+* Manual Rust struct yazmak:
 
-### C) Clear Data Flow
-```
-RPC/WS → Scanner → [AccountUpdated] 
-                ↓
-              Analyzer → [OpportunityFound]
-                ↓
-              Validator → [OpportunityApproved]
-                ↓
-              Executor → [TransactionSent]
-```
+    * Hata riskini artırır,
+    * Protokol güncellemelerine karşı kırılgandır.
 
-### D) Error Handling Strategy
-```
-- Her layer kendi hatalarını handle eder
-- Critical errors → Reconnect/Retry
-- Non-critical errors → Log & Continue
-- Exponential backoff for retries
-```
+Bu yüzden:
 
-### E) Configuration Management
-```
-- Tüm parametreler config'de
-- Environment variables ile override
-- Runtime validation
-- Sensible defaults
-```
-
-### F) Testing Strategy
-```
-- Unit tests: Her function bağımsız test
-- Integration tests: RPC mocking ile
-- End-to-end tests: Devnet'te
-```
+> **Kaynak gerçeğimiz**: `@solendprotocol/solend-sdk` Layout objeleri
+> **Ara format**: `idl/*.json`
+> **Son format**: `build.rs` ile generate edilmiş Rust struct’lar
 
 ---
 
-## 5. MEVCUT KOD ile KARŞILAŞTIRMA
+## 11. ***IDL / Layout’lar Nasıl İndirilir ve Üretilir?***  🔥
 
-### Mevcut Kodun Sorunları:
-1. ❌ **Karmaşık bağımlılıklar**: Her modül birçok şeye bağımlı
-2. ❌ **Unclear data flow**: Event'ler karmaşık, akış belirsiz
-3. ❌ **Tightly coupled**: Protocol, math, wallet hepsi iç içe
-4. ❌ **Over-engineering**: Çok fazla abstraction, gereksiz complexity
-5. ❌ **Poor separation**: Balance reservation, profit calculation, transaction building hepsi karışık
+Burası senin özellikle sorduğun kısım:
+**Solend IDL/layout bilgisi nasıl elde edilir?**
+Cevap: **TS SDK → Node script → JSON → build.rs → Rust**
 
-### Yeni Yapının Avantajları:
-1. ✅ **Clean separation**: Her worker tek sorumluluk
-2. ✅ **Clear flow**: Event-driven, anlaşılır akış
-3. ✅ **Modular**: Protocol, oracle, strategy ayrı
-4. ✅ **Testable**: Her component bağımsız test edilebilir
-5. ✅ **Maintainable**: Kod okumak ve değiştirmek kolay
+### 11.1. Adım 0 – Önkoşullar
+
+* Node.js (>= 18)
+* Yarn veya npm
+* Rust toolchain
+
+### 11.2. Adım 1 – Layout Dump Projesi Oluşturma
+
+Projende örneğin şu yapıyı kullan:
+
+```bash
+mkdir -p tools/solend-layout-dump
+cd tools/solend-layout-dump
+npm init -y
+npm install @solendprotocol/solend-sdk
+```
+
+İstersen TypeScript ile çalışmak için:
+
+```bash
+npm install --save-dev typescript ts-node @types/node
+npx tsc --init
+```
+
+`package.json` içinde (ESM kullanmak istersen):
+
+```json
+{
+  "type": "module",
+  "scripts": {
+    "dump-layouts": "ts-node src/dump-layouts.ts"
+  }
+}
+```
+
+### 11.3. Adım 2 – JSON Şemasını Tanımla
+
+`idl/*.json` dosyalarının **şeması** sabit olsun:
+
+```jsonc
+{
+  "meta": {
+    "sdkVersion": "0.13.16",
+    "sdkCommit": "xxxx",      // opsiyonel
+    "generatedAt": "2025-01-01T00:00:00Z"
+  },
+  "types": [
+    {
+      "name": "LastUpdate",
+      "fields": [
+        { "kind": "scalar", "name": "slot", "type": "u64" },
+        { "kind": "scalar", "name": "stale", "type": "bool" }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Obligation",
+      "fields": [
+        { "kind": "scalar", "name": "version", "type": "u8" },
+        { "kind": "custom", "name": "last_update", "type": "LastUpdate" },
+        { "kind": "scalar", "name": "lending_market", "type": "Pubkey" },
+        { "kind": "scalar", "name": "owner", "type": "Pubkey" },
+        { "kind": "array", "name": "deposits", "elementType": "ObligationCollateral", "len": 10 },
+        { "kind": "array", "name": "borrows", "elementType": "ObligationLiquidity", "len": 10 }
+      ]
+    }
+  ]
+}
+```
+
+Bu şema:
+
+* `types` → Nested struct tanımları
+* `accounts` → Asıl account layout’ları
+* `kind`:
+
+    * `"scalar"` → primitive (u64, bool, Pubkey vs.)
+    * `"array"` → fixed-length array
+    * `"custom"` → başka bir struct
+
+### 11.4. Adım 3 – TS SDK’den Layout Objelerini Kullan
+
+Solend SDK, şu değişkenleri export eder (docs’ta listeleniyor): ([sdk.solend.fi][1])
+
+* `LastUpdateLayout`
+* `LendingMarketLayout`
+* `ReserveLayout`
+* `ObligationLayout`
+* `ObligationCollateralLayout`
+* `ObligationLiquidityLayout`
+* `RESERVE_SIZE`
+* `OBLIGATION_SIZE`
+* `LENDING_MARKET_SIZE`
+
+**dump-layouts.ts iskeleti (konsept):**
+
+```ts
+// tools/solend-layout-dump/src/dump-layouts.ts
+
+import {
+  LastUpdateLayout,
+  LendingMarketLayout,
+  ReserveLayout,
+  ObligationLayout,
+  ObligationCollateralLayout,
+  ObligationLiquidityLayout,
+  LENDING_MARKET_SIZE,
+  RESERVE_SIZE,
+  OBLIGATION_SIZE,
+} from "@solendprotocol/solend-sdk";
+import { writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
+// import package.json to get sdkVersion if aynı projede istersen
+
+type Field =
+  | { kind: "scalar"; name: string; type: string }
+  | { kind: "array"; name: string; elementType: string; len: number }
+  | { kind: "custom"; name: string; type: string };
+
+interface LayoutFile {
+  meta: {
+    sdkVersion: string;
+    generatedAt: string;
+  };
+  types: { name: string; fields: Field[] }[];
+  accounts: { name: string; fields: Field[] }[];
+}
+
+// NOT: Burada BufferLayout iç yapısını solend-sdk source'una göre
+// sen dolduracaksın. Ama mantık şu:
+//   - layout.fields üzerinden dön
+//   - her field için name/type/len çıkar
+//   - bizim JSON Field tipine map et
+
+function dumpLayouts() {
+  const outDir = join(process.cwd(), "..", "..", "idl");
+  mkdirSync(outDir, { recursive: true });
+
+  // Örnek: LastUpdate + LendingMarket
+  const lendingMarketFile: LayoutFile = {
+    meta: {
+      sdkVersion: "0.13.16", // package.json'dan da çekebilirsin
+      generatedAt: new Date().toISOString(),
+    },
+    types: [
+      {
+        name: "LastUpdate",
+        fields: [
+          { kind: "scalar", name: "slot", type: "u64" },
+          { kind: "scalar", name: "stale", type: "bool" },
+        ],
+      },
+    ],
+    accounts: [
+      {
+        name: "LendingMarket",
+        fields: [
+          // Burayı LendingMarketLayout.fields'ten derive edeceksin
+          // (name, type vs. mapping)
+        ],
+      },
+    ],
+  };
+
+  writeFileSync(
+    join(outDir, "solend_lending_market_layout.json"),
+    JSON.stringify(lendingMarketFile, null, 2),
+    "utf-8",
+  );
+
+  // Benzer şekilde:
+  // - solend_reserve_layout.json
+  // - solend_obligation_layout.json
+  // - solend_last_update_layout.json
+}
+
+dumpLayouts();
+```
+
+> Burada gösterilen kod, **tasarım sözleşmesi**.
+> Gerçek implementasyonda `*Layout.fields` yapısını inceleyip tam mapping’i uyguluyorsun (Solend SDK source içinde `src/state/*.ts` dosyalarında görülüyor).
+
+**Prensip**:
+Bu node script’i CI’de veya manuel çalıştırıyorsun:
+
+```bash
+cd tools/solend-layout-dump
+npm run dump-layouts
+```
+
+Ve sonuçta repo kökünde:
+
+```text
+idl/
+  solend_last_update_layout.json
+  solend_lending_market_layout.json
+  solend_reserve_layout.json
+  solend_obligation_layout.json
+```
+
+dosyaların oluşmuş oluyor.
+
+### 11.5. Adım 4 – build.rs Nasıl Çalışır?
+
+`build.rs`:
+
+* Bu `idl/` JSON’larını okur.
+* JSON’daki `types` ve `accounts`’ı Rust struct’lara map eder.
+* `OUT_DIR/solend_layout.rs` dosyasını yazar.
+
+Örnek (önceden verdiğimiz iskelet):
+
+```rust
+// Kısaltılmış; tam versiyon daha önceki sürümde var.
+println!("cargo:rerun-if-changed=idl/solend_obligation_layout.json");
+// ...
+
+let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+let dest_path = out_dir.join("solend_layout.rs");
+let mut out = File::create(&dest_path)?;
+
+let layout_files = vec![
+    "idl/solend_last_update_layout.json",
+    "idl/solend_lending_market_layout.json",
+    "idl/solend_reserve_layout.json",
+    "idl/solend_obligation_layout.json",
+];
+
+let mut generated = String::new();
+generated.push_str("use borsh::{BorshDeserialize, BorshSerialize};\n");
+generated.push_str("use solana_program::pubkey::Pubkey;\n\n");
+
+// JSON -> LayoutFile parse, sonra render_struct(name, fields) ile Rust code yazma
+// ... (önceki build.rs iskeletine bire bir uyuyor)
+
+out.write_all(generated.as_bytes())?;
+```
+
+**Önemli**:
+
+* `build.rs` **internet üzerinden bir şey indirmez**.
+* Tüm IDL/layout bilgisi **önceden üretilmiş idl JSON’larından** gelir.
+* Böylece:
+
+    * Build deterministik,
+    * CI’de offline çalışabilir,
+    * Network hatalarına bağlı olmaz.
+
+### 11.6. Runtime’da Layout Doğrulama
+
+Runtime startup’ta:
+
+1. Solend SDK’daki sabit account size’ları (`RESERVE_SIZE`, `OBLIGATION_SIZE`, `LENDING_MARKET_SIZE`) JSON içindeki `meta` veya ayrı config ile senkron tut.
+2. Bot başlarken:
+
+    * `get_program_accounts(SOLEND_PROGRAM_ID)` ile birkaç örnek account çek.
+    * `data.len()` ile layout’tan beklenen size’ı karşılaştır.
+3. Eşleşmiyorsa:
+
+```text
+"Solend account size mismatch. Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et."
+```
+
+ve uygulamayı **başlatma**.
 
 ---
 
-## SONUÇ
+## 12. solend.rs
 
-Bu yeni yapı ile:
-- **Daha az kod** (basit, anlaşılır)
-- **Daha hızlı geliştirme** (modüler)
-- **Daha kolay debug** (clear data flow)
-- **Daha az bug** (separation of concerns)
-- **Daha kolay test** (independent components)
+```rust
+// src/solend.rs
+include!(concat!(env!("OUT_DIR"), "/solend_layout.rs"));
 
-Şimdi istersen bu pseudo-kod'u gerçek Rust koduna çevirebiliriz. Hangi modülden başlamak istersin?
+impl Obligation {
+    pub fn health_factor(&self) -> f64 {
+        // JSON/layout'tan gelen alanlara göre HF hesaplama.
+        // (collateral value, borrow value, liquidation_threshold vs.)
+        // Formül:
+        // HF = allowed_borrow_value / borrowed_value
+        1.0 // placeholder; gerçek implementasyon projede olacak.
+    }
+}
+```
+
+Bu dosyada sadece:
+
+* Otomatik struct’lar (include!)
+* HF helper’ları
+* Ufak convenience fonksiyonlar
+
+yer alır.
+
+---
+
+## 13. Hata Yönetimi ve Güvenlik
+
+Bot şu durumlarda **fail-fast** yapar:
+
+* Layout mismatch (account size tutmuyor).
+* Oracle stale / confidence çok kötü.
+* Wallet bakiyesi yetersiz.
+* Jito endpoint unreachable (ve fallback yoksa).
+* Jupiter profit < `min_profit_usdc`.
+
+Her hata:
+
+* Açık ve loggable bir mesaj üretir.
+* Gerektiğinde süreci durdurur.
+
+---
+
+## 14. AI İçin Final System Prompt (Güncellenmiş)
+
+AI’a verilecek **güncellenmiş system prompt** özetle:
+
+1. Dosya yapısı: `main.rs`, `pipeline.rs`, `solend.rs`, `jup.rs`, `utils.rs`, `build.rs`.
+2. `src/bin/`, `core/events`, `custom ws client` vb. her şey silinecek.
+3. Solend layout:
+
+    * **Elle struct yazamazsın.**
+    * Layout bilgi kaynağın yalnızca `idl/*.json` dosyalarıdır.
+    * `build.rs` bu JSON’lardan `OUT_DIR/solend_layout.rs` üretir.
+    * `solend.rs` include! ile bunu projeye dahil eder.
+4. Liquidation pipeline:
+
+    * Tek async loop.
+    * `get_program_accounts` → Obligation parse → HF < 1.0 → Oracle check → Jupiter profit → Wallet risk → Jito bundle.
+5. Wallet:
+
+    * `secret/main.json` kullanılır.
+    * Risk limiti ve min profit zorunlu.
+6. Oracle:
+
+    * Pyth/Switchboard guard zorunlu.
+7. Güvenlik:
+
+    * Layout mismatch guard,
+    * Account size guard,
+    * Oracle deviation guard,
+    * Min-profit guard,
+    * Max-position-percentage guard.
+8. Kod:
+
+    * Minimal,
+    * Over-engineering yok,
+    * Google/Microsoft temizliği.
+
+---
+
