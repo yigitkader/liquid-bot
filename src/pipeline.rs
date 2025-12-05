@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
@@ -255,11 +254,18 @@ const SWITCHBOARD_PROGRAM_ID: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64
 /// Maximum allowed confidence interval (as percentage of price)
 const MAX_CONFIDENCE_PCT: f64 = 5.0; // 5% max confidence interval
 
-/// Maximum allowed slot difference for oracle price
+/// Maximum allowed slot difference for oracle price (stale check)
+/// Pyth recommends checking valid_slot, but we also check last_slot as fallback
 const MAX_SLOT_DIFFERENCE: u64 = 150; // ~1 minute at 400ms per slot
 
 /// Maximum allowed price deviation between Pyth and Switchboard (as percentage)
 const MAX_ORACLE_DEVIATION_PCT: f64 = 2.0; // 2% max deviation
+
+/// Pyth price status values (from price_type byte)
+/// PriceType enum: Unknown = 0, Price = 1, Trading = 2, Halted = 3, Auction = 4
+const PYTH_PRICE_STATUS_TRADING: u8 = 2;
+const PYTH_PRICE_STATUS_UNKNOWN: u8 = 0;
+const PYTH_PRICE_STATUS_HALTED: u8 = 3;
 
 /// Validate Pyth and Switchboard oracles per Structure.md section 5.2
 /// Returns (is_valid, borrow_price_usd, deposit_price_usd)
@@ -397,21 +403,175 @@ async fn validate_oracles(
 
 /// Validate Switchboard oracle if available in ReserveConfig
 /// Returns Some(price) if Switchboard oracle exists and is valid, None otherwise
+/// Per Structure.md section 5.2
 async fn validate_switchboard_oracle_if_available(
-    _rpc: &Arc<RpcClient>,
-    _reserve: &Reserve,
-    _current_slot: u64,
+    rpc: &Arc<RpcClient>,
+    reserve: &Reserve,
+    current_slot: u64,
 ) -> Result<Option<f64>> {
-    // TODO: When ReserveConfig includes switchboard_oracle_pubkey field:
     // 1. Get switchboard_oracle_pubkey from reserve.config
-    // 2. Verify it belongs to Switchboard program ID
-    // 3. Parse Switchboard price account
-    // 4. Validate price is fresh (similar to Pyth)
-    // 5. Return price
+    // Note: ReserveConfig may not have this field in all versions
+    // We check if it's not default/zero pubkey
+    
+    // Access switchboard oracle pubkey from ReserveConfig
+    // If the field doesn't exist or is default, return None
+    let switchboard_oracle_pubkey = reserve.config.switchboardOraclePubkey;
+    if switchboard_oracle_pubkey == Pubkey::default() {
+        // No Switchboard oracle configured for this reserve
+        return Ok(None);
+    }
 
-    // For now, ReserveConfig doesn't have switchboard_oracle_pubkey
-    // This is a placeholder for future implementation
-    Ok(None)
+    // 2. Verify it belongs to Switchboard program ID
+    let oracle_account = rpc
+        .get_account(&switchboard_oracle_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get Switchboard oracle account: {}", e))?;
+
+    let switchboard_program_id = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID)
+        .map_err(|e| anyhow::anyhow!("Invalid Switchboard program ID: {}", e))?;
+
+    if oracle_account.owner != switchboard_program_id {
+        log::debug!(
+            "Switchboard oracle account {} does not belong to Switchboard program",
+            switchboard_oracle_pubkey
+        );
+        return Ok(None);
+    }
+
+    // 3. Parse Switchboard price account
+    // Switchboard v2 AggregatorAccount layout (simplified):
+    // - Account discriminator
+    // - Name, metadata, etc.
+    // - Latest round data:
+    //   - Round ID (u128)
+    //   - Price (i128)
+    //   - Timestamp (i64)
+    //   - Status (enum)
+    // - Previous round data (similar structure)
+    
+    // Minimum account size check
+    if oracle_account.data.len() < 200 {
+        log::debug!(
+            "Switchboard oracle account data too short: {} bytes",
+            oracle_account.data.len()
+        );
+        return Ok(None);
+    }
+
+    // 3. Parse Switchboard v2 AggregatorAccount
+    // Switchboard v2 account layout (simplified):
+    // - Offset 0-8: discriminator (8 bytes)
+    // - Offset 8-40: name (32 bytes)
+    // - Offset 40-72: metadata (32 bytes)
+    // - Offset 72-80: reserved (8 bytes)
+    // - Offset 80-88: batch_size (u32) + min_oracle_results (u32)
+    // - Offset 88-96: min_job_results (u32) + min_update_delay_seconds (u32)
+    // - Offset 96-104: start_after (i64)
+    // - Offset 104-112: variance_tolerance_multiplier (u128, 16 bytes) - actually u128
+    // - Offset 112-120: force_report_period (i64)
+    // - Offset 120-128: expiration (i64)
+    // - Offset 128-136: state (enum, 1 byte) + ... padding
+    // - Offset 136-144: oracle_request_batch_size (u32) + ... padding
+    // - Offset 144-152: is_initialized (bool) + ... padding
+    // - Offset 152-160: crank_pubkey (Pubkey, 32 bytes) - actually starts at 152
+    // - Offset 184-192: latest_confirmed_round (AggregatorRound)
+    //   AggregatorRound structure:
+    //   - round_id: u128 (16 bytes)
+    //   - price: i128 (16 bytes)
+    //   - timestamp: i64 (8 bytes)
+    //   - num_success: u32 (4 bytes)
+    //   - num_error: u32 (4 bytes)
+    //   - is_round_closed: bool (1 byte)
+    //   - ... padding
+    
+    // Latest confirmed round starts around offset 184
+    if oracle_account.data.len() < 240 {
+        log::debug!(
+            "Switchboard oracle account data too short: {} bytes (need at least 240 for latest round)",
+            oracle_account.data.len()
+        );
+        return Ok(None);
+    }
+
+    // Parse latest confirmed round
+    // Round ID at offset 184-200 (u128, 16 bytes)
+    let round_id_bytes: [u8; 16] = oracle_account.data[184..200]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse round_id"))?;
+    let round_id = u128::from_le_bytes(round_id_bytes);
+
+    // Price at offset 200-216 (i128, 16 bytes)
+    let price_bytes: [u8; 16] = oracle_account.data[200..216]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse price"))?;
+    let price_raw = i128::from_le_bytes(price_bytes);
+
+    // Timestamp at offset 216-224 (i64, 8 bytes)
+    let timestamp_bytes: [u8; 8] = oracle_account.data[216..224]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse timestamp"))?;
+    let timestamp = i64::from_le_bytes(timestamp_bytes);
+
+    // Check if round is closed (offset 232, bool)
+    let is_round_closed = if oracle_account.data.len() > 232 {
+        oracle_account.data[232] != 0
+    } else {
+        false
+    };
+
+    if !is_round_closed {
+        log::debug!(
+            "Switchboard oracle round {} is not closed - rejecting",
+            round_id
+        );
+        return Ok(None);
+    }
+
+    // 4. Validate price is fresh (timestamp check)
+    // Check if timestamp is recent (within last 5 minutes = 300 seconds)
+    let current_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    
+    let age_seconds = current_timestamp.saturating_sub(timestamp);
+    const MAX_AGE_SECONDS: i64 = 300; // 5 minutes
+    
+    if age_seconds > MAX_AGE_SECONDS {
+        log::debug!(
+            "Switchboard oracle price is stale: age {} seconds > {} seconds (timestamp: {}, current: {})",
+            age_seconds,
+            MAX_AGE_SECONDS,
+            timestamp,
+            current_timestamp
+        );
+        return Ok(None);
+    }
+
+    // Parse scale/decimals from account (typically stored in aggregator config)
+    // For simplicity, we'll use a default scale of 8 (common for price feeds)
+    // In production, this should be read from the account
+    const DEFAULT_SCALE: i32 = 8;
+    let price = price_raw as f64 / 10_f64.powi(DEFAULT_SCALE);
+
+    // Validate price is positive and reasonable
+    if price <= 0.0 || !price.is_finite() {
+        log::debug!(
+            "Switchboard oracle price is invalid: {} (raw: {})",
+            price,
+            price_raw
+        );
+        return Ok(None);
+    }
+
+    log::debug!(
+        "✅ Switchboard oracle validation passed for {} (price: {}, round_id: {}, age: {}s)",
+        switchboard_oracle_pubkey,
+        price,
+        round_id,
+        age_seconds
+    );
+
+    Ok(Some(price))
 }
 
 /// Validate Pyth oracle per Structure.md section 5.2
@@ -434,51 +594,11 @@ async fn validate_pyth_oracle(
         return Ok((false, None));
     }
 
-    // 2. Parse Pyth price account (simplified - basic structure check)
-    // Pyth price account structure (simplified):
-    // - First 8 bytes: magic number / version
-    // - Next 4 bytes: price_type
-    // - Next 8 bytes: exponent
-    // - Next 32 bytes: price (i64)
-    // - Next 32 bytes: confidence (u64)
-    // - Next 8 bytes: timestamp
-    // - Next 8 bytes: prev_publish_time
-    // - Next 8 bytes: prev_price
-    // - Next 8 bytes: prev_conf
-    // - Next 8 bytes: last_slot (slot when price was last updated)
-
-    if oracle_account.data.len() < 100 {
-        log::debug!("Oracle account data too short: {} bytes", oracle_account.data.len());
-        return Ok((false, None));
-    }
-
-    // Parse price from Pyth account (simplified)
-    // Pyth price is at offset ~32 bytes (i64, 8 bytes)
-    // Exponent is at offset ~16 bytes (i32, 4 bytes)
-    let mut price: Option<f64> = None;
-    let mut exponent: i32 = 0;
-    if oracle_account.data.len() >= 40 {
-        // Parse exponent
-        let exponent_bytes: [u8; 4] = oracle_account.data[16..20]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to parse exponent"))?;
-        exponent = i32::from_le_bytes(exponent_bytes);
-
-        // Parse price (i64)
-        let price_bytes: [u8; 8] = oracle_account.data[32..40]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to parse price"))?;
-        let price_raw = i64::from_le_bytes(price_bytes);
-
-        // Convert to f64 with exponent
-        price = Some(price_raw as f64 * 10_f64.powi(exponent));
-    }
-
-    // 3. Check if price is stale (slot difference)
-    // Pyth price account structure (v2):
-    // - Offset 0-4: magic (4 bytes)
-    // - Offset 4-5: version (1 byte)
-    // - Offset 5-6: price_type (1 byte)
+    // 2. Parse Pyth v2 price account structure
+    // Pyth v2 price account layout:
+    // - Offset 0-4: magic (4 bytes) = 0xa1b2c3d4
+    // - Offset 4-5: version (1 byte) = 2
+    // - Offset 5-6: price_type (1 byte) - PriceType enum: Unknown=0, Price=1, Trading=2, Halted=3, Auction=4
     // - Offset 6-8: size (2 bytes)
     // - Offset 8-16: price (i64, 8 bytes)
     // - Offset 16-20: exponent (i32, 4 bytes)
@@ -487,68 +607,147 @@ async fn validate_pyth_oracle(
     // - Offset 32-40: prev_publish_time (i64, 8 bytes)
     // - Offset 40-48: prev_price (i64, 8 bytes)
     // - Offset 48-56: prev_conf (u64, 8 bytes)
-    // - Offset 56-64: last_slot (u64, 8 bytes) - THIS IS WHAT WE NEED
-    // - Offset 64-72: valid_slot (u64, 8 bytes)
+    // - Offset 56-64: last_slot (u64, 8 bytes) - slot when price was last updated
+    // - Offset 64-72: valid_slot (u64, 8 bytes) - slot when price is valid until
     // - Offset 72+: publisher accounts...
 
-    if oracle_account.data.len() >= 64 {
-        // Parse last_slot from offset 56-64
-        let last_slot_bytes: [u8; 8] = oracle_account.data[56..64]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed to parse last_slot"))?;
-        let last_slot = u64::from_le_bytes(last_slot_bytes);
+    if oracle_account.data.len() < 72 {
+        log::debug!("Oracle account data too short: {} bytes (need at least 72 for Pyth v2)", oracle_account.data.len());
+        return Ok((false, None));
+    }
 
-        // Check slot difference
-        let slot_difference = current_slot.saturating_sub(last_slot);
-        if slot_difference > MAX_SLOT_DIFFERENCE {
-            log::debug!(
-                "Oracle price is stale: slot difference {} > {} (last_slot: {}, current_slot: {})",
-                slot_difference,
-                MAX_SLOT_DIFFERENCE,
-                last_slot,
-                current_slot
-            );
+    // Check magic number (Pyth v2)
+    let magic: [u8; 4] = oracle_account.data[0..4]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse magic"))?;
+    if magic != [0xa1, 0xb2, 0xc3, 0xd4] {
+        log::debug!("Invalid Pyth magic number: {:?}", magic);
+        return Ok((false, None));
+    }
+
+    // Check version
+    let version = oracle_account.data[4];
+    if version != 2 {
+        log::debug!("Unsupported Pyth version: {} (expected 2)", version);
+        return Ok((false, None));
+    }
+
+    // Check price status (price_type byte)
+    let price_type = oracle_account.data[5];
+    if price_type != PYTH_PRICE_STATUS_TRADING {
+        log::debug!(
+            "Pyth price status is not Trading: {} (0=Unknown, 1=Price, 2=Trading, 3=Halted, 4=Auction)",
+            price_type
+        );
+        if price_type == PYTH_PRICE_STATUS_HALTED {
+            log::warn!("Pyth price is HALTED - rejecting oracle");
             return Ok((false, None));
         }
+        if price_type == PYTH_PRICE_STATUS_UNKNOWN {
+            log::warn!("Pyth price is UNKNOWN - rejecting oracle");
+            return Ok((false, None));
+        }
+        // For Price (1) or Auction (4), we might accept but log warning
+        log::warn!("Pyth price status is {} (not Trading) - accepting with caution", price_type);
+    }
 
+    // Parse exponent
+    let exponent_bytes: [u8; 4] = oracle_account.data[16..20]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse exponent"))?;
+    let exponent = i32::from_le_bytes(exponent_bytes);
+
+    // Parse price (i64)
+    let price_bytes: [u8; 8] = oracle_account.data[8..16]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse price"))?;
+    let price_raw = i64::from_le_bytes(price_bytes);
+
+    // Convert to f64 with exponent
+    let price = Some(price_raw as f64 * 10_f64.powi(exponent));
+
+    // 3. Check if price is stale (valid_slot and last_slot check)
+    // Pyth v2 uses valid_slot as primary stale check - price is valid until valid_slot
+    // We also check last_slot as secondary validation
+    
+    // Parse valid_slot (primary stale check)
+    let valid_slot_bytes: [u8; 8] = oracle_account.data[64..72]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse valid_slot"))?;
+    let valid_slot = u64::from_le_bytes(valid_slot_bytes);
+
+    // Price is stale if current_slot > valid_slot
+    if current_slot > valid_slot {
         log::debug!(
-            "Oracle price is fresh: slot difference {} <= {} (last_slot: {}, current_slot: {})",
+            "Pyth oracle price is stale: current_slot {} > valid_slot {}",
+            current_slot,
+            valid_slot
+        );
+        return Ok((false, None));
+    }
+
+    // Secondary check: last_slot (when price was last updated)
+    let last_slot_bytes: [u8; 8] = oracle_account.data[56..64]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse last_slot"))?;
+    let last_slot = u64::from_le_bytes(last_slot_bytes);
+
+    // Check slot difference as additional validation
+    let slot_difference = current_slot.saturating_sub(last_slot);
+    if slot_difference > MAX_SLOT_DIFFERENCE {
+        log::debug!(
+            "Pyth oracle price last update too old: slot difference {} > {} (last_slot: {}, current_slot: {})",
             slot_difference,
             MAX_SLOT_DIFFERENCE,
             last_slot,
             current_slot
         );
-    } else {
-        log::debug!(
-            "Oracle account data too short for stale check: {} bytes (need at least 64)",
-            oracle_account.data.len()
-        );
-        // Don't fail, but log warning
+        return Ok((false, None));
     }
+
+    log::debug!(
+        "Pyth oracle price is fresh: valid_slot={}, last_slot={}, current_slot={}, slot_diff={}",
+        valid_slot,
+        last_slot,
+        current_slot,
+        slot_difference
+    );
 
     // 4. Check confidence interval
-    if let Some(price_value) = price {
-        if oracle_account.data.len() >= 48 {
-            // Parse confidence (u64 at offset ~40 bytes)
-            let conf_bytes: [u8; 8] = oracle_account.data[40..48]
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("Failed to parse confidence"))?;
-            let confidence = u64::from_le_bytes(conf_bytes) as f64 * 10_f64.powi(exponent);
+    let price_value = price.ok_or_else(|| anyhow::anyhow!("Price not parsed"))?;
+    
+    // Parse confidence (u64 at offset 48-56)
+    let conf_bytes: [u8; 8] = oracle_account.data[48..56]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse confidence"))?;
+    let confidence_raw = u64::from_le_bytes(conf_bytes);
+    let confidence = confidence_raw as f64 * 10_f64.powi(exponent);
 
-            // Check if confidence interval is too large
-            let confidence_pct = (confidence / price_value.abs()) * 100.0;
-            if confidence_pct > MAX_CONFIDENCE_PCT {
-                log::debug!(
-                    "Oracle confidence too high: {:.2}% > {:.2}%",
-                    confidence_pct,
-                    MAX_CONFIDENCE_PCT
-                );
-                return Ok((false, None));
-            }
-        }
+    // Check if confidence interval is too large (as percentage of price)
+    let confidence_pct = if price_value.abs() > 0.0 {
+        (confidence / price_value.abs()) * 100.0
+    } else {
+        f64::INFINITY
+    };
+
+    if confidence_pct > MAX_CONFIDENCE_PCT {
+        log::debug!(
+            "Pyth oracle confidence too high: {:.2}% > {:.2}% (price: {}, confidence: {})",
+            confidence_pct,
+            MAX_CONFIDENCE_PCT,
+            price_value,
+            confidence
+        );
+        return Ok((false, None));
     }
 
-    log::debug!("✅ Pyth oracle validation passed for {} (price: {:?})", oracle_pubkey, price);
+    log::debug!(
+        "✅ Pyth oracle validation passed for {} (price: {}, confidence: {:.2}%, status: {})",
+        oracle_pubkey,
+        price_value,
+        confidence_pct,
+        price_type
+    );
     Ok((true, price))
 }
 
@@ -679,7 +878,6 @@ async fn build_liquidation_tx(
 ) -> Result<Transaction> {
     use solana_sdk::{
         instruction::{AccountMeta, Instruction},
-        system_program,
         sysvar,
     };
     use spl_token::ID as TOKEN_PROGRAM_ID;

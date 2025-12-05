@@ -5,7 +5,7 @@
  * and generates JSON files in the format specified in Structure.md section 11.3
  */
 
-import { writeFileSync, mkdirSync } from "fs";
+import { writeFileSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 
 // Type definitions per Structure.md section 11.3
@@ -50,14 +50,16 @@ function layoutFieldToField(layoutField: any): Field | null {
  * - ObligationCollateralLayout
  * - ObligationLiquidityLayout
  */
-function dumpLayouts() {
+async function dumpLayouts() {
   const outDir = join(process.cwd(), "..", "..", "idl");
   mkdirSync(outDir, { recursive: true });
 
   // Get SDK version from package.json if available
   let sdkVersion = "0.13.16"; // Default
   try {
-    const sdkPackage = require("@solendprotocol/solend-sdk/package.json");
+    const sdkPackagePath = join(process.cwd(), "node_modules", "@solendprotocol", "solend-sdk", "package.json");
+    const sdkPackageContent = readFileSync(sdkPackagePath, "utf-8");
+    const sdkPackage = JSON.parse(sdkPackageContent);
     sdkVersion = sdkPackage.version || sdkVersion;
   } catch (e) {
     console.warn("Could not read SDK version, using default:", sdkVersion);
@@ -71,7 +73,14 @@ function dumpLayouts() {
       sdkVersion,
       generatedAt,
     },
-    types: [],
+    types: [
+      {
+        name: "Number",
+        fields: [
+          { kind: "scalar", name: "value", type: "u128" },
+        ],
+      },
+    ],
     accounts: [
       {
         name: "LastUpdate",
@@ -101,6 +110,12 @@ function dumpLayouts() {
         fields: [
           { kind: "scalar", name: "slot", type: "u64" },
           { kind: "scalar", name: "stale", type: "bool" },
+        ],
+      },
+      {
+        name: "Number",
+        fields: [
+          { kind: "scalar", name: "value", type: "u128" },
         ],
       },
     ],
@@ -138,6 +153,39 @@ function dumpLayouts() {
           { kind: "scalar", name: "stale", type: "bool" },
         ],
       },
+      {
+        name: "ReserveLiquidity",
+        fields: [
+          { kind: "scalar", name: "mintPubkey", type: "Pubkey" },
+          { kind: "scalar", name: "mintDecimals", type: "u8" },
+          { kind: "scalar", name: "supplyPubkey", type: "Pubkey" },
+          { kind: "scalar", name: "oraclePubkey", type: "Pubkey" },
+          { kind: "scalar", name: "availableAmount", type: "u64" },
+          { kind: "scalar", name: "borrowedAmountWads", type: "u128" },
+          { kind: "scalar", name: "cumulativeBorrowRateWads", type: "u128" },
+        ],
+      },
+      {
+        name: "ReserveCollateral",
+        fields: [
+          { kind: "scalar", name: "mintPubkey", type: "Pubkey" },
+          { kind: "scalar", name: "mintTotalSupply", type: "u64" },
+          { kind: "scalar", name: "supplyPubkey", type: "Pubkey" },
+        ],
+      },
+      {
+        name: "ReserveConfig",
+        fields: [
+          { kind: "scalar", name: "optimalUtilizationRate", type: "u8" },
+          { kind: "scalar", name: "loanToValueRatio", type: "u8" },
+          { kind: "scalar", name: "liquidationBonus", type: "u8" },
+          { kind: "scalar", name: "liquidationThreshold", type: "u8" },
+          { kind: "scalar", name: "minBorrowRate", type: "u8" },
+          { kind: "scalar", name: "optimalBorrowRate", type: "u8" },
+          { kind: "scalar", name: "maxBorrowRate", type: "u8" },
+          { kind: "scalar", name: "switchboardOraclePubkey", type: "Pubkey" },
+        ],
+      },
     ],
     accounts: [
       {
@@ -146,8 +194,9 @@ function dumpLayouts() {
           { kind: "scalar", name: "version", type: "u8" },
           { kind: "custom", name: "lastUpdate", type: "LastUpdate" },
           { kind: "scalar", name: "lendingMarket", type: "Pubkey" },
-          // Note: Reserve has nested structs (ReserveLiquidity, ReserveCollateral, ReserveConfig)
-          // These would be defined in the types section in a full implementation
+          { kind: "custom", name: "liquidity", type: "ReserveLiquidity" },
+          { kind: "custom", name: "collateral", type: "ReserveCollateral" },
+          { kind: "custom", name: "config", type: "ReserveConfig" },
         ],
       },
     ],
@@ -174,6 +223,12 @@ function dumpLayouts() {
         ],
       },
       {
+        name: "Number",
+        fields: [
+          { kind: "scalar", name: "value", type: "u128" },
+        ],
+      },
+      {
         name: "ObligationCollateral",
         fields: [
           { kind: "scalar", name: "depositReserve", type: "Pubkey" },
@@ -185,9 +240,9 @@ function dumpLayouts() {
         name: "ObligationLiquidity",
         fields: [
           { kind: "scalar", name: "borrowReserve", type: "Pubkey" },
-          { kind: "scalar", name: "borrowedAmountWads", type: "u128" },
-          { kind: "scalar", name: "marketValue", type: "u128" },
+          { kind: "scalar", name: "borrowedAmountWad", type: "u128" },
           { kind: "scalar", name: "cumulativeBorrowRateWads", type: "u128" },
+          { kind: "scalar", name: "marketValue", type: "u128" },
         ],
       },
     ],
@@ -199,6 +254,10 @@ function dumpLayouts() {
           { kind: "custom", name: "lastUpdate", type: "LastUpdate" },
           { kind: "scalar", name: "lendingMarket", type: "Pubkey" },
           { kind: "scalar", name: "owner", type: "Pubkey" },
+          { kind: "custom", name: "depositedValue", type: "Number" },
+          { kind: "custom", name: "borrowedValue", type: "Number" },
+          { kind: "custom", name: "allowedBorrowValue", type: "Number" },
+          { kind: "custom", name: "unhealthyBorrowValue", type: "Number" },
           { kind: "array", name: "deposits", elementType: "ObligationCollateral", len: 10 },
           { kind: "array", name: "borrows", elementType: "ObligationLiquidity", len: 10 },
         ],
@@ -222,5 +281,8 @@ function dumpLayouts() {
   console.log("   BufferLayout structures and implement full field mapping.");
 }
 
-dumpLayouts();
+dumpLayouts().catch((error) => {
+  console.error("Error dumping layouts:", error);
+  process.exit(1);
+});
 

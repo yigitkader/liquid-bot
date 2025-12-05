@@ -1,0 +1,137 @@
+{
+  "meta": {
+    "sdkVersion": "0.13.43",
+    "generatedAt": "2025-12-05T16:36:26.646Z"
+  },
+  "types": [
+    {
+      "name": "LastUpdate",
+      "fields": [
+        {
+          "kind": "scalar",
+          "name": "slot",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "stale",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "Number",
+      "fields": [
+        {
+          "kind": "scalar",
+          "name": "value",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "ObligationCollateral",
+      "fields": [
+        {
+          "kind": "scalar",
+          "name": "depositReserve",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "depositedAmount",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "marketValue",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "ObligationLiquidity",
+      "fields": [
+        {
+          "kind": "scalar",
+          "name": "borrowReserve",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "borrowedAmountWad",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "cumulativeBorrowRateWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "marketValue",
+          "type": "u128"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Obligation",
+      "fields": [
+        {
+          "kind": "scalar",
+          "name": "version",
+          "type": "u8"
+        },
+        {
+          "kind": "custom",
+          "name": "lastUpdate",
+          "type": "LastUpdate"
+        },
+        {
+          "kind": "scalar",
+          "name": "lendingMarket",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "owner",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "custom",
+          "name": "depositedValue",
+          "type": "Number"
+        },
+        {
+          "kind": "custom",
+          "name": "borrowedValue",
+          "type": "Number"
+        },
+        {
+          "kind": "custom",
+          "name": "allowedBorrowValue",
+          "type": "Number"
+        },
+        {
+          "kind": "custom",
+          "name": "unhealthyBorrowValue",
+          "type": "Number"
+        },
+        {
+          "kind": "array",
+          "name": "deposits",
+          "elementType": "ObligationCollateral",
+          "len": 10
+        },
+        {
+          "kind": "array",
+          "name": "borrows",
+          "elementType": "ObligationLiquidity",
+          "len": 10
+        }
+      ]
+    }
+  ]
+}
