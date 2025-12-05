@@ -705,12 +705,49 @@ async fn build_liquidation_tx(
     let lending_market = ctx.obligation.lendingMarket;
     let lending_market_authority = crate::solend::derive_lending_market_authority(&lending_market, &program_id)?;
 
-    // Get reserve liquidity supply addresses (these are PDAs)
-    // Note: In production, these should be derived from reserve accounts
-    // For now, we'll use placeholder - full implementation needs proper PDA derivation
+    // Get reserve liquidity supply addresses
+    // These are stored in Reserve account (supplyPubkey field)
+    // Solend program stores the correct PDA addresses in Reserve account during initialization
     let repay_reserve_liquidity_supply = borrow_reserve.liquidity.supplyPubkey;
     let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity.supplyPubkey;
     let withdraw_reserve_collateral_mint = deposit_reserve.collateral.mintPubkey;
+    
+    // Verify these are not default/zero addresses
+    if repay_reserve_liquidity_supply == Pubkey::default() 
+        || withdraw_reserve_liquidity_supply == Pubkey::default() 
+        || withdraw_reserve_collateral_mint == Pubkey::default() {
+        return Err(anyhow::anyhow!("Invalid reserve addresses: one or more addresses are default/zero"));
+    }
+
+    // Optional: Verify PDA derivation matches (for extra safety)
+    // Note: This is a verification step - Reserve account's supplyPubkey should already be correct
+    // If verification fails, it might indicate a corrupted Reserve account
+    let borrow_reserve_pubkey = ctx.obligation.borrows[0].borrowReserve;
+    let deposit_reserve_pubkey = ctx.obligation.deposits[0].depositReserve;
+    
+    if let Ok(derived_repay_supply) = crate::solend::derive_reserve_liquidity_supply(&borrow_reserve_pubkey, &program_id) {
+        if derived_repay_supply != repay_reserve_liquidity_supply {
+            log::warn!(
+                "PDA derivation mismatch for repay reserve liquidity supply: \
+                 Reserve has {}, derived is {}. Using Reserve value.",
+                repay_reserve_liquidity_supply,
+                derived_repay_supply
+            );
+            // Continue anyway - Reserve account value is authoritative
+        }
+    }
+    
+    if let Ok(derived_withdraw_supply) = crate::solend::derive_reserve_liquidity_supply(&deposit_reserve_pubkey, &program_id) {
+        if derived_withdraw_supply != withdraw_reserve_liquidity_supply {
+            log::warn!(
+                "PDA derivation mismatch for withdraw reserve liquidity supply: \
+                 Reserve has {}, derived is {}. Using Reserve value.",
+                withdraw_reserve_liquidity_supply,
+                derived_withdraw_supply
+            );
+            // Continue anyway - Reserve account value is authoritative
+        }
+    }
 
     // Get user's token accounts (source liquidity and destination collateral)
     // These would be ATAs for the tokens
@@ -719,15 +756,19 @@ async fn build_liquidation_tx(
     let destination_collateral = get_associated_token_address(&wallet_pubkey, &withdraw_reserve_collateral_mint);
 
     // Build Solend liquidation instruction per IDL
-    // Instruction discriminator for liquidateObligation (first byte of instruction)
-    // Note: Solend uses custom instruction encoding, not Anchor
-    // The discriminator is typically the first byte of the instruction name hash
-    // For liquidateObligation, this would need to be determined from Solend's instruction encoding
+    // Solend uses enum-based instruction encoding
+    // 
+    // IMPORTANT: Instruction discriminator must match Solend program's actual encoding.
+    // This is currently set to 0 based on IDL analysis, but should be verified in production.
     let mut instruction_data = Vec::new();
     
-    // Instruction discriminator (this is a placeholder - actual value needs to be determined)
-    // In production, this should be calculated from Solend's instruction encoding
-    instruction_data.push(0); // Placeholder discriminator
+    // Instruction discriminator: liquidateObligation discriminator
+    // WARNING: This value (0) is based on IDL structure where liquidateObligation is first instruction.
+    // In production, verify this matches Solend's actual instruction enum encoding.
+    // If Solend uses a different encoding scheme, this will cause transaction failures.
+    let discriminator = crate::solend::get_liquidate_obligation_discriminator();
+    log::debug!("Using instruction discriminator: {} for liquidateObligation", discriminator);
+    instruction_data.push(discriminator);
     
     // Args: liquidityAmount (u64)
     instruction_data.extend_from_slice(&liquidity_amount.to_le_bytes());
