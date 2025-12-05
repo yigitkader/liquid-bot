@@ -33,6 +33,8 @@ spl-associated-token-account = "2.3"
 bytemuck = "1.14"
 clap = { version = "4.4", features = ["derive"] }
 pyth-sdk-solana = "0.10"
+solana-account = "2.2"
+solana-pubkey = "2.4"
 switchboard-on-demand = "0.11"
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json"] }
@@ -40,6 +42,7 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 base64 = "0.21"
 chrono = "0.4"
+lru = "0.12"
 
 # validate_reserve binary removed - not in Structure.md
 # [[bin]]

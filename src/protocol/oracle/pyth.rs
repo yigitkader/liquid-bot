@@ -2,6 +2,8 @@ use crate::blockchain::rpc_client::RpcClient;
 use anyhow::Result;
 use pyth_sdk_solana::state::SolanaPriceAccount;
 use solana_sdk::pubkey::Pubkey;
+use solana_account::Account as SolanaAccount;
+use solana_pubkey::Pubkey as SolanaPubkey;
 use std::sync::Arc;
 
 pub struct PythOracle;
@@ -35,15 +37,20 @@ impl PythOracle {
             .parse::<Pubkey>()
             .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
 
-        let mut account = solana_sdk::account::Account {
+        // Convert solana_sdk types to solana_account/solana_pubkey types for Pyth SDK
+        // Both Pubkey types are [u8; 32], so we can convert via bytes
+        let pyth_program_id_bytes: [u8; 32] = pyth_program_id.to_bytes();
+        let pyth_program_id_solana = SolanaPubkey::from(pyth_program_id_bytes);
+
+        let mut account = SolanaAccount {
             lamports: 0,
             data: data.to_vec(),
-            owner: pyth_program_id,
+            owner: pyth_program_id_solana,
             executable: false,
             rent_epoch: 0,
         };
 
-        let feed = SolanaPriceAccount::account_to_feed(&pyth_program_id, &mut account)
+        let feed = SolanaPriceAccount::account_to_feed(&pyth_program_id_solana, &mut account)
             .map_err(|e| anyhow::anyhow!("Failed to parse Pyth account: {}", e))?;
 
         let current_time = std::time::SystemTime::now()

@@ -9,7 +9,6 @@ use liquid_bot::core::config::Config;
 // Registry types artık validation modüllerinde kullanılıyor
 use liquid_bot::blockchain::rpc_client::RpcClient;
 use liquid_bot::protocol::solend::accounts::{derive_lending_market_authority, derive_obligation_address};
-use liquid_bot::protocol::solend::types::SolendObligation;
 use liquid_bot::protocol::solend::SolendProtocol;
 use liquid_bot::protocol::Protocol;
 use liquid_bot::protocol::oracle::{read_pyth_price, get_pyth_oracle_account};
@@ -29,6 +28,7 @@ use validation::config as validate_config_mod;
 use validation::addresses as validate_addresses_mod;
 use validation::rpc as validate_rpc_mod;
 use validation::accounts as validate_accounts_mod;
+use validation::jito as validate_jito_mod;
 
 /// Load wallet pubkey from config
 /// Returns None if wallet cannot be loaded (file doesn't exist, invalid format, etc.)
@@ -215,7 +215,12 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    println!("1️⃣3️⃣  Testing Production Features...");
+    println!("1️⃣3️⃣  Testing Jito Bundle Double-Signing Prevention...");
+    println!("{}", "-".repeat(80));
+    results.extend(validate_jito_mod::validate_jito_bundle_signing().await?);
+    println!();
+
+    println!("1️⃣4️⃣  Testing Production Features...");
     println!("{}", "-".repeat(80));
     if let Some(cfg) = config.as_ref() {
         results.extend(validate_production_features(&rpc_client, cfg).await?);

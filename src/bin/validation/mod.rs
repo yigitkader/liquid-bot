@@ -9,6 +9,7 @@ pub mod config;
 pub mod addresses;
 pub mod rpc;
 pub mod accounts;
+pub mod jito;
 
 pub use builder::ValidationBuilder;
 pub use result::TestResult;

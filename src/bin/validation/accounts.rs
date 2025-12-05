@@ -6,7 +6,6 @@ use liquid_bot::protocol::solend::accounts::derive_obligation_address;
 use liquid_bot::protocol::solend::types::SolendObligation;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use super::result::TestResult;

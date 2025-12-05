@@ -62,10 +62,12 @@ pub async fn build_liquidate_obligation_ix(
 
     let obligation_address = opportunity.position.address;
 
-    let obligation_account = rpc
-        .get_account(&obligation_address)
-        .await
-        .context("Failed to fetch obligation account")?;
+    let obligation_account = retry_with_backoff(
+        || rpc.get_account(&obligation_address),
+        RetryConfig::for_rpc(),
+    )
+    .await
+    .context("Failed to fetch obligation account")?;
 
     use crate::protocol::solend::types::SolendObligation;
     let obligation = SolendObligation::from_account_data(&obligation_account.data)
@@ -253,8 +255,12 @@ pub async fn build_wrap_sol_instruction(
     }
     
     if let (Some(rpc_client), Some(config)) = (rpc, config) {
-        let wallet_account = rpc_client.get_account(wallet).await
-            .context("Failed to fetch wallet account for native SOL balance check")?;
+        let wallet_account = retry_with_backoff(
+            || rpc_client.get_account(wallet),
+            RetryConfig::for_rpc(),
+        )
+        .await
+        .context("Failed to fetch wallet account for native SOL balance check")?;
         let native_sol = wallet_account.lamports;
         let min_reserve = config.min_reserve_lamports;
         let required = amount.checked_add(min_reserve)
@@ -276,7 +282,12 @@ pub async fn build_wrap_sol_instruction(
     let wsol_mint = get_wsol_mint();
     let needs_ata_creation = if let Some(rpc_client) = rpc {
         // Check if ATA exists via RPC
-        match rpc_client.get_account(wsol_ata).await {
+        match retry_with_backoff(
+            || rpc_client.get_account(wsol_ata),
+            RetryConfig::for_rpc(),
+        )
+        .await
+        {
             Ok(_) => {
                 log::debug!("WSOL ATA {} exists, skipping creation", wsol_ata);
                 false

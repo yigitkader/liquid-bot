@@ -1,12 +1,11 @@
 use crate::blockchain::rpc_client::RpcClient;
 use crate::blockchain::transaction::TransactionBuilder;
 use crate::core::config::Config;
-use crate::protocol::solend::instructions::{build_unwrap_sol_instruction, build_wrap_sol_instruction, is_wsol_mint};
+use crate::protocol::solend::instructions::build_wrap_sol_instruction;
 use crate::utils::helpers::read_ata_balance;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
-use tokio::time::Duration;
 
 /// WSOL handling utilities for Executor
 pub struct WsolHandler;

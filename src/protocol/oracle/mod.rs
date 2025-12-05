@@ -6,6 +6,8 @@ use crate::utils::helpers;
 use anyhow::Result;
 use pyth_sdk_solana::state::SolanaPriceAccount;
 use solana_sdk::pubkey::Pubkey;
+use solana_account::Account as SolanaAccount;
+use solana_pubkey::Pubkey as SolanaPubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -205,8 +207,23 @@ pub async fn read_pyth_price(
         }
     };
 
-    let mut account_mut = account;
-    match SolanaPriceAccount::account_to_feed(oracle_account, &mut account_mut) {
+    // Convert solana_sdk types to solana_account/solana_pubkey types for Pyth SDK
+    // Both Pubkey types are [u8; 32], so we can convert via bytes
+    let oracle_account_bytes: [u8; 32] = oracle_account.to_bytes();
+    let oracle_account_solana = SolanaPubkey::from(oracle_account_bytes);
+    
+    let owner_bytes: [u8; 32] = account.owner.to_bytes();
+    let owner_solana = SolanaPubkey::from(owner_bytes);
+    
+    let mut account_mut = SolanaAccount {
+        lamports: account.lamports,
+        data: account.data.clone(),
+        owner: owner_solana,
+        executable: account.executable,
+        rent_epoch: account.rent_epoch,
+    };
+    
+    match SolanaPriceAccount::account_to_feed(&oracle_account_solana, &mut account_mut) {
         Ok(_feed) => {
             log::debug!(
                 "Pyth price feed parsed successfully for account: {}",
@@ -241,30 +258,31 @@ pub async fn read_pyth_price(
     // RPC client timeout is 10s (default), so oracle timeout should match
     // This prevents: Oracle timeout (5s) → RPC timeout (10s) → Total 15s wait
     // Instead: Oracle timeout (10s) matches RPC timeout (10s) → Total 10s wait
-    use solana_sdk::account::Account;
     use std::panic::catch_unwind;
 
     let oracle_timeout = rpc_client.request_timeout();
     let account_data = account_mut.data.clone();
     let account_owner = account_mut.owner;
     let account_lamports = account_mut.lamports;
-    let oracle_account_clone = *oracle_account;
+    let account_executable = account_mut.executable;
+    let account_rent_epoch = account_mut.rent_epoch;
+    let oracle_account_solana_clone = oracle_account_solana;
     let current_time_clone = current_time;
     let max_age_seconds_clone = max_age_seconds;
 
     let price_data_result = tokio::time::timeout(
         oracle_timeout,
         tokio::task::spawn_blocking(move || {
-            let mut account_for_feed = Account {
+            let mut account_for_feed = SolanaAccount {
                 lamports: account_lamports,
                 data: account_data,
                 owner: account_owner,
-                executable: false,
-                rent_epoch: 0,
+                executable: account_executable,
+                rent_epoch: account_rent_epoch,
             };
 
             let price_feed = match SolanaPriceAccount::account_to_feed(
-                &oracle_account_clone,
+                &oracle_account_solana_clone,
                 &mut account_for_feed,
             ) {
                 Ok(feed) => feed,

@@ -42,7 +42,7 @@ impl WorkerManager {
     /// Handle lag event by scaling up workers
     pub fn handle_lag(&self, semaphore: &Arc<Semaphore>, skipped: usize) {
         const MAX_CONCURRENT_VALIDATIONS: usize = 100;
-        let current_target = self.current_workers.load(Ordering::Relaxed);
+        let current_target = self.current_workers();
 
         if current_target < self.max_workers_limit {
             let increase = std::cmp::max(2, current_target / 2);
@@ -131,7 +131,7 @@ impl WorkerManager {
         if last_lag.elapsed() > SCALE_DOWN_THRESHOLD
             && last_scale_down.elapsed() > SCALE_DOWN_INTERVAL
         {
-            let current = self.current_workers.load(Ordering::Relaxed);
+            let current = self.current_workers();
             let target_workers = self.config.analyzer_max_workers;
 
             if current > target_workers {

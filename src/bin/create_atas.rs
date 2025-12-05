@@ -97,7 +97,11 @@ async fn main() -> Result<()> {
 
     let recent_blockhash = rpc.get_recent_blockhash().await?;
     let mut tx = Transaction::new_with_payer(&instructions, Some(&wallet_pubkey));
-    tx.sign(&[&wallet], recent_blockhash);
+    tx.message.recent_blockhash = recent_blockhash;
+    // ✅ FIX: Use sign_transaction instead of direct tx.sign() to avoid KeypairPubkeyMismatch
+    use liquid_bot::blockchain::transaction::sign_transaction;
+    sign_transaction(&mut tx, &wallet)
+        .context("Failed to sign ATA creation transaction")?;
 
     match rpc.send_transaction(&tx).await {
         Ok(sig) => {

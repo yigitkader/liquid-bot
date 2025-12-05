@@ -298,7 +298,6 @@ async fn send_ata_batch(
             Ok(account) => {
                 // Try to parse as token account to get owner
                 if account.data.len() >= 64 {
-                    use solana_sdk::pubkey::Pubkey;
                     let owner_bytes = &account.data[32..64];
                     if let Ok(owner) = solana_sdk::pubkey::Pubkey::try_from(owner_bytes) {
                         if owner == wallet_pubkey {
@@ -387,7 +386,10 @@ async fn send_ata_batch(
         tx.message.header.num_readonly_unsigned_accounts
     );
     
-    tx.sign(&[wallet.as_ref()], recent_blockhash);
+    // ✅ FIX: Use sign_transaction instead of direct tx.sign() to avoid KeypairPubkeyMismatch
+    use crate::blockchain::transaction::sign_transaction;
+    sign_transaction(&mut tx, wallet.as_ref())
+        .context("Failed to sign ATA creation transaction")?;
     
     log::info!("✅ Transaction signed with wallet: {}", wallet_pubkey);
     

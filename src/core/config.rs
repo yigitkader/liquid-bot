@@ -75,6 +75,7 @@ pub struct Config {
     pub event_bus_buffer_size: usize,
     pub analyzer_max_workers: usize,
     pub analyzer_max_workers_limit: usize,
+    pub validator_max_workers: usize,
     pub health_manager_max_error_age_seconds: u64,
     pub retry_jitter_max_ms: u64,
     pub use_jupiter_api: bool,
@@ -144,6 +145,13 @@ impl Config {
             event_bus_buffer_size: env_parse!("EVENT_BUS_BUFFER_SIZE", "50000"),
             analyzer_max_workers: env_parse!("ANALYZER_MAX_WORKERS", "4"),
             analyzer_max_workers_limit: env_parse!("ANALYZER_MAX_WORKERS_LIMIT", "16"),
+            // ✅ FIX: Make validator worker count configurable to prevent analyzer lagging
+            // Default: 8 workers (was hardcoded 4)
+            // Problem: 4 workers × 25s oracle timeout = 100s total block time
+            // - Analyzer buffer: 50,000 events, event rate: ~2000/s → 25s to fill
+            // - 25s < 100s → Analyzer lagging risk!
+            // Solution: Increase to 8 workers to reduce block time (8 × 5s = 40s max)
+            validator_max_workers: env_parse!("VALIDATOR_MAX_WORKERS", "8"),
             health_manager_max_error_age_seconds: env_parse!("HEALTH_MANAGER_MAX_ERROR_AGE_SECONDS", "300"),
             retry_jitter_max_ms: env_parse!("RETRY_JITTER_MAX_MS", "1000"),
             use_jupiter_api: env_str("USE_JUPITER_API", "true").parse().unwrap_or(true),

@@ -2604,6 +2604,7 @@ dependencies = [
  "fern",
  "futures-util",
  "log",
+ "lru",
  "once_cell",
  "pyth-sdk-solana",
  "rand 0.8.5",
@@ -2611,9 +2612,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solana-account",
  "solana-account-decoder",
  "solana-client",
  "solana-program 1.18.26",
+ "solana-pubkey",
  "solana-sdk",
  "spl-associated-token-account",
  "spl-token",
@@ -2646,6 +2649,15 @@ name = "log"
 version = "0.4.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.2",
+]
 
 [[package]]
 name = "memchr"
@@ -3274,7 +3286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "once_cell",
@@ -3294,7 +3306,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.111",
@@ -3420,7 +3432,7 @@ dependencies = [
  "num-traits",
  "pyth-sdk",
  "serde",
- "solana-program 1.18.26",
+ "solana-program 2.3.0",
  "thiserror 1.0.69",
 ]
 

@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use std::sync::Arc;
 use base64::{engine::general_purpose, Engine as _};
 
-use super::connection::{ConnectionManager, WsStream};
+use super::connection::ConnectionManager;
 use super::subscription::{
     SubscriptionManager, SubscriptionInfo, SubscriptionType,
     build_subscription_params, get_subscription_method,

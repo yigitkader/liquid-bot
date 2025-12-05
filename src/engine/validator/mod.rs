@@ -47,7 +47,15 @@ impl Validator {
     pub async fn run(&self) -> Result<()> {
         let mut receiver = self.event_bus.subscribe();
         let mut tasks = JoinSet::new();
-        let semaphore = Arc::new(Semaphore::new(4)); // Max 4 parallel validations
+        // ✅ FIX: Make validator worker count configurable to prevent analyzer lagging
+        // Default: 8 workers (was hardcoded 4)
+        // Problem: 4 workers × 25s oracle timeout = 100s total block time
+        // - Analyzer buffer: 50,000 events, event rate: ~2000/s → 25s to fill
+        // - 25s < 100s → Analyzer lagging risk!
+        // Solution: Increase to 8 workers to reduce block time (8 × 5s = 40s max with new timeout)
+        let max_workers = self.config.validator_max_workers;
+        let semaphore = Arc::new(Semaphore::new(max_workers));
+        log::info!("Validator: Initialized with {} parallel workers (configure via VALIDATOR_MAX_WORKERS env var)", max_workers);
 
         loop {
             tokio::select! {
@@ -181,10 +189,62 @@ impl Validator {
             .await
             .context("Insufficient balance - reservation failed")?;
 
+        // ✅ FIX: Reserve native SOL for WSOL wrap if needed
+        // Problem: WSOL wrapping requires native SOL, but we only reserve WSOL balance.
+        // If multiple threads try to wrap simultaneously, they may all pass validation
+        // but only one will succeed (race condition).
+        // Solution: Reserve the wrap amount in native SOL mint to prevent double-spending.
+        let native_sol_wrap_reserved = if crate::protocol::solend::instructions::is_wsol_mint(&opp.debt_mint) {
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_ata = get_associated_token_address(
+                self.balance_manager.wallet(),
+                &opp.debt_mint,
+                Some(&self.config),
+            )
+            .context("Failed to derive WSOL ATA for wrap amount calculation")?;
+            
+            let wsol_balance = read_ata_balance(&wsol_ata, &self.rpc).await.unwrap_or(0);
+            
+            if wsol_balance < max_liquidatable_token_amount {
+                let wrap_amount = max_liquidatable_token_amount.saturating_sub(wsol_balance);
+                
+                // Get native SOL mint from config
+                use std::str::FromStr;
+                let native_sol_mint = Pubkey::from_str(&self.config.sol_mint)
+                    .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+                
+                // Reserve native SOL for wrap amount
+                match self.balance_manager.reserve(&native_sol_mint, wrap_amount).await {
+                    Ok(()) => {
+                        log::debug!(
+                            "Validator: Reserved {} lamports of native SOL for WSOL wrap (WSOL balance: {}, needed: {})",
+                            wrap_amount,
+                            wsol_balance,
+                            max_liquidatable_token_amount
+                        );
+                        Some((native_sol_mint, wrap_amount))
+                    }
+                    Err(e) => {
+                        // Release WSOL reservation if native SOL reservation fails
+                        self.balance_manager.release(&opp.debt_mint, max_liquidatable_token_amount).await;
+                        return Err(e).context("Insufficient native SOL for WSOL wrap - reservation failed");
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         match self.validate_internal(opp).await {
             Ok(()) => Ok(()),
             Err(e) => {
+                // Release both WSOL and native SOL reservations on validation failure
                 self.balance_manager.release(&opp.debt_mint, max_liquidatable_token_amount).await;
+                if let Some((native_sol_mint, wrap_amount)) = native_sol_wrap_reserved {
+                    self.balance_manager.release(&native_sol_mint, wrap_amount).await;
+                }
                 Err(e)
             }
         }
@@ -195,14 +255,26 @@ impl Validator {
         log::debug!("🔍 Validating opportunity for position: {}", opp.position.address);
 
         use tokio::time::{Duration, timeout};
-        let rpc_timeout = self.rpc.request_timeout();
-        let total_oracle_timeout = if self.config.is_free_rpc_endpoint() {
-            rpc_timeout * 2 + Duration::from_secs(5)
-        } else {
-            rpc_timeout + Duration::from_secs(2)
-        };
-
-        let (debt_result, collateral_result) = timeout(total_oracle_timeout, async {
+        
+        // ✅ FIX: Aggressive oracle timeout to prevent cascading failure
+        // Problem: Oracle checks can take 10-25s (2x RPC timeout for debt + collateral)
+        // - Free RPC: Sequential check (100ms delay + 2x10s timeout = ~20s total)
+        // - Premium RPC: Parallel check (2x10s timeout = 10s total)
+        // - Validator workers: configurable (default 8, was hardcoded 4)
+        // - Old: 4 workers × 25s = 100s queue delay
+        // - New: 8 workers × 5s = 40s max queue delay (with aggressive timeout)
+        // - Analyzer buffer size: 50,000 events
+        // - Event rate: ~2000/s (high load)
+        // - 50,000 events ÷ 2000 events/s = 25s buffer fill time
+        // - Old: 25s < 100s → Analyzer lagging risk!
+        // - New: 25s < 40s → Reduced risk, but still need to monitor
+        // Solution: Aggressive timeout (5s) for oracle checks, fail fast and release semaphore permit
+        // This prevents cascading failures when RPC is slow
+        const MAX_ORACLE_TIMEOUT: Duration = Duration::from_secs(5);
+        
+        // Oracle check'leri agresif timeout ile yap
+        // Timeout olursa hemen error döndür (reject), böylece semaphore permit hemen release edilir
+        let (debt_result, collateral_result) = match timeout(MAX_ORACLE_TIMEOUT, async {
             if self.config.is_free_rpc_endpoint() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let debt = self.check_oracle_freshness_internal(&opp.debt_mint, true).await;
@@ -214,19 +286,57 @@ impl Validator {
                     self.check_oracle_freshness_internal(&opp.collateral_mint, false)
                 )
             }
-        }).await.map_err(|_| anyhow::anyhow!(
-            "Oracle check timeout after {:?} (RPC timeout: {:?})",
-            total_oracle_timeout, rpc_timeout
-        ))?;
+        }).await {
+            Ok(results) => results,
+            Err(_) => {
+                // ✅ Oracle check timeout - hızlıca reject et, semaphore permit'i hemen release et
+                log::warn!(
+                    "Validator: Oracle check timeout after {}s for position {} - skipping to prevent cascading failure",
+                    MAX_ORACLE_TIMEOUT.as_secs(),
+                    opp.position.address
+                );
+                return Err(anyhow::anyhow!(
+                    "Oracle check timeout after {}s - skipping to prevent cascading failure",
+                    MAX_ORACLE_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
-        debt_result.map_err(|e| {
-            log::debug!("Debt oracle failed: {}", e);
-            e
-        })?;
-        collateral_result.map_err(|e| {
-            log::debug!("Collateral oracle failed: {}", e);
-            e
-        })?;
+        // Oracle check sonuçlarını kontrol et
+        // Timeout olursa veya error olursa hızlıca reject et
+        match debt_result {
+            Ok(_) => {}
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("timeout") || error_str.contains("timed out") {
+                    log::warn!(
+                        "Validator: Debt oracle timeout for position {} - skipping to prevent cascading failure: {}",
+                        opp.position.address,
+                        e
+                    );
+                } else {
+                    log::debug!("Debt oracle failed: {}", e);
+                }
+                return Err(e);
+            }
+        }
+        
+        match collateral_result {
+            Ok(_) => {}
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("timeout") || error_str.contains("timed out") {
+                    log::warn!(
+                        "Validator: Collateral oracle timeout for position {} - skipping to prevent cascading failure: {}",
+                        opp.position.address,
+                        e
+                    );
+                } else {
+                    log::debug!("Collateral oracle failed: {}", e);
+                }
+                return Err(e);
+            }
+        }
 
         let _ = self.verify_ata_exists_internal(&opp.debt_mint).await;
         let _ = self.verify_ata_exists_internal(&opp.collateral_mint).await;

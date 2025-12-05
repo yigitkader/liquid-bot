@@ -19,7 +19,7 @@ use crate::utils::error_tracker::ErrorTracker;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
-use std::collections::HashMap;
+// ✅ FIX: Removed HashMap import - now using LruCache for better performance
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -107,27 +107,17 @@ impl Executor {
     }
 
     // Helper methods for cache compatibility
-    fn evict_lru_if_needed(cache: &mut HashMap<Pubkey, AtaCacheEntry>) {
-        const ATA_CACHE_MAX_SIZE: usize = 50000;
-        
-        if cache.len() >= ATA_CACHE_MAX_SIZE {
-            let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache.drain().collect();
-            // Sort by last_accessed (least-recently-used first)
-            entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
-            // Keep only the most-recently-used entries
-            let to_keep = ATA_CACHE_MAX_SIZE.saturating_sub(1000); // Keep 1k below max for buffer
-            let entries_len = entries.len();
-            let skip_count = entries_len.saturating_sub(to_keep);
-            for (pubkey, entry) in entries.into_iter().skip(skip_count) {
-                cache.insert(pubkey, entry);
-            }
-        }
-    }
-
-    fn get_cache_entry(cache: &mut HashMap<Pubkey, AtaCacheEntry>, key: &Pubkey) -> Option<AtaCacheEntry> {
-        if let Some(entry) = cache.get_mut(key) {
-            entry.last_accessed = Instant::now();
-            Some(entry.clone())
+    // ✅ FIX: Removed evict_lru_if_needed - LRU cache automatically evicts on insert
+    // Previous implementation used O(n log n) sort, now O(1) automatic eviction
+    
+    fn get_cache_entry(cache: &mut lru::LruCache<Pubkey, AtaCacheEntry>, key: &Pubkey) -> Option<AtaCacheEntry> {
+        // ✅ LRU cache automatically updates access order on get()
+        if let Some(entry) = cache.get(key) {
+            let mut updated_entry = entry.clone();
+            updated_entry.last_accessed = Instant::now();
+            // Re-insert to update access time (LRU maintains order)
+            cache.put(*key, updated_entry.clone());
+            Some(updated_entry)
         } else {
             None
         }
@@ -136,6 +126,9 @@ impl Executor {
     pub fn shutdown(&self) {
         log::info!("Executor: shutting down gracefully, cancelling background tasks");
         self.tx_lock.cancel_cleanup();
+        // ✅ FIX: Use stored cleanup token to cancel ATA cache cleanup task
+        // This ensures proper cleanup of the background task
+        self.ata_cache_cleanup_token.cancel();
         self.ata_cache.cancel_cleanup();
     }
 
@@ -228,9 +221,9 @@ impl Executor {
             if needs_wsol_ata {
                 match self.rpc.get_account(&source_liquidity_ata).await {
                     Ok(_) => {
-                        Self::evict_lru_if_needed(&mut cache);
+                        // ✅ LRU cache automatically evicts when max size reached (O(1))
                         let now = Instant::now();
-                        cache.insert(source_liquidity_ata, AtaCacheEntry {
+                        cache.put(source_liquidity_ata, AtaCacheEntry {
                             created_at: now,
                             last_accessed: now,
                             verified: true,
@@ -257,9 +250,9 @@ impl Executor {
         if needs_rpc_check {
             match self.rpc.get_account(&destination_collateral).await {
                 Ok(_) => {
-                    Self::evict_lru_if_needed(&mut cache);
+                    // ✅ LRU cache automatically evicts when max size reached (O(1))
                     let now = Instant::now();
-                    cache.insert(destination_collateral, AtaCacheEntry {
+                    cache.put(destination_collateral, AtaCacheEntry {
                         created_at: now,
                         last_accessed: now,
                         verified: true,
@@ -282,9 +275,9 @@ impl Executor {
                             destination_collateral,
                             e
                         );
-                        Self::evict_lru_if_needed(&mut cache);
+                        // ✅ LRU cache automatically evicts when max size reached (O(1))
                         let now = Instant::now();
-                        cache.insert(destination_collateral, AtaCacheEntry {
+                        cache.put(destination_collateral, AtaCacheEntry {
                             created_at: now,
                             last_accessed: now,
                             verified: false,
@@ -317,18 +310,49 @@ impl Executor {
         let mut tx_builder = TransactionBuilder::new(wallet_pubkey);
         tx_builder.add_compute_budget(200_000, 1_000);
         
-        if is_wsol_mint(&opp.debt_mint) {
-            WsolHandler::add_wrap_instructions_if_needed(
-                &wallet_pubkey,
-                &source_liquidity_ata,
-                max_liquidatable_token_amount,
-                &self.rpc,
-                &self.config,
-                &mut tx_builder,
-            )
-            .await
-            .context("Failed to add WSOL wrap instructions")?;
-        }
+        // ✅ FIX: Calculate wrap amount for native SOL release after transaction
+        // Validator reserves native SOL for WSOL wrap, so we must release it after wrap
+        let native_sol_wrap_amount = if is_wsol_mint(&opp.debt_mint) {
+            use crate::utils::helpers::read_ata_balance;
+            let wsol_balance = read_ata_balance(&source_liquidity_ata, &self.rpc).await.unwrap_or(0);
+            
+            if wsol_balance < max_liquidatable_token_amount {
+                let wrap_amount = max_liquidatable_token_amount.saturating_sub(wsol_balance);
+                
+                WsolHandler::add_wrap_instructions_if_needed(
+                    &wallet_pubkey,
+                    &source_liquidity_ata,
+                    max_liquidatable_token_amount,
+                    &self.rpc,
+                    &self.config,
+                    &mut tx_builder,
+                )
+                .await
+                .context("Failed to add WSOL wrap instructions")?;
+                
+                // Get native SOL mint from config for release
+                use std::str::FromStr;
+                let native_sol_mint = Pubkey::from_str(&self.config.sol_mint)
+                    .map_err(|_| anyhow::anyhow!("Failed to parse SOL mint address from config"))?;
+                
+                Some((native_sol_mint, wrap_amount))
+            } else {
+                WsolHandler::add_wrap_instructions_if_needed(
+                    &wallet_pubkey,
+                    &source_liquidity_ata,
+                    max_liquidatable_token_amount,
+                    &self.rpc,
+                    &self.config,
+                    &mut tx_builder,
+                )
+                .await
+                .context("Failed to add WSOL wrap instructions")?;
+                
+                None
+            }
+        } else {
+            None
+        };
         
         let liq_ix = self
             .protocol
@@ -351,7 +375,21 @@ impl Executor {
 
         tx_builder.add_instruction(liq_ix);
 
-        let signature = self.send_transaction(&tx_builder).await?;
+        let signature = match self.send_transaction(&tx_builder).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                // ✅ FIX: Release native SOL wrap reservation if transaction fails
+                // Validator reserved native SOL for wrap, so we must release it on failure
+                if let Some((native_sol_mint, wrap_amount)) = native_sol_wrap_amount {
+                    self.balance_manager.release(&native_sol_mint, wrap_amount).await;
+                    log::debug!(
+                        "Executor: Released {} lamports of native SOL reservation due to transaction failure",
+                        wrap_amount
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         // ✅ CRITICAL FIX: Release using token amount, not USD amount
         // Validator reserves using token amount (max_liquidatable_token_amount),
@@ -359,6 +397,16 @@ impl Executor {
         self.balance_manager
             .release(&opp.debt_mint, max_liquidatable_token_amount)
             .await;
+
+        // ✅ FIX: Release native SOL wrap reservation after successful wrap
+        // Validator reserved native SOL for wrap, so we must release it after successful transaction
+        if let Some((native_sol_mint, wrap_amount)) = native_sol_wrap_amount {
+            self.balance_manager.release(&native_sol_mint, wrap_amount).await;
+            log::debug!(
+                "Executor: Released {} lamports of native SOL reservation after successful WSOL wrap",
+                wrap_amount
+            );
+        }
 
         self.event_bus.publish(Event::TransactionSent {
             signature: signature.to_string(),
@@ -428,7 +476,7 @@ impl Executor {
         &self,
         mint: &Pubkey,
         ata: &Pubkey,
-        cache: &mut HashMap<Pubkey, AtaCacheEntry>,
+        cache: &mut lru::LruCache<Pubkey, AtaCacheEntry>,
     ) -> Result<()> {
         log::info!(
             "Executor: Creating ATA {} for mint {} in separate transaction",
@@ -468,9 +516,9 @@ impl Executor {
             match self.rpc.get_account(ata).await {
                 Ok(_) => {
                     log::info!("Executor: ATA {} verified after {} attempt(s)", ata, attempt);
-                    Self::evict_lru_if_needed(cache);
+                    // ✅ LRU cache automatically evicts when max size reached (O(1))
                     let now = Instant::now();
-                    cache.insert(*ata, AtaCacheEntry {
+                    cache.put(*ata, AtaCacheEntry {
                         created_at: now,
                         last_accessed: now,
                         verified: true,
@@ -495,9 +543,9 @@ impl Executor {
                                     match self.rpc.get_account(ata).await {
                                         Ok(_) => {
                                             log::info!("Executor: ATA {} verified after extended wait (attempt {})", ata, extended_attempt);
-                                            Self::evict_lru_if_needed(cache);
+                                            // ✅ LRU cache automatically evicts when max size reached (O(1))
                                             let now = Instant::now();
-                                            cache.insert(*ata, AtaCacheEntry {
+                                            cache.put(*ata, AtaCacheEntry {
                                                 created_at: now,
                                                 last_accessed: now,
                                                 verified: true,
@@ -510,9 +558,9 @@ impl Executor {
                                                 tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
                                             } else {
                                                 log::warn!("Executor: ATA {} still not found after extended wait ({} attempts), but transaction confirmed", ata, EXTENDED_WAIT_ATTEMPTS);
-                                                Self::evict_lru_if_needed(cache);
+                                                // ✅ LRU cache automatically evicts when max size reached (O(1))
                                                 let now = Instant::now();
-                                                cache.insert(*ata, AtaCacheEntry {
+                                                cache.put(*ata, AtaCacheEntry {
                                                     created_at: now,
                                                     last_accessed: now,
                                                     verified: true,
@@ -536,9 +584,9 @@ impl Executor {
                                     match self.rpc.get_account(ata).await {
                                         Ok(_) => {
                                             log::info!("Executor: ATA {} verified after extended wait (attempt {})", ata, extended_attempt);
-                                            Self::evict_lru_if_needed(cache);
+                                            // ✅ LRU cache automatically evicts when max size reached (O(1))
                                             let now = Instant::now();
-                                            cache.insert(*ata, AtaCacheEntry {
+                                            cache.put(*ata, AtaCacheEntry {
                                                 created_at: now,
                                                 last_accessed: now,
                                                 verified: true,
@@ -551,9 +599,9 @@ impl Executor {
                                                 tokio::time::sleep(Duration::from_millis(EXTENDED_WAIT_DELAY_MS)).await;
                                             } else {
                                                 log::warn!("Executor: ATA {} still not found after extended wait ({} attempts). Will add to liquidation transaction as fallback.", ata, EXTENDED_WAIT_ATTEMPTS);
-                                                Self::evict_lru_if_needed(cache);
+                                                // ✅ LRU cache automatically evicts when max size reached (O(1))
                                                 let now = Instant::now();
-                                                cache.insert(*ata, AtaCacheEntry {
+                                                cache.put(*ata, AtaCacheEntry {
                                                     created_at: now,
                                                     last_accessed: now,
                                                     verified: false,
@@ -566,13 +614,13 @@ impl Executor {
                             }
                             Err(status_err) => {
                                 log::warn!("Executor: Failed to check transaction signature status for {}: {}. Will add to liquidation transaction as fallback.", ata_sig, status_err);
-                                Self::evict_lru_if_needed(cache);
-                                let now = Instant::now();
-                                cache.insert(*ata, AtaCacheEntry {
-                                    created_at: now,
-                                    last_accessed: now,
-                                    verified: false,
-                                });
+                                                // ✅ LRU cache automatically evicts when max size reached (O(1))
+                                                let now = Instant::now();
+                                                cache.put(*ata, AtaCacheEntry {
+                                                    created_at: now,
+                                                    last_accessed: now,
+                                                    verified: false,
+                                                });
                                 return Ok(());
                             }
                         }

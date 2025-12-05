@@ -32,7 +32,8 @@ impl ValidationHelpers {
                 mint,
                 age,
                 max_oracle_age_seconds
-            ));
+            ))
+            .context("Oracle price data is too old");
         }
         if price_data.price <= 0.0 {
             return Err(anyhow::anyhow!(
@@ -40,7 +41,8 @@ impl ValidationHelpers {
                 oracle_type,
                 mint,
                 price_data.price
-            ));
+            ))
+            .context("Oracle price is invalid (non-positive)");
         }
         if !(MIN_PRICE..=MAX_PRICE).contains(&price_data.price) {
             return Err(anyhow::anyhow!(
@@ -48,7 +50,8 @@ impl ValidationHelpers {
                 oracle_type,
                 mint,
                 price_data.price
-            ));
+            ))
+            .context("Oracle price is outside acceptable range");
         }
         if price_data.confidence < 0.0 {
             return Err(anyhow::anyhow!(
@@ -56,7 +59,8 @@ impl ValidationHelpers {
                 oracle_type,
                 mint,
                 price_data.confidence
-            ));
+            ))
+            .context("Oracle confidence is invalid (negative)");
         }
         if price_data.price > 0.0 {
             let conf_ratio = price_data.confidence / price_data.price;
@@ -67,7 +71,8 @@ impl ValidationHelpers {
                     mint,
                     conf_ratio * 100.0,
                     MAX_CONF_RATIO * 100.0
-                ));
+                ))
+                .context("Oracle confidence ratio exceeds maximum threshold");
             }
         }
         Ok(())
@@ -83,7 +88,17 @@ impl ValidationHelpers {
         use crate::protocol::oracle::{get_pyth_oracle_account, get_switchboard_oracle_account, read_oracle_price};
         use tokio::time::{Duration, timeout};
 
-        let oracle_check_timeout = rpc.request_timeout();
+        // ✅ FIX: Use aggressive timeout for oracle checks to prevent validator blocking
+        // Problem: Oracle checks can take 10-25s (2x RPC timeout for debt + collateral)
+        // - Free RPC: Sequential (100ms delay + 2x10s = ~20s)
+        // - Premium RPC: Parallel (max(2x10s) = 10s)
+        // - 4 validator workers × 25s = 100s total block time
+        // - Analyzer buffer: 50,000 events, event rate: ~2000/s → 25s to fill
+        // - 25s < 100s → Analyzer lagging risk!
+        // Solution: Use 5s timeout (half of RPC timeout) to fail fast and release semaphore permit
+        // This prevents cascading failures when RPC is slow
+        const ORACLE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+        let oracle_check_timeout = ORACLE_CHECK_TIMEOUT;
 
         let timeout_result = timeout(oracle_check_timeout, async {
             if config.is_free_rpc_endpoint() && !skip_delay {

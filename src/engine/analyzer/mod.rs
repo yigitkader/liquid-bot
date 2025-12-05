@@ -134,7 +134,17 @@ impl Analyzer {
                             log::warn!("            4) Restart bot to trigger full account re-scan");
 
                             last_lag = Instant::now();
+                            let workers_before = self.worker_manager.current_workers();
                             self.worker_manager.handle_lag(&semaphore, skipped as usize);
+                            let workers_after = self.worker_manager.current_workers();
+                            if workers_before != workers_after {
+                                log::info!(
+                                    "Analyzer: Worker count changed: {} -> {} (current workers: {})",
+                                    workers_before,
+                                    workers_after,
+                                    workers_after
+                                );
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             log::error!("Event bus closed, analyzer shutting down");

@@ -12,7 +12,6 @@ use crate::core::config::Config;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// BalanceManager manages token balances and reservations.
 ///
@@ -24,6 +23,9 @@ use tokio::sync::RwLock;
 ///
 /// This order MUST be consistent across ALL functions to prevent deadlocks.
 /// If you need both locks, acquire `balances` first, then `reserved`.
+///
+/// Note: If you only need ONE lock (either balances OR reserved), you don't need
+/// to follow this order - it only applies when acquiring BOTH locks simultaneously.
 pub struct BalanceManager {
     reservation: ReservationManager,
     cache: BalanceCache,
@@ -62,6 +64,11 @@ impl BalanceManager {
         );
         self.subscription = Some(subscription);
         self
+    }
+
+    /// Get the wallet pubkey
+    pub fn wallet(&self) -> &Pubkey {
+        &self.wallet
     }
 
     pub async fn get_available_balance(&self, mint: &Pubkey) -> Result<u64> {
@@ -106,9 +113,9 @@ impl BalanceManager {
                 }
             };
             
+            // ✅ FIX: No need to acquire balances lock just to read reserved
+            // Lock order is only important when acquiring BOTH locks
             let reserved_amount = {
-                let balances_arc = self.cache.balances();
-                let _balances = balances_arc.read().await;
                 let reserved_arc = self.reservation.reserved();
                 let reserved = reserved_arc.read().await;
                 reserved.get(mint).copied().unwrap_or(0)
@@ -166,9 +173,9 @@ impl BalanceManager {
             }
         };
 
+        // ✅ FIX: No need to acquire balances lock just to read reserved
+        // Lock order is only important when acquiring BOTH locks
         let reserved_amount = {
-            let balances_arc = self.cache.balances();
-            let _balances = balances_arc.read().await;
             let reserved_arc = self.reservation.reserved();
             let reserved = reserved_arc.read().await;
             reserved.get(mint).copied().unwrap_or(0)
@@ -249,8 +256,12 @@ impl BalanceManager {
                 .await
                 .context("Failed to fetch account balance during reserve")?;
             
-            let balances_arc = self.cache.balances();
-            let _balances = balances_arc.read().await;
+            // ✅ Lock order: balances → reserved (when both are needed)
+            // However, we only need reserved.write() here since we already have balance from RPC
+            // The balances lock is not needed because:
+            // 1. We already fetched balance from RPC (line 253)
+            // 2. We're about to insert it into cache (line 262)
+            // 3. We only need reserved.write() to update reservation
             let reserved_arc = self.reservation.reserved();
             let mut reserved = reserved_arc.write().await;
             

@@ -129,55 +129,94 @@ impl ProfitCalculator {
 
         let size_usd = opp.seizable_collateral as f64 / 1_000_000.0;
         
-        let hop_count = hop_count.unwrap_or_else(|| {
-            let estimated = self.estimate_hop_count(&opp.debt_mint, &opp.collateral_mint);
-            log::warn!("ProfitCalculator: hop_count is None for {} -> {}, using estimate: {} hops", opp.debt_mint, opp.collateral_mint, estimated);
-            estimated
-        });
-
-        // ✅ CRITICAL FIX: Use Jupiter API for all pairs, not just stablecoin pairs
-        // Problem: 
-        //   1. Stablecoin pairs: Jupiter API fail ederse 5 bps fallback kullanılıyor
-        //      Gerçek fee: Orca direct pool 1 bps × 1 hop = 1 bps
-        //      4 bps overestimation → profit 4 bps azalır ($10k swap'te $4 loss)
-        //   2. Regular pairs: Jupiter API hiç kullanılmıyor, sadece config.dex_fee_bps
-        //      Bu yanlış fee estimate'e yol açabilir
+        // ✅ FIX: Only use fallback estimate_hop_count when necessary
+        // Problem: Previous code always called estimate_hop_count when hop_count was None,
+        //   even when Jupiter API was working fine. This caused:
+        //   1. Unnecessary log spam (warning logged even when Jupiter succeeded)
+        //   2. Potential override of Jupiter's hop count with estimate
         // Solution:
-        //   1. Tüm pair'ler için Jupiter API kullan (stablecoin + regular)
-        //   2. Fallback fee'leri düzelt:
-        //      - Stablecoin fallback: 1 bps (Orca direct pool, en yaygın)
-        //      - Regular fallback: config.dex_fee_bps (mevcut config değeri)
+        //   1. Try to get hop_count from Jupiter route if not provided
+        //   2. Only use estimate_hop_count fallback when Jupiter API is disabled or fails
+        //   3. Only log warning when actually using fallback (not when Jupiter succeeds)
         let is_stablecoin_pair = self.is_stablecoin_pair(&opp.debt_mint, &opp.collateral_mint);
-
-        // ✅ Try Jupiter API for all pairs (stablecoin and regular)
-        let base_dex_fee_bps = if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
-            // Got actual fee from Jupiter API route
-            let actual_fee_bps = self.estimate_fee_from_route(&route_info);
-            log::debug!(
-                "ProfitCalculator: dex_fee -> got actual fee from Jupiter API: {} bps per hop (stablecoin_pair: {})",
-                actual_fee_bps,
-                is_stablecoin_pair
-            );
-            actual_fee_bps as f64
-        } else {
-            // Jupiter API failed - use appropriate fallback
-            if is_stablecoin_pair {
-                // ✅ FIX: Stablecoin fallback should be 1 bps (Orca direct pool), not 5 bps
-                // Orca USDC/USDT direct pool: 1 bps (0.01%) - most common for stablecoin swaps
-                // Previous 5 bps was too high, causing 4 bps overestimation
-                const STABLECOIN_FEE_FALLBACK: u16 = 1;
-                log::warn!(
-                    "ProfitCalculator: dex_fee -> stablecoin pair detected, Jupiter API failed, using fallback: {} bps per hop (Orca direct pool fee)",
-                    STABLECOIN_FEE_FALLBACK
+        
+        let (hop_count, base_dex_fee_bps) = if let Some(provided_hop_count) = hop_count {
+            // hop_count already provided (e.g., from slippage_estimator)
+            // Try Jupiter API for fee, but use provided hop_count
+            let fee_bps = if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
+                let actual_fee_bps = self.estimate_fee_from_route(&route_info);
+                log::debug!(
+                    "ProfitCalculator: dex_fee -> got actual fee from Jupiter API: {} bps per hop (hop_count={} provided, stablecoin_pair: {})",
+                    actual_fee_bps,
+                    provided_hop_count,
+                    is_stablecoin_pair
                 );
-                STABLECOIN_FEE_FALLBACK as f64
+                actual_fee_bps as f64
             } else {
-                // Regular pairs: Use configured fee as fallback
-                log::warn!(
-                    "ProfitCalculator: dex_fee -> regular pair, Jupiter API failed, using config fallback: {} bps per hop",
-                    self.config.dex_fee_bps
+                // Jupiter API failed - use appropriate fallback
+                if is_stablecoin_pair {
+                    const STABLECOIN_FEE_FALLBACK: u16 = 1;
+                    log::warn!(
+                        "ProfitCalculator: dex_fee -> stablecoin pair detected, Jupiter API failed, using fallback: {} bps per hop (Orca direct pool fee)",
+                        STABLECOIN_FEE_FALLBACK
+                    );
+                    STABLECOIN_FEE_FALLBACK as f64
+                } else {
+                    log::warn!(
+                        "ProfitCalculator: dex_fee -> regular pair, Jupiter API failed, using config fallback: {} bps per hop",
+                        self.config.dex_fee_bps
+                    );
+                    self.config.dex_fee_bps as f64
+                }
+            };
+            (provided_hop_count, fee_bps)
+        } else {
+            // hop_count not provided - try to get it from Jupiter API
+            if let Ok(route_info) = self.get_jupiter_route_info(opp.debt_mint, opp.collateral_mint).await {
+                // ✅ Jupiter API succeeded - extract hop_count from route
+                let jupiter_hop_count = route_info.route_plan.as_ref()
+                    .map(|plan| plan.len() as u8)
+                    .unwrap_or(1); // Default to 1 hop if route_plan is empty/None
+                
+                let actual_fee_bps = self.estimate_fee_from_route(&route_info);
+                log::debug!(
+                    "ProfitCalculator: dex_fee -> got hop_count={} and fee={} bps from Jupiter API for {} -> {} (stablecoin_pair: {})",
+                    jupiter_hop_count,
+                    actual_fee_bps,
+                    opp.debt_mint,
+                    opp.collateral_mint,
+                    is_stablecoin_pair
                 );
-                self.config.dex_fee_bps as f64
+                (jupiter_hop_count, actual_fee_bps as f64)
+            } else {
+                // ✅ Jupiter API failed or disabled - use fallback estimate_hop_count
+                // This is the only case where we should log the warning
+                let estimated_hop_count = self.estimate_hop_count(&opp.debt_mint, &opp.collateral_mint);
+                
+                // Use appropriate fee fallback
+                let fee_bps = if is_stablecoin_pair {
+                    const STABLECOIN_FEE_FALLBACK: u16 = 1; // 1 bps per hop (Orca direct pool)
+                    log::warn!(
+                        "ProfitCalculator: hop_count is None and Jupiter API unavailable for stablecoin pair {} -> {}, using estimate: {} hops × {} bps = {} bps total (Orca direct pool fee). Note: Jupiter may use 2+ hops in practice, which would increase fee.",
+                        opp.debt_mint,
+                        opp.collateral_mint,
+                        estimated_hop_count,
+                        STABLECOIN_FEE_FALLBACK,
+                        estimated_hop_count as u16 * STABLECOIN_FEE_FALLBACK
+                    );
+                    STABLECOIN_FEE_FALLBACK as f64
+                } else {
+                    log::warn!(
+                        "ProfitCalculator: hop_count is None and Jupiter API unavailable for {} -> {}, using estimate: {} hops × {} bps = {} bps total",
+                        opp.debt_mint,
+                        opp.collateral_mint,
+                        estimated_hop_count,
+                        self.config.dex_fee_bps,
+                        estimated_hop_count as u16 * self.config.dex_fee_bps
+                    );
+                    self.config.dex_fee_bps as f64
+                };
+                (estimated_hop_count, fee_bps)
             }
         };
 
@@ -327,8 +366,26 @@ impl ProfitCalculator {
         major_tokens.contains(mint1) && major_tokens.contains(mint2)
     }
 
+    /// Estimate hop count for a swap route
+    /// 
+    /// # Stablecoin Pairs
+    /// Most stablecoin pairs (USDC/USDT) use direct pools (1 hop), but Jupiter may route
+    /// through intermediate tokens (e.g., USDC → WSOL → USDT = 2 hops) for better liquidity.
+    /// 
+    /// Conservative estimate: Use 1 hop (most common case - Orca direct pool)
+    /// This may underestimate fee if Jupiter uses multi-hop route, but prevents
+    /// rejecting profitable trades due to fee overestimation.
+    /// 
+    /// # Trade-off Analysis
+    /// - 1 hop estimate: Underestimate fee → Overestimate profit → More trades executed (safer)
+    /// - 2 hop estimate: Overestimate fee → Underestimate profit → Some profitable trades missed
+    /// 
+    /// Current approach: Conservative (1 hop) to avoid missing profitable opportunities
     pub fn estimate_hop_count(&self, mint1: &Pubkey, mint2: &Pubkey) -> u8 {
         if self.is_stablecoin_pair(mint1, mint2) {
+            // ✅ Conservative estimate: 1 hop (most common - Orca direct pool)
+            // Note: Jupiter may use 2+ hops (USDC → WSOL → USDT), but 1 hop is most common
+            // This prevents fee overestimation that would reject profitable trades
             1
         } else if self.is_major_pair(mint1, mint2) {
             2

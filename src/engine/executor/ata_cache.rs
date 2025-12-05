@@ -1,12 +1,12 @@
 // ATA (Associated Token Account) cache for executor
 
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
+use lru::LruCache;
 
 /// ATA cache entry with metadata
 #[derive(Clone, Debug)]
@@ -17,8 +17,11 @@ pub struct AtaCacheEntry {
 }
 
 /// ATA cache with TTL and size limits
+/// 
+/// Uses LRU cache for O(1) insert/get/eviction operations
+/// Previous implementation used O(n log n) sort for eviction, which was slow at scale
 pub struct AtaCache {
-    cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>>,
+    cache: Arc<RwLock<LruCache<Pubkey, AtaCacheEntry>>>,
     cleanup_token: CancellationToken,
 }
 
@@ -28,7 +31,21 @@ impl AtaCache {
     const CLEANUP_INTERVAL_SECONDS: u64 = 300; // 5 minutes
 
     pub fn new() -> (Self, CancellationToken) {
-        let cache: Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> = Arc::new(RwLock::new(HashMap::new()));
+        // ✅ FIX: Use LRU cache for O(1) operations instead of O(n log n) sort
+        // Problem: Previous implementation used HashMap + sort() for eviction
+        // - MAX_SIZE = 50,000
+        // - sort(): O(50,000 log 50,000) = ~800,000 operations
+        // - Cleanup interval: 5 minutes
+        // - Every cleanup: 800k operations → potential lag
+        // Solution: Use LruCache which provides O(1) insert/get/eviction
+        // - Automatic eviction when max size reached
+        // - No need for manual sorting
+        // - Much better performance at scale
+        use std::num::NonZeroUsize;
+        let max_size = NonZeroUsize::new(Self::MAX_SIZE).unwrap_or(NonZeroUsize::new(50000).unwrap());
+        let cache: Arc<RwLock<LruCache<Pubkey, AtaCacheEntry>>> = Arc::new(
+            RwLock::new(LruCache::new(max_size))
+        );
         let cleanup_token = CancellationToken::new();
         
         let cache_for_cleanup = Arc::clone(&cache);
@@ -42,36 +59,30 @@ impl AtaCache {
                         let now = Instant::now();
                         let before_len = cache_guard.len();
                         
-                        // Remove expired entries
-                        cache_guard.retain(|_, entry| {
-                            now.duration_since(entry.created_at) < Duration::from_secs(Self::TTL_SECONDS)
-                        });
-                        
-                        // If still too large, remove least recently used
-                        if cache_guard.len() > Self::MAX_SIZE {
-                            let mut entries: Vec<(Pubkey, AtaCacheEntry)> = cache_guard.drain().collect();
-                            entries.sort_by(|a, b| a.1.last_accessed.cmp(&b.1.last_accessed));
-                            let to_remove = entries.len().saturating_sub(Self::MAX_SIZE);
-                            let removed_count = to_remove;
-                            
-                            for (pubkey, entry) in entries.into_iter().skip(to_remove) {
-                                cache_guard.insert(pubkey, entry);
+                        // ✅ FIX: Remove expired entries efficiently
+                        // LRU cache doesn't support retain(), so we need to iterate and remove
+                        // But this is still O(n) instead of O(n log n) sort
+                        let mut keys_to_remove: Vec<Pubkey> = Vec::new();
+                        for (pubkey, entry) in cache_guard.iter() {
+                            if now.duration_since(entry.created_at) >= Duration::from_secs(Self::TTL_SECONDS) {
+                                keys_to_remove.push(*pubkey);
                             }
-                            
-                            log::warn!(
-                                "Executor: ATA cache exceeded max size ({}), removed {} least-recently-used entries (now: {})",
-                                Self::MAX_SIZE,
-                                removed_count,
-                                cache_guard.len()
-                            );
                         }
                         
+                        // Remove expired entries
+                        for key in keys_to_remove {
+                            cache_guard.pop(&key);
+                        }
+                        
+                        // ✅ LRU cache automatically evicts when max size is reached
+                        // No need for manual sorting - eviction happens on insert
                         let after_len = cache_guard.len();
                         if before_len != after_len {
                             log::debug!(
-                                "Executor: ATA cache cleanup: removed {} entries ({} remaining)",
+                                "Executor: ATA cache cleanup: removed {} expired entries ({} remaining, max: {})",
                                 before_len - after_len,
-                                after_len
+                                after_len,
+                                Self::MAX_SIZE
                             );
                         }
                     }
@@ -91,9 +102,13 @@ impl AtaCache {
 
     pub async fn get(&self, pubkey: &Pubkey) -> Option<AtaCacheEntry> {
         let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.get_mut(pubkey) {
-            entry.last_accessed = Instant::now();
-            Some(entry.clone())
+        // ✅ LRU cache automatically updates access order on get()
+        if let Some(entry) = cache.get(pubkey) {
+            let mut updated_entry = entry.clone();
+            updated_entry.last_accessed = Instant::now();
+            // Re-insert to update access time (LRU maintains order)
+            cache.put(*pubkey, updated_entry.clone());
+            Some(updated_entry)
         } else {
             None
         }
@@ -102,7 +117,9 @@ impl AtaCache {
     pub async fn insert(&self, pubkey: Pubkey, verified: bool) {
         let mut cache = self.cache.write().await;
         let now = Instant::now();
-        cache.insert(pubkey, AtaCacheEntry {
+        // ✅ LRU cache automatically evicts least-recently-used when max size reached
+        // This is O(1) operation, much faster than previous O(n log n) sort
+        cache.put(pubkey, AtaCacheEntry {
             created_at: now,
             last_accessed: now,
             verified,
@@ -111,14 +128,14 @@ impl AtaCache {
 
     pub async fn contains(&self, pubkey: &Pubkey) -> bool {
         let cache = self.cache.read().await;
-        cache.contains_key(pubkey)
+        cache.contains(pubkey)
     }
 
     pub fn cancel_cleanup(&self) {
         self.cleanup_token.cancel();
     }
 
-    pub fn cache(&self) -> Arc<RwLock<HashMap<Pubkey, AtaCacheEntry>>> {
+    pub fn cache(&self) -> Arc<RwLock<LruCache<Pubkey, AtaCacheEntry>>> {
         Arc::clone(&self.cache)
     }
 }

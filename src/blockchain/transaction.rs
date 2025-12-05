@@ -55,12 +55,24 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
             signer_pubkey
         ))?;
 
-    // ✅ FIX: Check signature array size matches account_keys size
-    if tx.signatures.len() != tx.message.account_keys.len() {
+    // ✅ FIX: Ensure signature array is properly initialized
+    // Solana transactions: signature array size = num_required_signatures (not account_keys.len())
+    // Transaction::new_with_payer initializes signatures to num_required_signatures size
+    // If signatures array is empty or wrong size, we need to resize it
+    let num_required_signatures = tx.message.header.num_required_signatures as usize;
+    if tx.signatures.len() != num_required_signatures {
+        // Resize signature array to match num_required_signatures
+        tx.signatures.resize(num_required_signatures, solana_sdk::signature::Signature::default());
+    }
+    
+    // ✅ FIX: Verify signer_index is within required signatures range
+    // Signer must be in the first num_required_signatures accounts
+    if signer_index >= num_required_signatures {
         return Err(anyhow::anyhow!(
-            "Transaction signature array mismatch: {} signatures, {} accounts",
-            tx.signatures.len(),
-            tx.message.account_keys.len()
+            "Transaction signing failed: signer {} at index {} is not in required signatures range (0..{})",
+            signer_pubkey,
+            signer_index,
+            num_required_signatures
         ));
     }
 
@@ -120,13 +132,35 @@ pub fn sign_transaction(tx: &mut Transaction, keypair: &Keypair) -> Result<()> {
     //   1. Transaction is not signed (signature is default)
     //   2. Signature exists but is invalid for this keypair
     //   3. Signer index is valid and within bounds
-    //   4. Signature array size matches account_keys size
+    //   4. Signature array size matches num_required_signatures
     // 
-    // ✅ SAFE FOR JITO BUNDLES:
-    // - tx.sign() will overwrite existing signature if invalid
-    // - Each transaction in bundle is a different Transaction object
-    // - Tip tx and main tx are signed separately - this is correct
-    tx.sign(&[keypair], tx.message.recent_blockhash);
+    // ✅ FIX: Manual signing to avoid KeypairPubkeyMismatch error
+    // Problem: tx.sign() expects keypair pubkeys to match account_keys[0..num_required_signatures] in order
+    // Solution: Manually sign the transaction message using Solana's signing algorithm
+    // 
+    // Solana transaction signing process:
+    // 1. Serialize the message (without signatures - they're already default)
+    // 2. Sign the serialized message with the keypair
+    // 3. Assign the signature to the correct index
+    // 
+    // Serialize the transaction message for signing
+    // Note: Solana uses a specific serialization format for transaction messages
+    // The message is serialized without the signatures array
+    let message_bytes = tx.message.serialize();
+    
+    // Sign the message with the keypair
+    // Use the Signer trait's sign_message method which handles the signing correctly
+    let signature = keypair.sign_message(&message_bytes);
+    
+    // Assign signature to the correct index
+    if signer_index >= tx.signatures.len() {
+        return Err(anyhow::anyhow!(
+            "Transaction signing failed: signer index {} out of bounds (signatures.len()={})",
+            signer_index,
+            tx.signatures.len()
+        ));
+    }
+    tx.signatures[signer_index] = signature;
 
     // Verify signing succeeded
     // Note: signer_index is already known from above, no need to recalculate

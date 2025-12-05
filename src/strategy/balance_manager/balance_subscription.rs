@@ -69,11 +69,13 @@ impl BalanceSubscription {
             }
 
             let mint = Pubkey::from_str(mint_str)
-                .map_err(|e| anyhow::anyhow!("Invalid {} mint: {}", name, e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid {} mint: {}", name, e))
+                .context(format!("Failed to parse {} mint address", name))?;
 
             if mint == sol_mint || is_wsol_mint(&mint) {
                 let wsol_ata = get_associated_token_address(&self.wallet, &mint, Some(&self.config))
-                    .map_err(|e| anyhow::anyhow!("Failed to derive WSOL ATA for {}: {}", name, e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to derive WSOL ATA for {}: {}", name, e))
+                    .context(format!("Failed to derive WSOL ATA for {}", name))?;
 
                 match self.ws.subscribe_account(&wsol_ata).await {
                     Ok(subscription_id) => {
@@ -120,7 +122,8 @@ impl BalanceSubscription {
             }
 
             let ata = get_associated_token_address(&self.wallet, &mint, Some(&self.config))
-                .map_err(|e| anyhow::anyhow!("Failed to derive ATA for {}: {}", name, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to derive ATA for {}: {}", name, e))
+                .context(format!("Failed to derive ATA for {}", name))?;
 
             match self.ws.subscribe_account(&ata).await {
                 Ok(subscription_id) => {

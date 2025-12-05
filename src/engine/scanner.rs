@@ -224,8 +224,11 @@ impl Scanner {
         let mut use_websocket = true;
         let mut last_reconnect_attempt = Instant::now();
         let mut last_failed_subscription_check = Instant::now();
-        const RECONNECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
-        const FAILED_SUBSCRIPTION_CHECK_INTERVAL: Duration = Duration::from_secs(30); // Check every 30 seconds
+        const RECONNECT_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes (normal mode)
+        const EMERGENCY_RECONNECT_COOLDOWN: Duration = Duration::from_secs(30); // 30 seconds (when failed subscriptions exist)
+        // ✅ FIX: Reduced check interval from 30s to 5s to detect failed subscriptions faster
+        // This prevents data loss during the 30s-5min window when subscriptions fail but reconnect is on cooldown
+        const FAILED_SUBSCRIPTION_CHECK_INTERVAL: Duration = Duration::from_secs(5); // Check every 5 seconds (was 30s)
 
         log::info!(
             "Starting monitoring for program: {} (WebSocket mode)",
@@ -354,10 +357,23 @@ impl Scanner {
 
                         self.reset_errors();
 
+                        // ✅ FIX: Use emergency cooldown if failed subscriptions exist
+                        // This prevents data loss by allowing faster reconnection when subscriptions are lost
+                        let failed_subscriptions = self.ws.get_failed_subscriptions().await;
+                        let has_failed_subscriptions = !failed_subscriptions.is_empty();
+                        let reconnect_cooldown = if has_failed_subscriptions {
+                            EMERGENCY_RECONNECT_COOLDOWN
+                        } else {
+                            RECONNECT_COOLDOWN
+                        };
+
                         if subscription_id.is_none()
-                            && last_reconnect_attempt.elapsed() >= RECONNECT_COOLDOWN
+                            && last_reconnect_attempt.elapsed() >= reconnect_cooldown
                         {
                             last_reconnect_attempt = Instant::now();
+                            if has_failed_subscriptions {
+                                log::info!("Emergency reconnect: {} failed subscription(s) detected, using {}s cooldown (instead of {}s)", failed_subscriptions.len(), EMERGENCY_RECONNECT_COOLDOWN.as_secs(), RECONNECT_COOLDOWN.as_secs());
+                            }
                             match self.ws.reconnect_with_backoff().await {
                                 Ok(()) => match self.ws.subscribe_program(&program_id).await {
                                     Ok(id) => {
@@ -367,22 +383,35 @@ impl Scanner {
                                         self.reset_errors();
                                     }
                                     Err(e) => {
-                                        log::debug!("WebSocket resubscription failed, will retry in 5min: {}", e);
+                                        let next_retry = if has_failed_subscriptions {
+                                            format!("{}s (emergency)", EMERGENCY_RECONNECT_COOLDOWN.as_secs())
+                                        } else {
+                                            format!("{}s", RECONNECT_COOLDOWN.as_secs())
+                                        };
+                                        log::debug!("WebSocket resubscription failed, will retry in {}: {}", next_retry, e);
                                     }
                                 },
                                 Err(e) => {
                                     // WebSocket still unavailable, continue RPC polling
+                                    let next_retry = if has_failed_subscriptions {
+                                        format!("{}s (emergency)", EMERGENCY_RECONNECT_COOLDOWN.as_secs())
+                                    } else {
+                                        format!("{}s", RECONNECT_COOLDOWN.as_secs())
+                                    };
                                     log::debug!(
-                                        "WebSocket reconnect failed, will retry in 5min: {}",
+                                        "WebSocket reconnect failed, will retry in {}: {}",
+                                        next_retry,
                                         e
                                     );
                                 }
                             }
                         } else if subscription_id.is_none() {
-                            let remaining_cooldown = RECONNECT_COOLDOWN.as_secs()
-                                - last_reconnect_attempt.elapsed().as_secs();
+                            let remaining_cooldown = reconnect_cooldown.as_secs()
+                                .saturating_sub(last_reconnect_attempt.elapsed().as_secs());
+                            let cooldown_type = if has_failed_subscriptions { "emergency" } else { "normal" };
                             log::debug!(
-                                "WebSocket reconnect cooldown active, {}s remaining",
+                                "WebSocket reconnect cooldown active ({}), {}s remaining",
+                                cooldown_type,
                                 remaining_cooldown
                             );
                         }

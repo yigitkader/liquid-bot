@@ -25,6 +25,11 @@ struct ReserveCacheInner {
     initialized: bool,
 }
 
+// ✅ MEMORY LEAK PREVENTION: Maximum cache size limit
+// Expected: ~50-100 reserves on Solend mainnet
+// Safety limit: 500 reserves (5-10x expected, protects against edge cases)
+const MAX_RESERVE_CACHE_SIZE: usize = 500;
+
 // ✅ FIX: Fetch lock to prevent multiple threads from making concurrent RPC calls
 static FETCH_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> = Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
@@ -148,7 +153,38 @@ impl ReserveCache {
         };
 
         let mut inner = self.inner.write().await;
+        
+        // ✅ MEMORY LEAK PREVENTION: Check cache size before inserting
+        // If cache is full and this reserve isn't already cached, we have a problem
+        if !inner.reserve_data.contains_key(reserve) && inner.reserve_data.len() >= MAX_RESERVE_CACHE_SIZE {
+            log::warn!(
+                "⚠️  Reserve cache size limit reached ({} entries). This may indicate a memory leak or refresh failure. Attempting emergency cleanup...",
+                inner.reserve_data.len()
+            );
+            
+            // Emergency cleanup: If refresh is failing, we can't rely on it
+            // Log warning but still allow insertion to prevent blocking operations
+            // The next successful refresh will clean up stale entries
+            if inner.reserve_data.len() >= MAX_RESERVE_CACHE_SIZE {
+                // Remove oldest entries (arbitrary - we don't track access time)
+                // In practice, refresh_from_rpc should handle this, but this is a safety net
+                let excess = inner.reserve_data.len().saturating_sub(MAX_RESERVE_CACHE_SIZE / 2);
+                if excess > 0 {
+                    let keys_to_remove: Vec<Pubkey> = inner.reserve_data.keys().take(excess).copied().collect();
+                    for key in keys_to_remove {
+                        inner.reserve_data.remove(&key);
+                    }
+                    log::warn!("Emergency cleanup: Removed {} excess reserve cache entries", excess);
+                }
+            }
+        }
+        
         inner.reserve_data.insert(*reserve, data.clone());
+        
+        // Log cache growth for monitoring
+        if inner.reserve_data.len() % 50 == 0 {
+            log::info!("Reserve cache size: {} entries (limit: {})", inner.reserve_data.len(), MAX_RESERVE_CACHE_SIZE);
+        }
 
         Ok(data)
     }
@@ -217,10 +253,16 @@ impl ReserveCache {
         let removed_mint_count = old_mint_count.saturating_sub(inner.mint_to_reserve.len());
         let removed_data_count = old_data_count.saturating_sub(inner.reserve_data.len());
         
+        // ✅ MEMORY LEAK PREVENTION: Always log cache size to monitor growth
         if removed_mint_count > 0 || removed_data_count > 0 {
-            log::info!("Reserve cache refresh: {} mint mappings (removed {} stale), {} reserve data entries (removed {} stale)", inner.mint_to_reserve.len(), removed_mint_count, inner.reserve_data.len(), removed_data_count);
+            log::info!("Reserve cache refresh: {} mint mappings (removed {} stale), {} reserve data entries (removed {} stale, limit: {})", inner.mint_to_reserve.len(), removed_mint_count, inner.reserve_data.len(), removed_data_count, MAX_RESERVE_CACHE_SIZE);
         } else {
-            log::debug!("Reserve cache refresh: {} mint mappings, {} reserve data entries", inner.mint_to_reserve.len(), inner.reserve_data.len());
+            log::debug!("Reserve cache refresh: {} mint mappings, {} reserve data entries (limit: {})", inner.mint_to_reserve.len(), inner.reserve_data.len(), MAX_RESERVE_CACHE_SIZE);
+        }
+        
+        // Warn if cache is approaching limit
+        if inner.reserve_data.len() > MAX_RESERVE_CACHE_SIZE * 3 / 4 {
+            log::warn!("⚠️  Reserve cache size ({}) is approaching limit ({}). This may indicate refresh issues or unexpected reserve growth.", inner.reserve_data.len(), MAX_RESERVE_CACHE_SIZE);
         }
 
         Ok(())
@@ -282,6 +324,9 @@ impl ReserveCache {
 
             // Periodic refresh every 30 seconds
             const REFRESH_INTERVAL_SECONDS: u64 = 30;
+            let mut consecutive_failures = 0u32;
+            const MAX_CONSECUTIVE_FAILURES: u32 = 5; // After 5 failures (2.5 minutes), trigger emergency cleanup
+            
             loop {
                 tokio::time::sleep(Duration::from_secs(REFRESH_INTERVAL_SECONDS)).await;
                 
@@ -293,7 +338,7 @@ impl ReserveCache {
                     is_rate_limit: false,
                 };
 
-                if let Err(e) = retry_with_backoff(
+                match retry_with_backoff(
                     || {
                         let cache = Arc::clone(&self);
                         let rpc = Arc::clone(&rpc);
@@ -306,7 +351,39 @@ impl ReserveCache {
                 )
                 .await
                 {
-                    log::warn!("Reserve cache periodic refresh failed: {}", e);
+                    Ok(_) => {
+                        if consecutive_failures > 0 {
+                            log::info!("✅ Reserve cache refresh recovered after {} consecutive failures", consecutive_failures);
+                            consecutive_failures = 0;
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        log::warn!("Reserve cache periodic refresh failed (consecutive failures: {}): {}", consecutive_failures, e);
+                        
+                        // ✅ MEMORY LEAK PREVENTION: Emergency cleanup if refresh fails repeatedly
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                            log::error!("⚠️  Reserve cache refresh has failed {} times consecutively. Performing emergency cleanup to prevent memory leak...", consecutive_failures);
+                            
+                            let cache = Arc::clone(&self);
+                            let mut inner = cache.inner.write().await;
+                            let old_size = inner.reserve_data.len();
+                            
+                            // Emergency cleanup: Clear cache if it's getting too large
+                            // This is a last resort - normally refresh_from_rpc handles cleanup
+                            if inner.reserve_data.len() > MAX_RESERVE_CACHE_SIZE {
+                                let target_size = MAX_RESERVE_CACHE_SIZE / 2;
+                                let excess = inner.reserve_data.len().saturating_sub(target_size);
+                                let keys_to_remove: Vec<Pubkey> = inner.reserve_data.keys().take(excess).copied().collect();
+                                for key in keys_to_remove {
+                                    inner.reserve_data.remove(&key);
+                                }
+                                log::warn!("Emergency cleanup: Removed {} reserve cache entries ({} -> {})", excess, old_size, inner.reserve_data.len());
+                            } else {
+                                log::debug!("Emergency cleanup check: Cache size {} is within limit {}", inner.reserve_data.len(), MAX_RESERVE_CACHE_SIZE);
+                            }
+                        }
+                    }
                 }
             }
         });
