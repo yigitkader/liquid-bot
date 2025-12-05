@@ -87,25 +87,34 @@ impl Default for SubscriptionManager {
 }
 
 /// Build subscription parameters for different subscription types
+/// Solana WebSocket API format:
+/// - programSubscribe: [programId, {encoding: "base64", commitment: "confirmed"}]
+/// - accountSubscribe: [accountPubkey, {encoding: "base64", commitment: "confirmed"}]
+/// - slotSubscribe: []
 pub fn build_subscription_params(sub_type: &SubscriptionType) -> serde_json::Value {
     match sub_type {
         SubscriptionType::Program(program_id) => {
-            json!([{
-                "account": {
-                    "programId": program_id.to_string()
-                },
-                "encoding": "base64",
-                "commitment": "confirmed"
-            }])
+            // Program subscription: [programId, options]
+            json!([
+                program_id.to_string(),
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed"
+                }
+            ])
         }
         SubscriptionType::Account(pubkey) => {
-            json!([{
-                "account": pubkey.to_string(),
-                "encoding": "base64",
-                "commitment": "confirmed"
-            }])
+            // Account subscription: [accountPubkey, options]
+            json!([
+                pubkey.to_string(),
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed"
+                }
+            ])
         }
         SubscriptionType::Slot => {
+            // Slot subscription: []
             json!([])
         }
     }
@@ -114,7 +123,7 @@ pub fn build_subscription_params(sub_type: &SubscriptionType) -> serde_json::Val
 /// Get subscription method name for subscription type
 pub fn get_subscription_method(sub_type: &SubscriptionType) -> &'static str {
     match sub_type {
-        SubscriptionType::Program(_) => "accountSubscribe",
+        SubscriptionType::Program(_) => "programSubscribe",  // ✅ FIX: Use programSubscribe for program subscriptions
         SubscriptionType::Account(_) => "accountSubscribe",
         SubscriptionType::Slot => "slotSubscribe",
     }

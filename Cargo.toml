@@ -60,3 +60,7 @@ path = "src/bin/create_atas.rs"
 [[bin]]
 name = "update_idls"
 path = "src/bin/update_idls.rs"
+
+[[bin]]
+name = "find_real_obligations"
+path = "src/bin/find_real_obligations.rs"

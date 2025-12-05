@@ -373,6 +373,7 @@ async fn send_ata_batch(
     }
     
     let mut tx = Transaction::new_with_payer(&instructions, Some(&wallet_pubkey));
+    tx.message.recent_blockhash = recent_blockhash;
     
     // Log transaction message account keys
     log::info!("📋 Transaction Message Account Keys ({} total):", tx.message.account_keys.len());

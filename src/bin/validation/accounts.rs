@@ -109,8 +109,10 @@ pub async fn validate_obligation_accounts(
         .parse::<Pubkey>()
         .context("Invalid main market address")?;
 
-    // Check TEST_OBLIGATION_PUBKEY if available
+    // Check TEST_OBLIGATION_PUBKEY if available, otherwise try wallet's obligation PDA
+    let mut obligation_found = false;
     if let Some(_cfg) = config {
+        // First, try TEST_OBLIGATION_PUBKEY if set
         if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
             if !test_obligation_str.trim().is_empty() {
                 match Pubkey::try_from(test_obligation_str.trim()) {
@@ -168,6 +170,7 @@ pub async fn validate_obligation_accounts(
                                                 obligation.borrows.len()
                                             )
                                         ));
+                                        obligation_found = true;
                                     }
                                     Err(e) => {
                                         results.push(TestResult::failure(
@@ -178,10 +181,18 @@ pub async fn validate_obligation_accounts(
                                 }
                             }
                             Err(e) => {
-                                results.push(TestResult::failure(
-                                    "Obligation Account Fetch (TEST_OBLIGATION_PUBKEY)",
-                                    &format!("Failed to fetch obligation account {}: {}", test_obligation, e),
-                                ));
+                                let error_str = e.to_string();
+                                if error_str.contains("AccountNotFound") || error_str.contains("account not found") {
+                                    results.push(TestResult::failure(
+                                        "Obligation Account Fetch (TEST_OBLIGATION_PUBKEY)",
+                                        &format!("Obligation account {} not found on-chain. This is normal if the account doesn't exist. If you want to test with a real obligation, set TEST_OBLIGATION_PUBKEY to a valid obligation address from mainnet.", test_obligation),
+                                    ));
+                                } else {
+                                    results.push(TestResult::failure(
+                                        "Obligation Account Fetch (TEST_OBLIGATION_PUBKEY)",
+                                        &format!("Failed to fetch obligation account {}: {}. Check RPC connection and account address.", test_obligation, e),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -190,6 +201,84 @@ pub async fn validate_obligation_accounts(
                             "Obligation Account Parsing (TEST_OBLIGATION_PUBKEY)",
                             &format!("Invalid TEST_OBLIGATION_PUBKEY: {}", e),
                         ));
+                    }
+                }
+            }
+        }
+        
+        // If TEST_OBLIGATION_PUBKEY not found or not set, try wallet's obligation PDA
+        if !obligation_found {
+            if let Some(wallet_pubkey) = load_wallet_pubkey_from_config(config) {
+                match derive_obligation_address(&wallet_pubkey, &main_market, &solend_program_id) {
+                    Ok(wallet_obligation_pda) => {
+                        log::info!("🔍 Trying wallet's obligation PDA: {}", wallet_obligation_pda);
+                        match rpc_client.get_account(&wallet_obligation_pda).await {
+                            Ok(account) => {
+                                match SolendObligation::from_account_data(&account.data) {
+                                    Ok(obligation) => {
+                                        let health_factor = obligation.calculate_health_factor();
+                                        let deposited = obligation.total_deposited_value_usd();
+                                        let borrowed = obligation.total_borrowed_value_usd();
+
+                                        log::info!(
+                                            "🧩 Solend Obligation Parsed (Wallet's Obligation PDA): pubkey={}, health_factor={:.6}, deposited_usd={:.6}, borrowed_usd={:.6}, deposits_len={}, borrows_len={}",
+                                            wallet_obligation_pda,
+                                            health_factor,
+                                            deposited,
+                                            borrowed,
+                                            obligation.deposits.len(),
+                                            obligation.borrows.len()
+                                        );
+
+                                        for (i, dep) in obligation.deposits.iter().enumerate() {
+                                            log::info!(
+                                                "   ▸ Deposit[{}]: reserve={}, deposited_amount={}, market_value_raw={}, market_value_usd={:.6}",
+                                                i,
+                                                dep.deposit_reserve,
+                                                dep.deposited_amount,
+                                                dep.market_value.value,
+                                                dep.market_value.to_f64()
+                                            );
+                                        }
+
+                                        for (i, bor) in obligation.borrows.iter().enumerate() {
+                                            log::info!(
+                                                "   ▸ Borrow[{}]: reserve={}, borrowed_amount_wads={}, market_value_raw={}, market_value_usd={:.6}",
+                                                i,
+                                                bor.borrow_reserve,
+                                                bor.borrowed_amount_wads.value,
+                                                bor.market_value.value,
+                                                bor.market_value.to_f64()
+                                            );
+                                        }
+
+                                        results.push(TestResult::success_with_details(
+                                            "Obligation Account Parsing (Wallet's Obligation PDA)",
+                                            "Successfully parsed wallet's obligation account",
+                                            format!(
+                                                "Obligation: {}, Health Factor: {:.4}, Deposited: ${:.2}, Borrowed: ${:.2}, Deposits: {}, Borrows: {}",
+                                                wallet_obligation_pda,
+                                                health_factor,
+                                                deposited,
+                                                borrowed,
+                                                obligation.deposits.len(),
+                                                obligation.borrows.len()
+                                            )
+                                        ));
+                                        obligation_found = true;
+                                    }
+                                    Err(e) => {
+                                        log::info!("Wallet's obligation PDA {} exists but failed to parse: {}", wallet_obligation_pda, e);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                log::info!("Wallet's obligation PDA {} not found on-chain (this is normal if wallet has no Solend position)", wallet_obligation_pda);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to derive wallet's obligation PDA: {}", e);
                     }
                 }
             }

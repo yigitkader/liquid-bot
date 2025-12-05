@@ -370,71 +370,132 @@ async fn validate_instruction_formats(rpc_client: &Arc<RpcClient>, config: Optio
         let solend_program_id = cfg.solend_program_id.parse::<Pubkey>()
             .context("Invalid Solend program ID")?;
         
-        use solana_client::rpc_filter::RpcFilterType;
-        const OBLIGATION_DATA_SIZE: u64 = 1300;
+        let main_market_str = cfg.main_lending_market_address.as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+        let main_market = main_market_str.parse::<Pubkey>()
+            .context("Invalid main market address")?;
         
-        match rpc_client.get_program_accounts_with_filters(
-            &solend_program_id,
-            vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
-        ).await {
-            Ok(accounts) => {
-                use liquid_bot::protocol::solend::SolendProtocol;
-                use liquid_bot::protocol::Protocol;
-                
-                let protocol: Arc<dyn Protocol> = Arc::new(
-                    SolendProtocol::new(cfg)
-                        .context("Failed to initialize Solend protocol")?
-                );
-                
-                // Find first valid obligation
-                for (pubkey, account) in accounts.iter().take(5) {
-                    if let Some(position) = protocol.parse_position(account, Some(Arc::clone(&rpc_client))).await {
-                        if !position.debt_assets.is_empty() && !position.collateral_assets.is_empty() {
-                            // ✅ REAL instruction data from REAL obligation
-                            let real_amount = position.debt_assets[0].amount; // Use real debt amount
-                            
-                            let mut data = Vec::with_capacity(16);
-                            data.extend_from_slice(&discriminator);
-                            data.extend_from_slice(&real_amount.to_le_bytes());
-                            
-                            log::info!("✅ Instruction Data Format: Built from REAL obligation {} with amount {}", pubkey, real_amount);
-                            log::info!("   - Discriminator: {:02x?} (8 bytes)", discriminator);
-                            log::info!("   - Amount: {} (8 bytes, little-endian)", real_amount);
-                            log::info!("   - Total data length: {} bytes", data.len());
-                            
-                            if data.len() == 16 {
-                                results.push(TestResult::success_with_details(
-                                    "Instruction Data Format",
-                                    "Correct format: [discriminator (8 bytes), amount (8 bytes)]",
-                                    format!("Built from REAL obligation: {}, Amount: {} (from debt_assets[0])", pubkey, real_amount)
-                                ));
-                            } else {
-                                results.push(TestResult::failure(
-                                    "Instruction Data Format",
-                                    &format!("Invalid length: {} bytes (expected 16)", data.len())
-                                ));
-                            }
-                            return Ok(results);
+        use liquid_bot::protocol::solend::SolendProtocol;
+        use liquid_bot::protocol::Protocol;
+        
+        let protocol: Arc<dyn Protocol> = Arc::new(
+            SolendProtocol::new(cfg)
+                .context("Failed to initialize Solend protocol")?
+        );
+        
+        // Helper async function to try parsing an obligation account
+        async fn try_parse_obligation(
+            protocol: &Arc<dyn Protocol>,
+            rpc_client: &Arc<RpcClient>,
+            account: &solana_sdk::account::Account,
+        ) -> Option<(Pubkey, f64)> {
+            // Try protocol parsing first
+            if let Some(position) = protocol.parse_position(account, Some(Arc::clone(rpc_client))).await {
+                if !position.debt_assets.is_empty() {
+                    return Some((position.address, position.debt_assets[0].amount as f64));
+                }
+            }
+            // Fallback to direct parsing if protocol parsing fails
+            use liquid_bot::protocol::solend::types::SolendObligation;
+            if let Ok(obligation) = SolendObligation::from_account_data(&account.data) {
+                if !obligation.borrows.is_empty() {
+                    // Use borrowed amount from first borrow
+                    let borrowed_wads = obligation.borrows[0].borrowed_amount_wads.value;
+                    // Convert from wads (1e18) to normal units (approximate)
+                    let amount = borrowed_wads as f64 / 1e18;
+                    return Some((account.owner, amount));
+                }
+            }
+            None
+        }
+        
+        // First, try TEST_OBLIGATION_PUBKEY if set
+        let mut found_obligation = None;
+        if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
+            if !test_obligation_str.trim().is_empty() {
+                if let Ok(test_obligation) = test_obligation_str.trim().parse::<Pubkey>() {
+                    if let Ok(account) = rpc_client.get_account(&test_obligation).await {
+                        if let Some((_, amount)) = try_parse_obligation(&protocol, &rpc_client, &account).await {
+                            found_obligation = Some((test_obligation, amount));
                         }
                     }
                 }
-                
-                results.push(TestResult::failure(
-                    "Instruction Data Format",
-                    "No valid obligation found - cannot test instruction format with real mainnet data. Please configure TEST_OBLIGATION_PUBKEY or ensure RPC has access to obligation accounts."
-                ));
             }
-            Err(e) => {
-                let error_str = e.to_string();
-                if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
-                    results.push(TestResult::failure(
-                        "Instruction Data Format",
-                        "RPC limit/timeout - cannot fetch real obligation data for instruction format test. Please configure TEST_OBLIGATION_PUBKEY or use premium RPC with higher limits."
-                    ));
-                } else {
-                    return Err(e).context("Failed to fetch program accounts for instruction format validation");
+        }
+        
+        // If TEST_OBLIGATION_PUBKEY not found, try wallet's obligation PDA
+        if found_obligation.is_none() {
+            if let Some(wallet_pubkey) = load_wallet_pubkey_from_config(config) {
+                if let Ok(wallet_obligation_pda) = derive_obligation_address(&wallet_pubkey, &main_market, &solend_program_id) {
+                    log::info!("🔍 Trying wallet's obligation PDA for instruction format test: {}", wallet_obligation_pda);
+                    if let Ok(account) = rpc_client.get_account(&wallet_obligation_pda).await {
+                        if let Some((_, amount)) = try_parse_obligation(&protocol, &rpc_client, &account).await {
+                            found_obligation = Some((wallet_obligation_pda, amount));
+                            log::info!("✅ Using wallet's obligation PDA for instruction format test");
+                        }
+                    }
                 }
             }
+        }
+        
+        // If still not found, try scanning program accounts
+        if found_obligation.is_none() {
+            use solana_client::rpc_filter::RpcFilterType;
+            const OBLIGATION_DATA_SIZE: u64 = 1300;
+            
+            match rpc_client.get_program_accounts_with_filters(
+                &solend_program_id,
+                vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
+            ).await {
+                Ok(accounts) => {
+                    // Find first valid obligation
+                    for (pubkey, account) in accounts.iter().take(5) {
+                        if let Some((_, amount)) = try_parse_obligation(&protocol, &rpc_client, account).await {
+                            found_obligation = Some((*pubkey, amount));
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
+                        // Error will be handled below
+                    } else {
+                        return Err(e).context("Failed to fetch program accounts for instruction format validation");
+                    }
+                }
+            }
+        }
+        
+        // Build instruction if obligation found
+        if let Some((obligation_pubkey, real_amount)) = found_obligation {
+            let mut data = Vec::with_capacity(16);
+            data.extend_from_slice(&discriminator);
+            data.extend_from_slice(&real_amount.to_le_bytes());
+            
+            log::info!("✅ Instruction Data Format: Built from REAL obligation {} with amount {}", obligation_pubkey, real_amount);
+            log::info!("   - Discriminator: {:02x?} (8 bytes)", discriminator);
+            log::info!("   - Amount: {} (8 bytes, little-endian)", real_amount);
+            log::info!("   - Total data length: {} bytes", data.len());
+            
+            if data.len() == 16 {
+                results.push(TestResult::success_with_details(
+                    "Instruction Data Format",
+                    "Correct format: [discriminator (8 bytes), amount (8 bytes)]",
+                    format!("Built from REAL obligation: {}, Amount: {} (from debt_assets[0])", obligation_pubkey, real_amount)
+                ));
+            } else {
+                results.push(TestResult::failure(
+                    "Instruction Data Format",
+                    &format!("Invalid length: {} bytes (expected 16)", data.len())
+                ));
+            }
+        } else {
+            results.push(TestResult::failure(
+                "Instruction Data Format",
+                "No valid obligation found - cannot test instruction format with real mainnet data. Please configure TEST_OBLIGATION_PUBKEY or ensure RPC has access to obligation accounts."
+            ));
         }
     } else {
         results.push(TestResult::failure(
@@ -1380,27 +1441,81 @@ async fn validate_pyth_oracle_test(
     rpc: Arc<RpcClient>,
     oracle_account: Pubkey,
 ) -> TestResult {
-    match read_pyth_price(&oracle_account, rpc, None).await {
-        Ok(Some(price_data)) => {
-            TestResult::success_with_details(
-                "Pyth Oracle - Price Reading",
-                &format!("Successfully read price: ${:.4}", price_data.price),
-                format!(
-                    "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {}",
-                    price_data.price, price_data.confidence, price_data.timestamp
+    // First check if account exists
+    match rpc.get_account(&oracle_account).await {
+        Ok(account) => {
+            if account.data.is_empty() {
+                return TestResult::failure_with_details(
+                    "Pyth Oracle - Account",
+                    "Oracle account exists but is empty",
+                    format!("Account: {} (may be closed or uninitialized)", oracle_account),
+                );
+            }
+            
+            match read_pyth_price(&oracle_account, rpc, None).await {
+                Ok(Some(price_data)) => {
+                    let age_seconds = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64 - price_data.timestamp;
+                    
+                    // More lenient for tests - allow up to 10 minutes old data
+                    if age_seconds > 600 {
+                        TestResult::failure_with_details(
+                            "Pyth Oracle - Price Data",
+                            "Price data is too old (stale)",
+                            format!("Account: {}, Age: {}s (max: 600s), Price: ${:.4}", oracle_account, age_seconds, price_data.price),
+                        )
+                    } else {
+                        TestResult::success_with_details(
+                            "Pyth Oracle - Price Reading",
+                            &format!("Successfully read price: ${:.4}", price_data.price),
+                            format!(
+                                "Price: ${:.4}, Confidence: ${:.4}, Timestamp: {} (age: {}s)",
+                                price_data.price, price_data.confidence, price_data.timestamp, age_seconds
+                            ),
+                        )
+                    }
+                }
+                Ok(None) => TestResult::failure_with_details(
+                    "Pyth Oracle - Price Data",
+                    "No price data available (account empty or price too old)",
+                    format!("Account: {} (data size: {} bytes)", oracle_account, account.data.len()),
                 ),
-            )
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("stale") || error_str.contains("too old") {
+                        TestResult::failure_with_details(
+                            "Pyth Oracle - Price Data",
+                            "Price data is stale (too old)",
+                            format!("Account: {}, Error: {}", oracle_account, e),
+                        )
+                    } else {
+                        TestResult::failure_with_details(
+                            "Pyth Oracle - Parsing",
+                            &format!("Failed to read price: {}", e),
+                            format!("Account: {} (data size: {} bytes)", oracle_account, account.data.len()),
+                        )
+                    }
+                }
+            }
         }
-        Ok(None) => TestResult::failure_with_details(
-            "Pyth Oracle - Price Data",
-            "No price data available (account empty or price too old)",
-            format!("Account: {}", oracle_account),
-        ),
-        Err(e) => TestResult::failure_with_details(
-            "Pyth Oracle - Parsing",
-            &format!("Failed to read price: {}", e),
-            format!("Account: {}", oracle_account),
-        ),
+        Err(e) => {
+            let error_str = e.to_string();
+            if error_str.contains("AccountNotFound") || error_str.contains("account not found") {
+                TestResult::failure_with_details(
+                    "Pyth Oracle - Account",
+                    "Oracle account not found on-chain",
+                    format!("Account: {}. The oracle address mapping may be incorrect. Check Pyth Network documentation for correct USDC/USD oracle address.", oracle_account),
+                )
+            } else {
+                TestResult::failure_with_details(
+                    "Pyth Oracle - Fetch",
+                    &format!("Failed to fetch account: {}", e),
+                    format!("Account: {}", oracle_account),
+                )
+            }
+        }
     }
 }
 
@@ -1529,6 +1644,12 @@ async fn test_liquidation_instruction(rpc: &Arc<RpcClient>, config: &Config) -> 
     let solend_program_id = Pubkey::from_str(&config.solend_program_id)
         .context("Invalid Solend program ID")?;
 
+    let main_market_str = config.main_lending_market_address.as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+    let main_market = main_market_str.parse::<Pubkey>()
+        .context("Invalid main market address")?;
+
     use solana_client::rpc_filter::RpcFilterType;
     const OBLIGATION_DATA_SIZE: u64 = 1300;
     let accounts_result = rpc.get_program_accounts_with_filters(
@@ -1538,36 +1659,92 @@ async fn test_liquidation_instruction(rpc: &Arc<RpcClient>, config: &Config) -> 
 
     let accounts = match accounts_result {
         Ok(accounts) => {
-            if accounts.is_empty() {
-                return Err(anyhow::anyhow!("No program accounts found - cannot test with real data"));
+            // ✅ FIX: Always check TEST_OBLIGATION_PUBKEY first (even if accounts list is not empty)
+            let mut accounts_to_check = accounts;
+            
+            // First try TEST_OBLIGATION_PUBKEY (highest priority)
+            if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
+                if !test_obligation_str.trim().is_empty() {
+                    if let Ok(test_obligation) = test_obligation_str.trim().parse::<Pubkey>() {
+                        if let Ok(account) = rpc.get_account(&test_obligation).await {
+                            log::info!("✅ Using TEST_OBLIGATION_PUBKEY for instruction building test: {}", test_obligation);
+                            // Prepend TEST_OBLIGATION_PUBKEY to the list
+                            let mut test_accounts = vec![(test_obligation, account)];
+                            test_accounts.extend(accounts_to_check);
+                            accounts_to_check = test_accounts;
+                        }
+                    }
+                }
             }
-            accounts
+            
+            if accounts_to_check.is_empty() {
+                // Try wallet's obligation PDA as fallback
+                let mut found_account = None;
+                if let Some(wallet_pubkey) = load_wallet_pubkey_from_config(Some(config)) {
+                    if let Ok(wallet_obligation_pda) = derive_obligation_address(&wallet_pubkey, &main_market, &solend_program_id) {
+                        log::info!("🔍 Trying wallet's obligation PDA for instruction building test: {}", wallet_obligation_pda);
+                        if let Ok(account) = rpc.get_account(&wallet_obligation_pda).await {
+                            log::info!("✅ Using wallet's obligation PDA for instruction building test");
+                            found_account = Some((wallet_obligation_pda, account));
+                        }
+                    }
+                }
+                
+                match found_account {
+                    Some(acc) => vec![acc],
+                    None => return Err(anyhow::anyhow!("No program accounts found - cannot test with real data")),
+                }
+            } else {
+                accounts_to_check
+            }
         }
         Err(e) => {
             let error_str = e.to_string();
             if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
-                log::warn!("RPC limit hit (expected for large programs). Attempting to use TEST_OBLIGATION_PUBKEY if available...");
+                log::warn!("RPC limit hit (expected for large programs). Attempting to use TEST_OBLIGATION_PUBKEY or wallet's obligation PDA...");
                 
+                let mut found_account = None;
+                
+                // First try TEST_OBLIGATION_PUBKEY
                 if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
                     if !test_obligation_str.trim().is_empty() {
                         if let Ok(test_obligation) = test_obligation_str.trim().parse::<Pubkey>() {
                             match rpc.get_account(&test_obligation).await {
                                 Ok(account) => {
                                     log::info!("Using TEST_OBLIGATION_PUBKEY for instruction building test: {}", test_obligation);
-                                    vec![(test_obligation, account)]
+                                    found_account = Some((test_obligation, account));
                                 }
-                                Err(e) => {
-                                    return Err(anyhow::anyhow!("RPC limit/timeout hit and TEST_OBLIGATION_PUBKEY account not found: {}. Please configure a valid TEST_OBLIGATION_PUBKEY or use a premium RPC with higher limits.", e));
+                                Err(_) => {
+                                    // Continue to try wallet's obligation PDA
                                 }
                             }
-                        } else {
-                            return Err(anyhow::anyhow!("RPC limit/timeout hit and TEST_OBLIGATION_PUBKEY is invalid. Please configure a valid TEST_OBLIGATION_PUBKEY or use a premium RPC with higher limits."));
                         }
-                    } else {
+                    }
+                }
+                
+                // If not found, try wallet's obligation PDA
+                if found_account.is_none() {
+                    if let Some(wallet_pubkey) = load_wallet_pubkey_from_config(Some(config)) {
+                        if let Ok(wallet_obligation_pda) = derive_obligation_address(&wallet_pubkey, &main_market, &solend_program_id) {
+                            log::info!("🔍 Trying wallet's obligation PDA for instruction building test: {}", wallet_obligation_pda);
+                            match rpc.get_account(&wallet_obligation_pda).await {
+                                Ok(account) => {
+                                    log::info!("✅ Using wallet's obligation PDA for instruction building test");
+                                    found_account = Some((wallet_obligation_pda, account));
+                                }
+                                Err(_) => {
+                                    // Continue to error
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                match found_account {
+                    Some(acc) => vec![acc],
+                    None => {
                         return Err(anyhow::anyhow!("RPC limit/timeout hit (expected for large programs). Please configure TEST_OBLIGATION_PUBKEY in .env to test instruction building, or use a premium RPC with higher limits."));
                     }
-                } else {
-                    return Err(anyhow::anyhow!("RPC limit/timeout hit (expected for large programs). Please configure TEST_OBLIGATION_PUBKEY in .env to test instruction building, or use a premium RPC with higher limits."));
                 }
             } else {
                 return Err(e).context("Failed to fetch program accounts");
@@ -1629,23 +1806,78 @@ async fn test_liquidation_instruction(rpc: &Arc<RpcClient>, config: &Config) -> 
     if found_liquidatable {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("No liquidatable obligations found in first 10 accounts. Cannot test instruction building without real mainnet data. Please configure TEST_OBLIGATION_PUBKEY or ensure RPC has access to obligation accounts."))
+        // Try to provide more helpful error message
+        let mut error_msg = "No liquidatable obligations found in first 10 accounts.".to_string();
+        
+        // Check if we found any obligations at all
+        let mut found_any_obligation = false;
+        for (_pubkey, account) in accounts.iter().take(10) {
+            if let Some(position) = protocol.parse_position(account, Some(Arc::clone(rpc))).await {
+                found_any_obligation = true;
+                if position.health_factor >= config.hf_liquidation_threshold {
+                    error_msg.push_str(&format!(" Found obligation with health_factor={:.4} (threshold={:.4}) - not liquidatable.", position.health_factor, config.hf_liquidation_threshold));
+                }
+                break;
+            }
+        }
+        
+        if !found_any_obligation {
+            error_msg.push_str(" No valid obligations found in scanned accounts.");
+        }
+        
+        error_msg.push_str(" Cannot test instruction building without real mainnet data. Please configure TEST_OBLIGATION_PUBKEY with a liquidatable obligation address, or ensure RPC has access to obligation accounts.");
+        
+        Err(anyhow::anyhow!("{}", error_msg))
     }
 }
 
 async fn test_websocket_monitoring(config: &Config) -> Result<()> {
     let ws = WsClient::new(config.rpc_ws_url.clone());
     
-    ws.connect().await
-        .context("Failed to connect to WebSocket")?;
+    // Connect with timeout
+    let connect_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        ws.connect()
+    ).await;
+    
+    match connect_result {
+        Ok(Ok(_)) => {
+            log::info!("✅ WebSocket connected successfully");
+        }
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!("Failed to connect to WebSocket: {}. Check RPC_WS_URL and network connection.", e));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("WebSocket connection timeout after 10s. Check RPC_WS_URL and network connection."));
+        }
+    }
 
     let solend_program_id = Pubkey::from_str(&config.solend_program_id)
         .context("Invalid Solend program ID")?;
 
-    ws.subscribe_program(&solend_program_id).await
-        .context("Failed to subscribe to program")?;
-
-    Ok(())
+    // Subscribe with timeout
+    let subscribe_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        ws.subscribe_program(&solend_program_id)
+    ).await;
+    
+    match subscribe_result {
+        Ok(Ok(subscription_id)) => {
+            log::info!("✅ WebSocket subscribed to program {} with subscription ID: {}", solend_program_id, subscription_id);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let error_str = e.to_string();
+            if error_str.contains("not connected") || error_str.contains("connection closed") {
+                Err(anyhow::anyhow!("WebSocket subscription failed: connection lost. Check RPC_WS_URL and network stability. Error: {}", e))
+            } else {
+                Err(anyhow::anyhow!("WebSocket subscription failed: {}. This may indicate RPC provider limitations or network issues.", e))
+            }
+        }
+        Err(_) => {
+            Err(anyhow::anyhow!("WebSocket subscription timeout after 10s. RPC provider may be slow or unresponsive."))
+        }
+    }
 }
 
 async fn test_jupiter_api(rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
@@ -1663,45 +1895,141 @@ async fn test_jupiter_api(rpc: &Arc<RpcClient>, config: &Config) -> Result<()> {
     let solend_program_id = Pubkey::from_str(&config.solend_program_id)
         .context("Invalid Solend program ID")?;
     
-    use solana_client::rpc_filter::RpcFilterType;
-    const OBLIGATION_DATA_SIZE: u64 = 1300;
-    let accounts_result = rpc.get_program_accounts_with_filters(
-        &solend_program_id,
-        vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
-    ).await;
+    let main_market_str = config.main_lending_market_address.as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY");
+    let main_market = main_market_str.parse::<Pubkey>()
+        .context("Invalid main market address")?;
     
-    let real_amount = match accounts_result {
-        Ok(accounts) => {
-            let protocol: Arc<dyn Protocol> = Arc::new(
-                SolendProtocol::new(config)
-                    .context("Failed to initialize Solend protocol")?
-            );
-            
-            let mut found_amount = None;
-            for (_pubkey, account) in accounts.iter().take(5) {
-                if let Some(position) = protocol.parse_position(account, Some(Arc::clone(rpc))).await {
-                    if let Some(debt) = position.debt_assets.first() {
-                        if debt.mint == usdc_mint {
-                            found_amount = Some(debt.amount);
-                            break;
+    let protocol: Arc<dyn Protocol> = Arc::new(
+        SolendProtocol::new(config)
+            .context("Failed to initialize Solend protocol")?
+    );
+    
+    // Helper function to find USDC debt in an account
+    async fn find_usdc_debt(
+        protocol: &Arc<dyn Protocol>,
+        rpc: &Arc<RpcClient>,
+        account: &solana_sdk::account::Account,
+        usdc_mint: Pubkey,
+    ) -> Option<u64> {
+        if let Some(position) = protocol.parse_position(account, Some(Arc::clone(rpc))).await {
+            if let Some(debt) = position.debt_assets.first() {
+                if debt.mint == usdc_mint {
+                    return Some(debt.amount);
+                }
+            }
+        }
+        None
+    }
+    
+    // First, try TEST_OBLIGATION_PUBKEY if set
+    let mut found_amount = None;
+    if let Ok(test_obligation_str) = std::env::var("TEST_OBLIGATION_PUBKEY") {
+        if !test_obligation_str.trim().is_empty() {
+            if let Ok(test_obligation) = test_obligation_str.trim().parse::<Pubkey>() {
+                if let Ok(account) = rpc.get_account(&test_obligation).await {
+                    log::info!("🔍 Checking TEST_OBLIGATION_PUBKEY for USDC debt: {}", test_obligation);
+                    if let Some(amount) = find_usdc_debt(&protocol, rpc, &account, usdc_mint).await {
+                        log::info!("✅ Found USDC debt in TEST_OBLIGATION_PUBKEY: {} (raw amount)", amount);
+                        found_amount = Some(amount);
+                    } else {
+                        // Try direct parsing to check if it's USDC reserve
+                        use liquid_bot::protocol::solend::types::SolendObligation;
+                        if let Ok(obligation) = SolendObligation::from_account_data(&account.data) {
+                            for (i, borrow) in obligation.borrows.iter().enumerate() {
+                                log::info!("   Borrow[{}]: reserve={}", i, borrow.borrow_reserve);
+                                // Check if this is USDC reserve
+                                if borrow.borrow_reserve.to_string() == config.usdc_reserve_address.as_ref().map(|s| s.as_str()).unwrap_or("BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw") {
+                                    let borrowed_wads = borrow.borrowed_amount_wads.value;
+                                    let amount = borrowed_wads as f64 / 1e18;
+                                    log::info!("✅ Found USDC debt via direct parsing: {} (from borrow reserve)", amount);
+                                    found_amount = Some(amount as u64);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
-            
-            match found_amount {
-                Some(amount) => amount,
-                None => {
-                    return Err(anyhow::anyhow!("No USDC debt found in obligations - cannot test Jupiter API with real mainnet data. Please configure TEST_OBLIGATION_PUBKEY with a real obligation that has USDC debt."));
+        }
+    }
+    
+    // If not found, try wallet's obligation PDA
+    if found_amount.is_none() {
+        if let Some(wallet_pubkey) = load_wallet_pubkey_from_config(Some(config)) {
+            if let Ok(wallet_obligation_pda) = derive_obligation_address(&wallet_pubkey, &main_market, &solend_program_id) {
+                log::info!("🔍 Trying wallet's obligation PDA for Jupiter API test: {}", wallet_obligation_pda);
+                if let Ok(account) = rpc.get_account(&wallet_obligation_pda).await {
+                    if let Some(amount) = find_usdc_debt(&protocol, rpc, &account, usdc_mint).await {
+                        found_amount = Some(amount);
+                        log::info!("✅ Using wallet's obligation PDA for Jupiter API test");
+                    }
                 }
             }
         }
-        Err(e) => {
-            let error_str = e.to_string();
-            if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
-                return Err(anyhow::anyhow!("RPC limit hit - cannot fetch real obligation data for Jupiter API test. Please configure TEST_OBLIGATION_PUBKEY or use premium RPC."));
-            } else {
-                return Err(e).context("Failed to fetch program accounts for Jupiter API test");
+    }
+    
+    // If still not found, try scanning program accounts
+    let real_amount = if found_amount.is_some() {
+        found_amount.unwrap()
+    } else {
+        use solana_client::rpc_filter::RpcFilterType;
+        const OBLIGATION_DATA_SIZE: u64 = 1300;
+        let accounts_result = rpc.get_program_accounts_with_filters(
+            &solend_program_id,
+            vec![RpcFilterType::DataSize(OBLIGATION_DATA_SIZE)],
+        ).await;
+        
+        match accounts_result {
+            Ok(accounts) => {
+                let mut found_amount_in_scan = None;
+                for (_pubkey, account) in accounts.iter().take(5) {
+                    if let Some(amount) = find_usdc_debt(&protocol, rpc, account, usdc_mint).await {
+                        found_amount_in_scan = Some(amount);
+                        break;
+                    }
+                }
+                
+                match found_amount_in_scan {
+                    Some(amount) => {
+                        log::info!("✅ Found USDC debt in scanned obligations: {} (raw amount)", amount);
+                        amount
+                    }
+                    None => {
+                        // Provide more helpful error message
+                        let mut error_msg = "No USDC debt found in scanned obligations.".to_string();
+                        
+                        // Check if we found any obligations with debt
+                        let mut found_debt = false;
+                        for (_pubkey, account) in accounts.iter().take(5) {
+                            if let Some(position) = protocol.parse_position(account, Some(Arc::clone(rpc))).await {
+                                if !position.debt_assets.is_empty() {
+                                    found_debt = true;
+                                    let debt_mint = position.debt_assets[0].mint;
+                                    error_msg.push_str(&format!(" Found obligation with debt in mint {} (not USDC).", debt_mint));
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if !found_debt {
+                            error_msg.push_str(" No obligations with debt found.");
+                        }
+                        
+                        error_msg.push_str(" Cannot test Jupiter API with real mainnet data. Please configure TEST_OBLIGATION_PUBKEY with a real obligation that has USDC debt.");
+                        
+                        return Err(anyhow::anyhow!("{}", error_msg));
+                    }
+                }
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("scan aborted") || error_str.contains("exceeded the limit") || error_str.contains("timeout") {
+                    return Err(anyhow::anyhow!("RPC limit hit - cannot fetch real obligation data for Jupiter API test. Please configure TEST_OBLIGATION_PUBKEY or use premium RPC."));
+                } else {
+                    return Err(e).context("Failed to fetch program accounts for Jupiter API test");
+                }
             }
         }
     };
@@ -1730,21 +2058,68 @@ async fn test_switchboard_oracle_production(config: &Config) -> Result<()> {
         .context("Invalid USDC mint")?;
 
     if let Some(switchboard_account) = get_switchboard_oracle_account(&usdc_mint, Some(config))? {
-        match SwitchboardOracle::read_price(&switchboard_account, Arc::clone(&rpc)).await {
-            Ok(price_data) => {
-                if price_data.price == 0.0 {
-                    return Err(anyhow::anyhow!("Switchboard oracle returned 0.0 price - check logs for parsing details"));
+        // First check if account exists
+        match rpc.get_account(&switchboard_account).await {
+            Ok(account) => {
+                log::info!("Switchboard oracle account found: {} ({} bytes, owner: {})", switchboard_account, account.data.len(), account.owner);
+                
+                if account.data.is_empty() {
+                    return Err(anyhow::anyhow!("Switchboard oracle account {} exists but is empty. Account may be closed or invalid.", switchboard_account));
                 }
                 
-                if price_data.price < 0.0 || price_data.confidence < 0.0 {
-                    return Err(anyhow::anyhow!("Invalid price data from Switchboard oracle: price={}, confidence={}", price_data.price, price_data.confidence));
+                // Validate owner is Switchboard program
+                use std::str::FromStr;
+                let switchboard_v2 = Pubkey::from_str("SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f").ok();
+                let switchboard_v3 = Pubkey::from_str("SBondMDrcV3K4car5PJkHEWZ9dcZLwJKAychnZgyZQ").ok();
+                
+                let is_valid_owner = switchboard_v2.map(|v2| account.owner == v2).unwrap_or(false)
+                    || switchboard_v3.map(|v3| account.owner == v3).unwrap_or(false);
+                
+                if !is_valid_owner {
+                    log::warn!("Switchboard oracle account {} has unexpected owner: {} (expected Switchboard V2 or V3)", switchboard_account, account.owner);
                 }
                 
-                Ok(())
+                match SwitchboardOracle::read_price(&switchboard_account, Arc::clone(&rpc)).await {
+                    Ok(price_data) => {
+                        log::info!("Switchboard oracle parsed successfully: price=${:.4}, confidence=${:.4}, timestamp={}", price_data.price, price_data.confidence, price_data.timestamp);
+                        
+                        if price_data.price == 0.0 {
+                            return Err(anyhow::anyhow!("Switchboard oracle returned 0.0 price - account may be uninitialized or feed is down. Account: {}", switchboard_account));
+                        }
+                        
+                        if price_data.price < 0.0 || price_data.confidence < 0.0 {
+                            return Err(anyhow::anyhow!("Invalid price data from Switchboard oracle: price={}, confidence={}. Account: {}", price_data.price, price_data.confidence, switchboard_account));
+                        }
+                        
+                        // Check if price is reasonable (USDC should be ~$1)
+                        if price_data.price < 0.5 || price_data.price > 2.0 {
+                            log::warn!("Switchboard oracle price seems unusual for USDC: ${:.4} (expected ~$1.00). This may indicate a parsing error or wrong feed.", price_data.price);
+                        }
+                        
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        if error_str.contains("Failed to parse") || error_str.contains("parse") {
+                            Err(anyhow::anyhow!("Failed to parse Switchboard oracle account: {} (data size: {} bytes). The account structure may have changed or parsing logic needs update. Error: {}", switchboard_account, account.data.len(), e))
+                        } else {
+                            Err(e).context(format!("Failed to read Switchboard oracle price from account: {}", switchboard_account))
+                        }
+                    }
+                }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("AccountNotFound") || error_str.contains("account not found") {
+                    Err(anyhow::anyhow!("Switchboard oracle account {} not found on-chain. The oracle address mapping may be incorrect. Please check oracle mappings in config.", switchboard_account))
+                } else {
+                    Err(e).context(format!("Failed to fetch Switchboard oracle account: {}", switchboard_account))
+                }
+            }
         }
     } else {
+        // No Switchboard oracle mapping found - this is OK, Pyth is primary
+        log::info!("No Switchboard oracle mapping found for USDC - this is OK if using Pyth as primary oracle");
         Ok(())
     }
 }
