@@ -59,40 +59,23 @@ pub async fn get_jupiter_quote(
     );
 
     // Create HTTP client with timeout configuration
-    // CRITICAL: Set timeout to prevent hanging on slow/down Jupiter API
-    // 15 seconds allows for busy periods when Jupiter API can take 10+ seconds
+    // CRITICAL FIX: Use only reqwest timeout to avoid race conditions with tokio timeout
+    // Reqwest timeout handles both connection and read timeouts, including JSON parsing
+    // This is cleaner and avoids conflicts between two timeout layers
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
         .context("Failed to create HTTP client")?;
 
-    // Wrap the entire request in a tokio timeout for additional safety
-    // This ensures we fail fast even if reqwest timeout doesn't work
-    let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
-    
-    let response_result = tokio::time::timeout(timeout_duration, async {
-        client
-            .get(&url)
-            .send()
-            .await
-    })
-    .await;
-
-    let response = match response_result {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "Jupiter API request failed: {}",
-                e
-            ));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Jupiter API request timed out after {} seconds",
-                REQUEST_TIMEOUT_SECS
-            ));
-        }
-    };
+    // Send request - reqwest timeout will handle both connection and response timeouts
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context(format!(
+            "Jupiter API request failed or timed out after {} seconds",
+            REQUEST_TIMEOUT_SECS
+        ))?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -101,24 +84,11 @@ pub async fn get_jupiter_quote(
         ));
     }
 
-    // Parse JSON with timeout protection
-    let quote_result = tokio::time::timeout(timeout_duration, response.json::<JupiterQuote>()).await;
-    
-    let quote: JupiterQuote = match quote_result {
-        Ok(Ok(q)) => q,
-        Ok(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "Failed to parse Jupiter quote: {}",
-                e
-            ));
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Jupiter API response parsing timed out after {} seconds",
-                REQUEST_TIMEOUT_SECS
-            ));
-        }
-    };
+    // Parse JSON - reqwest timeout also covers JSON parsing time
+    let quote: JupiterQuote = response
+        .json()
+        .await
+        .context("Failed to parse Jupiter quote JSON response")?;
 
     Ok(quote)
 }

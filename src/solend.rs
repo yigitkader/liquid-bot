@@ -20,6 +20,9 @@ impl Number {
 // Helper implementation for Obligation
 impl Obligation {
     /// Parse obligation from account data using Borsh
+    /// 
+    /// CRITICAL SECURITY: Validates version field to detect layout changes.
+    /// If Solend updates their layout (e.g., v1 -> v2), this will catch it early.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         // Skip discriminator (first 8 bytes) if present
         let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
@@ -27,12 +30,31 @@ impl Obligation {
         } else {
             data
         };
-        BorshDeserialize::try_from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Obligation: {}", e))
+        
+        let obligation: Obligation = BorshDeserialize::try_from_slice(data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize Obligation: {}", e))?;
+        
+        // CRITICAL: Validate version to detect layout changes
+        // Solend Obligation version 1 is the current supported version
+        // If Solend updates to v2, this will prevent silent parsing errors
+        const EXPECTED_VERSION: u8 = 1;
+        if obligation.version != EXPECTED_VERSION {
+            return Err(anyhow::anyhow!(
+                "Unsupported Obligation version: {} (expected {}). \
+                 Layout may have changed, please update bot to support new version.",
+                obligation.version,
+                EXPECTED_VERSION
+            ));
+        }
+        
+        Ok(obligation)
     }
 
     /// Calculate health factor: allowedBorrowValue / borrowedValue
     /// Per Structure.md section 4.2
+    /// 
+    /// NOTE: This uses f64 which has precision loss for very large values.
+    /// For high-precision calculations, use health_factor_u128() instead.
     pub fn health_factor(&self) -> f64 {
         let borrowed = self.borrowedValue.to_f64();
         if borrowed == 0.0 {
@@ -45,6 +67,49 @@ impl Obligation {
     /// Alias for health_factor (backward compatibility)
     pub fn calculate_health_factor(&self) -> f64 {
         self.health_factor()
+    }
+
+    /// Calculate health factor using u128 arithmetic to avoid precision loss
+    /// Returns health factor in WAD format (multiplied by 10^18)
+    /// 
+    /// CRITICAL: This preserves full precision for large values.
+    /// f64 only has ~15 significant digits, but u128 WAD format has 36 digits.
+    /// 
+    /// Returns u128::MAX if borrowed is 0 (represents infinity).
+    /// Returns u128::MAX on overflow (should not happen in practice).
+    /// 
+    /// Example:
+    ///   HF = 1.0 => returns 1_000_000_000_000_000_000 (WAD)
+    ///   HF = 0.5 => returns 500_000_000_000_000_000 (WAD / 2)
+    pub fn health_factor_u128(&self) -> u128 {
+        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+        
+        let borrowed = self.borrowedValue.value;
+        if borrowed == 0 {
+            return u128::MAX; // Infinity representation
+        }
+        
+        let weighted_collateral = self.allowedBorrowValue.value;
+        
+        // HF = weighted_collateral / borrowed (in WAD format)
+        // Result in WAD format: (weighted_collateral * WAD) / borrowed
+        weighted_collateral
+            .checked_mul(WAD)
+            .and_then(|v| v.checked_div(borrowed))
+            .unwrap_or(u128::MAX) // Overflow protection
+    }
+
+    /// Check if obligation is liquidatable using high-precision u128 arithmetic
+    /// 
+    /// Returns true if health factor < 1.0 (in WAD format: HF < WAD)
+    /// 
+    /// CRITICAL: This uses u128 arithmetic to avoid precision loss that could
+    /// cause false positives/negatives near the liquidation threshold (HF = 1.0).
+    pub fn is_liquidatable(&self) -> bool {
+        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+        
+        // HF < 1.0 => health_factor_u128 < WAD
+        self.health_factor_u128() < WAD
     }
 
     /// Get total deposited value in USD
@@ -204,6 +269,9 @@ pub fn get_liquidate_obligation_discriminator() -> u8 {
 // Helper implementation for Reserve
 impl Reserve {
     /// Parse reserve from account data using Borsh
+    /// 
+    /// CRITICAL SECURITY: Validates version field to detect layout changes.
+    /// If Solend updates their layout (e.g., v1 -> v2), this will catch it early.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         // Skip discriminator (first 8 bytes) if present
         let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
@@ -211,8 +279,24 @@ impl Reserve {
         } else {
             data
         };
-        BorshDeserialize::try_from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Reserve: {}", e))
+        
+        let reserve: Reserve = BorshDeserialize::try_from_slice(data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize Reserve: {}", e))?;
+        
+        // CRITICAL: Validate version to detect layout changes
+        // Solend Reserve version 1 is the current supported version
+        // If Solend updates to v2, this will prevent silent parsing errors
+        const EXPECTED_VERSION: u8 = 1;
+        if reserve.version != EXPECTED_VERSION {
+            return Err(anyhow::anyhow!(
+                "Unsupported Reserve version: {} (expected {}). \
+                 Layout may have changed, please update bot to support new version.",
+                reserve.version,
+                EXPECTED_VERSION
+            ));
+        }
+        
+        Ok(reserve)
     }
 
     /// Get mint address from reserve (liquidity mint)
