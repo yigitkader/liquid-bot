@@ -678,9 +678,8 @@ async fn validate_switchboard_oracle_if_available(
     reserve: &Reserve,
     current_slot: u64,
 ) -> Result<Option<f64>> {
-    // NOTE: Switchboard SDK import is commented out due to SDK compatibility issues
-    // When SDK is updated to fix Ref<'_, &mut [u8]> type issue, uncomment this:
-    // use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
+    // Use new Switchboard On-Demand SDK (Solana 2.0 compatible)
+    use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
     
     // 1. Get switchboard_oracle_pubkey from reserve.config (DYNAMIC - from chain)
     let switchboard_oracle_pubkey = reserve.config.switchboardOraclePubkey;
@@ -705,57 +704,31 @@ async fn validate_switchboard_oracle_if_available(
         return Ok(None);
     }
 
-    // 3. Parse using Switchboard SDK for off-chain usage
+    // 3. Parse using Switchboard On-Demand SDK (Solana 2.0 compatible)
     // 
-    // CRITICAL: Switchboard SDK compatibility issue - parse() method signature has type mismatch.
-    // The SDK's parse() method expects Ref<'_, &mut [u8]>, but Rust's type system prevents
-    // creating a mutable reference from an immutable Ref. This is a known SDK compatibility issue.
-    // 
-    // SOLUTION: Gracefully fall back to Pyth-only mode with stricter validation.
-    // This is the recommended approach per Problems.md section "PROBLEM 6: Switchboard SDK Compatibility".
-    // 
-    // When Switchboard SDK is updated to fix this issue, we can re-enable Switchboard parsing.
-    // For now, we return None to indicate Switchboard is unavailable, and the code will
-    // use Pyth-only mode with stricter confidence thresholds (already implemented).
-    // 
-    // NOTE: This does NOT break the bot - it simply uses Pyth as the sole oracle source
-    // with stricter validation (MAX_CONFIDENCE_PCT_PYTH_ONLY = 2% vs 5% with Switchboard).
-    log::warn!(
-        "Switchboard feed parsing temporarily disabled due to SDK compatibility issue. \
-         Falling back to Pyth-only mode with stricter validation ({}% confidence threshold). \
-         This is safe and does not affect bot functionality.",
-        MAX_CONFIDENCE_PCT_PYTH_ONLY
-    );
-    return Ok(None); // Graceful fallback to Pyth-only mode
-    
-    // TODO: Re-enable Switchboard parsing when SDK is updated to fix Ref<'_, &mut [u8]> type issue
-    // The code below is commented out until SDK compatibility is resolved:
-    /*
-    use std::cell::{RefCell, RefMut};
-    let mut account_data = oracle_account.data.clone();
-    let account_data_cell = RefCell::new(account_data.as_mut_slice());
-    let feed = match PullFeedAccountData::parse(RefMut::map(
-        account_data_cell.borrow_mut(),
-        |data| data
-    )) {
-        Ok(feed) => feed,
+    // PullFeedAccountData implements Pod (Plain Old Data), so we can use bytemuck
+    // to directly deserialize from the account data. This is the recommended approach
+    // for off-chain clients, as the SDK's parse() method is designed for Anchor's
+    // account.data.borrow() pattern which requires Ref<'_, &mut [u8]>.
+    use bytemuck::Pod;
+    let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
+        Ok(feed) => *feed,
         Err(e) => {
             log::warn!(
-                "Switchboard feed parsing failed (SDK compatibility issue?): {}. \
-                 Falling back to Pyth-only mode with stricter validation.",
-                e
+                "Switchboard feed parsing failed for {}: {}. \
+                 Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
+                switchboard_oracle_pubkey,
+                e,
+                MAX_CONFIDENCE_PCT_PYTH_ONLY
             );
             return Ok(None);
         }
     };
-    */
     
-    // NOTE: The code below is commented out because Switchboard parsing is temporarily disabled
-    // due to SDK compatibility issues. When SDK is updated, uncomment this code:
-    /*
-    // 4. Get price using SDK's value() method
-    // value(current_slot) requires current slot for staleness checking
+    // 4. Get price using SDK's value() method with staleness check
+    // The value() method requires current slot for staleness validation
     // It returns Result<Decimal, OnDemandError> - Ok if valid, Err if stale/insufficient
+    use rust_decimal::Decimal;
     let price_decimal = match feed.value(current_slot) {
         Ok(v) => v,
         Err(e) => {
@@ -767,9 +740,9 @@ async fn validate_switchboard_oracle_if_available(
             return Ok(None);
         }
     };
-
-    // 5. Convert Decimal to f64 for compatibility
-    // rust_decimal::Decimal provides better precision, but we use f64 for consistency
+    
+    // 5. Convert Decimal to f64
+    // rust_decimal::Decimal provides better precision, but we use f64 for consistency with Pyth
     let price = price_decimal.to_string().parse::<f64>()
         .unwrap_or_else(|_| {
             // Fallback: manual conversion using mantissa and scale
@@ -777,25 +750,26 @@ async fn validate_switchboard_oracle_if_available(
             let scale = price_decimal.scale();
             mantissa as f64 / 10_f64.powi(scale as i32)
         });
-
+    
     // 6. Validate price is positive and reasonable
     if price <= 0.0 || !price.is_finite() {
         log::debug!(
-            "Switchboard oracle price is invalid: {} (from feed {})",
+            "Switchboard oracle price is invalid: {} (from feed {}, decimal: {})",
             price,
-            switchboard_oracle_pubkey
+            switchboard_oracle_pubkey,
+            price_decimal
         );
         return Ok(None);
     }
-
+    
     log::debug!(
-        "✅ Switchboard oracle validation passed for {} (price: {})",
+        "✅ Switchboard oracle validation passed for {} (price: {}, decimal: {})",
         switchboard_oracle_pubkey,
-        price
+        price,
+        price_decimal
     );
-
+    
     Ok(Some(price))
-    */
 }
 
 /// Validate Pyth oracle per Structure.md section 5.2

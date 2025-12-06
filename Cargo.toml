@@ -31,3 +31,4 @@ chrono = "0.4"
 sha2 = "0.10"
 switchboard-on-demand = { git = "https://github.com/switchboard-xyz/solana-sdk", branch = "main", default-features = false, features = ["client", "solana-v2"] }
 rust_decimal = "1"
+bytemuck = "1.24.0"

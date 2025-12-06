@@ -135,38 +135,38 @@ Pyth Network, Solana ekosisteminde en yaygın kullanılan oracle protokolüdür.
    ```rust
    const PYTH_PROGRAM_ID: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH";
    ```
-    - Oracle account'un Pyth program'ına ait olduğunu doğrular
+   - Oracle account'un Pyth program'ına ait olduğunu doğrular
 
 2. **Magic Number ve Version Kontrolü**
-    - Pyth v2 magic: `[0xa1, 0xb2, 0xc3, 0xd4]`
-    - Version: `2`
+   - Pyth v2 magic: `[0xa1, 0xb2, 0xc3, 0xd4]`
+   - Version: `2`
 
 3. **Price Status Kontrolü**
-    - Sadece `Trading` status (2) kabul edilir
-    - `Unknown`, `Halted`, `Auction` status'leri reddedilir
+   - Sadece `Trading` status (2) kabul edilir
+   - `Unknown`, `Halted`, `Auction` status'leri reddedilir
 
 4. **Staleness Kontrolü**
    ```rust
    const MAX_SLOT_DIFFERENCE: u64 = 150; // ~1 dakika
    ```
-    - `valid_slot`: Price'ın geçerli olduğu son slot
-    - `last_slot`: Price'ın son güncellendiği slot
-    - Her iki kontrol de yapılır
+   - `valid_slot`: Price'ın geçerli olduğu son slot
+   - `last_slot`: Price'ın son güncellendiği slot
+   - Her iki kontrol de yapılır
 
 5. **Confidence Interval Kontrolü**
    ```rust
    const MAX_CONFIDENCE_PCT: f64 = 5.0; // Switchboard varsa %5
    const MAX_CONFIDENCE_PCT_PYTH_ONLY: f64 = 2.0; // Sadece Pyth varsa %2
    ```
-    - Confidence interval, price'ın yüzdesi olarak hesaplanır
-    - Switchboard yoksa daha sıkı threshold kullanılır
+   - Confidence interval, price'ın yüzdesi olarak hesaplanır
+   - Switchboard yoksa daha sıkı threshold kullanılır
 
 6. **Price Parsing**
    ```rust
    let price = price_raw as f64 * 10_f64.powi(exponent);
    ```
-    - Pyth price'ları `i64` formatında, exponent ile normalize edilir
-    - Örnek: `price_raw=150000000, exponent=-8 → 1.5 USD`
+   - Pyth price'ları `i64` formatında, exponent ile normalize edilir
+   - Örnek: `price_raw=150000000, exponent=-8 → 1.5 USD`
 
 #### Pyth Özellikleri
 

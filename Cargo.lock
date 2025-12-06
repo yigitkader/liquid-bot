@@ -2568,6 +2568,7 @@ dependencies = [
  "borsh 1.6.0",
  "borsh-derive 1.6.0",
  "bs58 0.5.1",
+ "bytemuck",
  "chrono",
  "dotenv",
  "env_logger 0.10.2",
