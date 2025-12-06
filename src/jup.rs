@@ -119,12 +119,20 @@ pub async fn get_jupiter_quote_with_retry(
             Err(e) => {
                 last_error = Some(e);
                 if attempt < max_retries {
-                    let delay_ms = 500 * attempt as u64;
+                    // ✅ FIXED: Exponential backoff with jitter
+                    // Base delay: 500ms * attempt (500ms, 1000ms, 1500ms...)
+                    // Jitter: random 0-200ms to prevent thundering herd
+                    use rand::Rng;
+                    let base_delay_ms = 500 * attempt as u64;
+                    let jitter_ms = rand::thread_rng().gen_range(0..200);
+                    let delay_ms = base_delay_ms + jitter_ms;
                     log::warn!(
-                        "Jupiter quote attempt {}/{} failed, retrying in {}ms...",
+                        "Jupiter quote attempt {}/{} failed, retrying in {}ms (base: {}ms + jitter: {}ms)...",
                         attempt,
                         max_retries,
-                        delay_ms
+                        delay_ms,
+                        base_delay_ms,
+                        jitter_ms
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }

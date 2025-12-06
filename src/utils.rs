@@ -393,13 +393,21 @@ pub async fn rpc_account_exists_with_retry(
             }
             Err(_) => {
                 if attempt < max_retries {
-                    let delay_ms = 200 * attempt as u64; // Exponential backoff: 200ms, 400ms, 600ms...
+                    // ✅ FIXED: Exponential backoff with jitter
+                    // Base delay: 200ms * attempt (200ms, 400ms, 600ms...)
+                    // Jitter: random 0-100ms to prevent thundering herd
+                    use rand::Rng;
+                    let base_delay_ms = 200 * attempt as u64;
+                    let jitter_ms = rand::thread_rng().gen_range(0..100);
+                    let delay_ms = base_delay_ms + jitter_ms;
                     log::debug!(
-                        "RPC get_account attempt {}/{} failed for {}, retrying in {}ms...",
+                        "RPC get_account attempt {}/{} failed for {}, retrying in {}ms (base: {}ms + jitter: {}ms)...",
                         attempt,
                         max_retries,
                         pubkey,
-                        delay_ms
+                        delay_ms,
+                        base_delay_ms,
+                        jitter_ms
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }

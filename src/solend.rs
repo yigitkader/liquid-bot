@@ -207,12 +207,10 @@ impl Obligation {
         const LEGACY_VERSION: u8 = 0;
         
         if obligation.version == LEGACY_VERSION {
-            // Version 0 is legacy but still valid - log warning but allow
-            log::warn!(
-                "Obligation version {} (legacy) detected. Version {} is recommended. \
-                 Account is still valid but may have different layout.",
-                obligation.version,
-                EXPECTED_VERSION
+            // Version 0 is legacy but still valid - log debug (not warning to reduce spam)
+            log::debug!(
+                "Obligation version {} (legacy) - still valid",
+                obligation.version
             );
         } else if obligation.version != EXPECTED_VERSION {
             // Unknown version - reject
@@ -609,63 +607,32 @@ impl Reserve {
         
         log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
         
-        // CRITICAL: Calculate expected Reserve struct size
-        // Reserve struct: 1 + 9 + 32*8 + 1 + 8*4 + 16*6 + 1*12 + 8*4 + 16*2 + 8*1 + 1*2 + 8*1 = 619 bytes
-        // BUT: Actual Solend Reserve accounts are 1300 bytes (layout is incomplete/incorrect)
-        // TEMPORARY FIX: Parse only the first 619 bytes, ignore the rest
-        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 619;
-        const ACTUAL_RESERVE_ACCOUNT_SIZE: usize = 1300; // Real account size on-chain
+        // ✅ FIXED: Reserve struct now includes all fields including padding (1300 bytes total)
+        // Layout generator has been fixed to extract all fields from SDK and add missing padding
+        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 1300; // Full Reserve struct size including padding
         
-        // If account is 1300 bytes (actual size), parse only first 619 bytes (known struct size)
-        let data_to_parse = if data.len() == ACTUAL_RESERVE_ACCOUNT_SIZE {
-            log::debug!("Reserve account is {} bytes (expected struct: {} bytes) - parsing first {} bytes only", 
-                data.len(), EXPECTED_RESERVE_STRUCT_SIZE, EXPECTED_RESERVE_STRUCT_SIZE);
-            &data[..EXPECTED_RESERVE_STRUCT_SIZE]
-        } else if data.len() < EXPECTED_RESERVE_STRUCT_SIZE {
+        // Validate data length
+        if data.len() < EXPECTED_RESERVE_STRUCT_SIZE {
             return Err(anyhow::anyhow!(
                 "Reserve data too short: {} bytes (minimum: {} bytes)", 
                 data.len(), 
                 EXPECTED_RESERVE_STRUCT_SIZE
             ));
-        } else {
-            // Try full data first, fallback to slice if needed
-            data
-        };
+        }
         
-        let reserve: Reserve = match BorshDeserialize::try_from_slice(data_to_parse) {
+        // ✅ FIXED: Parse full 1300 bytes - struct now matches actual account size
+        let reserve: Reserve = match BorshDeserialize::try_from_slice(data) {
             Ok(res) => res,
             Err(e) => {
-                // If error is "Not all bytes read" and we have extra bytes, try slicing to exact size
-                let error_msg = e.to_string();
-                if error_msg.contains("Not all bytes read") && data.len() >= EXPECTED_RESERVE_STRUCT_SIZE {
-                    let extra_bytes = data.len() - EXPECTED_RESERVE_STRUCT_SIZE;
-                    log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - trying exact slice", extra_bytes);
-                    // Try deserializing only the expected size (ignore extra padding bytes)
-                    match BorshDeserialize::try_from_slice(&data[..EXPECTED_RESERVE_STRUCT_SIZE]) {
-                        Ok(res) => res,
-                        Err(e2) => {
-                            log::error!("Borsh deserialization failed even with exact slice: {}", e2);
-                            log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
-                            if data.len() > 0 {
-                                log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
-                            }
-                            if data.len() > 1 {
-                                log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
-                            }
-                            return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e2));
-                        }
-                    }
-                } else {
                 log::error!("Borsh deserialization failed: {}", e);
-                    log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
+                log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
                 if data.len() > 0 {
                     log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
                 }
                 if data.len() > 1 {
                     log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
                 }
-                    return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
-                }
+                return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
             }
         };
         
@@ -828,6 +795,20 @@ pub fn find_usdc_mint_from_reserves(
     let known_usdc_mint = Pubkey::from_str(USDC_MINT_MAINNET)
         .map_err(|e| anyhow::anyhow!("Invalid known USDC mint: {}", e))?;
     
+    log::info!("🔍 Starting USDC reserve discovery...");
+    log::info!("   Program ID: {}", program_id);
+    log::info!("   Expected USDC mint: {}", known_usdc_mint);
+    
+    // Log RPC URL (partially masked for security)
+    if let Ok(rpc_url) = std::env::var("RPC_URL") {
+        let masked_url = if rpc_url.len() > 30 {
+            format!("{}...{}", &rpc_url[..15], &rpc_url[rpc_url.len()-15..])
+        } else {
+            "***".to_string()
+        };
+        log::info!("   RPC URL: {} (masked)", masked_url);
+    }
+    
     // CRITICAL: Read all reserves from chain - no mock/dummy data
     // Add retry mechanism for RPC errors (network issues, rate limits, etc.)
     
@@ -932,29 +913,170 @@ pub fn find_usdc_mint_from_reserves(
         ));
     }
     
+    log::info!("🔍 Searching for USDC reserve among {} accounts...", accounts_count);
+    log::info!("   Account size distribution will be analyzed during parsing...");
+    
     // Search for USDC reserve by checking all reserves from chain
-    for (_pubkey, account) in accounts {
-        if let Ok(reserve) = Reserve::from_account_data(&account.data) {
-            let mint = reserve.mint_pubkey();
-            // Check if this reserve is USDC (by mint address)
-            if mint == known_usdc_mint {
-                log::info!("✅ Found USDC reserve from chain (mint: {})", mint);
-                return Ok(mint);
+    let mut parsed_reserves = 0;
+    let mut skipped_accounts = 0;
+    let mut parse_errors = 0;
+    let mut found_mints = std::collections::HashSet::new();
+    let mut account_size_distribution = std::collections::HashMap::new();
+    let start_time = std::time::Instant::now();
+    
+    for (pubkey, account) in &accounts {
+        let account_size = account.data.len();
+        
+        // Track account size distribution
+        *account_size_distribution.entry(account_size).or_insert(0) += 1;
+        
+        // Pre-filter: Reserves should be ~1300 bytes (same as obligations, but we'll try to parse)
+        // Skip accounts that are clearly too small (LendingMarkets are ~200-300 bytes)
+        if account_size < 400 {
+            skipped_accounts += 1;
+            continue;
+        }
+        
+        // Try to parse as Reserve
+        match Reserve::from_account_data(&account.data) {
+            Ok(reserve) => {
+                parsed_reserves += 1;
+                let liquidity_mint = reserve.mint_pubkey();
+                let collateral_mint = reserve.collateral_mint_pubkey();
+                found_mints.insert(liquidity_mint);
+                found_mints.insert(collateral_mint);
+                
+                // Log first 20 reserves found for debugging
+                if parsed_reserves <= 20 {
+                    log::info!("  ✅ Reserve #{}: liquidity_mint={}, collateral_mint={}, pubkey={}", 
+                               parsed_reserves, liquidity_mint, collateral_mint, pubkey);
+                }
+                
+                // Progress logging every 1000 reserves
+                if parsed_reserves % 1000 == 0 {
+                    let elapsed = start_time.elapsed().as_secs();
+                    let rate = if elapsed > 0 { parsed_reserves as f64 / elapsed as f64 } else { 0.0 };
+                    log::info!("  📊 Progress: {} reserves parsed ({} reserves/sec, {} unique mints found)", 
+                               parsed_reserves, rate as u64, found_mints.len());
+                }
+                
+                // Check if this reserve is USDC (check both liquidity and collateral mints)
+                // USDC is typically a liquidity mint (debt token), but check both to be safe
+                if liquidity_mint == known_usdc_mint {
+                    let elapsed = start_time.elapsed();
+                    log::info!("✅ Found USDC reserve from chain (as liquidity mint)!");
+                    log::info!("   Reserve pubkey: {}", pubkey);
+                    log::info!("   USDC liquidity mint: {}", liquidity_mint);
+                    log::info!("   Collateral mint: {}", collateral_mint);
+                    log::info!("   Parsed {} reserves total in {:?}", parsed_reserves, elapsed);
+                    log::info!("   Skipped {} accounts (too small)", skipped_accounts);
+                    log::info!("   Found {} unique token mints", found_mints.len());
+                    return Ok(liquidity_mint);
+                } else if collateral_mint == known_usdc_mint {
+                    let elapsed = start_time.elapsed();
+                    log::warn!("⚠️  Found USDC as collateral mint (unusual, but using liquidity mint)");
+                    log::info!("   Reserve pubkey: {}", pubkey);
+                    log::info!("   Liquidity mint: {}", liquidity_mint);
+                    log::info!("   USDC collateral mint: {}", collateral_mint);
+                    log::info!("   Note: Using liquidity mint for USDC operations");
+                    log::info!("   Parsed {} reserves total in {:?}", parsed_reserves, elapsed);
+                    // Still return liquidity mint as USDC is typically used as debt token
+                    // But log this unusual case
+                    return Ok(liquidity_mint);
+                }
+            }
+            Err(e) => {
+                parse_errors += 1;
+                // Log first few parse errors for debugging
+                if parse_errors <= 5 {
+                    log::debug!("  ❌ Failed to parse account {} (size: {} bytes): {}", 
+                                pubkey, account_size, e);
+                }
             }
         }
     }
+    
+    let elapsed = start_time.elapsed();
+    log::warn!("⚠️  USDC reserve not found after parsing {} reserves", parsed_reserves);
+    log::warn!("   Total accounts checked: {}", accounts_count);
+    log::warn!("   Successfully parsed: {} reserves", parsed_reserves);
+    log::warn!("   Parse errors: {}", parse_errors);
+    log::warn!("   Skipped (too small): {} accounts", skipped_accounts);
+    log::warn!("   Unique mints found: {}", found_mints.len());
+    log::warn!("   Time taken: {:?}", elapsed);
+    
+    // Log account size distribution (top 10 most common sizes)
+    let mut size_dist: Vec<_> = account_size_distribution.iter().collect();
+    size_dist.sort_by(|a, b| b.1.cmp(a.1));
+    log::info!("📊 Account size distribution (top 10):");
+    for (size, count) in size_dist.iter().take(10) {
+        log::info!("   {} bytes: {} accounts", size, count);
+    }
+    
+    // Log first 20 unique mints found (for debugging)
+    if !found_mints.is_empty() {
+        log::info!("📋 First 20 unique token mints found in reserves:");
+        for (idx, mint) in found_mints.iter().take(20).enumerate() {
+            log::info!("   {}. {}", idx + 1, mint);
+        }
+        if found_mints.len() > 20 {
+            log::info!("   ... and {} more mints", found_mints.len() - 20);
+        }
+    }
+    
+    // Try to write all mints to a file for manual inspection
+    let mints_file = "logs/found_mints.txt";
+    if let Ok(mut file) = std::fs::File::create(mints_file) {
+        use std::io::Write;
+        writeln!(file, "# All token mints found in Solend reserves").ok();
+        writeln!(file, "# Total: {} unique mints", found_mints.len()).ok();
+        writeln!(file, "# Expected USDC mint: {}", known_usdc_mint).ok();
+        writeln!(file, "").ok();
+        for mint in &found_mints {
+            writeln!(file, "{}", mint).ok();
+        }
+        log::info!("💾 All {} unique mints written to: {}", found_mints.len(), mints_file);
+        log::info!("   You can search for USDC in this file to verify if it exists with a different address");
+    }
+    
+    // Check if USDC might be in the list with a different address
+    log::warn!("🔍 Checking if USDC exists with a different mint address...");
+    log::warn!("   This Solend instance may use a different USDC variant (e.g., USDC.e)");
+    log::warn!("   Or USDC may not be available in this Solend program");
     
     // CRITICAL: No fallback - if USDC reserve not found, it's an error
     // This ensures we're always using real chain data, not hardcoded values
     // CRITICAL: Only mainnet is supported - no devnet/testnet
     Err(anyhow::anyhow!(
         "USDC reserve not found in chain data. \
-         Found {} reserves but none match USDC mint {}. \
-         This bot only supports mainnet production. \
-         Please verify RPC_URL points to mainnet (https://api.mainnet-beta.solana.com or premium mainnet RPC) \
-         and that the Solend program is accessible on mainnet.",
+         Checked {} accounts, successfully parsed {} reserves, but none match USDC mint {}. \
+         \n\
+         Analysis:\n\
+         - Found {} unique token mints (both liquidity and collateral)\n\
+         - USDC mint {} was not found in any reserve\n\
+         - All mints have been saved to: {}\n\
+         \n\
+         Possible causes:\n\
+         1. This Solend program instance does not have a USDC reserve\n\
+         2. USDC may be using a different mint address (check {})\n\
+         3. RPC_URL may not be pointing to the correct Solend program\n\
+         4. Solend program layout may have changed\n\
+         \n\
+         Troubleshooting:\n\
+         - Check {} file to see all available mints\n\
+         - Verify Solend program ID is correct: {}\n\
+         - Verify RPC_URL points to mainnet\n\
+         - Check Solana Explorer for this program's reserves\n\
+         - Consider if USDC is actually needed (maybe use a different stablecoin?)",
         accounts_count,
-        known_usdc_mint
+        parsed_reserves,
+        known_usdc_mint,
+        found_mints.len(),
+        known_usdc_mint,
+        mints_file,
+        mints_file,
+        mints_file,
+        program_id
     ))
 }
 

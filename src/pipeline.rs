@@ -139,7 +139,7 @@ pub async fn run_liquidation_loop(
             // AccountNotFound is OK - Jito tip accounts are just transfer addresses
             // They don't need to exist in RPC, they're just used for SOL transfers
             // Bot will work fine - tip transaction will be created and sent
-            log::info!(
+            log::warn!(
                 "ℹ️  Jito tip account {} not found in RPC (this is OK - tip accounts are transfer addresses, not regular accounts). \
                  Bot will work normally - tip transaction will be created when sending bundles.",
                 jito_tip_account
@@ -1004,8 +1004,12 @@ async fn build_liquidation_context(
 /// Pyth Network program ID (mainnet)
 const PYTH_PROGRAM_ID: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH";
 
-/// Switchboard program ID (mainnet)
-const SWITCHBOARD_PROGRAM_ID: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f";
+/// Switchboard v2 program ID (mainnet)
+const SWITCHBOARD_PROGRAM_ID_V2: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f";
+
+/// Switchboard On-Demand v3 program ID (mainnet)
+/// Solend uses Switchboard On-Demand v3, so this is the primary program ID we check
+const SWITCHBOARD_PROGRAM_ID_V3: &str = "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv";
 
 /// Maximum allowed confidence interval (as percentage of price)
 /// When Switchboard is available, this is used as secondary validation.
@@ -1126,30 +1130,110 @@ fn get_price_caches() -> &'static RwLock<HashMap<Pubkey, OraclePriceCache>> {
 
 /// Pyth price status values (from price_type byte)
 /// PriceType enum: Unknown = 0, Price = 1, Trading = 2, Halted = 3, Auction = 4
-const PYTH_PRICE_STATUS_TRADING: u8 = 2;
 const PYTH_PRICE_STATUS_UNKNOWN: u8 = 0;
+const PYTH_PRICE_STATUS_PRICE: u8 = 1; // Price status - acceptable for liquidations
+const PYTH_PRICE_STATUS_TRADING: u8 = 2; // Trading status - preferred for liquidations
 const PYTH_PRICE_STATUS_HALTED: u8 = 3;
 
 /// Validate Pyth and Switchboard oracles per Structure.md section 5.2
+/// Helper function to get price from either Pyth or Switchboard oracle
+/// Returns (price, has_pyth, has_switchboard) where:
+/// - price: Some(f64) if valid price found, None otherwise
+/// - has_pyth: true if price came from Pyth
+/// - has_switchboard: true if price came from Switchboard (and we also checked for cross-validation)
+async fn get_reserve_price(
+    rpc: &Arc<RpcClient>,
+    reserve: &Reserve,
+    current_slot: u64,
+) -> Result<(Option<f64>, bool, bool)> {
+    let pyth_pubkey = reserve.oracle_pubkey();
+    let switchboard_pubkey = reserve.config().switchboardOraclePubkey;
+    
+    // Try Pyth first if available
+    if pyth_pubkey != Pubkey::default() {
+        match validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
+            Ok((valid, price)) => {
+                if valid {
+                    if let Some(price) = price {
+                        // Pyth succeeded - check if Switchboard is also available for cross-validation
+                        let has_switchboard = if switchboard_pubkey != Pubkey::default() {
+                            validate_switchboard_oracle_if_available(rpc, reserve, current_slot)
+                                .await?
+                                .is_some()
+                        } else {
+                            false
+                        };
+                        return Ok((Some(price), true, has_switchboard));
+                    }
+                }
+                // Pyth validation failed or no price - try Switchboard
+            }
+            Err(e) => {
+                log::debug!("Pyth oracle validation error: {}, trying Switchboard", e);
+                // Pyth error - try Switchboard
+            }
+        }
+    }
+    
+    // Pyth not available or failed - try Switchboard
+    if switchboard_pubkey != Pubkey::default() {
+        match validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
+            Ok(Some(switchboard_price)) => {
+                log::debug!("Using Switchboard price (Pyth not available or failed)");
+                return Ok((Some(switchboard_price), false, true));
+            }
+            Ok(None) => {
+                log::debug!("Switchboard oracle not available or invalid");
+            }
+            Err(e) => {
+                log::debug!("Switchboard oracle validation error: {}", e);
+            }
+        }
+    }
+    
+    // Neither oracle worked
+    Ok((None, false, false))
+}
+
 /// Returns (is_valid, borrow_price_usd, deposit_price_usd)
 async fn validate_oracles(
     rpc: &Arc<RpcClient>,
     borrow_reserve: &Option<Reserve>,
     deposit_reserve: &Option<Reserve>,
 ) -> Result<(bool, Option<f64>, Option<f64>)> {
-    // Basic validation: check if reserves exist and have oracle pubkeys
+    // ✅ FIXED: Check if reserves exist and have EITHER Pyth OR Switchboard oracle
     let borrow_ok = borrow_reserve
         .as_ref()
-        .map(|r| r.oracle_pubkey() != Pubkey::default())
+        .map(|r| {
+            // Check if Pyth oracle exists
+            if r.oracle_pubkey() != Pubkey::default() {
+                return true;
+            }
+            // Check if Switchboard oracle exists
+            if r.config().switchboardOraclePubkey != Pubkey::default() {
+                return true;
+            }
+            false
+        })
         .unwrap_or(false);
 
     let deposit_ok = deposit_reserve
         .as_ref()
-        .map(|r| r.oracle_pubkey() != Pubkey::default())
+        .map(|r| {
+            // Check if Pyth oracle exists
+            if r.oracle_pubkey() != Pubkey::default() {
+                return true;
+            }
+            // Check if Switchboard oracle exists
+            if r.config().switchboardOraclePubkey != Pubkey::default() {
+                return true;
+            }
+            false
+        })
         .unwrap_or(false);
 
     if !borrow_ok || !deposit_ok {
-        log::debug!("Oracle validation failed: missing oracle pubkeys");
+        log::debug!("Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
         return Ok((false, None, None));
     }
 
@@ -1158,171 +1242,169 @@ async fn validate_oracles(
         .get_slot()
         .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
 
-    // Validate borrow reserve oracle
-    let borrow_pyth_price = if let Some(reserve) = borrow_reserve {
-        match validate_pyth_oracle(rpc, reserve.oracle_pubkey(), current_slot).await {
-            Ok((valid, price)) => {
-                if !valid {
-                    log::debug!("Borrow reserve oracle validation failed");
+    // ✅ FIXED: Validate borrow reserve oracle - try Pyth first, fallback to Switchboard
+    let (borrow_price, borrow_has_pyth, borrow_has_switchboard_for_crossval) = if let Some(reserve) = borrow_reserve {
+        match get_reserve_price(rpc, reserve, current_slot).await {
+            Ok((price, has_pyth, has_switchboard)) => {
+                if price.is_none() {
+                    log::debug!("Borrow reserve: No valid oracle price found");
                     return Ok((false, None, None));
                 }
-                price
+                (price, has_pyth, has_switchboard)
             }
             Err(e) => {
-                log::debug!("Borrow reserve oracle validation error: {}", e);
+                log::debug!("Borrow reserve oracle error: {}", e);
                 return Ok((false, None, None));
             }
         }
     } else {
-        None
+        (None, false, false)
     };
 
-    // Validate deposit reserve oracle
-    let deposit_pyth_price = if let Some(reserve) = deposit_reserve {
-        match validate_pyth_oracle(rpc, reserve.oracle_pubkey(), current_slot).await {
-            Ok((valid, price)) => {
-                if !valid {
-                    log::debug!("Deposit reserve oracle validation failed");
+    // ✅ FIXED: Validate deposit reserve oracle - try Pyth first, fallback to Switchboard
+    let (deposit_price, deposit_has_pyth, deposit_has_switchboard_for_crossval) = if let Some(reserve) = deposit_reserve {
+        match get_reserve_price(rpc, reserve, current_slot).await {
+            Ok((price, has_pyth, has_switchboard)) => {
+                if price.is_none() {
+                    log::debug!("Deposit reserve: No valid oracle price found");
                     return Ok((false, None, None));
                 }
-                price
+                (price, has_pyth, has_switchboard)
             }
             Err(e) => {
-                log::debug!("Deposit reserve oracle validation error: {}", e);
+                log::debug!("Deposit reserve oracle error: {}", e);
                 return Ok((false, None, None));
             }
         }
     } else {
-        None
+        (None, false, false)
     };
 
-    // Validate Switchboard oracles if available per Structure.md section 5.2
+    // ✅ FIXED: Validate Switchboard oracles if available per Structure.md section 5.2
     // "Switchboard varsa, Pyth ile sapma fazla mı?"
     // 
     // CRITICAL SECURITY: If Switchboard is NOT available, we rely solely on Pyth.
     // In this case, we apply stricter validation (stricter confidence threshold).
     // This mitigates the risk of Pyth oracle manipulation when no cross-validation exists.
     
-    let mut borrow_has_switchboard = false;
-    let mut deposit_has_switchboard = false;
-
-    // Validate Switchboard oracles if available for borrow reserve
-    if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_pyth_price) {
-        if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
-            rpc,
-            &borrow_reserve,
-            current_slot,
-        )
-        .await?
-        {
-            borrow_has_switchboard = true;
-            // Compare Pyth and Switchboard prices
-            let deviation_pct = ((borrow_price - switchboard_price).abs() / borrow_price) * 100.0;
-            if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
-                log::warn!(
-                    "Oracle deviation too high for borrow reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
+    // Cross-validate: If we have both Pyth and Switchboard, compare them
+    if borrow_has_pyth && borrow_has_switchboard_for_crossval {
+        if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
+            if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
+                rpc,
+                borrow_reserve,
+                current_slot,
+            )
+            .await?
+            {
+                // Compare Pyth and Switchboard prices
+                let deviation_pct = ((borrow_price - switchboard_price).abs() / borrow_price) * 100.0;
+                if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
+                    log::warn!(
+                        "Oracle deviation too high for borrow reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
+                        deviation_pct,
+                        MAX_ORACLE_DEVIATION_PCT,
+                        borrow_price,
+                        switchboard_price
+                    );
+                    return Ok((false, None, None));
+                }
+                log::debug!(
+                    "✅ Oracle deviation OK for borrow reserve: {:.2}% (Pyth: {}, Switchboard: {})",
                     deviation_pct,
-                    MAX_ORACLE_DEVIATION_PCT,
                     borrow_price,
                     switchboard_price
                 );
-                return Ok((false, None, None));
             }
-            log::debug!(
-                "✅ Oracle deviation OK for borrow reserve: {:.2}% (Pyth: {}, Switchboard: {})",
-                deviation_pct,
-                borrow_price,
-                switchboard_price
-            );
         }
     }
 
-    // Validate Switchboard oracles if available for deposit reserve
-    if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_pyth_price) {
-        if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
-            rpc,
-            &deposit_reserve,
-            current_slot,
-        )
-        .await?
-        {
-            deposit_has_switchboard = true;
-            let deviation_pct = ((deposit_price - switchboard_price).abs() / deposit_price) * 100.0;
-            if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
-                log::warn!(
-                    "Oracle deviation too high for deposit reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
+    if deposit_has_pyth && deposit_has_switchboard_for_crossval {
+        if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
+            if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
+                rpc,
+                deposit_reserve,
+                current_slot,
+            )
+            .await?
+            {
+                let deviation_pct = ((deposit_price - switchboard_price).abs() / deposit_price) * 100.0;
+                if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
+                    log::warn!(
+                        "Oracle deviation too high for deposit reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
+                        deviation_pct,
+                        MAX_ORACLE_DEVIATION_PCT,
+                        deposit_price,
+                        switchboard_price
+                    );
+                    return Ok((false, None, None));
+                }
+                log::debug!(
+                    "✅ Oracle deviation OK for deposit reserve: {:.2}% (Pyth: {}, Switchboard: {})",
                     deviation_pct,
-                    MAX_ORACLE_DEVIATION_PCT,
                     deposit_price,
                     switchboard_price
                 );
-                return Ok((false, None, None));
             }
-            log::debug!(
-                "✅ Oracle deviation OK for deposit reserve: {:.2}% (Pyth: {}, Switchboard: {})",
-                deviation_pct,
-                deposit_price,
-                switchboard_price
-            );
         }
     }
 
-    // SECURITY: If Switchboard is NOT available for either reserve, apply stricter Pyth validation
+    // SECURITY: If Switchboard is NOT available for either reserve AND we're using Pyth, apply stricter Pyth validation
     // This mitigates the risk of relying solely on Pyth without cross-validation
-    if !borrow_has_switchboard || !deposit_has_switchboard {
+    // Note: If we're using Switchboard-only (no Pyth), we don't need this check
+    let borrow_needs_stricter_validation = borrow_has_pyth && !borrow_has_switchboard_for_crossval;
+    let deposit_needs_stricter_validation = deposit_has_pyth && !deposit_has_switchboard_for_crossval;
+    
+    if borrow_needs_stricter_validation || deposit_needs_stricter_validation {
         log::warn!(
-            "⚠️  SECURITY WARNING: Switchboard oracle not available (borrow: {}, deposit: {}). \
-             Relying solely on Pyth with stricter confidence threshold ({}% vs {}%). \
+            "⚠️  SECURITY WARNING: Switchboard oracle not available for cross-validation (borrow: {}, deposit: {}). \
+             Using Pyth-only with stricter confidence threshold ({}% vs {}%). \
              This increases risk of oracle manipulation.",
-            if borrow_has_switchboard { "✓" } else { "✗" },
-            if deposit_has_switchboard { "✓" } else { "✗" },
+            if borrow_has_switchboard_for_crossval { "✓" } else { "✗" },
+            if deposit_has_switchboard_for_crossval { "✓" } else { "✗" },
             MAX_CONFIDENCE_PCT_PYTH_ONLY,
             MAX_CONFIDENCE_PCT
         );
         
-        // Re-validate Pyth confidence with stricter threshold
-        if let Some(borrow_reserve) = borrow_reserve {
-            if !borrow_has_switchboard {
-                if let Some(borrow_price) = borrow_pyth_price {
-                    // Re-check Pyth confidence with stricter threshold
-                    let confidence_check = validate_pyth_confidence_strict(
-                        rpc,
-                        borrow_reserve.oracle_pubkey(),
-                        borrow_price,
-                        current_slot,
-                    ).await?;
-                    if !confidence_check {
-                        log::warn!(
-                            "Borrow reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
-                        );
-                        return Ok((false, None, None));
-                    }
+        // Re-validate Pyth confidence with stricter threshold (only if we're using Pyth without Switchboard)
+        if borrow_needs_stricter_validation {
+            if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
+                // Re-check Pyth confidence with stricter threshold
+                let confidence_check = validate_pyth_confidence_strict(
+                    rpc,
+                    borrow_reserve.oracle_pubkey(),
+                    borrow_price,
+                    current_slot,
+                ).await?;
+                if !confidence_check {
+                    log::warn!(
+                        "Borrow reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
+                    );
+                    return Ok((false, None, None));
                 }
             }
         }
         
-        if let Some(deposit_reserve) = deposit_reserve {
-            if !deposit_has_switchboard {
-                if let Some(deposit_price) = deposit_pyth_price {
-                    // Re-check Pyth confidence with stricter threshold
-                    let confidence_check = validate_pyth_confidence_strict(
-                        rpc,
-                        deposit_reserve.oracle_pubkey(),
-                        deposit_price,
-                        current_slot,
-                    ).await?;
-                    if !confidence_check {
-                        log::warn!(
-                            "Deposit reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
-                        );
-                        return Ok((false, None, None));
-                    }
+        if deposit_needs_stricter_validation {
+            if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
+                // Re-check Pyth confidence with stricter threshold
+                let confidence_check = validate_pyth_confidence_strict(
+                    rpc,
+                    deposit_reserve.oracle_pubkey(),
+                    deposit_price,
+                    current_slot,
+                ).await?;
+                if !confidence_check {
+                    log::warn!(
+                        "Deposit reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
+                    );
+                    return Ok((false, None, None));
                 }
             }
         }
     }
 
-    Ok((true, borrow_pyth_price, deposit_pyth_price))
+    Ok((true, borrow_price, deposit_price))
 }
 
 /// Enhanced oracle validation with TWAP protection
@@ -1463,15 +1545,29 @@ async fn validate_switchboard_oracle_if_available(
         .get_account(&switchboard_oracle_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get Switchboard oracle account from chain: {}", e))?;
 
-    let switchboard_program_id = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID)
-        .map_err(|e| anyhow::anyhow!("Invalid Switchboard program ID: {}", e))?;
+    // ✅ FIXED: Check for both Switchboard v2 and v3 program IDs
+    // Solend uses Switchboard On-Demand v3, but we also support v2 for compatibility
+    let switchboard_program_id_v2 = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID_V2)
+        .map_err(|e| anyhow::anyhow!("Invalid Switchboard v2 program ID: {}", e))?;
+    
+    let switchboard_program_id_v3 = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID_V3)
+        .map_err(|e| anyhow::anyhow!("Invalid Switchboard v3 program ID: {}", e))?;
 
-    if oracle_account.owner != switchboard_program_id {
+    if oracle_account.owner != switchboard_program_id_v2 
+        && oracle_account.owner != switchboard_program_id_v3 {
         log::debug!(
-            "Switchboard oracle account {} does not belong to Switchboard program",
-            switchboard_oracle_pubkey
+            "Switchboard oracle account {} does not belong to Switchboard v2 or v3 program (owner: {})",
+            switchboard_oracle_pubkey,
+            oracle_account.owner
         );
         return Ok(None);
+    }
+    
+    // Log which version we're using for debugging
+    if oracle_account.owner == switchboard_program_id_v3 {
+        log::trace!("Using Switchboard On-Demand v3 oracle");
+    } else {
+        log::trace!("Using Switchboard v2 oracle");
     }
 
     // 3. Parse using Switchboard On-Demand SDK (Solana 2.0 compatible)
@@ -1700,10 +1796,11 @@ async fn validate_pyth_oracle(
     }
 
     // Check price status (price_type byte)
-    // CRITICAL: Only Trading status (2) is acceptable for liquidations
-    // All other statuses (Unknown=0, Price=1, Halted=3, Auction=4) must be rejected
+    // ✅ FIXED: Accept both Trading (2) and Price (1) statuses for liquidations
+    // Trading is preferred, but Price status is also acceptable (feed may be updating)
+    // Reject: Unknown (0), Halted (3), Auction (4)
     let price_type = oracle_account.data[5];
-    if price_type != PYTH_PRICE_STATUS_TRADING {
+    if price_type != PYTH_PRICE_STATUS_TRADING && price_type != PYTH_PRICE_STATUS_PRICE {
         let status_name = match price_type {
             0 => "Unknown",
             1 => "Price",
@@ -1714,11 +1811,19 @@ async fn validate_pyth_oracle(
         };
         
         log::warn!(
-            "Pyth price status is {} ({}) - REJECTING oracle. Only Trading status is acceptable for liquidations.",
+            "Pyth price status is {} ({}) - REJECTING oracle. Only Trading or Price status is acceptable for liquidations.",
             price_type,
             status_name
         );
         return Ok((false, None));
+    }
+    
+    // Log which status we're accepting (for debugging)
+    if price_type == PYTH_PRICE_STATUS_PRICE {
+        log::debug!(
+            "⚠️  Pyth oracle {} has Price status (not Trading). This may indicate feed is updating, but accepting for liquidation.",
+            oracle_pubkey
+        );
     }
     
     // CRITICAL FIX: Check aggregate.status (offset 72-80, u64)
@@ -2634,11 +2739,29 @@ async fn get_liquidation_quote(
     let tx2_priority_fee_lamports = (TX2_COMPUTE_UNITS * TX2_PRIORITY_FEE_PER_CU) / 1_000_000;
     let tx2_total_fee_lamports = TX2_BASE_FEE_LAMPORTS + tx2_priority_fee_lamports;
     
+    // ✅ FIXED: Flashloan fee calculation
+    // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)
+    // This fee is applied to debt_to_repay_raw amount
+    let flashloan_fee_usd = if let Some(borrow_reserve) = &ctx.borrow_reserve {
+        const WAD: f64 = 1_000_000_000_000_000_000.0; // 10^18
+        let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad;
+        let flashloan_fee_pct = flashloan_fee_wad as f64 / WAD; // WAD to percentage
+        
+        // Flashloan fee amount (in raw token units)
+        let flashloan_fee_amount_raw = ((debt_to_repay_raw as f64) * flashloan_fee_pct) as u64;
+        
+        // Convert to USD
+        let flashloan_fee_tokens = (flashloan_fee_amount_raw as f64) / 10_f64.powi(debt_decimals as i32);
+        flashloan_fee_tokens * debt_price_usd
+    } else {
+        0.0 // No flashloan fee if borrow reserve not available (shouldn't happen)
+    };
+    
     // Total fees in USD
     let jito_fee_usd = jito_tip_sol * sol_price_usd * 2.0; // TWO tips (one per transaction)
     let tx1_fee_usd = (tx1_total_fee_lamports as f64 / 1_000_000_000.0) * sol_price_usd;
     let tx2_fee_usd = (tx2_total_fee_lamports as f64 / 1_000_000_000.0) * sol_price_usd;
-    let total_fees_usd = jito_fee_usd + tx1_fee_usd + tx2_fee_usd;
+    let total_fees_usd = jito_fee_usd + tx1_fee_usd + tx2_fee_usd + flashloan_fee_usd;
     
     // FINAL PROFIT (corrected for two transactions)
     let profit_usdc = profit_before_fees_usd - total_fees_usd;
@@ -2651,6 +2774,7 @@ async fn get_liquidation_quote(
          Jito fees (2x): ${:.4}\n\
          TX1 fee: ${:.4}\n\
          TX2 fee: ${:.4}\n\
+         Flashloan fee: ${:.4}\n\
          Total fees: ${:.4}\n\
          FINAL PROFIT: ${:.2}",
         jupiter_out_amount,
@@ -2663,6 +2787,7 @@ async fn get_liquidation_quote(
         jito_fee_usd,
         tx1_fee_usd,
         tx2_fee_usd,
+        flashloan_fee_usd,
         total_fees_usd,
         profit_usdc
     );
@@ -3743,8 +3868,55 @@ async fn execute_liquidation_with_swap(
         bundle_id
     );
     
-    // Wait briefly for confirmation (optional, for logging)
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // ✅ FIXED: Real-time bundle status polling (instead of fixed 1s wait)
+    // Bundle can confirm in ~400ms, so we poll status proactively
+    let mut confirmed = false;
+    for i in 0..20 {
+        // Max 4 seconds (20 * 200ms)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        
+        if let Ok(Some(status)) = jito_client.get_bundle_status(&bundle_id).await {
+            if let Some(status_str) = &status.status {
+                if status_str == "landed" || status_str == "confirmed" {
+                    confirmed = true;
+                    log::debug!(
+                        "✅ Bundle {} confirmed in {:.1}s (poll #{})",
+                        bundle_id,
+                        (i + 1) as f64 * 0.2,
+                        i + 1
+                    );
+                    break;
+                } else if status_str == "failed" || status_str == "dropped" {
+                    log::warn!(
+                        "Bundle {} failed/dropped after {:.1}s (poll #{})",
+                        bundle_id,
+                        (i + 1) as f64 * 0.2,
+                        i + 1
+                    );
+                    break;
+                }
+            }
+            
+            // If slot is present, bundle likely executed
+            if status.slot.is_some() {
+                confirmed = true;
+                log::debug!(
+                    "✅ Bundle {} confirmed (has slot) in {:.1}s (poll #{})",
+                    bundle_id,
+                    (i + 1) as f64 * 0.2,
+                    i + 1
+                );
+                break;
+            }
+        }
+    }
+    
+    if !confirmed {
+        log::debug!(
+            "Bundle {} status still unknown after 4s polling, will be tracked by bundle_tracker",
+            bundle_id
+        );
+    }
     
     Ok(())
 }

@@ -369,57 +369,104 @@ async fn validate_wallet_balances(
     rpc: &Arc<RpcClient>,
     wallet_pubkey: &Pubkey,
 ) -> Result<()> {
+    log::info!("💰 Checking wallet balances...");
+    log::info!("   Wallet address: {}", wallet_pubkey);
+    
     // Get SOL balance
     let sol_balance = rpc
         .get_balance(wallet_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
+
+    let sol_balance_sol = sol_balance as f64 / 1_000_000_000.0;
+    
+    // Get current SOL price estimate (rough estimate for logging)
+    // This is just for display, not used in calculations
+    let estimated_sol_price_usd = 150.0; // Rough estimate
+    let sol_balance_usd = sol_balance_sol * estimated_sol_price_usd;
 
     // Minimum SOL for fees + Jito tip
     // Dynamically calculated: base fee (0.001 SOL) + Jito tip (0.01 SOL) + buffer (0.005 SOL)
     // Total: ~0.016 SOL = 16_000_000 lamports
     // This is automatically calculated, not hardcoded
     const MIN_SOL_LAMPORTS: u64 = 16_000_000; // ~0.016 SOL for safety
+    let min_sol = MIN_SOL_LAMPORTS as f64 / 1_000_000_000.0;
+    
+    log::info!("   SOL balance: {} lamports", sol_balance);
+    log::info!("   SOL balance: {:.9} SOL", sol_balance_sol);
+    log::info!("   SOL balance: ~${:.2} USD (estimated)", sol_balance_usd);
+    log::info!("   Minimum required: {:.9} SOL (~${:.2} USD)", min_sol, min_sol * estimated_sol_price_usd);
+    
     if sol_balance < MIN_SOL_LAMPORTS {
         panic!("Insufficient SOL balance. Required: {} lamports (~{} SOL), Available: {} lamports (~{} SOL)", 
             MIN_SOL_LAMPORTS, 
-            MIN_SOL_LAMPORTS as f64 / 1_000_000_000.0,
+            min_sol,
             sol_balance,
-            sol_balance as f64 / 1_000_000_000.0);
+            sol_balance_sol);
     }
 
-    log::info!("✅ SOL balance: {} lamports (~{} SOL)", sol_balance, sol_balance as f64 / 1_000_000_000.0);
+    log::info!("✅ SOL balance sufficient: {:.9} SOL (~${:.2} USD)", sol_balance_sol, sol_balance_usd);
 
     // Automatically discover USDC mint from chain (Solend reserves)
     // This is chain-based discovery, not hardcoded
+    log::info!("🔍 Discovering USDC mint from Solend reserves...");
     let program_id = solend::solend_program_id()?;
+    log::info!("   Solend program ID: {}", program_id);
+    
     let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)
         .context("Failed to discover USDC mint from chain")?;
     
     log::info!("✅ USDC mint discovered from chain: {}", usdc_mint);
     
     let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+    log::info!("   USDC ATA address: {}", usdc_ata);
 
     // Check USDC balance
+    log::info!("   Checking USDC token account...");
     let usdc_balance = match rpc.get_token_account(&usdc_ata) {
         Ok(Some(account)) => {
+            log::info!("   USDC token account found");
+            log::info!("   Token account owner: {}", account.owner);
+            log::info!("   Token account mint: {}", account.mint);
+            log::info!("   Token account decimals: {}", account.token_amount.decimals);
+            log::info!("   Raw token amount: {}", account.token_amount.amount);
             // Parse token amount from UI account
             account.token_amount.amount.parse::<u64>().unwrap_or(0)
         }
-        Ok(None) => 0, // ATA doesn't exist
-        Err(_) => 0,   // Error getting account, assume 0
+        Ok(None) => {
+            log::warn!("   USDC token account does not exist (will be created if needed)");
+            0 // ATA doesn't exist
+        }
+        Err(e) => {
+            log::warn!("   Error getting USDC token account: {} (assuming 0 balance)", e);
+            0   // Error getting account, assume 0
+        }
     };
 
+    let usdc_balance_decimal = usdc_balance as f64 / 1_000_000.0; // USDC has 6 decimals
+    
     // Minimum USDC for strategy (10 USDC = 10_000_000 with 6 decimals)
     // This is a reasonable minimum for liquidation operations
     const MIN_USDC_AMOUNT: u64 = 10_000_000; // 10 USDC
+    let min_usdc_decimal = MIN_USDC_AMOUNT as f64 / 1_000_000.0;
+    
+    log::info!("   USDC balance: {} (raw)", usdc_balance);
+    log::info!("   USDC balance: {:.6} USDC", usdc_balance_decimal);
+    log::info!("   Minimum required: {:.6} USDC", min_usdc_decimal);
+    
     if usdc_balance < MIN_USDC_AMOUNT {
-        panic!("Insufficient USDC balance. Required: {} (10 USDC), Available: {} ({} USDC)", 
-            MIN_USDC_AMOUNT, 
+        panic!("Insufficient USDC balance. Required: {} ({:.6} USDC), Available: {} ({:.6} USDC)", 
+            MIN_USDC_AMOUNT,
+            min_usdc_decimal,
             usdc_balance,
-            usdc_balance / 1_000_000);
+            usdc_balance_decimal);
     }
 
-    log::info!("✅ USDC balance: {} ({} USDC)", usdc_balance, usdc_balance / 1_000_000);
+    log::info!("✅ USDC balance sufficient: {:.6} USDC", usdc_balance_decimal);
+    
+    // Calculate total wallet value
+    let total_wallet_value_usd = sol_balance_usd + usdc_balance_decimal;
+    log::info!("💰 Total wallet value: ~${:.2} USD (SOL: ${:.2} + USDC: ${:.2})", 
+               total_wallet_value_usd, sol_balance_usd, usdc_balance_decimal);
 
     Ok(())
 }
