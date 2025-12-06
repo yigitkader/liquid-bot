@@ -121,6 +121,97 @@ impl Obligation {
     pub fn total_borrowed_value_usd(&self) -> f64 {
         self.borrowedValue.to_f64()
     }
+
+    /// Parse deposits array from dataFlat
+    /// SDK stores deposits in dataFlat, we need to parse them
+    pub fn deposits(&self) -> Result<Vec<ObligationCollateral>> {
+        use borsh::BorshDeserialize;
+        
+        let deposits_len = self.depositsLen as usize;
+        if deposits_len == 0 {
+            return Ok(Vec::new());
+        }
+        
+        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) = 56 bytes
+        const COLLATERAL_SIZE: usize = 32 + 8 + 16; // 56 bytes
+        let deposits_size = deposits_len * COLLATERAL_SIZE;
+        
+        if deposits_size > self.dataFlat.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid deposits size: {} bytes (max: {})",
+                deposits_size,
+                self.dataFlat.len()
+            ));
+        }
+        
+        let deposits_buffer = &self.dataFlat[0..deposits_size];
+        let mut deposits = Vec::new();
+        
+        for i in 0..deposits_len {
+            let offset = i * COLLATERAL_SIZE;
+            if offset + COLLATERAL_SIZE > deposits_buffer.len() {
+                break;
+            }
+            let collateral_data = &deposits_buffer[offset..offset + COLLATERAL_SIZE];
+            match ObligationCollateral::try_from_slice(collateral_data) {
+                Ok(collateral) => deposits.push(collateral),
+                Err(e) => {
+                    log::warn!("Failed to parse deposit {}: {}", i, e);
+                }
+            }
+        }
+        
+        Ok(deposits)
+    }
+
+    /// Parse borrows array from dataFlat
+    /// SDK stores borrows in dataFlat, we need to parse them
+    pub fn borrows(&self) -> Result<Vec<ObligationLiquidity>> {
+        use borsh::BorshDeserialize;
+        
+        let borrows_len = self.borrowsLen as usize;
+        if borrows_len == 0 {
+            return Ok(Vec::new());
+        }
+        
+        // Each ObligationLiquidity is 32 (Pubkey) + 16 (u128) + 16 (u128) + 16 (u128) = 80 bytes
+        const LIQUIDITY_SIZE: usize = 32 + 16 + 16 + 16; // 80 bytes
+        let borrows_size = borrows_len * LIQUIDITY_SIZE;
+        
+        // Deposits come first, then borrows
+        let deposits_len = self.depositsLen as usize;
+        const COLLATERAL_SIZE: usize = 32 + 8 + 16; // 56 bytes
+        let deposits_size = deposits_len * COLLATERAL_SIZE;
+        let borrows_offset = deposits_size;
+        
+        if borrows_offset + borrows_size > self.dataFlat.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid borrows size: {} bytes (offset: {}, max: {})",
+                borrows_size,
+                borrows_offset,
+                self.dataFlat.len()
+            ));
+        }
+        
+        let borrows_buffer = &self.dataFlat[borrows_offset..borrows_offset + borrows_size];
+        let mut borrows = Vec::new();
+        
+        for i in 0..borrows_len {
+            let offset = i * LIQUIDITY_SIZE;
+            if offset + LIQUIDITY_SIZE > borrows_buffer.len() {
+                break;
+            }
+            let liquidity_data = &borrows_buffer[offset..offset + LIQUIDITY_SIZE];
+            match ObligationLiquidity::try_from_slice(liquidity_data) {
+                Ok(liquidity) => borrows.push(liquidity),
+                Err(e) => {
+                    log::warn!("Failed to parse borrow {}: {}", i, e);
+                }
+            }
+        }
+        
+        Ok(borrows)
+    }
 }
 
 // Solend program ID (mainnet)
@@ -336,27 +427,27 @@ impl Reserve {
 
     /// Get mint address from reserve (liquidity mint)
     pub fn mint_pubkey(&self) -> Pubkey {
-        self.liquidity.mintPubkey
+        self.liquidity().mintPubkey
     }
 
     /// Get collateral mint address
     pub fn collateral_mint_pubkey(&self) -> Pubkey {
-        self.collateral.mintPubkey
+        self.collateral().mintPubkey
     }
 
     /// Get oracle pubkey (Pyth primary oracle)
     pub fn oracle_pubkey(&self) -> Pubkey {
-        self.liquidity.oraclePubkey
+        self.liquidity().liquidityPythOracle
     }
 
     /// Get liquidation threshold (as f64, 0-1 range)
     pub fn liquidation_threshold(&self) -> f64 {
-        self.config.liquidationThreshold as f64 / 100.0
+        self.liquidationThreshold as f64 / 100.0
     }
 
     /// Get liquidation bonus (as f64, 0-1 range)
     pub fn liquidation_bonus(&self) -> f64 {
-        self.config.liquidationBonus as f64 / 100.0
+        self.liquidationBonus as f64 / 100.0
     }
 
     /// Get close factor (as f64, 0-1 range)
@@ -372,13 +463,75 @@ impl Reserve {
     /// Returns: Close factor as f64 (e.g., 0.5 = 50%)
     pub fn close_factor(&self) -> f64 {
         // TODO: When Solend adds closeFactor to ReserveConfig, uncomment this:
-        // if let Some(cf) = self.config.closeFactor {
+        // let config = self.config();
+        // if let Some(cf) = config.closeFactor {
         //     return cf as f64 / 100.0;
         // }
         
         // Fallback to standard 50% (0.5) - Solend's current default
         // This matches the hardcoded value used in debt calculation
         0.5
+    }
+
+    /// Get ReserveLiquidity struct (helper for accessing liquidity fields)
+    pub fn liquidity(&self) -> ReserveLiquidity {
+        ReserveLiquidity {
+            mintPubkey: self.liquidityMintPubkey,
+            mintDecimals: self.liquidityMintDecimals,
+            supplyPubkey: self.liquiditySupplyPubkey,
+            liquidityPythOracle: self.liquidityPythOracle,
+            liquiditySwitchboardOracle: self.liquiditySwitchboardOracle,
+            availableAmount: self.liquidityAvailableAmount,
+            borrowedAmountWads: self.liquidityBorrowedAmountWads,
+            cumulativeBorrowRateWads: self.liquidityCumulativeBorrowRateWads,
+            liquidityMarketPrice: self.liquidityMarketPrice,
+        }
+    }
+
+    /// Get ReserveCollateral struct (helper for accessing collateral fields)
+    pub fn collateral(&self) -> ReserveCollateral {
+        ReserveCollateral {
+            mintPubkey: self.collateralMintPubkey,
+            mintTotalSupply: self.collateralMintTotalSupply,
+            supplyPubkey: self.collateralSupplyPubkey,
+        }
+    }
+
+    /// Get ReserveConfig struct (helper for accessing config fields)
+    pub fn config(&self) -> ReserveConfig {
+        ReserveConfig {
+            optimalUtilizationRate: self.optimalUtilizationRate,
+            loanToValueRatio: self.loanToValueRatio,
+            liquidationBonus: self.liquidationBonus,
+            liquidationThreshold: self.liquidationThreshold,
+            minBorrowRate: self.minBorrowRate,
+            optimalBorrowRate: self.optimalBorrowRate,
+            maxBorrowRate: self.maxBorrowRate,
+            switchboardOraclePubkey: self.switchboardOraclePubkey,
+            borrowFeeWad: self.borrowFeeWad,
+            flashLoanFeeWad: self.flashLoanFeeWad,
+            hostFeePercentage: self.hostFeePercentage,
+            depositLimit: self.depositLimit,
+            borrowLimit: self.borrowLimit,
+            feeReceiver: self.feeReceiver,
+            protocolLiquidationFee: self.protocolLiquidationFee,
+            protocolTakeRate: self.protocolTakeRate,
+            accumulatedProtocolFeesWads: self.accumulatedProtocolFeesWads,
+            addedBorrowWeightBPS: self.addedBorrowWeightBPS,
+            liquiditySmoothedMarketPrice: self.liquiditySmoothedMarketPrice,
+            reserveType: self.reserveType,
+            maxUtilizationRate: self.maxUtilizationRate,
+            superMaxBorrowRate: self.superMaxBorrowRate,
+            maxLiquidationBonus: self.maxLiquidationBonus,
+            maxLiquidationThreshold: self.maxLiquidationThreshold,
+            scaledPriceOffsetBPS: self.scaledPriceOffsetBPS,
+            extraOracle: self.extraOracle,
+            liquidityExtraMarketPriceFlag: self.liquidityExtraMarketPriceFlag,
+            liquidityExtraMarketPrice: self.liquidityExtraMarketPrice,
+            attributedBorrowValue: self.attributedBorrowValue,
+            attributedBorrowLimitOpen: self.attributedBorrowLimitOpen,
+            attributedBorrowLimitClose: self.attributedBorrowLimitClose,
+        }
     }
 }
 

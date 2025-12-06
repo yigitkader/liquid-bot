@@ -16,6 +16,7 @@ use lazy_static::lazy_static;
 
 use crate::jup::{get_jupiter_quote_with_retry, JupiterQuote};
 use crate::solend::{Obligation, Reserve, solend_program_id};
+use crate::solend::{ObligationLiquidity, ObligationCollateral};
 use crate::utils::{send_jito_bundle, JitoClient};
 
 // Static aligned buffer pool for Switchboard Oracle alignment fix
@@ -157,7 +158,19 @@ pub async fn run_liquidation_loop(
     log::info!("   Max Position %: {:.2}%", config.max_position_pct * 100.0);
     log::info!("   Mode: {:?}", config.liquidation_mode);
 
+    // Track last balance log time for periodic logging
+    let mut last_balance_log = Instant::now();
+    const BALANCE_LOG_INTERVAL_SECS: u64 = 30; // Log balances every 30 seconds
+    
     loop {
+        // Log wallet balances periodically
+        if last_balance_log.elapsed().as_secs() >= BALANCE_LOG_INTERVAL_SECS {
+            if let Err(e) = log_wallet_balances(&rpc, &wallet).await {
+                log::warn!("Failed to log wallet balances: {}", e);
+            }
+            last_balance_log = Instant::now();
+        }
+        
         match process_cycle(&rpc, &program_id, &config, &jito_client).await {
             Ok(_) => {}
             Err(e) => {
@@ -840,6 +853,8 @@ async fn validate_jito_endpoint(jito_client: &JitoClient) -> Result<()> {
 struct LiquidationContext {
     obligation_pubkey: Pubkey,
     obligation: Obligation,
+    borrows: Vec<ObligationLiquidity>,  // Parsed borrows from dataFlat
+    deposits: Vec<ObligationCollateral>, // Parsed deposits from dataFlat
     borrow_reserve: Option<Reserve>,
     deposit_reserve: Option<Reserve>,
     borrow_price_usd: Option<f64>,  // Price from oracle
@@ -857,24 +872,34 @@ async fn build_liquidation_context(
     let mut deposit_reserve = None;
 
     // Get first borrow reserve if exists
-    if !obligation.borrows.is_empty() {
-        let borrow_reserve_pubkey = obligation.borrows[0].borrowReserve;
-        if let Ok(account) = rpc.get_account_data(&borrow_reserve_pubkey) {
-            if let Ok(reserve) = Reserve::from_account_data(&account) {
-                borrow_reserve = Some(reserve);
+    if let Ok(borrows) = obligation.borrows() {
+        if !borrows.is_empty() {
+            let borrow_reserve_pubkey = borrows[0].borrowReserve;
+            if let Ok(account) = rpc.get_account_data(&borrow_reserve_pubkey) {
+                if let Ok(reserve) = Reserve::from_account_data(&account) {
+                    borrow_reserve = Some(reserve);
+                }
             }
         }
     }
 
     // Get first deposit reserve if exists
-    if !obligation.deposits.is_empty() {
-        let deposit_reserve_pubkey = obligation.deposits[0].depositReserve;
-        if let Ok(account) = rpc.get_account_data(&deposit_reserve_pubkey) {
-            if let Ok(reserve) = Reserve::from_account_data(&account) {
-                deposit_reserve = Some(reserve);
+    if let Ok(deposits) = obligation.deposits() {
+        if !deposits.is_empty() {
+            let deposit_reserve_pubkey = deposits[0].depositReserve;
+            if let Ok(account) = rpc.get_account_data(&deposit_reserve_pubkey) {
+                if let Ok(reserve) = Reserve::from_account_data(&account) {
+                    deposit_reserve = Some(reserve);
+                }
             }
         }
     }
+
+    // Parse borrows and deposits from obligation
+    let borrows = obligation.borrows()
+        .map_err(|e| anyhow::anyhow!("Failed to parse borrows: {}", e))?;
+    let deposits = obligation.deposits()
+        .map_err(|e| anyhow::anyhow!("Failed to parse deposits: {}", e))?;
 
     // Validate Oracle per Structure.md section 5.2
     // Use TWAP protection when Switchboard is not available (Pyth-only mode)
@@ -883,6 +908,8 @@ async fn build_liquidation_context(
     Ok(LiquidationContext {
         obligation_pubkey: obligation.owner, // Note: actual obligation pubkey should be passed separately
         obligation: obligation.clone(),
+        borrows,
+        deposits,
         borrow_reserve,
         deposit_reserve,
         borrow_price_usd: borrow_price,
@@ -1342,7 +1369,7 @@ async fn validate_switchboard_oracle_if_available(
     use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
     
     // 1. Get switchboard_oracle_pubkey from reserve.config (DYNAMIC - from chain)
-    let switchboard_oracle_pubkey = reserve.config.switchboardOraclePubkey;
+    let switchboard_oracle_pubkey = reserve.config().switchboardOraclePubkey;
     if switchboard_oracle_pubkey == Pubkey::default() {
         // No Switchboard oracle configured for this reserve
         return Ok(None);
@@ -1866,13 +1893,13 @@ async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Op
     
     // Check if collateral or debt is SOL, use its price
     if let Some(deposit_reserve) = &ctx.deposit_reserve {
-        if deposit_reserve.liquidity.mintPubkey == sol_native_mint {
+        if deposit_reserve.liquidity().mintPubkey == sol_native_mint {
             return ctx.deposit_price_usd;
         }
     }
     
     if let Some(borrow_reserve) = &ctx.borrow_reserve {
-        if borrow_reserve.liquidity.mintPubkey == sol_native_mint {
+        if borrow_reserve.liquidity().mintPubkey == sol_native_mint {
             return ctx.borrow_price_usd;
         }
     }
@@ -1898,11 +1925,11 @@ async fn get_liquidation_quote(
     rpc: &Arc<RpcClient>,
 ) -> Result<LiquidationQuote> {
     // Use first borrow and first deposit
-    if ctx.obligation.borrows.is_empty() || ctx.obligation.deposits.is_empty() {
+    if ctx.borrows.is_empty() || ctx.deposits.is_empty() {
         return Err(anyhow::anyhow!("No borrows or deposits in obligation"));
     }
 
-    let borrow = &ctx.obligation.borrows[0];
+    let borrow = &ctx.borrows[0];
     // Note: deposit is available but we use deposit_reserve directly for mint address
 
     // CRITICAL FIX: Solend liquidation collateral flow
@@ -1924,21 +1951,21 @@ async fn get_liquidation_quote(
     let collateral_ctoken_mint = ctx
         .deposit_reserve
         .as_ref()
-        .map(|r| r.collateral.mintPubkey) // cToken mint (e.g., cSOL)
+        .map(|r| r.collateral().mintPubkey) // cToken mint (e.g., cSOL)
         .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
     
     // Step 2: Get underlying collateral token mint (what we need for Jupiter)
     let collateral_underlying_mint = ctx
         .deposit_reserve
         .as_ref()
-        .map(|r| r.liquidity.mintPubkey) // Underlying token mint (e.g., SOL)
+        .map(|r| r.liquidity().mintPubkey) // Underlying token mint (e.g., SOL)
         .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
     
     // Step 3: Get debt token mint
     let debt_mint = ctx
         .borrow_reserve
         .as_ref()
-        .map(|r| r.liquidity.mintPubkey) // Debt token mint (e.g., USDC)
+        .map(|r| r.liquidity().mintPubkey) // Debt token mint (e.g., USDC)
         .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
     
     log::debug!(
@@ -1977,8 +2004,8 @@ async fn get_liquidation_quote(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
     
-    let debt_decimals = borrow_reserve.liquidity.mintDecimals;
-    let collateral_decimals = deposit_reserve.liquidity.mintDecimals;
+    let debt_decimals = borrow_reserve.liquidity().mintDecimals;
+    let collateral_decimals = deposit_reserve.liquidity().mintDecimals;
     
     // CRITICAL SECURITY: Validate decimal values to prevent corrupt data issues
     // SPL tokens use 0-18 decimals (standard range)
@@ -1987,7 +2014,7 @@ async fn get_liquidation_quote(
         return Err(anyhow::anyhow!(
             "Invalid debt decimals: {} (expected 0-18). Reserve: {}. This may indicate corrupt data or layout changes.",
             debt_decimals,
-            ctx.obligation.borrows[0].borrowReserve
+            ctx.borrows[0].borrowReserve
         ));
     }
     
@@ -1995,7 +2022,7 @@ async fn get_liquidation_quote(
         return Err(anyhow::anyhow!(
             "Invalid collateral decimals: {} (expected 0-18). Reserve: {}. This may indicate corrupt data or layout changes.",
             collateral_decimals,
-            ctx.obligation.deposits[0].depositReserve
+            ctx.deposits[0].depositReserve
         ));
     }
     
@@ -2164,10 +2191,10 @@ async fn get_liquidation_quote(
     // CRITICAL: borrowedAmountWads is NOT raw amount! It needs to account for interest accrual.
     // NOTE: WAD is already defined earlier in this function
     
-    let ctokens_total_supply = deposit_reserve.collateral.mintTotalSupply;
-    let available_amount = deposit_reserve.liquidity.availableAmount;
-    let borrowed_amount_wads = deposit_reserve.liquidity.borrowedAmountWads;
-    let cumulative_borrow_rate = deposit_reserve.liquidity.cumulativeBorrowRateWads;
+    let ctokens_total_supply = deposit_reserve.collateral().mintTotalSupply;
+    let available_amount = deposit_reserve.liquidity().availableAmount;
+    let borrowed_amount_wads = deposit_reserve.liquidity().borrowedAmountWads;
+    let cumulative_borrow_rate = deposit_reserve.liquidity().cumulativeBorrowRateWads;
     
     // Step 1: Calculate actual borrowed amount (normalized, no decimals)
     // Formula: borrowedAmountWads * cumulativeBorrowRateWads / WAD / WAD
@@ -2370,7 +2397,7 @@ async fn get_liquidation_quote(
     let debt_decimals = ctx
         .borrow_reserve
         .as_ref()
-        .map(|r| r.liquidity.mintDecimals)
+        .map(|r| r.liquidity().mintDecimals)
         .unwrap_or(6);
     
     // CRITICAL SECURITY: Validate decimal value to prevent corrupt data issues
@@ -2379,7 +2406,7 @@ async fn get_liquidation_quote(
         return Err(anyhow::anyhow!(
             "Invalid debt decimals: {} (expected 0-18). Reserve: {}. This may indicate corrupt data or layout changes.",
             debt_decimals,
-            ctx.obligation.borrows[0].borrowReserve
+            ctx.borrows[0].borrowReserve
         ));
     }
 
@@ -2524,6 +2551,91 @@ async fn get_liquidation_quote(
         debt_to_repay_raw, // Debt amount to repay in Solend instruction
         collateral_to_seize_raw, // Collateral cToken amount to seize (for redemption check)
     })
+}
+
+/// Log wallet balances (SOL and USDC) to console
+/// Used for periodic balance monitoring
+async fn log_wallet_balances(
+    rpc: &Arc<RpcClient>,
+    wallet_pubkey: &Pubkey,
+) -> Result<()> {
+    // Get SOL balance
+    let sol_balance_lamports = rpc
+        .get_balance(wallet_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
+    let sol_balance = sol_balance_lamports as f64 / 1_000_000_000.0;
+    
+    // Get SOL price for USD value
+    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+        Ok(pk) => pk,
+        Err(_) => {
+            log::info!(
+                "💰 Wallet Balances: SOL: {:.6} SOL (~${:.2}), USDC: (checking...)",
+                sol_balance,
+                sol_balance * 150.0
+            );
+            // Continue with USDC check using fallback price
+            let program_id = crate::solend::solend_program_id()?;
+            let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+                .context("Failed to discover USDC mint")?;
+            use spl_associated_token_account::get_associated_token_address;
+            let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+            let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+                Ok(Some(account)) => account.token_amount.amount.parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+            log::info!(
+                "💰 Wallet Balances: SOL: {:.6} SOL (~${:.2}), USDC: {:.2} USDC, Total: ~${:.2}",
+                sol_balance,
+                sol_balance * 150.0,
+                usdc_balance,
+                sol_balance * 150.0 + usdc_balance
+            );
+            return Ok(());
+        }
+    };
+    
+    let current_slot = rpc.get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+    let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
+        Ok((true, Some(price))) => price,
+        _ => {
+            log::warn!("Failed to get SOL price from oracle, using fallback $150");
+            150.0
+        }
+    };
+    
+    let sol_value_usd = sol_balance * sol_price_usd;
+    
+    // Get USDC balance
+    let program_id = crate::solend::solend_program_id()?;
+    let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+        .context("Failed to discover USDC mint")?;
+    
+    use spl_associated_token_account::get_associated_token_address;
+    let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+    
+    let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+        Ok(Some(account)) => {
+            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+        }
+        Ok(None) => 0,
+        Err(_) => 0,
+    };
+    
+    let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+    let total_value_usd = sol_value_usd + usdc_balance;
+    
+    log::info!(
+        "💰 Wallet Balances: SOL: {:.6} SOL (${:.2}), USDC: {:.2} USDC, Total: ${:.2}",
+        sol_balance,
+        sol_value_usd,
+        usdc_balance,
+        total_value_usd
+    );
+    
+    Ok(())
 }
 
 /// Get total wallet value in USD (SOL + USDC)
@@ -2703,10 +2815,10 @@ async fn build_liquidation_tx1(
     // Get reserve liquidity supply addresses
     // These are stored in Reserve account (supplyPubkey field)
     // Solend program stores the correct PDA addresses in Reserve account during initialization
-    let repay_reserve_liquidity_supply = borrow_reserve.liquidity.supplyPubkey;
-    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity.supplyPubkey;
-    let withdraw_reserve_collateral_supply = deposit_reserve.collateral.supplyPubkey;
-    let withdraw_reserve_collateral_mint = deposit_reserve.collateral.mintPubkey;
+    let repay_reserve_liquidity_supply = borrow_reserve.liquidity().supplyPubkey;
+    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity().supplyPubkey;
+    let withdraw_reserve_collateral_supply = deposit_reserve.collateral().supplyPubkey;
+    let withdraw_reserve_collateral_mint = deposit_reserve.collateral().mintPubkey;
     
     // Verify these are not default/zero addresses
     // CRITICAL: Reserve account's supplyPubkey is the authoritative source.
@@ -2728,8 +2840,8 @@ async fn build_liquidation_tx1(
     // 
     // If PDA cannot be derived (None), this may indicate unknown seed format, but we
     // still log a warning as this is unusual.
-    let borrow_reserve_pubkey = ctx.obligation.borrows[0].borrowReserve;
-    let deposit_reserve_pubkey = ctx.obligation.deposits[0].depositReserve;
+    let borrow_reserve_pubkey = ctx.borrows[0].borrowReserve;
+    let deposit_reserve_pubkey = ctx.deposits[0].depositReserve;
     
     // Verify repay reserve liquidity supply
     // CRITICAL SECURITY FIX: Fail-fast if PDA cannot be derived (None)
@@ -2813,7 +2925,7 @@ async fn build_liquidation_tx1(
     // Get user's token accounts (source liquidity and destination collateral)
     // These would be ATAs for the tokens
     use spl_associated_token_account::get_associated_token_address;
-    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity.mintPubkey);
+    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity().mintPubkey);
     let destination_collateral = get_associated_token_address(&wallet_pubkey, &withdraw_reserve_collateral_mint);
     
     // CRITICAL SECURITY: Validate that ATAs exist before building transaction
@@ -2826,7 +2938,7 @@ async fn build_liquidation_tx1(
              Please create ATA for token {} before liquidation. \
              NOTE: In production, create all required ATAs at startup to avoid this check.",
             source_liquidity,
-            borrow_reserve.liquidity.mintPubkey
+            borrow_reserve.liquidity().mintPubkey
         ));
     }
     
@@ -2894,9 +3006,9 @@ async fn build_liquidation_tx1(
     let accounts = vec![
         AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity
         AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral
-        AccountMeta::new(ctx.obligation.borrows[0].borrowReserve, false),  // 2: repayReserve (writable, refreshed)
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: repayReserve (writable, refreshed)
         AccountMeta::new(repay_reserve_liquidity_supply, false),      // 3: repayReserveLiquiditySupply
-        AccountMeta::new_readonly(ctx.obligation.deposits[0].depositReserve, false), // 4: withdrawReserve (readonly, refreshed)
+        AccountMeta::new_readonly(ctx.deposits[0].depositReserve, false), // 4: withdrawReserve (readonly, refreshed)
         AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
         AccountMeta::new(ctx.obligation_pubkey, false),                // 6: obligation (writable, refreshed)
         AccountMeta::new_readonly(lending_market, false),            // 7: lendingMarket
@@ -2986,7 +3098,7 @@ async fn build_liquidation_tx1(
     // Destination liquidity: User's underlying token ATA
     let destination_liquidity = get_associated_token_address(
         &wallet_pubkey,
-        &deposit_reserve.liquidity.mintPubkey // Underlying token mint (e.g., SOL)
+        &deposit_reserve.liquidity().mintPubkey // Underlying token mint (e.g., SOL)
     );
     
     // CRITICAL SECURITY: Validate that destination liquidity ATA exists
@@ -2998,7 +3110,7 @@ async fn build_liquidation_tx1(
              Please create ATA for underlying token {} before liquidation. \
              NOTE: In production, create all required ATAs at startup to avoid this check.",
             destination_liquidity,
-            deposit_reserve.liquidity.mintPubkey
+            deposit_reserve.liquidity().mintPubkey
         ));
     }
     
@@ -3011,7 +3123,7 @@ async fn build_liquidation_tx1(
     let redeem_accounts = vec![
         AccountMeta::new(source_collateral, false),                     // 0: sourceCollateral
         AccountMeta::new(destination_liquidity, false),                 // 1: destinationLiquidity
-        AccountMeta::new(ctx.obligation.deposits[0].depositReserve, false), // 2: reserve
+        AccountMeta::new(ctx.deposits[0].depositReserve, false), // 2: reserve
         AccountMeta::new(withdraw_reserve_collateral_mint, false),      // 3: reserveCollateralMint
         AccountMeta::new(withdraw_reserve_liquidity_supply, false),     // 4: reserveLiquiditySupply
         AccountMeta::new_readonly(lending_market, false),              // 5: lendingMarket
@@ -3192,10 +3304,10 @@ async fn build_flashloan_liquidation_tx(
     let lending_market_authority = crate::solend::derive_lending_market_authority(&lending_market, &program_id)?;
     
     // Get reserve addresses
-    let repay_reserve_liquidity_supply = borrow_reserve.liquidity.supplyPubkey;
-    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity.supplyPubkey;
-    let withdraw_reserve_collateral_supply = deposit_reserve.collateral.supplyPubkey;
-    let withdraw_reserve_collateral_mint = deposit_reserve.collateral.mintPubkey;
+    let repay_reserve_liquidity_supply = borrow_reserve.liquidity().supplyPubkey;
+    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity().supplyPubkey;
+    let withdraw_reserve_collateral_supply = deposit_reserve.collateral().supplyPubkey;
+    let withdraw_reserve_collateral_mint = deposit_reserve.collateral().mintPubkey;
     
     // Validate reserve addresses
     if repay_reserve_liquidity_supply == Pubkey::default() 
@@ -3206,16 +3318,16 @@ async fn build_flashloan_liquidation_tx(
     }
     
     // Get user's token accounts
-    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity.mintPubkey);
+    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity().mintPubkey);
     let destination_collateral = get_associated_token_address(&wallet_pubkey, &withdraw_reserve_collateral_mint);
-    let destination_liquidity = get_associated_token_address(&wallet_pubkey, &deposit_reserve.liquidity.mintPubkey);
+    let destination_liquidity = get_associated_token_address(&wallet_pubkey, &deposit_reserve.liquidity().mintPubkey);
     
     // Validate ATAs exist
     if rpc.get_account(&source_liquidity).is_err() {
         return Err(anyhow::anyhow!(
             "Source liquidity ATA does not exist: {}. Please create ATA for token {} before liquidation.",
             source_liquidity,
-            borrow_reserve.liquidity.mintPubkey
+            borrow_reserve.liquidity().mintPubkey
         ));
     }
     if rpc.get_account(&destination_collateral).is_err() {
@@ -3229,7 +3341,7 @@ async fn build_flashloan_liquidation_tx(
         return Err(anyhow::anyhow!(
             "Destination liquidity ATA does not exist: {}. Please create ATA for token {} before liquidation.",
             destination_liquidity,
-            deposit_reserve.liquidity.mintPubkey
+            deposit_reserve.liquidity().mintPubkey
         ));
     }
     
@@ -3253,7 +3365,7 @@ async fn build_flashloan_liquidation_tx(
     // 7. [readonly] tokenProgram - SPL Token program
     let flashloan_accounts = vec![
         AccountMeta::new(source_liquidity, false),           // 0: Destination for borrowed funds
-        AccountMeta::new(ctx.obligation.borrows[0].borrowReserve, false), // 1: Reserve to borrow from
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false), // 1: Reserve to borrow from
         AccountMeta::new(repay_reserve_liquidity_supply, false), // 2: Reserve liquidity supply
         AccountMeta::new_readonly(lending_market, false),   // 3: Lending market
         AccountMeta::new_readonly(lending_market_authority, false), // 4: Lending market authority
@@ -3280,9 +3392,9 @@ async fn build_flashloan_liquidation_tx(
     let liquidation_accounts = vec![
         AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity (borrowed USDC)
         AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral (receive cSOL)
-        AccountMeta::new(ctx.obligation.borrows[0].borrowReserve, false), // 2: repayReserve
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false), // 2: repayReserve
         AccountMeta::new(repay_reserve_liquidity_supply, false),     // 3: repayReserveLiquiditySupply
-        AccountMeta::new_readonly(ctx.obligation.deposits[0].depositReserve, false), // 4: withdrawReserve
+        AccountMeta::new_readonly(ctx.deposits[0].depositReserve, false), // 4: withdrawReserve
         AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
         AccountMeta::new(ctx.obligation_pubkey, false),               // 6: obligation
         AccountMeta::new_readonly(lending_market, false),             // 7: lendingMarket
@@ -3310,7 +3422,7 @@ async fn build_flashloan_liquidation_tx(
     let redeem_accounts = vec![
         AccountMeta::new(destination_collateral, false),              // 0: sourceCollateral (cSOL from liquidation)
         AccountMeta::new(destination_liquidity, false),               // 1: destinationLiquidity (receive SOL)
-        AccountMeta::new(ctx.obligation.deposits[0].depositReserve, false), // 2: reserve
+        AccountMeta::new(ctx.deposits[0].depositReserve, false), // 2: reserve
         AccountMeta::new(withdraw_reserve_collateral_mint, false),    // 3: reserveCollateralMint
         AccountMeta::new(withdraw_reserve_liquidity_supply, false),   // 4: reserveLiquiditySupply
         AccountMeta::new_readonly(lending_market, false),             // 5: lendingMarket

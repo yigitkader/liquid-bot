@@ -1,7 +1,7 @@
 {
   "meta": {
     "sdkVersion": "0.13.43",
-    "generatedAt": "2025-12-05T16:36:26.646Z"
+    "generatedAt": "2025-12-06T15:45:56.714Z"
   },
   "types": [
     {
@@ -15,7 +15,7 @@
         {
           "kind": "scalar",
           "name": "stale",
-          "type": "bool"
+          "type": "u8"
         }
       ]
     },
@@ -39,7 +39,12 @@
         },
         {
           "kind": "scalar",
-          "name": "oraclePubkey",
+          "name": "liquidityPythOracle",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquiditySwitchboardOracle",
           "type": "Pubkey"
         },
         {
@@ -55,6 +60,11 @@
         {
           "kind": "scalar",
           "name": "cumulativeBorrowRateWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityMarketPrice",
           "type": "u128"
         }
       ]
@@ -121,6 +131,121 @@
           "kind": "scalar",
           "name": "switchboardOraclePubkey",
           "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "borrowFeeWad",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "flashLoanFeeWad",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "hostFeePercentage",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "depositLimit",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "borrowLimit",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "feeReceiver",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "protocolLiquidationFee",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "protocolTakeRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "accumulatedProtocolFeesWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "addedBorrowWeightBPS",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquiditySmoothedMarketPrice",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "reserveType",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxUtilizationRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "superMaxBorrowRate",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxLiquidationBonus",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxLiquidationThreshold",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "scaledPriceOffsetBPS",
+          "type": "i64"
+        },
+        {
+          "kind": "scalar",
+          "name": "extraOracle",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityExtraMarketPriceFlag",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityExtraMarketPrice",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowValue",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowLimitOpen",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowLimitClose",
+          "type": "u64"
         }
       ]
     }
@@ -145,19 +270,219 @@
           "type": "Pubkey"
         },
         {
-          "kind": "custom",
-          "name": "liquidity",
-          "type": "ReserveLiquidity"
+          "kind": "scalar",
+          "name": "liquidityMintPubkey",
+          "type": "Pubkey"
         },
         {
-          "kind": "custom",
-          "name": "collateral",
-          "type": "ReserveCollateral"
+          "kind": "scalar",
+          "name": "liquidityMintDecimals",
+          "type": "u8"
         },
         {
-          "kind": "custom",
-          "name": "config",
-          "type": "ReserveConfig"
+          "kind": "scalar",
+          "name": "liquiditySupplyPubkey",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityPythOracle",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquiditySwitchboardOracle",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityAvailableAmount",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityBorrowedAmountWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityCumulativeBorrowRateWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityMarketPrice",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "collateralMintPubkey",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "collateralMintTotalSupply",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "collateralSupplyPubkey",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "optimalUtilizationRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "loanToValueRatio",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidationBonus",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidationThreshold",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "minBorrowRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "optimalBorrowRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxBorrowRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "switchboardOraclePubkey",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "borrowFeeWad",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "flashLoanFeeWad",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "hostFeePercentage",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "depositLimit",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "borrowLimit",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "feeReceiver",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "protocolLiquidationFee",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "protocolTakeRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "accumulatedProtocolFeesWads",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "addedBorrowWeightBPS",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquiditySmoothedMarketPrice",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "reserveType",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxUtilizationRate",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "superMaxBorrowRate",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxLiquidationBonus",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "maxLiquidationThreshold",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "scaledPriceOffsetBPS",
+          "type": "i64"
+        },
+        {
+          "kind": "scalar",
+          "name": "extraOracle",
+          "type": "Pubkey"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityExtraMarketPriceFlag",
+          "type": "u8"
+        },
+        {
+          "kind": "scalar",
+          "name": "liquidityExtraMarketPrice",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowValue",
+          "type": "u128"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowLimitOpen",
+          "type": "u64"
+        },
+        {
+          "kind": "scalar",
+          "name": "attributedBorrowLimitClose",
+          "type": "u64"
         }
       ]
     }

@@ -274,7 +274,7 @@ async fn ensure_required_atas_exist(
     for (_pubkey, account) in accounts {
         if let Ok(reserve) = solend::Reserve::from_account_data(&account.data) {
             // Add liquidity mint (debt tokens)
-            token_mints.insert(reserve.liquidity.mintPubkey);
+            token_mints.insert(reserve.liquidity().mintPubkey);
             // Note: We don't need collateral mints (cTokens) for liquidation
             // We only need the actual token mints (liquidity.mintPubkey)
         }
