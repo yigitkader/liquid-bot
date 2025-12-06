@@ -283,6 +283,24 @@ pub fn get_redeem_reserve_collateral_discriminator() -> u8 {
     5u8 // RedeemReserveCollateral enum variant tag
 }
 
+/// Get Solend instruction discriminator for FlashLoan
+/// 
+/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
+/// Solend uses enum-based instruction encoding via LendingInstruction enum.
+/// 
+/// Reference: solend-sdk crate, instruction.rs
+/// LendingInstruction enum tag mapping:
+///   tag 13 => FlashLoan  <-- THIS ONE
+/// 
+/// Format: [13] + amount.to_le_bytes()
+/// Note: Only the first byte (tag = 13) is used as discriminator, followed by amount (u64).
+/// FlashLoan repay is automatic - Solend checks balance at end of transaction.
+pub fn get_flashloan_discriminator() -> u8 {
+    // LendingInstruction::FlashLoan tag = 13
+    // Native Solana programs use only 1 byte as enum tag discriminator
+    13u8 // FlashLoan enum variant tag
+}
+
 // Helper implementation for Reserve
 impl Reserve {
     /// Parse reserve from account data using Borsh
@@ -339,6 +357,28 @@ impl Reserve {
     /// Get liquidation bonus (as f64, 0-1 range)
     pub fn liquidation_bonus(&self) -> f64 {
         self.config.liquidationBonus as f64 / 100.0
+    }
+
+    /// Get close factor (as f64, 0-1 range)
+    /// 
+    /// CRITICAL: Close factor determines what percentage of debt can be liquidated.
+    /// Currently, Solend's ReserveConfig doesn't include close_factor field, so we use
+    /// the standard 50% (0.5) as fallback. If Solend adds close_factor to ReserveConfig
+    /// in the future, this function should be updated to read it from config.
+    /// 
+    /// Close factor can be changed by governance, so hardcoding it is risky.
+    /// This function is prepared for future ReserveConfig.closeFactor field.
+    /// 
+    /// Returns: Close factor as f64 (e.g., 0.5 = 50%)
+    pub fn close_factor(&self) -> f64 {
+        // TODO: When Solend adds closeFactor to ReserveConfig, uncomment this:
+        // if let Some(cf) = self.config.closeFactor {
+        //     return cf as f64 / 100.0;
+        // }
+        
+        // Fallback to standard 50% (0.5) - Solend's current default
+        // This matches the hardcoded value used in debt calculation
+        0.5
     }
 }
 
