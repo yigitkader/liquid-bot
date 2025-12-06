@@ -29,6 +29,10 @@ spl-token = "6.0"
 spl-associated-token-account = "4.0"
 chrono = "0.4"
 sha2 = "0.10"
+# Switchboard On-Demand SDK (Solana 2.0 compatible)
+# Using git repo with solana-v2 feature for Solana 2.0 compatibility
+# Note: crates.io version (0.11.3) has Solana 2.0 compatibility issues, so using git repo
+# Code includes alignment mismatch fallback handling in pipeline.rs:1636
 switchboard-on-demand = { git = "https://github.com/switchboard-xyz/solana-sdk", branch = "main", default-features = false, features = ["client", "solana-v2"] }
 rust_decimal = "1"
 bytemuck = "1.24.0"

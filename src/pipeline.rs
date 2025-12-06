@@ -747,10 +747,14 @@ async fn process_cycle(
 
         // d) Jito bundle ile gönder
         if matches!(config.liquidation_mode, LiquidationMode::Live) {
-            // CRITICAL: Use two-transaction flow to avoid atomicity issues
-            // TX1: Liquidation + Redemption (Solend protocol)
-            // TX2: Jupiter Swap (DEX)
-            // These must be separate because TX2 needs TX1's output (SOL tokens)
+            // ✅ FLASHLOAN APPROACH: Single atomic transaction (NO race condition risk!)
+            // All operations in ONE transaction: FlashBorrow -> Liquidate -> Redeem -> Swap -> FlashRepay
+            // Benefits:
+            // - ✅ Atomicity: All operations succeed or fail together
+            // - ✅ No MEV risk: No intermediate state exposed
+            // - ✅ No race condition: TX1/TX2 split eliminated
+            // - ✅ Gas-efficient: Single transaction fee
+            // - ✅ No capital needed: Flashloan provides initial funds
             match execute_liquidation_with_swap(&ctx, &quote, &config, rpc, jito_client).await {
                 Ok(_) => {
                             // Update balance tracker
@@ -1664,8 +1668,16 @@ async fn validate_switchboard_oracle_if_available(
                 Err(e) => {
                     log::warn!(
                         "Switchboard feed parsing failed after explicit alignment fix for {}: {}. \
-                         This may indicate a data structure issue or incompatible SDK version. \
-                         Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
+                         This may indicate:\n\
+                         - Data structure issue (Switchboard v3 format may have changed)\n\
+                         - Incompatible SDK version (try updating switchboard-on-demand in Cargo.toml)\n\
+                         - Account data corruption\n\
+                         Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).\n\
+                         \n\
+                         TROUBLESHOOTING:\n\
+                         1. Check Cargo.toml for latest Switchboard SDK version\n\
+                         2. Try: cargo update -p switchboard-on-demand\n\
+                         3. Verify Switchboard account owner matches expected program ID",
                         switchboard_oracle_pubkey,
                         e,
                         MAX_CONFIDENCE_PCT_PYTH_ONLY
@@ -2733,9 +2745,9 @@ async fn get_liquidation_quote(
     // Step 7d: Convert to USD
     let profit_before_fees_usd = profit_tokens * debt_price_usd;
     
-    // Step 7e: Calculate total fees for TWO transactions
-    // CRITICAL FIX: Two-transaction flow (TX1: Liquidation + Redemption, TX2: Jupiter Swap)
-    // Each transaction has its own Jito tip + transaction fee
+    // Step 7e: Calculate total fees for SINGLE atomic transaction (Flashloan approach)
+    // ✅ FLASHLOAN APPROACH: Single transaction eliminates race condition and MEV risk
+    // All operations in ONE transaction: FlashBorrow -> Liquidate -> Redeem -> Swap -> FlashRepay
     // Get SOL price for fee calculations
     // CRITICAL: SOL price is REQUIRED - cannot use fallback as it causes incorrect profit calculations
     let sol_price_usd = match get_sol_price_usd(rpc, ctx).await {
@@ -2756,19 +2768,13 @@ async fn get_liquidation_quote(
     let jito_tip_lamports = config.jito_tip_amount_lamports.unwrap_or(10_000_000u64);
     let jito_tip_sol = jito_tip_lamports as f64 / 1_000_000_000.0;
     
-    // TX1 fees: Liquidation + Redemption
-    const TX1_BASE_FEE_LAMPORTS: u64 = 5_000; // Base transaction fee
-    const TX1_COMPUTE_UNITS: u64 = 200_000;
-    const TX1_PRIORITY_FEE_PER_CU: u64 = 1_000; // micro-lamports per compute unit
-    let tx1_priority_fee_lamports = (TX1_COMPUTE_UNITS * TX1_PRIORITY_FEE_PER_CU) / 1_000_000;
-    let tx1_total_fee_lamports = TX1_BASE_FEE_LAMPORTS + tx1_priority_fee_lamports;
-    
-    // TX2 fees: Jupiter Swap
-    const TX2_BASE_FEE_LAMPORTS: u64 = 5_000;
-    const TX2_COMPUTE_UNITS: u64 = 200_000;
-    const TX2_PRIORITY_FEE_PER_CU: u64 = 1_000;
-    let tx2_priority_fee_lamports = (TX2_COMPUTE_UNITS * TX2_PRIORITY_FEE_PER_CU) / 1_000_000;
-    let tx2_total_fee_lamports = TX2_BASE_FEE_LAMPORTS + tx2_priority_fee_lamports;
+    // Single transaction fees (Flashloan approach - all operations in one TX)
+    // Higher compute units needed for flashloan transaction (~500k vs 200k per TX)
+    const TX_BASE_FEE_LAMPORTS: u64 = 5_000; // Base transaction fee
+    const TX_COMPUTE_UNITS: u64 = 500_000; // Higher limit for flashloan (FlashBorrow + Liquidate + Redeem + Swap + FlashRepay)
+    const TX_PRIORITY_FEE_PER_CU: u64 = 1_000; // micro-lamports per compute unit
+    let tx_priority_fee_lamports = (TX_COMPUTE_UNITS * TX_PRIORITY_FEE_PER_CU) / 1_000_000;
+    let tx_total_fee_lamports = TX_BASE_FEE_LAMPORTS + tx_priority_fee_lamports;
     
     // ✅ FIXED: Flashloan fee calculation
     // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)
@@ -2788,23 +2794,21 @@ async fn get_liquidation_quote(
         0.0 // No flashloan fee if borrow reserve not available (shouldn't happen)
     };
     
-    // Total fees in USD
-    let jito_fee_usd = jito_tip_sol * sol_price_usd * 2.0; // TWO tips (one per transaction)
-    let tx1_fee_usd = (tx1_total_fee_lamports as f64 / 1_000_000_000.0) * sol_price_usd;
-    let tx2_fee_usd = (tx2_total_fee_lamports as f64 / 1_000_000_000.0) * sol_price_usd;
-    let total_fees_usd = jito_fee_usd + tx1_fee_usd + tx2_fee_usd + flashloan_fee_usd;
+    // Total fees in USD (single transaction approach)
+    let jito_fee_usd = jito_tip_sol * sol_price_usd; // Single Jito tip (one transaction)
+    let tx_fee_usd = (tx_total_fee_lamports as f64 / 1_000_000_000.0) * sol_price_usd;
+    let total_fees_usd = jito_fee_usd + tx_fee_usd + flashloan_fee_usd;
     
-    // FINAL PROFIT (corrected for two transactions)
+    // FINAL PROFIT (single atomic transaction - no race condition!)
     let profit_usdc = profit_before_fees_usd - total_fees_usd;
     
     log::debug!(
-        "Profit calculation (TWO TX):\n\
+        "Profit calculation (FLASHLOAN - SINGLE TX):\n\
          Jupiter output: {} raw ({:.6} tokens, ${:.2} USD)\n\
          Debt to repay: {} raw ({:.6} tokens, ${:.2} USD)\n\
          Profit before fees: ${:.2}\n\
-         Jito fees (2x): ${:.4}\n\
-         TX1 fee: ${:.4}\n\
-         TX2 fee: ${:.4}\n\
+         Jito fee: ${:.4}\n\
+         TX fee: ${:.4}\n\
          Flashloan fee: ${:.4}\n\
          Total fees: ${:.4}\n\
          FINAL PROFIT: ${:.2}",
@@ -2816,8 +2820,7 @@ async fn get_liquidation_quote(
         debt_to_repay_usd,
         profit_before_fees_usd,
         jito_fee_usd,
-        tx1_fee_usd,
-        tx2_fee_usd,
+        tx_fee_usd,
         flashloan_fee_usd,
         total_fees_usd,
         profit_usdc
@@ -3061,10 +3064,28 @@ async fn get_wallet_value_usd(
 
 /// Build liquidation transaction per Structure.md section 8
 /// 
+/// ⚠️ DEPRECATED: Two-Transaction Approach (Race Condition Risk!)
+/// 
+/// This function is DEPRECATED and should NOT be used.
+/// Use `build_flashloan_liquidation_tx` instead for atomic single-transaction approach.
+/// 
+/// ❌ PROBLEMS WITH TWO-TRANSACTION APPROACH:
+/// - Race condition: TX1 and TX2 can be front-run by MEV bots
+/// - MEV risk: Intermediate SOL state exposed between TX1 and TX2
+/// - Capital requirement: Need USDC upfront for TX1
+/// - Higher fees: Two transaction fees instead of one
+/// 
+/// ✅ USE FLASHLOAN APPROACH INSTEAD:
+/// - Atomic: All operations in single transaction
+/// - No MEV risk: No intermediate state
+/// - No capital needed: Flashloan provides funds
+/// - Gas-efficient: Single transaction fee
+/// 
 /// Build transaction 1: Liquidation + Redemption (NO Jupiter Swap!)
 /// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
 /// Blockhashes are valid for ~150 slots (~60 seconds), so fetch blockhash right before
 /// building the transaction to minimize staleness risk.
+#[deprecated(note = "Use build_flashloan_liquidation_tx instead for atomic single-transaction approach")]
 async fn build_liquidation_tx1(
     wallet: &Arc<Keypair>,
     ctx: &LiquidationContext,
@@ -3529,8 +3550,28 @@ async fn build_liquidation_tx1(
     Ok(tx)
 }
 
+/// ⚠️ DEPRECATED: Two-Transaction Approach (Race Condition Risk!)
+/// 
+/// This function is DEPRECATED and should NOT be used.
+/// Use `build_flashloan_liquidation_tx` instead for atomic single-transaction approach.
+/// 
+/// ❌ PROBLEMS WITH TWO-TRANSACTION APPROACH:
+/// - Race condition: TX1 and TX2 can be front-run by MEV bots
+/// - MEV risk: Intermediate SOL state exposed between TX1 and TX2
+/// - Capital requirement: Need USDC upfront for TX1
+/// - Higher fees: Two transaction fees instead of one
+/// 
+/// ✅ USE FLASHLOAN APPROACH INSTEAD:
+/// - Atomic: All operations in single transaction
+/// - No MEV risk: No intermediate state
+/// - No capital needed: Flashloan provides funds
+/// - Gas-efficient: Single transaction fee
+/// 
 /// Build transaction 2: Jupiter Swap (SOL -> USDC)
 /// This is called AFTER TX1 confirms and SOL is available in wallet
+/// 
+/// ❌ WARNING: This creates a race condition window where MEV bots can front-run TX2!
+#[deprecated(note = "Use build_flashloan_liquidation_tx instead for atomic single-transaction approach")]
 /// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
 async fn build_liquidation_tx2(
     wallet: &Arc<Keypair>,
@@ -3604,7 +3645,7 @@ async fn build_liquidation_tx2(
 /// 2. LiquidateObligation: Repay debt, receive cSOL
 /// 3. RedeemReserveCollateral: cSOL -> SOL
 /// 4. Jupiter Swap: SOL -> USDC
-/// 5. RepayFlashLoan: Repay borrowed USDC + fee (automatic - Solend checks balance at end)
+/// 5. FlashRepayReserveLiquidity: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
 /// All in ONE transaction - atomicity guaranteed!
 /// 
 /// AVANTAJLAR:
@@ -3697,24 +3738,30 @@ async fn build_flashloan_liquidation_tx(
     let mut flashloan_data = vec![crate::solend::get_flashloan_discriminator()]; // FlashLoan discriminator (tag 13)
     flashloan_data.extend_from_slice(&flashloan_amount.to_le_bytes()); // amount (u64)
     
-    // FlashLoan accounts per Solend IDL:
-    // 0. [writable] sourceLiquidity - Destination for borrowed funds (user's ATA)
-    // 1. [writable] reserve - Reserve to borrow from
-    // 2. [writable] reserveLiquiditySupply - Reserve liquidity supply
-    // 3. [readonly] lendingMarket - Lending market
-    // 4. [readonly] lendingMarketAuthority - Lending market authority PDA
-    // 5. [signer] transferAuthority - User wallet (signer)
-    // 6. [readonly] instructionsSysvar - Instructions sysvar (for flashloan callback verification)
-    // 7. [readonly] tokenProgram - SPL Token program
+    // FlashLoan accounts per Solend IDL (FlashBorrowReserveLiquidity - tag 13):
+    // CRITICAL: Account order must match Solend SDK exactly
+    // Reference: solend-sdk/src/instruction.rs - LendingInstruction::FlashBorrowReserveLiquidity
+    // 
+    // Correct account order (9 accounts total):
+    // 0. [writable] sourceLiquidity - Reserve's liquidity supply (source of funds)
+    // 1. [writable] destinationLiquidity - User's ATA to receive borrowed funds (DESTINATION)
+    // 2. [writable] reserve - Reserve account to borrow from
+    // 3. [writable] reserveLiquiditySupply - Reserve liquidity supply (same as sourceLiquidity)
+    // 4. [readonly] lendingMarket - Lending market account
+    // 5. [readonly] lendingMarketAuthority - Lending market authority PDA
+    // 6. [signer] transferAuthority - User wallet (signer)
+    // 7. [readonly] instructionsSysvar - Instructions sysvar (for flashloan callback verification)
+    // 8. [readonly] tokenProgram - SPL Token program
     let flashloan_accounts = vec![
-        AccountMeta::new(source_liquidity, false),           // 0: Destination for borrowed funds
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false), // 1: Reserve to borrow from
-        AccountMeta::new(repay_reserve_liquidity_supply, false), // 2: Reserve liquidity supply
-        AccountMeta::new_readonly(lending_market, false),   // 3: Lending market
-        AccountMeta::new_readonly(lending_market_authority, false), // 4: Lending market authority
-        AccountMeta::new_readonly(wallet_pubkey, true),     // 5: Authority (signer)
-        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 6: Instructions sysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // 7: Token program
+        AccountMeta::new(repay_reserve_liquidity_supply, false), // 0: sourceLiquidity (reserve's supply)
+        AccountMeta::new(source_liquidity, false),               // 1: destinationLiquidity (user's ATA to receive funds)
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: reserve (reserve to borrow from)
+        AccountMeta::new(repay_reserve_liquidity_supply, false), // 3: reserveLiquiditySupply (same as source)
+        AccountMeta::new_readonly(lending_market, false),       // 4: lendingMarket
+        AccountMeta::new_readonly(lending_market_authority, false), // 5: lendingMarketAuthority
+        AccountMeta::new_readonly(wallet_pubkey, true),         // 6: transferAuthority (signer)
+        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 7: instructionsSysvar
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 8: tokenProgram
     ];
     
     let flashloan_ix = Instruction {
@@ -3793,6 +3840,53 @@ async fn build_flashloan_liquidation_tx(
     .context("Failed to build Jupiter swap instruction")?;
     
     // ============================================================================
+    // INSTRUCTION 5: FlashRepayReserveLiquidity (CRITICAL - Explicit Repayment Required!)
+    // ============================================================================
+    // CRITICAL: FlashLoan requires explicit repayment instruction - NOT automatic!
+    // Solend uses two-instruction pattern: FlashBorrow (tag 13) + FlashRepay (tag 14)
+    // 
+    // Calculate flashloan fee
+    const WAD: f64 = 1_000_000_000_000_000_000.0;
+    let fee_wad = borrow_reserve.config().flashLoanFeeWad;
+    let fee_pct = fee_wad as f64 / WAD;
+    let flashloan_fee_amount = ((flashloan_amount as f64) * fee_pct) as u64;
+    let repay_amount = flashloan_amount + flashloan_fee_amount;
+    
+    // FlashRepayReserveLiquidity instruction data:
+    // [14] (discriminator) + repay_amount (u64) + borrowed_amount (u64)
+    let mut repay_data = vec![crate::solend::get_flashrepay_discriminator()]; // tag 14
+    repay_data.extend_from_slice(&repay_amount.to_le_bytes()); // repay_amount (u64)
+    repay_data.extend_from_slice(&flashloan_amount.to_le_bytes()); // borrowed_amount (u64)
+    
+    // FlashRepayReserveLiquidity accounts per Solend IDL:
+    // CRITICAL: Account order must match Solend SDK exactly
+    // Reference: solend-sdk/src/instruction.rs - LendingInstruction::FlashRepayReserveLiquidity
+    // 
+    // Correct account order (7 accounts total):
+    // 0. [writable] sourceLiquidity - User's ATA (source of repayment funds)
+    // 1. [writable] destinationLiquidity - Reserve's liquidity supply (destination)
+    // 2. [writable] reserve - Reserve account
+    // 3. [readonly] lendingMarket - Lending market account
+    // 4. [signer] transferAuthority - User wallet (signer)
+    // 5. [readonly] instructionsSysvar - Instructions sysvar
+    // 6. [readonly] tokenProgram - SPL Token program
+    let repay_accounts = vec![
+        AccountMeta::new(source_liquidity, false),              // 0: sourceLiquidity (user's ATA)
+        AccountMeta::new(repay_reserve_liquidity_supply, false), // 1: destinationLiquidity (reserve supply)
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: reserve
+        AccountMeta::new_readonly(lending_market, false),       // 3: lendingMarket
+        AccountMeta::new_readonly(wallet_pubkey, true),         // 4: transferAuthority (signer)
+        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 5: instructionsSysvar
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 6: tokenProgram
+    ];
+    
+    let repay_ix = Instruction {
+        program_id,
+        accounts: repay_accounts,
+        data: repay_data,
+    };
+    
+    // ============================================================================
     // Compute Budget Instructions
     // ============================================================================
     let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
@@ -3820,16 +3914,16 @@ async fn build_flashloan_liquidation_tx(
     // BUILD TRANSACTION
     // ============================================================================
     // All instructions in ONE transaction - atomicity guaranteed!
-    // FlashLoan repay is automatic - Solend checks balance at end of transaction
+    // CRITICAL: FlashLoan requires explicit repayment instruction (FlashRepayReserveLiquidity)
     let mut tx = Transaction::new_with_payer(
         &[
             compute_budget_ix,        // Compute unit limit
             priority_fee_ix,          // Priority fee
-            flashloan_ix,             // 1. Borrow USDC (flash)
-            liquidation_ix,           // 2. Liquidate (USDC -> cSOL)
-            redeem_ix,                 // 3. Redeem (cSOL -> SOL)
-            jupiter_swap_ix,           // 4. Swap (SOL -> USDC)
-            // 5. FlashLoan repay is automatic (Solend checks balance at end)
+            flashloan_ix,             // 1. FlashBorrow: Borrow USDC (flash)
+            liquidation_ix,           // 2. Liquidate: USDC -> cSOL
+            redeem_ix,                 // 3. Redeem: cSOL -> SOL
+            jupiter_swap_ix,           // 4. Jupiter Swap: SOL -> USDC
+            repay_ix,                  // 5. FlashRepay: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
         ],
         Some(&wallet_pubkey),
     );
@@ -3837,15 +3931,18 @@ async fn build_flashloan_liquidation_tx(
     
                 log::info!(
         "Built atomic flashloan liquidation transaction for obligation {}:\n\
-         - FlashLoan: {} USDC (flash)\n\
+         - FlashBorrow: {} USDC (flash)\n\
          - Liquidate: {} debt tokens (USDC -> cSOL)\n\
          - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
          - Jupiter Swap: SOL -> USDC\n\
-         - FlashLoan repay: Automatic (Solend checks balance at end)",
+         - FlashRepay: {} USDC (borrowed: {} + fee: {}) (EXPLICIT - REQUIRED!)",
         ctx.obligation_pubkey,
         flashloan_amount,
-        liquidity_amount,
-        redeem_collateral_amount
+        quote.debt_to_repay_raw,
+        quote.collateral_to_seize_raw,
+        repay_amount,
+        flashloan_amount,
+        flashloan_fee_amount
     );
     
     Ok(tx)
@@ -3865,7 +3962,7 @@ async fn build_flashloan_liquidation_tx(
 /// 2. LiquidateObligation: Repay debt, receive cSOL
 /// 3. RedeemReserveCollateral: cSOL -> SOL
 /// 4. Jupiter Swap: SOL -> USDC
-/// 5. RepayFlashLoan: Automatic (Solend checks balance at end)
+/// 5. FlashRepayReserveLiquidity: Explicit repayment instruction (REQUIRED!)
 async fn execute_liquidation_with_swap(
     ctx: &LiquidationContext,
     quote: &LiquidationQuote,

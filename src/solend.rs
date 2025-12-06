@@ -399,42 +399,44 @@ impl Obligation {
     }
 }
 
-// CRITICAL FIX: Solend/Save Protocol Program ID (2024 Update)
+// CRITICAL FIX: Solend Program ID - USDC Reserve Required
 // 
-// ⚠️  DEPRECATED PROGRAMS (DO NOT USE):
-//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn" - OLD Solend (CLOSED 2024)
+// ⚠️  IMPORTANT: Bot requires USDC reserve (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)
+//    Only programs with USDC reserve can be used for liquidation operations.
 //
-// ✅ CORRECT (ACTIVE PROGRAMS):
-//    Solend rebranded to "Save" in 2024 and migrated to new contracts.
-//    Multiple lending markets exist, each with different reserves/pools.
+// ✅ ACTIVE PROGRAMS WITH USDC:
+// 1. Original Solend Program (RECOMMENDED): So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
+//    - Still active on mainnet
+//    - Has USDC reserve (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)
+//    - Verified working for liquidation bot
 //
-// Known ACTIVE Save/Solend markets on mainnet:
-// 1. Save Main Market (RECOMMENDED): So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
-//    - Widest USDC support
-//    - Main production market
-// 2. Turbo SOL Market: turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP
-//    - SOL-focused market
-// 3. Altcoins Market: ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw
-//    - Alt token support
+// ❌ PROGRAMS WITHOUT USDC (DO NOT USE):
+//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo" - Save Main Market (NO USDC reserve)
+//    "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw" - Altcoins Market (NO USDC)
+//    "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP" - Turbo SOL Market (NO USDC)
 //
-// IMPORTANT: Check Save documentation for current markets:
-// https://docs.save.finance or https://app.save.finance
-pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"; // Save Main Market (Active - RECOMMENDED)
-pub const SOLEND_PROGRAM_ID_ALTCOINS: &str = "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw"; // Altcoins Market
-pub const SOLEND_PROGRAM_ID_TURBO: &str = "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP"; // Turbo SOL Market
+// NOTE: Save markets (2024 rebrand) may not have USDC reserves.
+//       Always verify USDC reserve exists before using a program ID.
+//
+// Verification: Check Solana Explorer for USDC reserves:
+// https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
+pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"; // Original Solend (USDC reserve available)
+pub const SOLEND_PROGRAM_ID_ALTCOINS: &str = "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw"; // Altcoins Market (NO USDC)
+pub const SOLEND_PROGRAM_ID_TURBO: &str = "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP"; // Turbo SOL Market (NO USDC)
 
-/// Known active Save/Solend program IDs (for validation)
+/// Known Solend program IDs (for validation)
+/// NOTE: Only programs with USDC reserve should be used for liquidation bot
 pub const SOLEND_PROGRAM_IDS: &[&str] = &[
-    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo", // Save Main Market (RECOMMENDED - USDC supported)
-    "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw", // Altcoins Market
-    "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP", // Turbo SOL Market
+    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn", // Original Solend (USDC reserve available - RECOMMENDED)
 ];
 
-/// Get Save/Solend program ID (mainnet production)
+/// Get Solend program ID (mainnet production)
 /// 
-/// CRITICAL: This returns the correct mainnet Save program ID (Save rebranded from Solend in 2024)
-/// Defaults to Save Main Market (So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo)
+/// CRITICAL: This returns the Solend program ID that has USDC reserve
+/// Defaults to original Solend program (So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn)
 /// Can be overridden via SOLEND_PROGRAM_ID environment variable
+/// 
+/// NOTE: Bot requires USDC reserve - only programs with USDC can be used
 pub fn solend_program_id() -> Result<Pubkey> {
     use std::env;
     
@@ -451,10 +453,10 @@ pub fn solend_program_id() -> Result<Pubkey> {
         .map_err(|e| anyhow::anyhow!("Invalid Save program ID: {}", e))
 }
 
-/// Verify if a program ID is a known Save/Solend program
+/// Verify if a program ID is a known Solend program
 /// 
-/// This can be used to validate that we're connecting to a legitimate Save program
-/// (Save rebranded from Solend in 2024)
+/// This can be used to validate that we're connecting to a legitimate Solend program
+/// NOTE: Only programs with USDC reserve should be used for liquidation operations
 pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
     SOLEND_PROGRAM_IDS
         .iter()
@@ -619,15 +621,32 @@ pub fn get_redeem_reserve_collateral_discriminator() -> u8 {
 /// 
 /// Reference: solend-sdk crate, instruction.rs
 /// LendingInstruction enum tag mapping:
-///   tag 13 => FlashLoan  <-- THIS ONE
+///   tag 13 => FlashBorrowReserveLiquidity  <-- THIS ONE
 /// 
 /// Format: [13] + amount.to_le_bytes()
 /// Note: Only the first byte (tag = 13) is used as discriminator, followed by amount (u64).
-/// FlashLoan repay is automatic - Solend checks balance at end of transaction.
 pub fn get_flashloan_discriminator() -> u8 {
-    // LendingInstruction::FlashLoan tag = 13
+    // LendingInstruction::FlashBorrowReserveLiquidity tag = 13
     // Native Solana programs use only 1 byte as enum tag discriminator
-    13u8 // FlashLoan enum variant tag
+    13u8 // FlashBorrowReserveLiquidity enum variant tag
+}
+
+/// Get Solend instruction discriminator for FlashRepayReserveLiquidity
+/// 
+/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
+/// Solend uses enum-based instruction encoding via LendingInstruction enum.
+/// 
+/// Reference: solend-sdk crate, instruction.rs
+/// LendingInstruction enum tag mapping:
+///   tag 14 => FlashRepayReserveLiquidity  <-- THIS ONE
+/// 
+/// Format: [14] + repay_amount.to_le_bytes() + borrowed_amount.to_le_bytes()
+/// Note: First byte (tag = 14) is discriminator, followed by repay_amount (u64) and borrowed_amount (u64).
+/// CRITICAL: FlashLoan requires explicit repayment instruction - NOT automatic!
+pub fn get_flashrepay_discriminator() -> u8 {
+    // LendingInstruction::FlashRepayReserveLiquidity tag = 14
+    // Native Solana programs use only 1 byte as enum tag discriminator
+    14u8 // FlashRepayReserveLiquidity enum variant tag
 }
 
 // Helper implementation for Reserve
