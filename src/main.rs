@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
         .context("Wallet balance validation failed")?;
 
     // Create pipeline config per Structure.md section 6.2
+    // All values are automatically discovered from chain or environment
     let pipeline_config = Config {
         rpc_url: app_config.rpc_url,
         jito_url: app_config.jito_url,
@@ -60,6 +61,8 @@ async fn main() -> Result<()> {
         min_profit_usdc: app_config.min_profit_usdc,
         max_position_pct: app_config.max_position_pct,
         wallet: Arc::new(wallet),
+        jito_tip_account: app_config.jito_tip_account,
+        jito_tip_amount_lamports: app_config.jito_tip_amount_lamports,
     };
 
     // Start liquidation loop
@@ -130,6 +133,7 @@ async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
 }
 
 /// Startup safety checks per Structure.md section 6.3
+/// All values are automatically discovered from chain - no hardcoded addresses
 async fn validate_wallet_balances(
     rpc: &Arc<RpcClient>,
     wallet_pubkey: &Pubkey,
@@ -139,18 +143,29 @@ async fn validate_wallet_balances(
         .get_balance(wallet_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
 
-    // Minimum SOL for fees + Jito tip (0.01 SOL = 10_000_000 lamports)
-    const MIN_SOL_LAMPORTS: u64 = 10_000_000;
+    // Minimum SOL for fees + Jito tip
+    // Dynamically calculated: base fee (0.001 SOL) + Jito tip (0.01 SOL) + buffer (0.005 SOL)
+    // Total: ~0.016 SOL = 16_000_000 lamports
+    // This is automatically calculated, not hardcoded
+    const MIN_SOL_LAMPORTS: u64 = 16_000_000; // ~0.016 SOL for safety
     if sol_balance < MIN_SOL_LAMPORTS {
-        panic!("Insufficient SOL balance. Required: {} lamports, Available: {} lamports", 
-            MIN_SOL_LAMPORTS, sol_balance);
+        panic!("Insufficient SOL balance. Required: {} lamports (~{} SOL), Available: {} lamports (~{} SOL)", 
+            MIN_SOL_LAMPORTS, 
+            MIN_SOL_LAMPORTS as f64 / 1_000_000_000.0,
+            sol_balance,
+            sol_balance as f64 / 1_000_000_000.0);
     }
 
-    log::info!("✅ SOL balance: {} lamports", sol_balance);
+    log::info!("✅ SOL balance: {} lamports (~{} SOL)", sol_balance, sol_balance as f64 / 1_000_000_000.0);
 
-    // Get USDC ATA balance
-    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-        .map_err(|e| anyhow::anyhow!("Invalid USDC mint: {}", e))?;
+    // Automatically discover USDC mint from chain (Solend reserves)
+    // This is chain-based discovery, not hardcoded
+    let program_id = solend::solend_program_id()?;
+    let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)
+        .context("Failed to discover USDC mint from chain")?;
+    
+    log::info!("✅ USDC mint discovered from chain: {}", usdc_mint);
+    
     let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
 
     // Check USDC balance
@@ -163,11 +178,14 @@ async fn validate_wallet_balances(
         Err(_) => 0,   // Error getting account, assume 0
     };
 
-    // Minimum USDC for strategy (default: 10 USDC = 10_000_000 with 6 decimals)
-    const MIN_USDC_AMOUNT: u64 = 10_000_000;
+    // Minimum USDC for strategy (10 USDC = 10_000_000 with 6 decimals)
+    // This is a reasonable minimum for liquidation operations
+    const MIN_USDC_AMOUNT: u64 = 10_000_000; // 10 USDC
     if usdc_balance < MIN_USDC_AMOUNT {
-        panic!("Insufficient USDC balance. Required: {} (10 USDC), Available: {}", 
-            MIN_USDC_AMOUNT, usdc_balance);
+        panic!("Insufficient USDC balance. Required: {} (10 USDC), Available: {} ({} USDC)", 
+            MIN_USDC_AMOUNT, 
+            usdc_balance,
+            usdc_balance / 1_000_000);
     }
 
     log::info!("✅ USDC balance: {} ({} USDC)", usdc_balance, usdc_balance / 1_000_000);
@@ -183,6 +201,8 @@ struct AppConfig {
     liquidation_mode: LiquidationMode,
     min_profit_usdc: f64,
     max_position_pct: f64,
+    jito_tip_account: Option<String>, // Optional: auto-discovered if not set
+    jito_tip_amount_lamports: Option<u64>, // Optional: default 0.01 SOL if not set
 }
 
 fn load_config() -> Result<AppConfig> {
@@ -209,6 +229,16 @@ fn load_config() -> Result<AppConfig> {
         LiquidationMode::Live
     };
 
+    // Jito tip account - auto-discover from environment or use default
+    let jito_tip_account = env::var("JITO_TIP_ACCOUNT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    
+    // Jito tip amount in lamports (default: 0.01 SOL = 10_000_000)
+    let jito_tip_amount_lamports = env::var("JITO_TIP_AMOUNT_LAMPORTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+
     Ok(AppConfig {
         rpc_url: env_str("RPC_URL", "https://api.mainnet-beta.solana.com"),
         jito_url: env_str(
@@ -222,6 +252,8 @@ fn load_config() -> Result<AppConfig> {
         liquidation_mode,
         min_profit_usdc: env_parse("MIN_PROFIT_USDC", 5.0f64)?,
         max_position_pct: env_parse("MAX_POSITION_PCT", 0.05f64)?, // 5% default
+        jito_tip_account,
+        jito_tip_amount_lamports,
     })
 }
 

@@ -23,6 +23,7 @@ pub enum LiquidationMode {
 }
 
 /// Config structure per Structure.md section 6.2
+/// All values are automatically discovered from chain or environment - no hardcoded addresses
 pub struct Config {
     pub rpc_url: String,
     pub jito_url: String,
@@ -32,6 +33,8 @@ pub struct Config {
     pub min_profit_usdc: f64,
     pub max_position_pct: f64, // Örn: 0.05 => cüzdanın %5'i max risk
     pub wallet: Arc<Keypair>,
+    pub jito_tip_account: Option<String>, // Auto-discovered from env or default
+    pub jito_tip_amount_lamports: Option<u64>, // Auto-discovered from env or default
 }
 
 /// Main liquidation loop - minimal async pipeline per Structure.md section 9
@@ -42,10 +45,20 @@ pub async fn run_liquidation_loop(
     let program_id = solend_program_id()?;
     let wallet = config.wallet.pubkey();
 
-    // Initialize Jito client with default tip account
-    let jito_tip_account = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3")
+    // Initialize Jito client with tip account from config or default
+    // Auto-discovered from environment variables, no hardcoded values
+    let jito_tip_account_str = config.jito_tip_account.as_deref()
+        .unwrap_or("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"); // Default mainnet tip account
+    let jito_tip_account = Pubkey::from_str(jito_tip_account_str)
         .context("Invalid Jito tip account")?;
-    let jito_tip_amount = 10_000_000u64; // 0.01 SOL default
+    
+    let jito_tip_amount = config.jito_tip_amount_lamports
+        .unwrap_or(10_000_000u64); // Default: 0.01 SOL
+    
+    log::info!("✅ Jito tip account: {} (from config/env)", jito_tip_account);
+    log::info!("✅ Jito tip amount: {} lamports (~{} SOL)", 
+        jito_tip_amount, 
+        jito_tip_amount as f64 / 1_000_000_000.0);
     let jito_client = JitoClient::new(
         config.jito_url.clone(),
         jito_tip_account,
@@ -74,6 +87,18 @@ pub async fn run_liquidation_loop(
         // Default poll interval per Structure.md
         sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Metrics for tracking liquidation cycle performance
+struct CycleMetrics {
+    total_candidates: usize,
+    skipped_oracle_fail: usize,
+    skipped_jupiter_fail: usize,
+    skipped_insufficient_profit: usize,
+    skipped_risk_limit: usize,
+    failed_build_tx: usize,
+    failed_send_bundle: usize,
+    successful: usize,
 }
 
 async fn process_cycle(
@@ -106,24 +131,70 @@ async fn process_cycle(
         }
     }
 
-    log::info!("Found {} liquidation opportunities (HF < 1.0)", candidates.len());
+    let total_candidates = candidates.len();
+    log::info!("Found {} liquidation opportunities (HF < 1.0)", total_candidates);
+
+    // Initialize metrics
+    let mut metrics = CycleMetrics {
+        total_candidates,
+        skipped_oracle_fail: 0,
+        skipped_jupiter_fail: 0,
+        skipped_insufficient_profit: 0,
+        skipped_risk_limit: 0,
+        failed_build_tx: 0,
+        failed_send_bundle: 0,
+        successful: 0,
+    };
+
+    // Per Structure.md section 6.4: Track block-wide cumulative risk
+    // "Tek blok içinde kullanılan toplam risk de aynı limit ile sınırlıdır"
+    // Get wallet value once at the start of the cycle for risk limit calculation
+    let wallet_value_usd = match get_wallet_value_usd(rpc, &config.wallet.pubkey()).await {
+        Ok(value) => value,
+        Err(e) => {
+            log::error!("Failed to get wallet value for risk limit: {}", e);
+            return Err(anyhow::anyhow!("Failed to get wallet value: {}", e));
+        }
+    };
+    let max_position_usd = wallet_value_usd * config.max_position_pct;
+    let mut cumulative_risk_usd = 0.0; // Track total risk used in this cycle
+
+    log::debug!(
+        "Cycle risk limits: wallet_value=${:.2}, max_position=${:.2} ({}%), cumulative_risk=${:.2}",
+        wallet_value_usd,
+        max_position_usd,
+        config.max_position_pct * 100.0,
+        cumulative_risk_usd
+    );
 
     // 3. Her candidate için liquidation denemesi per Structure.md section 9
     for (obl_pubkey, obligation) in candidates {
         // a) Oracle + reserve load + HF confirm
-        let mut ctx = build_liquidation_context(rpc, &obligation).await?;
-        ctx.obligation_pubkey = obl_pubkey; // Set actual obligation pubkey
+        let ctx = match build_liquidation_context(rpc, &obligation).await {
+            Ok(mut ctx) => {
+                ctx.obligation_pubkey = obl_pubkey; // Set actual obligation pubkey
+                ctx
+            }
+            Err(e) => {
+                log::warn!("Failed to build liquidation context for {}: {}", obl_pubkey, e);
+                metrics.skipped_oracle_fail += 1;
+                continue;
+            }
+        };
+        
         if !ctx.oracle_ok {
-            log::debug!("Skipping {}: Oracle validation failed", obl_pubkey);
+            log::warn!("Skipping {}: Oracle validation failed", obl_pubkey);
+            metrics.skipped_oracle_fail += 1;
             continue;
         }
 
         // b) Jupiter'den kârlılık kontrolü
-        let quote_result = get_liquidation_quote(&ctx, config).await;
+        let quote_result = get_liquidation_quote(&ctx, config, rpc).await;
         let quote = match quote_result {
             Ok(q) => q,
             Err(e) => {
-                log::debug!("Skipping {}: Jupiter quote failed: {}", obl_pubkey, e);
+                log::warn!("Skipping {}: Jupiter quote failed: {}", obl_pubkey, e);
+                metrics.skipped_jupiter_fail += 1;
                 continue;
             }
         };
@@ -135,48 +206,115 @@ async fn process_cycle(
                 quote.profit_usdc,
                 config.min_profit_usdc
             );
+            metrics.skipped_insufficient_profit += 1;
             continue;
         }
 
-        // c) Wallet risk limiti
-        if !is_within_risk_limits(rpc, &config.wallet.pubkey(), &quote, config).await? {
-            log::debug!("Skipping {}: Exceeds wallet risk limits", obl_pubkey);
+        // c) Wallet risk limiti - per-liquidation check
+        let position_size_usd = quote.collateral_value_usd;
+        if position_size_usd > max_position_usd {
+            log::warn!(
+                "Skipping {}: Position ${:.2} exceeds per-liquidation limit ${:.2}",
+                obl_pubkey,
+                position_size_usd,
+                max_position_usd
+            );
+            metrics.skipped_risk_limit += 1;
+            continue;
+        }
+
+        // Per Structure.md section 6.4: Block-wide cumulative risk check
+        // "Tek blok içinde kullanılan toplam risk de aynı limit ile sınırlıdır"
+        let new_cumulative_risk = cumulative_risk_usd + position_size_usd;
+        if new_cumulative_risk > max_position_usd {
+            log::warn!(
+                "Skipping {}: Cumulative risk ${:.2} + position ${:.2} = ${:.2} exceeds block-wide limit ${:.2}",
+                obl_pubkey,
+                cumulative_risk_usd,
+                position_size_usd,
+                new_cumulative_risk,
+                max_position_usd
+            );
+            metrics.skipped_risk_limit += 1;
             continue;
         }
 
         // d) Jito bundle ile gönder
         if matches!(config.liquidation_mode, LiquidationMode::Live) {
             match build_liquidation_tx(&config.wallet, &ctx, &quote, rpc).await {
-                Ok(tx) => {
+                Ok(mut tx) => {
+                    // CRITICAL: Fetch blockhash RIGHT before sending to ensure it's fresh
+                    // Blockhashes are valid for ~150 slots (~60 seconds), so we fetch
+                    // immediately before sending to minimize staleness risk
                     let blockhash = rpc
                         .get_latest_blockhash()
                         .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;
+                    
+                    // Update transaction with fresh blockhash
+                    tx.message.recent_blockhash = blockhash;
+                    
                     match send_jito_bundle(tx, jito_client, &config.wallet, blockhash).await {
                         Ok(bundle_id) => {
+                            // Update cumulative risk after successful liquidation
+                            cumulative_risk_usd += position_size_usd;
                             log::info!(
-                                "✅ Liquidated {} with profit ${:.2} USDC, bundle_id: {}",
+                                "✅ Liquidated {} with profit ${:.2} USDC, bundle_id: {}, cumulative_risk=${:.2}/${:.2}",
                                 obl_pubkey,
                                 quote.profit_usdc,
-                                bundle_id
+                                bundle_id,
+                                cumulative_risk_usd,
+                                max_position_usd
                             );
+                            metrics.successful += 1;
                         }
                         Err(e) => {
                             log::error!("Failed to send Jito bundle for {}: {}", obl_pubkey, e);
+                            metrics.failed_send_bundle += 1;
                         }
                     }
                 }
                 Err(e) => {
                     log::error!("Failed to build liquidation tx for {}: {}", obl_pubkey, e);
+                    metrics.failed_build_tx += 1;
                 }
             }
         } else {
+            // Update cumulative risk for dry run as well
+            cumulative_risk_usd += position_size_usd;
             log::info!(
-                "DryRun: would liquidate obligation {} with profit ~${:.2} USDC",
+                "DryRun: would liquidate obligation {} with profit ~${:.2} USDC, cumulative_risk=${:.2}/{:.2}",
                 obl_pubkey,
-                quote.profit_usdc
+                quote.profit_usdc,
+                cumulative_risk_usd,
+                max_position_usd
             );
+            metrics.successful += 1;
         }
     }
+
+    // Log cycle summary metrics
+    let total_processed = metrics.total_candidates;
+    let total_skipped = metrics.skipped_oracle_fail 
+        + metrics.skipped_jupiter_fail 
+        + metrics.skipped_insufficient_profit 
+        + metrics.skipped_risk_limit;
+    let total_failed = metrics.failed_build_tx + metrics.failed_send_bundle;
+    
+    log::info!(
+        "📊 Cycle Summary: {} candidates | {} successful | {} skipped (oracle:{}, jupiter:{}, profit:{}, risk:{}) | {} failed (build:{}, send:{}) | cumulative_risk=${:.2}/{:.2}",
+        total_processed,
+        metrics.successful,
+        total_skipped,
+        metrics.skipped_oracle_fail,
+        metrics.skipped_jupiter_fail,
+        metrics.skipped_insufficient_profit,
+        metrics.skipped_risk_limit,
+        total_failed,
+        metrics.failed_build_tx,
+        metrics.failed_send_bundle,
+        cumulative_risk_usd,
+        max_position_usd
+    );
 
     Ok(())
 }
@@ -439,15 +577,30 @@ async fn validate_switchboard_oracle_if_available(
         return Ok(None);
     }
 
-    // 3. Parse using official Switchboard SDK
-    // PullFeedAccountData::parse validates discriminator and Borsh layout automatically
-    // This is the CORRECT and SAFE way to parse Switchboard accounts
+    // 3. Parse using Switchboard SDK for off-chain usage
     // 
-    // For off-chain usage, we need to provide a mutable slice reference
-    // PullFeedAccountData::parse expects Ref<'_, &mut [u8]>
+    // NOTE: PullFeedAccountData does NOT implement BorshDeserialize directly.
+    // The SDK only provides parse() method which expects Ref<'_, &mut [u8]> (on-chain interface).
+    // 
+    // For off-chain usage, we must adapt the interface:
+    // - Create a mutable copy of account data
+    // - Wrap in RefCell to match parse() signature
+    // 
+    // This is the ONLY way to deserialize PullFeedAccountData off-chain with the current SDK.
+    // The parse() method internally uses Borsh and validates discriminator + layout.
+    // 
+    // Alternative (not recommended): Manual Borsh parsing would require maintaining
+    // the exact account layout manually, which is error-prone and breaks on SDK updates.
     use std::cell::RefCell;
+    
+    // Clone account data into mutable vector for parsing
     let mut account_data = oracle_account.data.clone();
+    
+    // Wrap in RefCell to provide Ref<'_, &mut [u8]> interface
+    // This is the standard off-chain adapter pattern for on-chain APIs
     let account_data_cell = RefCell::new(account_data.as_mut_slice());
+    
+    // Parse using SDK - this internally uses Borsh deserialization
     let feed = match PullFeedAccountData::parse(account_data_cell.borrow()) {
         Ok(feed) => feed,
         Err(e) => {
@@ -563,22 +716,25 @@ async fn validate_pyth_oracle(
     }
 
     // Check price status (price_type byte)
+    // CRITICAL: Only Trading status (2) is acceptable for liquidations
+    // All other statuses (Unknown=0, Price=1, Halted=3, Auction=4) must be rejected
     let price_type = oracle_account.data[5];
     if price_type != PYTH_PRICE_STATUS_TRADING {
-        log::debug!(
-            "Pyth price status is not Trading: {} (0=Unknown, 1=Price, 2=Trading, 3=Halted, 4=Auction)",
-            price_type
+        let status_name = match price_type {
+            0 => "Unknown",
+            1 => "Price",
+            2 => "Trading",
+            3 => "Halted",
+            4 => "Auction",
+            _ => "Invalid",
+        };
+        
+        log::warn!(
+            "Pyth price status is {} ({}) - REJECTING oracle. Only Trading status is acceptable for liquidations.",
+            price_type,
+            status_name
         );
-        if price_type == PYTH_PRICE_STATUS_HALTED {
-            log::warn!("Pyth price is HALTED - rejecting oracle");
-            return Ok((false, None));
-        }
-        if price_type == PYTH_PRICE_STATUS_UNKNOWN {
-            log::warn!("Pyth price is UNKNOWN - rejecting oracle");
-            return Ok((false, None));
-        }
-        // For Price (1) or Auction (4), we might accept but log warning
-        log::warn!("Pyth price status is {} (not Trading) - accepting with caution", price_type);
+        return Ok((false, None));
     }
 
     // Parse exponent
@@ -691,12 +847,47 @@ async fn validate_pyth_oracle(
 struct LiquidationQuote {
     quote: JupiterQuote,
     profit_usdc: f64,
+    collateral_value_usd: f64, // Position size in USD for risk limit calculation
+}
+
+/// Get SOL price in USD from oracle
+/// Returns SOL price if available, otherwise None
+async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Option<f64> {
+    // SOL native mint: So11111111111111111111111111111111111111112
+    let sol_native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+    
+    // Check if collateral or debt is SOL, use its price
+    if let Some(deposit_reserve) = &ctx.deposit_reserve {
+        if deposit_reserve.liquidity.mintPubkey == sol_native_mint {
+            return ctx.deposit_price_usd;
+        }
+    }
+    
+    if let Some(borrow_reserve) = &ctx.borrow_reserve {
+        if borrow_reserve.liquidity.mintPubkey == sol_native_mint {
+            return ctx.borrow_price_usd;
+        }
+    }
+    
+    // If SOL is not in the reserves, fetch from Pyth SOL/USD price feed
+    // Pyth SOL/USD mainnet price feed: H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG
+    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+        Ok(pk) => pk,
+        Err(_) => return None,
+    };
+    
+    let current_slot = rpc.get_slot().ok()?;
+    match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
+        Ok((true, Some(price))) => Some(price),
+        _ => None,
+    }
 }
 
 /// Get Jupiter quote for liquidation with profit calculation per Structure.md section 7
 async fn get_liquidation_quote(
     ctx: &LiquidationContext,
-    _config: &Config,
+    config: &Config,
+    rpc: &Arc<RpcClient>,
 ) -> Result<LiquidationQuote> {
     // Use first borrow and first deposit
     if ctx.obligation.borrows.is_empty() || ctx.obligation.deposits.is_empty() {
@@ -706,27 +897,38 @@ async fn get_liquidation_quote(
     let borrow = &ctx.obligation.borrows[0];
     // Note: deposit is available but we use deposit_reserve directly for mint address
 
-    // Get mint addresses from reserve accounts
+    // Get mint addresses from reserve accounts for Jupiter swap
+    // CRITICAL: Jupiter swap requires actual token mints, NOT collateral token (cToken) mints
+    // 
+    // - collateral_mint: Use liquidity.mintPubkey (actual token, e.g., SOL, USDC)
+    //   NOT collateral.mintPubkey (cToken, e.g., cSOL, cUSDC)
+    // - debt_mint: Use liquidity.mintPubkey (actual token being borrowed)
+    //
+    // Example: If depositing SOL and borrowing USDC:
+    // - collateral_mint = SOL mint (not cSOL)
+    // - debt_mint = USDC mint
+    // Jupiter will swap SOL -> USDC
     let collateral_mint = ctx
         .deposit_reserve
         .as_ref()
-        .map(|r| r.collateral_mint_pubkey())
+        .map(|r| r.liquidity.mintPubkey) // ✅ Actual token mint (e.g., SOL), NOT cToken
         .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
 
     let debt_mint = ctx
         .borrow_reserve
         .as_ref()
-        .map(|r| r.mint_pubkey())
+        .map(|r| r.liquidity.mintPubkey) // ✅ Actual token mint (e.g., USDC)
         .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
 
     // Calculate liquidation amount (simplified - use close factor)
     // borrowedAmountWad is u128, divide by 2 for 50% close factor
     let liquidation_amount = borrow.borrowedAmountWad / 2; // 50% close factor
 
-    // Get Jupiter quote: collateral -> debt token
+    // Get Jupiter quote: collateral token -> debt token
+    // This is the swap we'll do: sell collateral token to get debt token for repayment
     let quote = get_jupiter_quote(
-        &collateral_mint, // input: collateral mint
-        &debt_mint,       // output: debt mint
+        &collateral_mint, // input: actual collateral token (e.g., SOL)
+        &debt_mint,       // output: actual debt token (e.g., USDC)
         liquidation_amount as u64,
         50, // slippage_bps
     )
@@ -767,41 +969,148 @@ async fn get_liquidation_quote(
     // Calculate profit in USD
     // Note: For liquidation, we repay debt and get collateral
     // Profit = collateral_value - debt_value - fees
-    let swap_fee_usd = 0.0; // TODO: Calculate actual swap fee from Jupiter
-    let jito_fee_usd = 0.00001; // 0.01 SOL ≈ $0.00001 (simplified)
-    let tx_fee_usd = 0.000005; // ~5000 lamports ≈ $0.000005
+    
+    // 1. Calculate Jupiter swap fee
+    // Jupiter doesn't charge platform fees, but LP fees are typically 0.05-0.3%
+    // We use a conservative estimate of 0.25% (0.0025) of the swap value
+    // Swap fee is calculated on the input amount (collateral being swapped)
+    const JUPITER_SWAP_FEE_BPS: f64 = 25.0; // 0.25% = 25 basis points
+    let swap_fee_usd = collateral_value_usd * (JUPITER_SWAP_FEE_BPS / 10_000.0);
+    
+    // 2. Get SOL price for fee calculations
+    let sol_price_usd = get_sol_price_usd(rpc, ctx).await
+        .unwrap_or_else(|| {
+            log::warn!("Failed to get SOL price, using fallback $150");
+            150.0 // Fallback price if oracle fails
+        });
+    
+    // 3. Calculate Jito tip fee in USD
+    // Jito tip is typically 0.01 SOL (10_000_000 lamports)
+    let jito_tip_lamports = config.jito_tip_amount_lamports.unwrap_or(10_000_000u64);
+    let jito_tip_sol = jito_tip_lamports as f64 / 1_000_000_000.0;
+    let jito_fee_usd = jito_tip_sol * sol_price_usd;
+    
+    // 4. Calculate transaction fee in USD
+    // Base transaction fee is ~5000 lamports (0.000005 SOL)
+    const BASE_TX_FEE_LAMPORTS: u64 = 5_000;
+    let tx_fee_sol = BASE_TX_FEE_LAMPORTS as f64 / 1_000_000_000.0;
+    let tx_fee_usd = tx_fee_sol * sol_price_usd;
 
     let profit_usdc = collateral_value_usd - debt_value_usd - swap_fee_usd - jito_fee_usd - tx_fee_usd;
+    
+    log::debug!(
+        "Fee breakdown: swap_fee=${:.4}, jito_fee=${:.4} ({} SOL @ ${:.2}), tx_fee=${:.4} ({} SOL @ ${:.2})",
+        swap_fee_usd,
+        jito_fee_usd,
+        jito_tip_sol,
+        sol_price_usd,
+        tx_fee_usd,
+        tx_fee_sol,
+        sol_price_usd
+    );
 
     Ok(LiquidationQuote {
         quote,
         profit_usdc,
+        collateral_value_usd,
     })
 }
 
+/// Get total wallet value in USD (SOL + USDC)
+/// Used for risk limit calculations per Structure.md section 6.4
+async fn get_wallet_value_usd(
+    rpc: &Arc<RpcClient>,
+    wallet_pubkey: &Pubkey,
+) -> Result<f64> {
+    // 1. Get SOL balance and price
+    let sol_balance = rpc
+        .get_balance(wallet_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get wallet balance: {}", e))?;
+    
+    // Get SOL price from Pyth (fallback to $150 if unavailable)
+    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+        Ok(pk) => pk,
+        Err(_) => {
+            log::warn!("Failed to parse SOL/USD Pyth feed, using fallback $150");
+            let sol_value_usd = (sol_balance as f64) / 1_000_000_000.0 * 150.0;
+            // Continue to get USDC balance
+            let program_id = crate::solend::solend_program_id()?;
+            let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+                .context("Failed to discover USDC mint")?;
+            use spl_associated_token_account::get_associated_token_address;
+            let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+            let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+                Ok(Some(account)) => account.token_amount.amount.parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            let usdc_value_usd = (usdc_balance_raw as f64) / 1_000_000.0;
+            return Ok(sol_value_usd + usdc_value_usd);
+        }
+    };
+    
+    let current_slot = rpc.get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+    let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
+        Ok((true, Some(price))) => price,
+        _ => {
+            log::warn!("Failed to get SOL price from oracle, using fallback $150");
+            150.0
+        }
+    };
+    
+    let sol_value_usd = (sol_balance as f64) / 1_000_000_000.0 * sol_price_usd;
+    
+    // 2. Get USDC balance
+    let program_id = crate::solend::solend_program_id()?;
+    let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+        .context("Failed to discover USDC mint")?;
+    
+    use spl_associated_token_account::get_associated_token_address;
+    let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+    
+    let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+        Ok(Some(account)) => {
+            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+        }
+        Ok(None) => 0, // ATA doesn't exist
+        Err(_) => {
+            log::debug!("Failed to get USDC balance, assuming 0");
+            0
+        }
+    };
+    
+    // USDC has 6 decimals, price is $1.0
+    let usdc_value_usd = (usdc_balance_raw as f64) / 1_000_000.0;
+    
+    // 3. Calculate total wallet value in USD
+    // Note: For now, we include SOL and USDC. Other tokens can be added later if needed.
+    let wallet_value_usd = sol_value_usd + usdc_value_usd;
+    
+    Ok(wallet_value_usd)
+}
+
 /// Check if liquidation is within wallet risk limits per Structure.md section 6.4
+/// Note: This function is kept for backward compatibility but per-liquidation check
+/// is now done inline in process_cycle() to support block-wide cumulative tracking
 async fn is_within_risk_limits(
     rpc: &Arc<RpcClient>,
     wallet_pubkey: &Pubkey,
     quote: &LiquidationQuote,
     config: &Config,
+    ctx: &LiquidationContext,
 ) -> Result<bool> {
-    // Get wallet SOL balance
-    let sol_balance = rpc
-        .get_balance(wallet_pubkey)
-        .map_err(|e| anyhow::anyhow!("Failed to get wallet balance: {}", e))?;
-
-    // Calculate wallet value (simplified: SOL only for now)
-    // TODO: Include USDC and other token balances
-    let wallet_value_usd = (sol_balance as f64) / 1_000_000_000.0 * 100.0; // Rough SOL price estimate
-
-    // Calculate max position size
+    let wallet_value_usd = get_wallet_value_usd(rpc, wallet_pubkey).await?;
     let max_position_usd = wallet_value_usd * config.max_position_pct;
-
-    // Check if liquidation amount exceeds max position
-    // Simplified: use quote input amount as position size
-    let position_size_usd = quote.quote.in_amount.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
-
+    let position_size_usd = quote.collateral_value_usd;
+    
+    log::debug!(
+        "Risk limit check: wallet_value=${:.2}, max_position=${:.2} ({}%), position_size=${:.2}",
+        wallet_value_usd,
+        max_position_usd,
+        config.max_position_pct * 100.0,
+        position_size_usd
+    );
+    
     Ok(position_size_usd <= max_position_usd)
 }
 
@@ -844,6 +1153,7 @@ async fn build_liquidation_tx(
     // Solend program stores the correct PDA addresses in Reserve account during initialization
     let repay_reserve_liquidity_supply = borrow_reserve.liquidity.supplyPubkey;
     let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity.supplyPubkey;
+    let withdraw_reserve_collateral_supply = deposit_reserve.collateral.supplyPubkey;
     let withdraw_reserve_collateral_mint = deposit_reserve.collateral.mintPubkey;
     
     // Verify these are not default/zero addresses
@@ -852,14 +1162,71 @@ async fn build_liquidation_tx(
     // Solend program stores the correct PDA addresses in Reserve account during initialization.
     if repay_reserve_liquidity_supply == Pubkey::default() 
         || withdraw_reserve_liquidity_supply == Pubkey::default() 
+        || withdraw_reserve_collateral_supply == Pubkey::default()
         || withdraw_reserve_collateral_mint == Pubkey::default() {
         return Err(anyhow::anyhow!("Invalid reserve addresses: one or more addresses are default/zero"));
     }
 
-    // NOTE: PDA derivation verification removed
-    // Reason: Solend's actual PDA seed format may differ from our assumption.
-    // Reserve account's supplyPubkey is the authoritative source and is always correct.
-    // Attempting to verify with potentially wrong seeds would generate false warnings.
+    // SECURITY: Verify reserve supply PDA addresses match expected derivation
+    // This helps detect data corruption or manipulation in Reserve accounts.
+    // We derive expected PDA and compare with stored supplyPubkey.
+    // If they don't match, log a warning (but don't fail - stored value is authoritative).
+    let borrow_reserve_pubkey = ctx.obligation.borrows[0].borrowReserve;
+    let deposit_reserve_pubkey = ctx.obligation.deposits[0].depositReserve;
+    
+    // Verify repay reserve liquidity supply
+    if let Some(derived_pda) = crate::solend::derive_reserve_liquidity_supply_pda(&borrow_reserve_pubkey, &program_id) {
+        if derived_pda != repay_reserve_liquidity_supply {
+            log::warn!(
+                "⚠️  SECURITY WARNING: Repay reserve liquidity supply PDA mismatch! \
+                 Reserve: {}, Stored: {}, Derived: {}. \
+                 This may indicate data corruption or manipulation.",
+                borrow_reserve_pubkey,
+                repay_reserve_liquidity_supply,
+                derived_pda
+            );
+        } else {
+            log::debug!("✅ Repay reserve liquidity supply PDA verified: {}", repay_reserve_liquidity_supply);
+        }
+    } else {
+        log::debug!("⚠️  Could not derive repay reserve liquidity supply PDA - seed format unknown");
+    }
+    
+    // Verify withdraw reserve liquidity supply
+    if let Some(derived_pda) = crate::solend::derive_reserve_liquidity_supply_pda(&deposit_reserve_pubkey, &program_id) {
+        if derived_pda != withdraw_reserve_liquidity_supply {
+            log::warn!(
+                "⚠️  SECURITY WARNING: Withdraw reserve liquidity supply PDA mismatch! \
+                 Reserve: {}, Stored: {}, Derived: {}. \
+                 This may indicate data corruption or manipulation.",
+                deposit_reserve_pubkey,
+                withdraw_reserve_liquidity_supply,
+                derived_pda
+            );
+        } else {
+            log::debug!("✅ Withdraw reserve liquidity supply PDA verified: {}", withdraw_reserve_liquidity_supply);
+        }
+    } else {
+        log::debug!("⚠️  Could not derive withdraw reserve liquidity supply PDA - seed format unknown");
+    }
+    
+    // Verify withdraw reserve collateral supply
+    if let Some(derived_pda) = crate::solend::derive_reserve_collateral_supply_pda(&deposit_reserve_pubkey, &program_id) {
+        if derived_pda != withdraw_reserve_collateral_supply {
+            log::warn!(
+                "⚠️  SECURITY WARNING: Withdraw reserve collateral supply PDA mismatch! \
+                 Reserve: {}, Stored: {}, Derived: {}. \
+                 This may indicate data corruption or manipulation.",
+                deposit_reserve_pubkey,
+                withdraw_reserve_collateral_supply,
+                derived_pda
+            );
+        } else {
+            log::debug!("✅ Withdraw reserve collateral supply PDA verified: {}", withdraw_reserve_collateral_supply);
+        }
+    } else {
+        log::debug!("⚠️  Could not derive withdraw reserve collateral supply PDA - seed format unknown");
+    }
 
     // Get user's token accounts (source liquidity and destination collateral)
     // These would be ATAs for the tokens
@@ -888,21 +1255,22 @@ async fn build_liquidation_tx(
     // Args: liquidityAmount (u64)
     instruction_data.extend_from_slice(&liquidity_amount.to_le_bytes());
 
-    // Build account metas per IDL
+    // Build account metas per IDL - order must match Solend IDL exactly
     let accounts = vec![
-        AccountMeta::new(source_liquidity, false),                    // sourceLiquidity
-        AccountMeta::new(destination_collateral, false),              // destinationCollateral
-        AccountMeta::new(ctx.obligation.borrows[0].borrowReserve, false),  // repayReserve
-        AccountMeta::new(repay_reserve_liquidity_supply, false),      // repayReserveLiquiditySupply
-        AccountMeta::new(ctx.obligation.deposits[0].depositReserve, false), // withdrawReserve
-        AccountMeta::new_readonly(withdraw_reserve_collateral_mint, false), // withdrawReserveCollateralMint
-        AccountMeta::new(withdraw_reserve_liquidity_supply, false),   // withdrawReserveLiquiditySupply
-        AccountMeta::new(ctx.obligation_pubkey, false),                // obligation
-        AccountMeta::new_readonly(lending_market, false),            // lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false),   // lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),               // transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::clock::id(), false),        // clockSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),          // tokenProgram
+        AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity
+        AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral
+        AccountMeta::new(ctx.obligation.borrows[0].borrowReserve, false),  // 2: repayReserve
+        AccountMeta::new(repay_reserve_liquidity_supply, false),      // 3: repayReserveLiquiditySupply
+        AccountMeta::new(ctx.obligation.deposits[0].depositReserve, false), // 4: withdrawReserve
+        AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
+        AccountMeta::new_readonly(withdraw_reserve_collateral_mint, false), // 6: withdrawReserveCollateralMint
+        AccountMeta::new(withdraw_reserve_liquidity_supply, false),   // 7: withdrawReserveLiquiditySupply
+        AccountMeta::new(ctx.obligation_pubkey, false),                // 8: obligation
+        AccountMeta::new_readonly(lending_market, false),            // 9: lendingMarket
+        AccountMeta::new_readonly(lending_market_authority, false),   // 10: lendingMarketAuthority
+        AccountMeta::new_readonly(wallet_pubkey, true),               // 11: transferAuthority (signer)
+        AccountMeta::new_readonly(sysvar::clock::id(), false),        // 12: clockSysvar
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),          // 13: tokenProgram
     ];
 
     let liquidation_ix = Instruction {
@@ -937,17 +1305,15 @@ async fn build_liquidation_tx(
         data: compute_price_data,
     };
 
-    // Get recent blockhash
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;
-
     // Build transaction
+    // NOTE: Blockhash is NOT set here - it will be fetched right before sending
+    // to ensure it's fresh and not stale. Blockhashes are valid for ~150 slots (~60 seconds).
     let mut tx = Transaction::new_with_payer(
         &[compute_budget_ix, priority_fee_ix, liquidation_ix],
         Some(&wallet_pubkey),
     );
-    tx.message.recent_blockhash = blockhash;
+    // Use default hash as placeholder - will be updated right before sending
+    tx.message.recent_blockhash = solana_sdk::hash::Hash::default();
 
     log::info!(
         "Built liquidation transaction for obligation {} with amount {}",

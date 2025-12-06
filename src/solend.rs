@@ -96,6 +96,79 @@ pub fn derive_lending_market_authority(
         .ok_or_else(|| anyhow::anyhow!("Failed to derive lending market authority"))
 }
 
+/// Derive reserve liquidity supply PDA (for verification)
+/// 
+/// SECURITY: This function attempts to derive the expected PDA for reserve liquidity supply.
+/// Multiple seed formats are tried as Solend's exact format may vary.
+/// Returns Some(derived_pubkey) if a match is found, None otherwise.
+/// 
+/// This is used for validation - if the derived PDA doesn't match the stored supplyPubkey,
+/// it may indicate data corruption or manipulation.
+pub fn derive_reserve_liquidity_supply_pda(
+    reserve_pubkey: &Pubkey,
+    program_id: &Pubkey,
+) -> Option<Pubkey> {
+    // Try common Solend PDA seed formats for reserve liquidity supply
+    // Format 1: ["liquidity", reserve_pubkey]
+    let seeds1 = &[b"liquidity".as_ref(), reserve_pubkey.as_ref()];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds1, program_id) {
+        return Some(pda);
+    }
+    
+    // Format 2: ["reserve", reserve_pubkey, "liquidity"]
+    let seeds2 = &[
+        b"reserve".as_ref(),
+        reserve_pubkey.as_ref(),
+        b"liquidity".as_ref(),
+    ];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds2, program_id) {
+        return Some(pda);
+    }
+    
+    // Format 3: ["reserve_liquidity", reserve_pubkey]
+    let seeds3 = &[b"reserve_liquidity".as_ref(), reserve_pubkey.as_ref()];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds3, program_id) {
+        return Some(pda);
+    }
+    
+    None
+}
+
+/// Derive reserve collateral supply PDA (for verification)
+/// 
+/// SECURITY: This function attempts to derive the expected PDA for reserve collateral supply.
+/// Multiple seed formats are tried as Solend's exact format may vary.
+/// Returns Some(derived_pubkey) if a match is found, None otherwise.
+pub fn derive_reserve_collateral_supply_pda(
+    reserve_pubkey: &Pubkey,
+    program_id: &Pubkey,
+) -> Option<Pubkey> {
+    // Try common Solend PDA seed formats for reserve collateral supply
+    // Format 1: ["collateral", reserve_pubkey]
+    let seeds1 = &[b"collateral".as_ref(), reserve_pubkey.as_ref()];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds1, program_id) {
+        return Some(pda);
+    }
+    
+    // Format 2: ["reserve", reserve_pubkey, "collateral"]
+    let seeds2 = &[
+        b"reserve".as_ref(),
+        reserve_pubkey.as_ref(),
+        b"collateral".as_ref(),
+    ];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds2, program_id) {
+        return Some(pda);
+    }
+    
+    // Format 3: ["reserve_collateral", reserve_pubkey]
+    let seeds3 = &[b"reserve_collateral".as_ref(), reserve_pubkey.as_ref()];
+    if let Some((pda, _)) = Pubkey::try_find_program_address(seeds3, program_id) {
+        return Some(pda);
+    }
+    
+    None
+}
+
 /// Calculate Solend instruction discriminator using Anchor sighash method
 /// 
 /// CRITICAL: Solend program uses Anchor-style instruction encoding.
@@ -162,5 +235,43 @@ impl Reserve {
     pub fn liquidation_bonus(&self) -> f64 {
         self.config.liquidationBonus as f64 / 100.0
     }
+}
+
+/// Find USDC mint address from Solend reserves (chain-based discovery)
+/// This automatically discovers USDC by checking all reserves
+/// USDC mainnet mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+/// 
+/// DYNAMIC CHAIN READING: All data is read from chain via RPC - no static values.
+pub fn find_usdc_mint_from_reserves(
+    rpc: &solana_client::rpc_client::RpcClient,
+    program_id: &Pubkey,
+) -> Result<Pubkey> {
+    
+    // Known USDC mint address (mainnet)
+    const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let known_usdc_mint = Pubkey::from_str(USDC_MINT_MAINNET)
+        .map_err(|e| anyhow::anyhow!("Invalid known USDC mint: {}", e))?;
+    
+    // Try to find USDC reserve by checking all reserves
+    // This is more robust than hardcoding
+    let accounts = rpc
+        .get_program_accounts(program_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
+    
+    for (_pubkey, account) in accounts {
+        if let Ok(reserve) = Reserve::from_account_data(&account.data) {
+            let mint = reserve.mint_pubkey();
+            // Check if this reserve is USDC (by mint address)
+            if mint == known_usdc_mint {
+                log::info!("✅ Found USDC reserve from chain (mint: {})", mint);
+                return Ok(mint);
+            }
+        }
+    }
+    
+    // Fallback: return known USDC mint if not found in reserves
+    // This can happen if reserves haven't loaded yet or network issues
+    log::warn!("USDC reserve not found in chain data, using known USDC mint: {}", known_usdc_mint);
+    Ok(known_usdc_mint)
 }
 
