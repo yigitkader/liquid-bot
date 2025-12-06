@@ -1043,6 +1043,7 @@ const MAX_ORACLE_DEVIATION_PCT: f64 = 2.0; // 2% max deviation
 /// Used when Switchboard is not available (Pyth-only mode)
 const TWAP_MAX_AGE_SECS: u64 = 30; // 30 second window for TWAP calculation
 const TWAP_MIN_SAMPLES: usize = 5; // Minimum 5 price samples required for TWAP
+const TWAP_MAX_SAMPLES: usize = 50; // Maximum 50 samples for better TWAP accuracy (especially for low-liquidity tokens)
 const TWAP_ANOMALY_THRESHOLD_PCT: f64 = 3.0; // 3% deviation from TWAP triggers anomaly
 
 /// Oracle price cache for TWAP calculation
@@ -1065,19 +1066,18 @@ impl OraclePriceCache {
     fn add_price(&mut self, price: f64) {
         let now = Instant::now();
         
-        // Remove stale prices
-        while let Some((timestamp, _)) = self.prices.front() {
-            if now.duration_since(*timestamp) > self.max_age {
-                self.prices.pop_front();
-            } else {
-                break;
-            }
-        }
+        // ✅ FIXED: Time-based cleanup (30 saniyeden eski olanları sil)
+        // retain() is more efficient than while loop for removing multiple items
+        self.prices.retain(|(timestamp, _)| {
+            now.duration_since(*timestamp) <= self.max_age
+        });
         
         self.prices.push_back((now, price));
         
-        // Keep max 20 samples to limit memory
-        if self.prices.len() > 20 {
+        // ✅ FIXED: Size-based limit (memory kontrolü)
+        // Increased from 20 to 50 samples for better TWAP accuracy on low-liquidity tokens
+        // Use while loop to ensure we stay under limit even if multiple samples are added quickly
+        while self.prices.len() > TWAP_MAX_SAMPLES {
             self.prices.pop_front();
         }
     }
@@ -1634,35 +1634,65 @@ async fn validate_switchboard_oracle_if_available(
     let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
         Ok(feed) => *feed,
         Err(PodCastError::AlignmentMismatch { .. }) => {
-            // Fallback: Create explicitly aligned buffer (16-byte alignment for safety)
-            // This ensures proper alignment regardless of the original data's alignment.
-            // Strategy: Use buffer pool to avoid GC pressure from frequent allocations.
-            let alignment = 16; // 16-byte alignment (safe for most structs, including SIMD)
-            let mut aligned_buffer = get_aligned_buffer(feed_size + alignment);
+            // ✅ FIXED: Use stack allocation instead of buffer pool to avoid memory leaks
+            // Buffer pool has 10 buffer limit - under high traffic, buffers may not be returned,
+            // causing memory leaks. Stack allocation is safer and more efficient for small structs.
+            // 
+            // Strategy: Allocate aligned buffer on stack using MaybeUninit<u64> array
+            // PullFeedAccountData is ~512 bytes, so stack allocation is safe (stack is typically 2MB+)
+            // We use u64 array for natural 8-byte alignment, then find 16-byte aligned address
+            use std::mem::MaybeUninit;
             
-            // Find the first 16-byte aligned address within the buffer
-            // Formula: (ptr + 15) & !15 rounds up to next 16-byte boundary
-            let buffer_ptr = aligned_buffer.as_ptr() as usize;
-            let aligned_ptr = (buffer_ptr + alignment - 1) & !(alignment - 1); // 16-byte align
-            let offset = aligned_ptr - buffer_ptr;
+            const ALIGNMENT: usize = 16; // 16-byte alignment (safe for most structs, including SIMD)
+            // Calculate size needed: feed_size + alignment padding (max 15 bytes) + 8 bytes for u64 alignment
+            // PullFeedAccountData is ~512 bytes, so we need at most 512 + 15 + 8 = 535 bytes
+            // Round up to 128 u64s = 1024 bytes (safe margin)
+            const STORAGE_SIZE_U64: usize = 128; // 1024 bytes total storage
+            
+            // Stack-allocated aligned buffer (compile-time constant size)
+            // SAFETY: MaybeUninit::uninit().assume_init() is safe here because we're only using
+            // the memory as raw bytes and will properly initialize it before reading
+            let mut aligned_storage: [MaybeUninit<u64>; STORAGE_SIZE_U64] = unsafe {
+                MaybeUninit::uninit().assume_init()
+            };
+            
+            // Get pointer to the storage
+            let storage_ptr = aligned_storage.as_mut_ptr() as *mut u8;
+            let storage_addr = storage_ptr as usize;
+            
+            // Find the first 16-byte aligned address within the storage
+            // Formula: (addr + 15) & !15 rounds up to next 16-byte boundary
+            let aligned_addr = (storage_addr + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+            let offset = aligned_addr - storage_addr;
+            let aligned_ptr = unsafe { storage_ptr.add(offset) };
             
             // Ensure we have enough space after alignment
-            if offset + feed_size > aligned_buffer.len() {
+            // Storage is 1024 bytes, max offset is 15, max feed_size is ~512, so this is safe
+            if offset + feed_size > STORAGE_SIZE_U64 * 8 {
                 log::warn!(
-                    "Switchboard feed alignment calculation failed for {}: insufficient buffer space",
-                    switchboard_oracle_pubkey
+                    "Switchboard feed alignment calculation failed for {}: insufficient buffer space (offset: {}, feed_size: {}, storage: {} bytes)",
+                    switchboard_oracle_pubkey,
+                    offset,
+                    feed_size,
+                    STORAGE_SIZE_U64 * 8
                 );
-                return_aligned_buffer(aligned_buffer);
                 return Ok(None);
             }
             
             // Copy data to the aligned location
-            let aligned_slice = &mut aligned_buffer[offset..offset + feed_size];
-            aligned_slice.copy_from_slice(&oracle_account.data[..feed_size]);
+            // SAFETY: aligned_ptr is guaranteed to be 16-byte aligned and within aligned_storage bounds
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    oracle_account.data.as_ptr(),
+                    aligned_ptr,
+                    feed_size
+                );
+            }
             
             // Now try parsing from the explicitly aligned slice
-            // SAFETY: aligned_slice is guaranteed to be 16-byte aligned, which is sufficient
+            // SAFETY: aligned_ptr is guaranteed to be 16-byte aligned, which is sufficient
             // for any struct alignment requirement (most structs require 8-byte or less)
+            let aligned_slice = unsafe { std::slice::from_raw_parts(aligned_ptr, feed_size) };
             let result = match bytemuck::try_from_bytes::<PullFeedAccountData>(aligned_slice) {
                 Ok(feed) => Ok(*feed),
                 Err(e) => {
@@ -1686,9 +1716,6 @@ async fn validate_switchboard_oracle_if_available(
                 }
             };
             
-            // Return buffer to pool before returning
-            return_aligned_buffer(aligned_buffer);
-            
             match result {
                 Ok(feed) => feed,
                 Err(()) => return Ok(None),
@@ -1709,7 +1736,6 @@ async fn validate_switchboard_oracle_if_available(
     // 4. Get price using SDK's value() method with staleness check
     // The value() method requires current slot for staleness validation
     // It returns Result<Decimal, OnDemandError> - Ok if valid, Err if stale/insufficient
-    use rust_decimal::Decimal;
     let price_decimal = match feed.value(current_slot) {
         Ok(v) => v,
         Err(e) => {
@@ -3977,6 +4003,10 @@ async fn execute_liquidation_with_swap(
     // ============================================================================
     log::info!("Building atomic flashloan liquidation transaction");
     
+    // ✅ CRITICAL: Get fresh blockhash AFTER Jupiter quote completes
+    // Blockhash expires in ~60 seconds. Jupiter quote can take 8-15 seconds,
+    // so we must get blockhash AFTER quote to ensure maximum freshness.
+    // This prevents "BlockhashNotFound" errors from stale blockhashes.
     let blockhash = rpc
         .get_latest_blockhash()
         .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;

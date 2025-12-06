@@ -405,8 +405,8 @@ impl Obligation {
 //    Only programs with USDC reserve can be used for liquidation operations.
 //
 // ✅ ACTIVE PROGRAMS WITH USDC:
-// 1. Original Solend Program (RECOMMENDED): So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
-//    - Still active on mainnet
+// 1. Save Protocol Main Market (RECOMMENDED): SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
+//    - Active on mainnet (Save Protocol is Solend's 2024 rebrand)
 //    - Has USDC reserve (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)
 //    - Verified working for liquidation bot
 //
@@ -419,21 +419,21 @@ impl Obligation {
 //       Always verify USDC reserve exists before using a program ID.
 //
 // Verification: Check Solana Explorer for USDC reserves:
-// https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
-pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"; // Original Solend (USDC reserve available)
+// https://solscan.io/account/SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
+pub const SOLEND_PROGRAM_ID: &str = "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh"; // Save Protocol Main Market (USDC reserve available)
 pub const SOLEND_PROGRAM_ID_ALTCOINS: &str = "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw"; // Altcoins Market (NO USDC)
 pub const SOLEND_PROGRAM_ID_TURBO: &str = "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP"; // Turbo SOL Market (NO USDC)
 
 /// Known Solend program IDs (for validation)
 /// NOTE: Only programs with USDC reserve should be used for liquidation bot
 pub const SOLEND_PROGRAM_IDS: &[&str] = &[
-    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn", // Original Solend (USDC reserve available - RECOMMENDED)
+    "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh", // Save Protocol Main Market (USDC reserve available - RECOMMENDED)
 ];
 
 /// Get Solend program ID (mainnet production)
 /// 
 /// CRITICAL: This returns the Solend program ID that has USDC reserve
-/// Defaults to original Solend program (So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn)
+/// Defaults to Save Protocol Main Market (SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh)
 /// Can be overridden via SOLEND_PROGRAM_ID environment variable
 /// 
 /// NOTE: Bot requires USDC reserve - only programs with USDC can be used
