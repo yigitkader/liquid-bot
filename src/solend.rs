@@ -8,6 +8,62 @@ include!(concat!(env!("OUT_DIR"), "/solend_layout.rs"));
 use anyhow::Result;
 use std::str::FromStr;
 
+// Helper structs for Reserve (not in generated layout, but used by helper methods)
+#[derive(Debug, Clone)]
+pub struct ReserveLiquidity {
+    pub mintPubkey: Pubkey,
+    pub mintDecimals: u8,
+    pub supplyPubkey: Pubkey,
+    pub liquidityPythOracle: Pubkey,
+    pub liquiditySwitchboardOracle: Pubkey,
+    pub availableAmount: u64,
+    pub borrowedAmountWads: u128,
+    pub cumulativeBorrowRateWads: u128,
+    pub liquidityMarketPrice: u128,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReserveCollateral {
+    pub mintPubkey: Pubkey,
+    pub mintTotalSupply: u64,
+    pub supplyPubkey: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReserveConfig {
+    pub optimalUtilizationRate: u8,
+    pub loanToValueRatio: u8,
+    pub liquidationBonus: u8,
+    pub liquidationThreshold: u8,
+    pub minBorrowRate: u8,
+    pub optimalBorrowRate: u8,
+    pub maxBorrowRate: u8,
+    pub switchboardOraclePubkey: Pubkey,
+    pub borrowFeeWad: u64,
+    pub flashLoanFeeWad: u64,
+    pub hostFeePercentage: u8,
+    pub depositLimit: u64,
+    pub borrowLimit: u64,
+    pub feeReceiver: Pubkey,
+    pub protocolLiquidationFee: u8,
+    pub protocolTakeRate: u8,
+    pub accumulatedProtocolFeesWads: u128,
+    pub addedBorrowWeightBPS: u64,
+    pub liquiditySmoothedMarketPrice: u128,
+    pub reserveType: u8,
+    pub maxUtilizationRate: u8,
+    pub superMaxBorrowRate: u64,
+    pub maxLiquidationBonus: u8,
+    pub maxLiquidationThreshold: u8,
+    pub scaledPriceOffsetBPS: u64,
+    pub extraOracle: Pubkey,
+    pub liquidityExtraMarketPriceFlag: u8,
+    pub liquidityExtraMarketPrice: u128,
+    pub attributedBorrowValue: u128,
+    pub attributedBorrowLimitOpen: u64,
+    pub attributedBorrowLimitClose: u64,
+}
+
 // Helper implementation for Number type (u128 wrapper)
 impl Number {
     pub fn to_f64(&self) -> f64 {
@@ -47,94 +103,76 @@ impl Obligation {
         
         log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
         
-        // CRITICAL: Calculate expected size (1298 bytes for struct, but account may be 1300 with padding)
-        // Struct size: 1 + 9 + 32 + 32 + 16*5 + 1 + 16*2 + 1 + 14 + 1 + 1 + 1096 = 1298 bytes
-        const EXPECTED_STRUCT_SIZE: usize = 1298;
-        const ACTUAL_OBLIGATION_ACCOUNT_SIZE: usize = 1300; // Real account size on-chain
+        // CRITICAL: Calculate expected size from actual struct layout
+        // Struct size: 1 + 9 + 32 + 32 + 16*5 + 1 + 16*2 + 1 + 14 + 1 + 1 + 1096 = 1300 bytes
+        // Log analysis shows: account size = 1300 bytes, offset before _padding = 188 bytes
+        // Total: 188 + 14 (padding) + 1 (depositsLen) + 1 (borrowsLen) + 1096 (dataFlat) = 1300 bytes
+        const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from layout analysis
         
-        // If account is 1300 bytes (actual size), parse only first 1298 bytes (known struct size)
-        let data_to_parse = if data.len() == ACTUAL_OBLIGATION_ACCOUNT_SIZE {
-            log::debug!("Obligation account is {} bytes (expected struct: {} bytes) - parsing first {} bytes only", 
+        // Use data as-is if it matches expected size, otherwise error
+        let data_to_parse = if data.len() == EXPECTED_STRUCT_SIZE {
+            data
+        } else if data.len() > EXPECTED_STRUCT_SIZE {
+            // More than expected - log warning but try to parse first 1300 bytes
+            log::warn!("Obligation account is {} bytes (expected: {} bytes) - parsing first {} bytes", 
                 data.len(), EXPECTED_STRUCT_SIZE, EXPECTED_STRUCT_SIZE);
             &data[..EXPECTED_STRUCT_SIZE]
-        } else if data.len() < EXPECTED_STRUCT_SIZE {
+        } else {
+            // Too short
             return Err(anyhow::anyhow!(
                 "Obligation data too short: {} bytes (minimum: {} bytes)", 
                 data.len(), 
                 EXPECTED_STRUCT_SIZE
             ));
-        } else {
-            // Try full data first, fallback to slice if needed
-            data
         };
         
-        // Try deserialization - handle "Not all bytes read" error for padding
+        // Try deserialization - data_to_parse is already sliced to correct size
         let obligation: Obligation = match BorshDeserialize::try_from_slice(data_to_parse) {
             Ok(obl) => obl,
             Err(e) => {
-                // If error is "Not all bytes read" and we have extra bytes, try slicing to exact size
+                // If we still get an error, log detailed information and try one more time
                 let error_msg = e.to_string();
-                if error_msg.contains("Not all bytes read") && data.len() >= EXPECTED_STRUCT_SIZE {
-                    let extra_bytes = data.len() - EXPECTED_STRUCT_SIZE;
-                    log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - trying exact slice", extra_bytes);
-                    // Try deserializing only the expected size (ignore extra padding bytes)
+                log::error!("Borsh deserialization failed: {}", e);
+                log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
+                log::error!("Parsed length: {} bytes", data_to_parse.len());
+                
+                // If error mentions length/Unexpected and we have extra bytes, try explicit slice one more time
+                if (error_msg.contains("length") || error_msg.contains("Unexpected")) && data.len() > EXPECTED_STRUCT_SIZE {
+                    log::debug!("Retrying with explicit slice to {} bytes", EXPECTED_STRUCT_SIZE);
                     match BorshDeserialize::try_from_slice(&data[..EXPECTED_STRUCT_SIZE]) {
-                        Ok(obl) => obl,
+                        Ok(obl) => {
+                            log::debug!("Successfully deserialized after retry with explicit slice");
+                            obl
+                        },
                         Err(e2) => {
-                            log::error!("Borsh deserialization failed even with exact slice: {}", e2);
-                            log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
-                            return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}", e2));
+                            log::error!("Borsh deserialization failed even with explicit slice: {}", e2);
+                            
+                            // Log detailed byte analysis
+                            if data.len() >= 200 {
+                                let hex_preview: String = data.iter()
+                                    .take(200)
+                                    .enumerate()
+                                    .map(|(i, b)| {
+                                        if i % 32 == 0 && i > 0 {
+                                            format!("\n  [{:04x}]: {:02x}", i, b)
+                                        } else {
+                                            format!(" {:02x}", b)
+                                        }
+                                    })
+                                    .collect();
+                                log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
+                            }
+                            
+                            log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
+                            log::error!("Actual data size: {} bytes", data.len());
+                            
+                            return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e2));
                         }
                     }
                 } else {
-                    log::error!("Borsh deserialization failed: {}", e);
-                    log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
-                
-                // Log byte-by-byte analysis for first 200 bytes
-                if data.len() >= 200 {
-                    let hex_preview: String = data.iter()
-                        .take(200)
-                        .enumerate()
-                        .map(|(i, b)| {
-                            if i % 32 == 0 && i > 0 {
-                                format!("\n  [{:04x}]: {:02x}", i, b)
-                            } else {
-                                format!(" {:02x}", b)
-                            }
-                        })
-                        .collect();
-                    log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
-                }
-                
-                // Calculate expected size
-                log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
-                log::error!("Actual data size: {} bytes", data.len());
-                
-                if data.len() < EXPECTED_STRUCT_SIZE {
-                    log::error!("Size mismatch! Data is too small (truncated).");
-                } else if data.len() > EXPECTED_STRUCT_SIZE {
-                    log::warn!("Data has {} extra bytes (likely padding/discriminator)", data.len() - EXPECTED_STRUCT_SIZE);
-                }
-                
-                // Try to manually calculate where deserialization might fail
-                let mut offset = 0;
-                offset += 1; // version
-                offset += 9; // lastUpdate
-                offset += 32; // lendingMarket
-                offset += 32; // owner
-                offset += 16 * 5; // 5x u128 (depositedValue, borrowedValue, etc.)
-                offset += 1; // borrowingIsolatedAsset
-                offset += 16 * 2; // 2x u128 (superUnhealthyBorrowValue, unweightedBorrowValue)
-                offset += 1; // closeable
-                log::error!("Expected offset before _padding: {} bytes", offset);
-                log::error!("Actual bytes at offset {}: {:02x} {:02x} {:02x} {:02x}", 
-                    offset, 
-                    data.get(offset).copied().unwrap_or(0),
-                    data.get(offset+1).copied().unwrap_or(0),
-                    data.get(offset+2).copied().unwrap_or(0),
-                    data.get(offset+3).copied().unwrap_or(0)
-                );
-                
+                    // Other error or no extra bytes - return error
+                    log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
+                    log::error!("Actual data size: {} bytes", data.len());
                     return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e));
                 }
             }
@@ -169,11 +207,11 @@ impl Obligation {
     /// NOTE: This uses f64 which has precision loss for very large values.
     /// For high-precision calculations, use health_factor_u128() instead.
     pub fn health_factor(&self) -> f64 {
-        let borrowed = self.borrowedValue.to_f64();
+        let borrowed = self.borrowedValue as f64 / 1e18; // Convert WAD to f64
         if borrowed == 0.0 {
             return f64::INFINITY;
         }
-        let weighted_collateral = self.allowedBorrowValue.to_f64();
+        let weighted_collateral = self.allowedBorrowValue as f64 / 1e18; // Convert WAD to f64
         weighted_collateral / borrowed
     }
 
@@ -197,12 +235,12 @@ impl Obligation {
     pub fn health_factor_u128(&self) -> u128 {
         const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
         
-        let borrowed = self.borrowedValue.value;
+        let borrowed = self.borrowedValue;
         if borrowed == 0 {
             return u128::MAX; // Infinity representation
         }
         
-        let weighted_collateral = self.allowedBorrowValue.value;
+        let weighted_collateral = self.allowedBorrowValue;
         
         // HF = weighted_collateral / borrowed (in WAD format)
         // Result in WAD format: (weighted_collateral * WAD) / borrowed
@@ -227,12 +265,12 @@ impl Obligation {
 
     /// Get total deposited value in USD
     pub fn total_deposited_value_usd(&self) -> f64 {
-        self.depositedValue.to_f64()
+        self.depositedValue as f64 / 1e18 // Convert WAD to f64
     }
 
     /// Get total borrowed value in USD
     pub fn total_borrowed_value_usd(&self) -> f64 {
-        self.borrowedValue.to_f64()
+        self.borrowedValue as f64 / 1e18 // Convert WAD to f64
     }
 
     /// Parse deposits array from dataFlat
@@ -691,6 +729,8 @@ impl Reserve {
     }
 
     /// Get ReserveConfig struct (helper for accessing config fields)
+    /// NOTE: switchboardOraclePubkey field was removed from Reserve struct in newer Solend layouts
+    /// Use extraOracle field instead, or liquiditySwitchboardOracle for liquidity oracle
     pub fn config(&self) -> ReserveConfig {
         ReserveConfig {
             optimalUtilizationRate: self.optimalUtilizationRate,
@@ -700,7 +740,7 @@ impl Reserve {
             minBorrowRate: self.minBorrowRate,
             optimalBorrowRate: self.optimalBorrowRate,
             maxBorrowRate: self.maxBorrowRate,
-            switchboardOraclePubkey: self.switchboardOraclePubkey,
+            switchboardOraclePubkey: self.extraOracle, // Use extraOracle as fallback (may be Switchboard oracle)
             borrowFeeWad: self.borrowFeeWad,
             flashLoanFeeWad: self.flashLoanFeeWad,
             hostFeePercentage: self.hostFeePercentage,

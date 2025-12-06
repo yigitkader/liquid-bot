@@ -10,6 +10,8 @@ logs/*
 .DS_Store
 *.xml
 
+idl/*.json
+
 # Wallet directories (CRITICAL - never commit!)
 /secret
 /secret/*

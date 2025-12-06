@@ -2082,7 +2082,7 @@ async fn get_liquidation_quote(
     // CRITICAL: Both borrowedAmountWad and cumulativeBorrowRateWads are in WAD format (10^18)
     // When multiplied: 10^36, so we need to divide by WAD twice to get normalized amount
     // Formula: actual_debt = borrowedAmountWad * cumulativeBorrowRateWads / WAD / WAD
-    let actual_debt_wad: u128 = borrow.borrowedAmountWad
+    let actual_debt_wad: u128 = borrow.borrowedAmountWads
         .checked_mul(borrow.cumulativeBorrowRateWads)
         .and_then(|v| v.checked_div(WAD))
         .and_then(|v| v.checked_div(WAD))  // ✅ İKİNCİ DIVISION - CRITICAL FIX
@@ -2115,7 +2115,7 @@ async fn get_liquidation_quote(
     
     log::debug!(
         "Debt calculation (CORRECTED): borrowed_wad={}, cumulative_rate={}, actual_debt_wad={}, debt_to_repay_wad={}, debt_to_repay_raw={} (decimals={})",
-        borrow.borrowedAmountWad,
+        borrow.borrowedAmountWads,
         borrow.cumulativeBorrowRateWads,
         actual_debt_wad,
         debt_to_repay_wad,
