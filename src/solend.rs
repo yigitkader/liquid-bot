@@ -8,6 +8,16 @@ include!(concat!(env!("OUT_DIR"), "/solend_layout.rs"));
 use anyhow::Result;
 use std::str::FromStr;
 
+/// Solend account type identification
+/// Used to quickly identify account types without parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolendAccountType {
+    Obligation,
+    Reserve,
+    LendingMarket,
+    Unknown,
+}
+
 // Helper structs for Reserve (not in generated layout, but used by helper methods)
 #[derive(Debug, Clone)]
 pub struct ReserveLiquidity {
@@ -92,80 +102,75 @@ impl Obligation {
             log::trace!("First 32 bytes (hex): {}", preview);
         }
         
-        // CRITICAL: Obligation struct is exactly 1300 bytes (from generated layout)
-        // Account data can be:
-        // 1. Exactly 1300 bytes (no discriminator) - use as-is
-        // 2. 1308 bytes (8-byte discriminator + 1300 bytes struct) - skip discriminator
-        // 3. Other sizes - error
         const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from generated layout
+        const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
         
-        // CRITICAL: Determine correct parse offset
-        // Solend accounts structure:
-        // - If account is exactly 1300 bytes: no discriminator, parse from offset 0
-        // - If account is 1308 bytes and first 8 bytes are zeros: has discriminator, skip 8 bytes
-        // - If account is > 1300 bytes but not 1308: unusual, try to parse first 1300 bytes
-        let data_to_parse = if data.len() == EXPECTED_STRUCT_SIZE {
-            // Exactly 1300 bytes - no discriminator, use as-is
-            // Note: If first byte is 0, this is version 0 (legacy), not a discriminator
-            data
-        } else if data.len() == EXPECTED_STRUCT_SIZE + 8 && data[0..8] == [0u8; 8] {
-            // 1308 bytes with 8-byte zero discriminator - skip discriminator
-            log::trace!("Skipping 8-byte discriminator (all zeros)");
-            &data[8..EXPECTED_STRUCT_SIZE + 8]
-        } else if data.len() > EXPECTED_STRUCT_SIZE {
-            // More than expected - try to parse first 1300 bytes
-            log::warn!(
-                "Obligation account is {} bytes (expected: {} bytes) - parsing first {} bytes", 
-                data.len(), 
-                EXPECTED_STRUCT_SIZE, 
-                EXPECTED_STRUCT_SIZE
-            );
-            &data[..EXPECTED_STRUCT_SIZE]
+        // ✅ FIXED: Consistent discriminator handling
+        // STEP 1: Check if account has Anchor discriminator (8 bytes)
+        // Obligation accounts from native Solend program don't use discriminators
+        // But Save Protocol (2024 rebrand) may use Anchor-style discriminators
+        let has_discriminator = if data.len() >= DISCRIMINATOR_SIZE {
+            // Anchor discriminator is NOT all zeros
+            // Solend native program uses zero discriminator or no discriminator
+            let first_8 = &data[0..DISCRIMINATOR_SIZE];
+            !first_8.iter().all(|&b| b == 0)
         } else {
-            // Too short - cannot parse
-            return Err(anyhow::anyhow!(
-                "Obligation data too short: {} bytes (minimum: {} bytes). \
-                 Account may be corrupted or layout may have changed.", 
-                data.len(), 
-                EXPECTED_STRUCT_SIZE
-            ));
+            false
         };
         
-        // Log version byte for debugging
-        if data_to_parse.len() > 0 {
-            let version_byte = data_to_parse[0];
-            log::trace!(
-                "Attempting Borsh deserialization of {} bytes (version byte: 0x{:02x} = {})", 
-                data_to_parse.len(),
-                version_byte,
-                version_byte
-            );
+        // STEP 2: Skip discriminator if present
+        let data_without_discriminator = if has_discriminator {
+            log::trace!("Skipping 8-byte Anchor discriminator");
+            if data.len() < DISCRIMINATOR_SIZE + EXPECTED_STRUCT_SIZE {
+                return Err(anyhow::anyhow!(
+                    "Account too short: {} bytes (need {} bytes after discriminator)",
+                    data.len(),
+                    DISCRIMINATOR_SIZE + EXPECTED_STRUCT_SIZE
+                ));
+            }
+            &data[DISCRIMINATOR_SIZE..]
         } else {
-            log::trace!("Attempting Borsh deserialization of {} bytes", data_to_parse.len());
+            data
+        };
+        
+        // STEP 3: Validate size
+        if data_without_discriminator.len() < EXPECTED_STRUCT_SIZE {
+            return Err(anyhow::anyhow!(
+                "Obligation data too short: {} bytes (need {} bytes). \
+                 Account may be corrupted or layout may have changed.",
+                data_without_discriminator.len(),
+                EXPECTED_STRUCT_SIZE
+            ));
         }
         
-        // Try deserialization - data_to_parse is already sliced to correct size
-        let obligation: Obligation = match BorshDeserialize::try_from_slice(data_to_parse) {
-            Ok(obl) => obl,
-            Err(e) => {
-                // If we still get an error, log detailed information and try one more time
-                let error_msg = e.to_string();
+        // STEP 4: Take exactly EXPECTED_STRUCT_SIZE bytes
+        let data_to_parse = &data_without_discriminator[..EXPECTED_STRUCT_SIZE];
+        
+        // STEP 5: Pre-check version byte (early validation)
+        let version_byte = data_to_parse[0];
+        if version_byte != 0 && version_byte != 1 {
+            return Err(anyhow::anyhow!(
+                "Invalid Obligation version: {} (expected 0 or 1). \
+                 This is likely not an Obligation account.",
+                version_byte
+            ));
+        }
+        
+        log::trace!(
+            "Attempting Borsh deserialization of {} bytes (version byte: 0x{:02x} = {})",
+            data_to_parse.len(),
+            version_byte,
+            version_byte
+        );
+        
+        // STEP 6: Parse with Borsh
+        let obligation: Obligation = BorshDeserialize::try_from_slice(data_to_parse)
+            .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
                 log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
                 log::error!("Parsed length: {} bytes", data_to_parse.len());
                 
-                // If error mentions length/Unexpected and we have extra bytes, try explicit slice one more time
-                if (error_msg.contains("length") || error_msg.contains("Unexpected")) && data.len() > EXPECTED_STRUCT_SIZE {
-                    log::debug!("Retrying with explicit slice to {} bytes", EXPECTED_STRUCT_SIZE);
-                    match BorshDeserialize::try_from_slice(&data[..EXPECTED_STRUCT_SIZE]) {
-                        Ok(obl) => {
-                            log::debug!("Successfully deserialized after retry with explicit slice");
-                            obl
-                        },
-                        Err(e2) => {
-                            log::error!("Borsh deserialization failed even with explicit slice: {}", e2);
-                            
-                            // Log detailed byte analysis
+                // Log detailed byte analysis for debugging
                 if data.len() >= 200 {
                     let hex_preview: String = data.iter()
                         .take(200)
@@ -181,28 +186,12 @@ impl Obligation {
                     log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
                 }
                 
-                            log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
-                log::error!("Actual data size: {} bytes", data.len());
-                
-                            return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e2));
-                        }
-                    }
-                } else {
-                    // Other error or no extra bytes - return error
-                    log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
-                    log::error!("Actual data size: {} bytes", data.len());
-                    return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e));
-                }
-            }
-        };
+                anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e)
+            })?;
         
         log::trace!("Successfully deserialized Obligation, version={}", obligation.version);
         
-        // CRITICAL: Validate version to detect layout changes
-        // Solend Obligation versions: 0 (legacy), 1 (current)
-        // Version 0 accounts are older but still valid on mainnet
-        // Version 1 is the current standard
-        // If Solend updates to v2, this will prevent silent parsing errors
+        // STEP 7: Validate version again (double-check after parsing)
         const EXPECTED_VERSION: u8 = 1;
         const LEGACY_VERSION: u8 = 0;
         
@@ -463,6 +452,67 @@ pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
         .any(|&id| Pubkey::from_str(id).ok() == Some(*pubkey))
 }
 
+/// Identify Solend account type without parsing
+/// 
+/// Uses heuristics based on size, discriminator, and version byte to quickly
+/// identify account types without expensive Borsh deserialization.
+/// 
+/// This is faster and more reliable than attempting to parse every account.
+pub fn identify_solend_account_type(data: &[u8]) -> SolendAccountType {
+    if data.len() < 8 {
+        return SolendAccountType::Unknown;
+    }
+    
+    // STEP 1: Check discriminator
+    // Anchor discriminators are NOT all zeros
+    // Solend native program uses zero discriminator or no discriminator
+    let has_discriminator = !data[0..8].iter().all(|&b| b == 0);
+    
+    // STEP 2: Get actual data (skip discriminator if present)
+    let actual_data = if has_discriminator {
+        if data.len() < 8 {
+            return SolendAccountType::Unknown;
+        }
+        &data[8..]
+    } else {
+        data
+    };
+    
+    // STEP 3: Size-based heuristic (after discriminator)
+    let size = actual_data.len();
+    
+    // STEP 4: Check version byte
+    if size > 0 {
+        let version = actual_data[0];
+        
+        // Obligation: 1200-1400 bytes, version 0 or 1
+        // Note: Obligation can be version 0 (legacy) or 1 (current)
+        if (1200..=1400).contains(&size) && (version == 0 || version == 1) {
+            return SolendAccountType::Obligation;
+        }
+        
+        // Reserve: 1200-1400 bytes, version 1 only
+        // Note: Reserve is always version 1 (version 0 is invalid for Reserve)
+        // CRITICAL: Both Obligation and Reserve can be 1300 bytes with version 1
+        // We check Obligation first (version 0 or 1), so if we reach here with version 1,
+        // it could be either. We return Reserve as a heuristic, but caller should
+        // try parsing to confirm (Obligation parsing will fail if it's actually a Reserve)
+        if (1200..=1400).contains(&size) && version == 1 {
+            // This could be either Obligation or Reserve
+            // Return Reserve as default, but caller should verify by parsing
+            return SolendAccountType::Reserve;
+        }
+        
+        // LendingMarket: 200-400 bytes
+        // LendingMarket doesn't have a version byte in the same way
+        if (200..=400).contains(&size) {
+            return SolendAccountType::LendingMarket;
+        }
+    }
+    
+    SolendAccountType::Unknown
+}
+
 /// Derive obligation address (PDA)
 pub fn derive_obligation_address(
     wallet_pubkey: &Pubkey,
@@ -668,53 +718,93 @@ impl Reserve {
             log::trace!("First 32 bytes (hex): {}", preview);
         }
         
-        // Skip discriminator (first 8 bytes) if present
-        let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
-            log::trace!("Skipping 8-byte discriminator (all zeros)");
-            &data[8..]
+        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 1300; // Full Reserve struct size including padding
+        const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
+        
+        // ✅ FIXED: Consistent discriminator handling (same as Obligation)
+        // STEP 1: Check if account has Anchor discriminator (8 bytes)
+        // Reserve accounts from native Solend program don't use discriminators
+        // But Save Protocol (2024 rebrand) may use Anchor-style discriminators
+        let has_discriminator = if data.len() >= DISCRIMINATOR_SIZE {
+            // Anchor discriminator is NOT all zeros
+            // Solend native program uses zero discriminator or no discriminator
+            let first_8 = &data[0..DISCRIMINATOR_SIZE];
+            !first_8.iter().all(|&b| b == 0)
         } else {
-            log::trace!("No discriminator detected, using full data");
+            false
+        };
+        
+        // STEP 2: Skip discriminator if present
+        let data_without_discriminator = if has_discriminator {
+            log::trace!("Skipping 8-byte Anchor discriminator");
+            if data.len() < DISCRIMINATOR_SIZE + EXPECTED_RESERVE_STRUCT_SIZE {
+                return Err(anyhow::anyhow!(
+                    "Account too short: {} bytes (need {} bytes after discriminator)",
+                    data.len(),
+                    DISCRIMINATOR_SIZE + EXPECTED_RESERVE_STRUCT_SIZE
+                ));
+            }
+            &data[DISCRIMINATOR_SIZE..]
+        } else {
             data
         };
         
-        log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
-        
-        // ✅ FIXED: Reserve struct now includes all fields including padding (1300 bytes total)
-        // Layout generator has been fixed to extract all fields from SDK and add missing padding
-        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 1300; // Full Reserve struct size including padding
-        
-        // Validate data length
-        if data.len() < EXPECTED_RESERVE_STRUCT_SIZE {
+        // STEP 3: Validate size
+        if data_without_discriminator.len() < EXPECTED_RESERVE_STRUCT_SIZE {
             return Err(anyhow::anyhow!(
-                "Reserve data too short: {} bytes (minimum: {} bytes)", 
-                data.len(), 
+                "Reserve data too short: {} bytes (need {} bytes). \
+                 Account may be corrupted or layout may have changed.",
+                data_without_discriminator.len(),
                 EXPECTED_RESERVE_STRUCT_SIZE
             ));
         }
         
-        // ✅ FIXED: Parse full 1300 bytes - struct now matches actual account size
-        let reserve: Reserve = match BorshDeserialize::try_from_slice(data) {
-            Ok(res) => res,
-            Err(e) => {
+        // STEP 4: Take exactly EXPECTED_RESERVE_STRUCT_SIZE bytes
+        let data_to_parse = &data_without_discriminator[..EXPECTED_RESERVE_STRUCT_SIZE];
+        
+        // STEP 5: Pre-check version byte (early validation)
+        // Reserve version must be 1 (unlike Obligation which can be 0 or 1)
+        let version_byte = data_to_parse[0];
+        if version_byte != 1 {
+            // Version 0 or invalid values usually indicate this is NOT a Reserve account
+            if version_byte == 0 || version_byte >= 250 {
+                return Err(anyhow::anyhow!(
+                    "Invalid Reserve version: {} (likely not a Reserve account - may be Obligation/LendingMarket)",
+                    version_byte
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "Invalid Reserve version: {} (expected 1). \
+                 This is likely not a Reserve account.",
+                version_byte
+            ));
+        }
+        
+        log::trace!(
+            "Attempting Borsh deserialization of {} bytes (version byte: 0x{:02x} = {})",
+            data_to_parse.len(),
+            version_byte,
+            version_byte
+        );
+        
+        // STEP 6: Parse with Borsh
+        let reserve: Reserve = BorshDeserialize::try_from_slice(data_to_parse)
+            .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
                 log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
-                if data.len() > 0 {
-                    log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
+                log::error!("Parsed length: {} bytes", data_to_parse.len());
+                if data_to_parse.len() > 0 {
+                    log::error!("First byte: {} (0x{:02x})", data_to_parse[0], data_to_parse[0]);
                 }
-                if data.len() > 1 {
-                    log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                if data_to_parse.len() > 1 {
+                    log::error!("Second byte: {} (0x{:02x})", data_to_parse[1], data_to_parse[1]);
                 }
-                return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
-            }
-        };
+                anyhow::anyhow!("Failed to deserialize Reserve: {}", e)
+            })?;
         
         log::trace!("Successfully deserialized Reserve, version={}", reserve.version);
         
-        // CRITICAL: Validate version to detect layout changes
-        // Solend Reserve version 1 is the current supported version
-        // If Solend updates to v2, this will prevent silent parsing errors
-        // NOTE: Version values like 0, 254, 255 usually indicate this is NOT a Reserve account
-        // (they're likely Obligation, LendingMarket, or other account types)
+        // STEP 7: Validate version again (double-check after parsing)
         const EXPECTED_VERSION: u8 = 1;
         if reserve.version != EXPECTED_VERSION {
             // If version is clearly invalid (0, 254, 255), this is likely not a Reserve account

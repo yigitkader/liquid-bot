@@ -277,56 +277,43 @@ async fn process_cycle(
 
     // 2. HF < 1.0 olanları bul
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data
-    // CRITICAL FIX: Pre-filter accounts by size to avoid parsing non-Obligation accounts
-    // Solend program has multiple account types:
-    // - Obligations: ~1300 bytes (what we want)
-    // - Reserves: ~600-700 bytes (skip these)
-    // - LendingMarkets: ~200-300 bytes (skip these)
-    const OBLIGATION_MIN_SIZE: usize = 1200; // Minimum size for valid obligation
-    const OBLIGATION_MAX_SIZE: usize = 1400; // Maximum size (with padding/variations)
-    
+    // ✅ FIXED: Use account type identification utility
+    // This is faster and more reliable than attempting to parse every account
     let mut candidates = Vec::new();
     let mut parse_errors = 0;
-    let mut skipped_wrong_size = 0;
+    let mut skipped_wrong_type = 0;
     let total_accounts = accounts.len();
     
     for (pk, acc) in accounts {
-        // Pre-filter by account size - skip accounts that are clearly not Obligations
-        let account_size = acc.data.len();
-        if account_size < OBLIGATION_MIN_SIZE || account_size > OBLIGATION_MAX_SIZE {
-            // This is likely a Reserve (~600 bytes) or LendingMarket (~300 bytes), skip it
-            skipped_wrong_size += 1;
-            continue;
-        }
-        
-        // Account size is in valid range, try to parse as Obligation
-        match Obligation::from_account_data(&acc.data) {
-            Ok(obligation) => {
-                let hf = obligation.health_factor();
-                if hf < 1.0 {
-                    candidates.push((pk, obligation));
+        // Use account type identification to quickly filter accounts
+        match crate::solend::identify_solend_account_type(&acc.data) {
+            crate::solend::SolendAccountType::Obligation => {
+                // This looks like an Obligation - try to parse it
+                match Obligation::from_account_data(&acc.data) {
+                    Ok(obligation) => {
+                        let hf = obligation.health_factor();
+                        if hf < 1.0 {
+                            candidates.push((pk, obligation));
+                        }
+                    }
+                    Err(e) => {
+                        parse_errors += 1;
+                        log::debug!("Failed to parse Obligation {}: {}", pk, e);
+                    }
                 }
             }
-            Err(e) => {
-                parse_errors += 1;
-                // Log first 5 errors in detail for debugging
-                if parse_errors <= 5 {
-                    log::warn!(
-                        "Failed to parse obligation {} (size: {} bytes): {}. This may indicate layout changes or corrupt data.",
-                        pk,
-                        account_size,
-                        e
-                    );
-                }
+            _ => {
+                // Skip non-Obligation accounts (Reserve, LendingMarket, Unknown)
+                skipped_wrong_type += 1;
             }
         }
     }
     
     // Log filtering statistics
-    if skipped_wrong_size > 0 {
+    if skipped_wrong_type > 0 {
         log::debug!(
-            "Skipped {} accounts with wrong size (likely Reserves/LendingMarkets, not Obligations)",
-            skipped_wrong_size
+            "Skipped {} accounts with wrong type (likely Reserves/LendingMarkets, not Obligations)",
+            skipped_wrong_type
         );
     }
     

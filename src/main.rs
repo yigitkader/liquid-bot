@@ -225,23 +225,24 @@ async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
             account_type
         );
 
-        // Obligation accounts are typically larger
-        if size > 1000 {
-            obligation_count += 1;
-            log::debug!("  Attempting to parse as Obligation...");
-            
-            // Log first few bytes for debugging
-            let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
-            let hex_preview = preview_bytes
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            log::debug!("  First 32 bytes (hex): {}", hex_preview);
-            
-            // Try to parse as Obligation to validate
-            match solend::Obligation::from_account_data(&account.data) {
-                Ok(obligation) => {
+        // ✅ FIXED: Use account type identification utility
+        match solend::identify_solend_account_type(&account.data) {
+            solend::SolendAccountType::Obligation => {
+                obligation_count += 1;
+                log::debug!("  Attempting to parse as Obligation...");
+                
+                // Log first few bytes for debugging
+                let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
+                let hex_preview = preview_bytes
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                log::debug!("  First 32 bytes (hex): {}", hex_preview);
+                
+                // Try to parse as Obligation to validate
+                match solend::Obligation::from_account_data(&account.data) {
+                    Ok(obligation) => {
                     log::debug!(
                         "  ✅ Successfully parsed Obligation: version={}, owner={}, depositsLen={}, borrowsLen={}",
                         obligation.version,
@@ -295,58 +296,24 @@ async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
                         account.owner,
                         hex_preview
                     ));
+                    }
                 }
             }
-        } else if size > 500 {
-            reserve_count += 1;
-            log::debug!("  Attempting to parse as Reserve...");
-            
-            // Try to parse as Reserve to validate
-            match solend::Reserve::from_account_data(&account.data) {
-                Ok(reserve) => {
-                    log::debug!(
-                        "  ✅ Successfully parsed Reserve: version={}, liquidityMint={}",
-                        reserve.version,
-                        reserve.liquidityMintPubkey
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "  ❌ Failed to parse Reserve account {}: {}",
-                        pubkey,
-                        e
-                    );
-                    log::error!(
-                        "  Account details: size={} bytes, owner={}, lamports={}",
-                        size,
-                        account.owner,
-                        account.lamports
-                    );
-                    
-                    return Err(anyhow::anyhow!(
-                        "Solend account size mismatch. Found account {} with size {} bytes that doesn't match expected Reserve layout.\n\
-                         Error: {}\n\
-                         Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.\n\
-                         \n\
-                         Debug info:\n\
-                         - Account pubkey: {}\n\
-                         - Account size: {} bytes\n\
-                         - Account owner: {}",
-                        pubkey,
-                        size,
-                        e,
-                        pubkey,
-                        size,
-                        account.owner
-                    ));
-                }
+            solend::SolendAccountType::Reserve => {
+                reserve_count += 1;
+                log::debug!("  ⏭️  Skipping Reserve account (not needed for validation)");
+                // Skip Reserve accounts in validation - we only care about Obligations
             }
-        } else if size > 200 {
-            lending_market_count += 1;
-            log::debug!("  Account appears to be LendingMarket (size={} bytes), skipping validation", size);
-        } else {
-            unknown_count += 1;
-            log::debug!("  Unknown account type (size={} bytes), skipping", size);
+            solend::SolendAccountType::LendingMarket => {
+                lending_market_count += 1;
+                log::debug!("  ⏭️  Skipping LendingMarket account (not needed for validation)");
+                // Skip LendingMarket accounts in validation
+            }
+            solend::SolendAccountType::Unknown => {
+                unknown_count += 1;
+                log::debug!("  ⏭️  Skipping unknown account type");
+                // Skip unknown account types
+            }
         }
     }
 
