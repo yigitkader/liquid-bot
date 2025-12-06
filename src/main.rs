@@ -76,6 +76,12 @@ async fn main() -> Result<()> {
 
     // Runtime layout validation per Structure.md section 11.6
     let rpc = Arc::new(RpcClient::new(app_config.rpc_url.clone()));
+    
+    // CRITICAL: Verify we're connected to mainnet, not devnet/testnet
+    validate_mainnet_connection(&rpc)
+        .await
+        .context("Mainnet connection validation failed - this bot only supports mainnet production")?;
+    
     validate_solend_layouts(&rpc)
         .await
         .context("Solend layout validation failed - please rebuild the bot")?;
@@ -115,6 +121,53 @@ async fn main() -> Result<()> {
 
     // Start liquidation loop
     run_liquidation_loop(rpc, pipeline_config).await
+}
+
+/// CRITICAL: Validate that RPC is connected to mainnet, not devnet/testnet
+/// This bot only supports mainnet production
+async fn validate_mainnet_connection(rpc: &Arc<RpcClient>) -> Result<()> {
+    log::info!("🔍 Validating mainnet connection...");
+    
+    // Check RPC connection first
+    let slot = rpc.get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to connect to RPC: {}", e))?;
+    log::info!("✅ RPC connected (current slot: {})", slot);
+    
+    // Verify we're on mainnet by checking a known mainnet account
+    // USDC mint on mainnet: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    // This account exists on mainnet but has different address on devnet
+    const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let usdc_mint = Pubkey::from_str(MAINNET_USDC_MINT)
+        .map_err(|e| anyhow::anyhow!("Invalid USDC mint address: {}", e))?;
+    
+    match rpc.get_account(&usdc_mint) {
+        Ok(account) => {
+            // Verify it's a token mint account (owner should be Token Program)
+            use spl_token::ID as TOKEN_PROGRAM_ID;
+            if account.owner == TOKEN_PROGRAM_ID {
+                log::info!("✅ Mainnet verified: USDC mint account found and valid");
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "CRITICAL: Network validation failed. \
+                     USDC mint account found but owner is {} (expected Token Program). \
+                     This may indicate wrong network or corrupted data.",
+                    account.owner
+                ))
+            }
+        }
+        Err(e) => {
+            // If USDC mint not found, we're likely on wrong network
+            Err(anyhow::anyhow!(
+                "CRITICAL: Mainnet validation failed. \
+                 USDC mint account {} not found: {}. \
+                 This bot only supports mainnet production. \
+                 Please verify RPC_URL points to mainnet (https://api.mainnet-beta.solana.com or premium mainnet RPC). \
+                 Current RPC_URL may be pointing to devnet/testnet.",
+                MAINNET_USDC_MINT, e
+            ))
+        }
+    }
 }
 
 /// Runtime layout validation per Structure.md section 11.6
@@ -405,6 +458,17 @@ async fn ensure_required_atas_exist(
     let mut reserve_parse_success = 0;
     
     for (_pubkey, account) in accounts {
+        // CRITICAL: Pre-filter by account size to avoid parsing non-Reserve accounts
+        // Reserves are typically 500-700 bytes (actual on-chain: ~1300 bytes with padding)
+        // Obligations are ~1300 bytes, LendingMarkets are ~200 bytes
+        let account_size = account.data.len();
+        
+        // Skip accounts that are clearly not Reserves
+        if account_size < 400 || account_size > 1500 {
+            // Too small (LendingMarket) or too large (Obligation with extra data)
+            continue;
+        }
+        
         // Try to parse as Reserve - be lenient, log errors but continue
         match solend::Reserve::from_account_data(&account.data) {
             Ok(reserve) => {
@@ -415,13 +479,20 @@ async fn ensure_required_atas_exist(
                 // We only need the actual token mints (liquidity.mintPubkey)
             }
             Err(e) => {
-                // Only count as error if account size suggests it might be a Reserve
-                // Reserves are typically 500-600 bytes
-                if account.data.len() > 400 && account.data.len() < 700 {
-                    reserve_parse_errors += 1;
-                    log::debug!("Failed to parse potential Reserve account (size: {} bytes): {}", account.data.len(), e);
+                // Only log if error message suggests it might have been a Reserve
+                // Version mismatch with invalid versions (0, 254, 255) are likely not Reserves
+                let error_msg = e.to_string();
+                if !error_msg.contains("likely not a Reserve") && 
+                   !error_msg.contains("Invalid Reserve version") {
+                    // This might have been a Reserve that failed to parse
+                    if account_size > 400 && account_size < 1500 {
+                        reserve_parse_errors += 1;
+                        if reserve_parse_errors <= 5 {
+                            log::debug!("Failed to parse potential Reserve account (size: {} bytes): {}", account_size, e);
+                        }
+                    }
                 }
-                // Ignore other account types (Obligations, LendingMarkets, etc.)
+                // Silently ignore other account types (Obligations, LendingMarkets, etc.)
             }
         }
     }
@@ -441,22 +512,30 @@ async fn ensure_required_atas_exist(
     
     log::info!("Found {} unique token mints in Solend reserves", token_mints.len());
     
-    // CRITICAL: Ensure wrapped SOL (WSOL) ATA exists for Jupiter swaps
-    // Jupiter swaps often use SOL as intermediate token (e.g., SOL-USDC swap)
-    // WSOL mint: So11111111111111111111111111111111111111112
+    // CRITICAL OPTIMIZATION: Only check ATAs for tokens actually needed for liquidation
+    // We don't need ATAs for all 277k+ tokens - only for:
+    // 1. USDC (for repaying debt)
+    // 2. WSOL (for Jupiter swaps)
+    // Other token ATAs will be created on-demand during liquidation if needed
+    
+    let mut required_mints = std::collections::HashSet::new();
+    
+    // 1. USDC mint (required for repaying debt)
+    let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)?;
+    required_mints.insert(usdc_mint);
+    log::debug!("USDC mint added to required ATAs: {}", usdc_mint);
+    
+    // 2. WSOL mint (required for Jupiter swaps)
     let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
         .map_err(|e| anyhow::anyhow!("Invalid WSOL mint address: {}", e))?;
-    let wsol_ata = get_associated_token_address(wallet_pubkey, &wsol_mint);
-    if rpc.get_account(&wsol_ata).is_err() {
-        log::info!("WSOL ATA missing (required for Jupiter swaps), will create: {}", wsol_ata);
-        token_mints.insert(wsol_mint); // Add to set so it gets created with other ATAs
-    } else {
-        log::debug!("WSOL ATA already exists: {}", wsol_ata);
-    }
+    required_mints.insert(wsol_mint);
+    log::debug!("WSOL mint added to required ATAs: {}", wsol_mint);
     
-    // Check and create missing ATAs
+    log::info!("🔍 Checking ATAs for {} required tokens (USDC + WSOL)...", required_mints.len());
+    
+    // Check and create missing ATAs (only for required tokens)
     let mut missing_atas = Vec::new();
-    for token_mint in &token_mints {
+    for token_mint in &required_mints {
         let ata = get_associated_token_address(wallet_pubkey, token_mint);
         if rpc.get_account(&ata).is_err() {
             missing_atas.push((*token_mint, ata));
@@ -583,12 +662,43 @@ fn load_config() -> Result<AppConfig> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
 
+    // CRITICAL: Validate RPC_URL - only mainnet is allowed
+    let rpc_url = env_str("RPC_URL", "https://api.mainnet-beta.solana.com");
+    
+    // Reject devnet/testnet URLs explicitly
+    let rpc_url_lower = rpc_url.to_lowercase();
+    if rpc_url_lower.contains("devnet") || rpc_url_lower.contains("testnet") {
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Devnet/Testnet URLs are not allowed. This bot only supports mainnet production.\n\
+             RPC_URL: {}\n\
+             Please set RPC_URL to a mainnet endpoint (e.g., https://api.mainnet-beta.solana.com or premium mainnet RPC)",
+            rpc_url
+        ));
+    }
+    
+    // Warn if using free public RPC (but allow it)
+    if rpc_url_lower.contains("api.mainnet-beta.solana.com") {
+        log::warn!("⚠️  Using free public RPC endpoint. Consider using a premium RPC for better performance and reliability.");
+    }
+
+    // CRITICAL: Validate JITO_URL - only mainnet is allowed
+    let jito_url = env_str(
+        "JITO_URL",
+        "https://mainnet.block-engine.jito.wtf",
+    );
+    let jito_url_lower = jito_url.to_lowercase();
+    if jito_url_lower.contains("devnet") || jito_url_lower.contains("testnet") {
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Devnet/Testnet JITO_URL is not allowed. This bot only supports mainnet production.\n\
+             JITO_URL: {}\n\
+             Please set JITO_URL to mainnet endpoint: https://mainnet.block-engine.jito.wtf",
+            jito_url
+        ));
+    }
+
     Ok(AppConfig {
-        rpc_url: env_str("RPC_URL", "https://api.mainnet-beta.solana.com"),
-        jito_url: env_str(
-            "JITO_URL",
-            "https://mainnet.block-engine.jito.wtf",
-        ),
+        rpc_url,
+        jito_url,
         jupiter_url: env_str(
             "JUPITER_URL",
             "https://quote-api.jup.ag",

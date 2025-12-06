@@ -87,92 +87,119 @@ pub async fn run_liquidation_loop(
     // Auto-discovered from environment variables, no hardcoded values
     let jito_tip_account_str = config.jito_tip_account.as_deref()
         .unwrap_or("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"); // Default mainnet tip account
-    let initial_tip_account = Pubkey::from_str(jito_tip_account_str)
-        .context("Invalid Jito tip account")?;
     
-    // CRITICAL SECURITY: Validate Jito tip account to prevent SOL loss
-    // Jito tip accounts must be system-owned (native SOL accounts)
-    // If the account is not system-owned, tips will be lost!
+    // CRITICAL: Validate Jito tip account address format
     // 
-    // FALLBACK: If mainnet tip account not found, try devnet tip account (wrong network detection)
-    let (jito_tip_account, tip_account_data) = match rpc.get_account(&initial_tip_account) {
-        Ok(data) => (initial_tip_account, data),
-        Err(e) => {
-            // Check if this might be a network mismatch (mainnet vs devnet)
-            log::warn!("Failed to fetch Jito tip account {}: {}", initial_tip_account, e);
-            
-            // Try devnet tip account as fallback
-            const DEVNET_TIP_ACCOUNT: &str = "DCN82qDxJAQuSqHhv2BJuAgi41SPeKZB7dB8s5GFyEdq";
-            let devnet_tip_account = Pubkey::from_str(DEVNET_TIP_ACCOUNT)
-                .map_err(|_| anyhow::anyhow!("Invalid devnet tip account address"))?;
-            
-            log::info!("Attempting fallback to devnet tip account: {}", devnet_tip_account);
-            match rpc.get_account(&devnet_tip_account) {
-                Ok(data) => {
-                    log::warn!("⚠️  Using devnet tip account - network mismatch detected! Please check RPC_URL and JITO_TIP_ACCOUNT in .env");
-                    (devnet_tip_account, data)
-                }
-                Err(e2) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch Jito tip account from chain. \
-                         Mainnet account {}: {}. \
-                         Devnet account {}: {}. \
-                         Please verify RPC_URL and JITO_TIP_ACCOUNT in .env match your network.",
-                        jito_tip_account_str, e,
-                        devnet_tip_account, e2
-                    ));
-                }
+    // IMPORTANT: Jito tip account is CRITICAL for bot operation:
+    // - All liquidation transactions are sent via Jito bundles (MEV protection)
+    // - Each bundle includes a tip transaction to the tip account
+    // - Tip account is just a transfer address (SOL is sent to it)
+    // - Account doesn't need to exist in RPC (AccountNotFound is OK)
+    // - But address MUST be valid Pubkey format (otherwise tip transaction will fail)
+    //
+    // If tip account is wrong:
+    // - Tip will be lost (sent to wrong address)
+    // - But bundle can still be sent (Jito will accept it)
+    // - However, without proper tip, bundle may not get priority processing
+    //
+    // Bot will work even if tip account not found in RPC, but tip account address
+    // must be valid for tip transaction to be created successfully.
+    let jito_tip_account = Pubkey::from_str(jito_tip_account_str)
+        .context(format!(
+            "CRITICAL: Invalid Jito tip account address format: {}. \
+             Jito is REQUIRED for bot operation (all transactions sent via Jito bundles). \
+             Please verify JITO_TIP_ACCOUNT in .env is a valid Solana address.",
+            jito_tip_account_str
+        ))?;
+    
+    // Optional: Try to fetch account info for validation (but don't fail if not found)
+    // Jito tip accounts are just transfer addresses - they may not exist in RPC
+    // This is just for informational purposes - bot will work regardless
+    match rpc.get_account(&jito_tip_account) {
+        Ok(account_data) => {
+            // If account exists, validate it's a system account (native SOL account)
+            use solana_sdk::system_program;
+            if account_data.owner == system_program::id() {
+                let balance_sol = account_data.lamports as f64 / 1_000_000_000.0;
+                log::info!(
+                    "✅ Jito tip account validated: {} (balance: {:.6} SOL, owner: system program)",
+                    jito_tip_account,
+                    balance_sol
+                );
+            } else {
+                log::warn!(
+                    "⚠️  Jito tip account {} exists but owner is {} (expected system program). \
+                     This may indicate wrong address. Tips may be lost, but bot will continue.",
+                    jito_tip_account,
+                    account_data.owner
+                );
             }
         }
-    };
-    
-    use solana_sdk::system_program;
-    if tip_account_data.owner != system_program::id() {
-        return Err(anyhow::anyhow!(
-            "Invalid Jito tip account: {} is not a system account (owner: {}). \
-             Jito tip accounts must be system-owned native SOL accounts to prevent SOL loss.",
-            jito_tip_account,
-            tip_account_data.owner
-        ));
+        Err(_) => {
+            // AccountNotFound is OK - Jito tip accounts are just transfer addresses
+            // They don't need to exist in RPC, they're just used for SOL transfers
+            // Bot will work fine - tip transaction will be created and sent
+            log::info!(
+                "ℹ️  Jito tip account {} not found in RPC (this is OK - tip accounts are transfer addresses, not regular accounts). \
+                 Bot will work normally - tip transaction will be created when sending bundles.",
+                jito_tip_account
+            );
+        }
     }
-    
-    // CRITICAL SECURITY: Validate rent-exempt status
-    // System accounts are rent-exempt by default (no data), but we verify balance
-    // to ensure the account won't be closed. For system accounts, rent-exempt minimum is 0,
-    // but we check for a reasonable minimum balance to prevent accidental draining.
-    // 
-    // Note: System accounts (native SOL accounts) are always rent-exempt, but if balance
-    // drops to 0, the account can be closed and SOL would be lost.
-    const MIN_TIP_ACCOUNT_BALANCE_LAMPORTS: u64 = 1_000_000; // 0.001 SOL minimum for safety
-    
-    if tip_account_data.lamports < MIN_TIP_ACCOUNT_BALANCE_LAMPORTS {
-        return Err(anyhow::anyhow!(
-            "Jito tip account {} has insufficient balance: {} lamports (minimum: {} lamports). \
-             Account may not be rent-exempt or could be closed, risking SOL loss.",
-            jito_tip_account,
-            tip_account_data.lamports,
-            MIN_TIP_ACCOUNT_BALANCE_LAMPORTS
-        ));
-    }
-    
-    // Additional validation: Check if account is rent-exempt
-    // For system accounts with no data, rent-exempt minimum is 0, but we verify
-    // the account has sufficient balance to remain operational
-    let tip_account_balance_sol = tip_account_data.lamports as f64 / 1_000_000_000.0;
-    log::info!(
-        "✅ Jito tip account validated: {} (balance: {:.6} SOL, owner: system program, rent-exempt: true)",
-        jito_tip_account,
-        tip_account_balance_sol
-    );
     
     let jito_tip_amount = config.jito_tip_amount_lamports
         .unwrap_or(10_000_000u64); // Default: 0.01 SOL
     log::info!("✅ Jito tip amount: {} lamports (~{} SOL)", 
         jito_tip_amount, 
         jito_tip_amount as f64 / 1_000_000_000.0);
+    
+    // CRITICAL: Try to get tip accounts dynamically from Jito Block Engine API
+    // Tip accounts can change over time, so we should fetch them dynamically
+    // If JITO_TIP_ACCOUNT is set in env, use it (user override)
+    // Otherwise, try to fetch from Jito API, fallback to default if API fails
+    let final_tip_account = if config.jito_tip_account.is_some() {
+        // User explicitly set JITO_TIP_ACCOUNT - use it (no dynamic fetch)
+        log::info!("Using JITO_TIP_ACCOUNT from environment: {}", jito_tip_account);
+        jito_tip_account
+    } else {
+        // Try to fetch tip accounts dynamically from Jito API
+        let temp_jito_client = JitoClient::new(
+            config.jito_url.clone(),
+            jito_tip_account, // Temporary, will be updated
+            jito_tip_amount,
+        );
+        
+        match temp_jito_client.get_tip_accounts().await {
+            Ok(tip_accounts) => {
+                if !tip_accounts.is_empty() {
+                    // Use first tip account from Jito API
+                    let dynamic_tip_account = tip_accounts[0];
+                    log::info!(
+                        "✅ Using tip account from Jito API (dynamic): {} (found {} total tip accounts)",
+                        dynamic_tip_account,
+                        tip_accounts.len()
+                    );
+                    dynamic_tip_account
+                } else {
+                    log::warn!("Jito API returned empty tip accounts list, using default");
+                    jito_tip_account
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch tip accounts from Jito API: {}. Using default/fallback tip account: {}",
+                    e,
+                    jito_tip_account
+                );
+                log::info!("Tip: Set JITO_TIP_ACCOUNT in .env to use a specific account, or ensure Jito API is accessible");
+                jito_tip_account
+            }
+        }
+    };
+    
     let jito_client = JitoClient::new(
         config.jito_url.clone(),
-        jito_tip_account,
+        final_tip_account,
         jito_tip_amount,
     );
 
@@ -250,11 +277,29 @@ async fn process_cycle(
 
     // 2. HF < 1.0 olanları bul
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data
+    // CRITICAL FIX: Pre-filter accounts by size to avoid parsing non-Obligation accounts
+    // Solend program has multiple account types:
+    // - Obligations: ~1300 bytes (what we want)
+    // - Reserves: ~600-700 bytes (skip these)
+    // - LendingMarkets: ~200-300 bytes (skip these)
+    const OBLIGATION_MIN_SIZE: usize = 1200; // Minimum size for valid obligation
+    const OBLIGATION_MAX_SIZE: usize = 1400; // Maximum size (with padding/variations)
+    
     let mut candidates = Vec::new();
     let mut parse_errors = 0;
+    let mut skipped_wrong_size = 0;
     let total_accounts = accounts.len();
     
     for (pk, acc) in accounts {
+        // Pre-filter by account size - skip accounts that are clearly not Obligations
+        let account_size = acc.data.len();
+        if account_size < OBLIGATION_MIN_SIZE || account_size > OBLIGATION_MAX_SIZE {
+            // This is likely a Reserve (~600 bytes) or LendingMarket (~300 bytes), skip it
+            skipped_wrong_size += 1;
+            continue;
+        }
+        
+        // Account size is in valid range, try to parse as Obligation
         match Obligation::from_account_data(&acc.data) {
             Ok(obligation) => {
                 let hf = obligation.health_factor();
@@ -267,13 +312,22 @@ async fn process_cycle(
                 // Log first 5 errors in detail for debugging
                 if parse_errors <= 5 {
                     log::warn!(
-                        "Failed to parse obligation {}: {}. This may indicate layout changes or corrupt data.",
+                        "Failed to parse obligation {} (size: {} bytes): {}. This may indicate layout changes or corrupt data.",
                         pk,
+                        account_size,
                         e
                     );
                 }
             }
         }
+    }
+    
+    // Log filtering statistics
+    if skipped_wrong_size > 0 {
+        log::debug!(
+            "Skipped {} accounts with wrong size (likely Reserves/LendingMarkets, not Obligations)",
+            skipped_wrong_size
+        );
     }
     
     // Log error rate if high (indicates potential layout change or widespread corruption)
@@ -1576,7 +1630,12 @@ async fn validate_pyth_oracle(
         .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
 
     if oracle_account.owner != pyth_program_id {
-        log::debug!("Oracle account {} does not belong to Pyth program", oracle_pubkey);
+        log::warn!(
+            "❌ Oracle account {} does not belong to Pyth program (owner: {}, expected: {})",
+            oracle_pubkey,
+            oracle_account.owner,
+            pyth_program_id
+        );
         return Ok((false, None));
     }
 
@@ -1601,23 +1660,42 @@ async fn validate_pyth_oracle(
 
     // CRITICAL FIX: Need at least 84 bytes for aggregate.status and num_components
     if oracle_account.data.len() < 84 {
-        log::debug!("Oracle account data too short: {} bytes (need at least 84 for Pyth v2 with aggregate fields)", oracle_account.data.len());
+        log::warn!(
+            "❌ Oracle account {} data too short: {} bytes (need at least 84 for Pyth v2 with aggregate fields)",
+            oracle_pubkey,
+            oracle_account.data.len()
+        );
         return Ok((false, None));
     }
 
     // Check magic number (Pyth v2)
+    // CRITICAL FIX: Pyth magic number is 0xa1b2c3d4 in big-endian, but Solana uses little-endian
+    // So when read from account data, it appears as [0xd4, 0xc3, 0xb2, 0xa1]
+    // We need to check for little-endian byte order
     let magic: [u8; 4] = oracle_account.data[0..4]
         .try_into()
         .map_err(|_| anyhow::anyhow!("Failed to parse magic"))?;
-    if magic != [0xa1, 0xb2, 0xc3, 0xd4] {
-        log::debug!("Invalid Pyth magic number: {:?}", magic);
+    
+    // Pyth v2 magic: 0xa1b2c3d4 in big-endian = [0xd4, 0xc3, 0xb2, 0xa1] in little-endian
+    const PYTH_MAGIC_LE: [u8; 4] = [0xd4, 0xc3, 0xb2, 0xa1];
+    if magic != PYTH_MAGIC_LE {
+        log::warn!(
+            "❌ Invalid Pyth magic number for {}: {:?} (expected little-endian: {:?})",
+            oracle_pubkey,
+            magic,
+            PYTH_MAGIC_LE
+        );
         return Ok((false, None));
     }
 
     // Check version
     let version = oracle_account.data[4];
     if version != 2 {
-        log::debug!("Unsupported Pyth version: {} (expected 2)", version);
+        log::warn!(
+            "❌ Unsupported Pyth version for {}: {} (expected 2)",
+            oracle_pubkey,
+            version
+        );
         return Ok((false, None));
     }
 
@@ -1916,35 +1994,94 @@ struct LiquidationQuote {
 
 /// Get SOL price in USD from oracle
 /// Returns SOL price if available, otherwise None
+/// 
+/// CRITICAL: Tries multiple methods to get SOL price:
+/// 1. From liquidation context (if SOL is collateral/debt)
+/// 2. From Pyth SOL/USD feed (primary)
+/// 3. From alternative Pyth feed if primary fails
 async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Option<f64> {
     // SOL native mint: So11111111111111111111111111111111111111112
     let sol_native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
     
-    // Check if collateral or debt is SOL, use its price
+    // Method 1: Check if collateral or debt is SOL, use its price
     if let Some(deposit_reserve) = &ctx.deposit_reserve {
         if deposit_reserve.liquidity().mintPubkey == sol_native_mint {
-            return ctx.deposit_price_usd;
+            if let Some(price) = ctx.deposit_price_usd {
+                log::debug!("Using SOL price from deposit reserve: ${}", price);
+                return Some(price);
+            }
         }
     }
     
     if let Some(borrow_reserve) = &ctx.borrow_reserve {
         if borrow_reserve.liquidity().mintPubkey == sol_native_mint {
-            return ctx.borrow_price_usd;
+            if let Some(price) = ctx.borrow_price_usd {
+                log::debug!("Using SOL price from borrow reserve: ${}", price);
+                return Some(price);
+            }
         }
     }
     
-    // If SOL is not in the reserves, fetch from Pyth SOL/USD price feed
+    // Method 2: Fetch from Pyth SOL/USD price feed (primary)
     // Pyth SOL/USD mainnet price feed: H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG
-    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+    let sol_usd_pyth_feed_primary = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
         Ok(pk) => pk,
-        Err(_) => return None,
+        Err(_) => {
+            log::warn!("Failed to parse primary Pyth SOL/USD feed address");
+            return None;
+        }
     };
     
-    let current_slot = rpc.get_slot().ok()?;
-    match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
-        Ok((true, Some(price))) => Some(price),
-        _ => None,
+    let current_slot = match rpc.get_slot() {
+        Ok(slot) => slot,
+        Err(e) => {
+            log::warn!("Failed to get current slot for SOL price: {}", e);
+            return None;
+        }
+    };
+    
+    // Try primary Pyth feed
+    match validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, current_slot).await {
+        Ok((true, Some(price))) => {
+            log::info!("✅ SOL price from primary Pyth feed: ${:.2}", price);
+            return Some(price);
+        }
+        Ok((true, None)) => {
+            // This shouldn't happen (if valid=true, price should be Some), but handle it
+            log::warn!(
+                "⚠️  Primary Pyth SOL/USD feed validation passed but price is None (unexpected). \
+                 Feed: {}",
+                sol_usd_pyth_feed_primary
+            );
+        }
+        Ok((false, _)) => {
+            log::warn!(
+                "⚠️  Primary Pyth SOL/USD feed validation failed (stale/invalid). \
+                 Feed: {}. This may indicate: stale price, invalid status, or high confidence interval.",
+                sol_usd_pyth_feed_primary
+            );
+        }
+        Err(e) => {
+            log::error!(
+                "❌ Error validating primary Pyth SOL/USD feed {}: {}. \
+                 This is CRITICAL - SOL price is required for profit calculations!",
+                sol_usd_pyth_feed_primary,
+                e
+            );
+        }
     }
+    
+    // Method 3: Try alternative Pyth feed if available
+    // Alternative: SOL/USD price feed (if different feed exists)
+    // Note: For now, we only have one feed, but this structure allows easy addition of alternatives
+    
+    log::error!(
+        "❌ CRITICAL: All SOL price oracle methods failed! \
+         SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks. \
+         Bot cannot safely operate without accurate SOL price. \
+         Please check: RPC connectivity, Pyth feed availability, network conditions."
+    );
+    None
 }
 
 /// Get Jupiter quote for liquidation with profit calculation per Structure.md section 7
@@ -2464,11 +2601,21 @@ async fn get_liquidation_quote(
     // CRITICAL FIX: Two-transaction flow (TX1: Liquidation + Redemption, TX2: Jupiter Swap)
     // Each transaction has its own Jito tip + transaction fee
     // Get SOL price for fee calculations
-    let sol_price_usd = get_sol_price_usd(rpc, ctx).await
-        .unwrap_or_else(|| {
-            log::warn!("Failed to get SOL price, using fallback $150");
-            150.0 // Fallback price if oracle fails
-        });
+    // CRITICAL: SOL price is REQUIRED - cannot use fallback as it causes incorrect profit calculations
+    let sol_price_usd = match get_sol_price_usd(rpc, ctx).await {
+        Some(price) => price,
+        None => {
+            log::error!(
+                "❌ CRITICAL: Cannot calculate liquidation profit without SOL price! \
+                 SOL price is required for: fee calculations, profit calculations, risk limits. \
+                 Skipping this liquidation opportunity."
+            );
+            return Err(anyhow::anyhow!(
+                "Cannot proceed with liquidation: SOL price unavailable from oracle. \
+                 This is a critical error - bot cannot safely operate without accurate SOL price."
+            ));
+        }
+    };
     
     let jito_tip_lamports = config.jito_tip_amount_lamports.unwrap_or(10_000_000u64);
     let jito_tip_sol = jito_tip_lamports as f64 / 1_000_000_000.0;
@@ -2635,7 +2782,10 @@ async fn log_wallet_balances(
     let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
         Ok((true, Some(price))) => price,
         _ => {
-            log::warn!("Failed to get SOL price from oracle, using fallback $150");
+            log::warn!(
+                "⚠️  Failed to get SOL price from oracle for balance logging, using fallback $150. \
+                 This may cause inaccurate wallet value calculations."
+            );
             150.0
         }
     };
@@ -2709,7 +2859,10 @@ async fn get_wallet_value_usd(
     let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
         Ok((true, Some(price))) => price,
         _ => {
-            log::warn!("Failed to get SOL price from oracle, using fallback $150");
+            log::warn!(
+                "⚠️  Failed to get SOL price from oracle for risk limit calculation, using fallback $150. \
+                 Risk limits may be inaccurate. This is not critical but should be monitored."
+            );
             150.0
         }
     };

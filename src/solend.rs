@@ -92,39 +92,57 @@ impl Obligation {
             log::trace!("First 32 bytes (hex): {}", preview);
         }
         
-        // Skip discriminator (first 8 bytes) if present
-        let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
-            log::trace!("Skipping 8-byte discriminator (all zeros)");
-            &data[8..]
-        } else {
-            log::trace!("No discriminator detected, using full data");
-            data
-        };
+        // CRITICAL: Obligation struct is exactly 1300 bytes (from generated layout)
+        // Account data can be:
+        // 1. Exactly 1300 bytes (no discriminator) - use as-is
+        // 2. 1308 bytes (8-byte discriminator + 1300 bytes struct) - skip discriminator
+        // 3. Other sizes - error
+        const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from generated layout
         
-        log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
-        
-        // CRITICAL: Calculate expected size from actual struct layout
-        // Struct size: 1 + 9 + 32 + 32 + 16*5 + 1 + 16*2 + 1 + 14 + 1 + 1 + 1096 = 1300 bytes
-        // Log analysis shows: account size = 1300 bytes, offset before _padding = 188 bytes
-        // Total: 188 + 14 (padding) + 1 (depositsLen) + 1 (borrowsLen) + 1096 (dataFlat) = 1300 bytes
-        const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from layout analysis
-        
-        // Use data as-is if it matches expected size, otherwise error
+        // CRITICAL: Determine correct parse offset
+        // Solend accounts structure:
+        // - If account is exactly 1300 bytes: no discriminator, parse from offset 0
+        // - If account is 1308 bytes and first 8 bytes are zeros: has discriminator, skip 8 bytes
+        // - If account is > 1300 bytes but not 1308: unusual, try to parse first 1300 bytes
         let data_to_parse = if data.len() == EXPECTED_STRUCT_SIZE {
+            // Exactly 1300 bytes - no discriminator, use as-is
+            // Note: If first byte is 0, this is version 0 (legacy), not a discriminator
             data
+        } else if data.len() == EXPECTED_STRUCT_SIZE + 8 && data[0..8] == [0u8; 8] {
+            // 1308 bytes with 8-byte zero discriminator - skip discriminator
+            log::trace!("Skipping 8-byte discriminator (all zeros)");
+            &data[8..EXPECTED_STRUCT_SIZE + 8]
         } else if data.len() > EXPECTED_STRUCT_SIZE {
-            // More than expected - log warning but try to parse first 1300 bytes
-            log::warn!("Obligation account is {} bytes (expected: {} bytes) - parsing first {} bytes", 
-                data.len(), EXPECTED_STRUCT_SIZE, EXPECTED_STRUCT_SIZE);
+            // More than expected - try to parse first 1300 bytes
+            log::warn!(
+                "Obligation account is {} bytes (expected: {} bytes) - parsing first {} bytes", 
+                data.len(), 
+                EXPECTED_STRUCT_SIZE, 
+                EXPECTED_STRUCT_SIZE
+            );
             &data[..EXPECTED_STRUCT_SIZE]
         } else {
-            // Too short
+            // Too short - cannot parse
             return Err(anyhow::anyhow!(
-                "Obligation data too short: {} bytes (minimum: {} bytes)", 
+                "Obligation data too short: {} bytes (minimum: {} bytes). \
+                 Account may be corrupted or layout may have changed.", 
                 data.len(), 
                 EXPECTED_STRUCT_SIZE
             ));
         };
+        
+        // Log version byte for debugging
+        if data_to_parse.len() > 0 {
+            let version_byte = data_to_parse[0];
+            log::trace!(
+                "Attempting Borsh deserialization of {} bytes (version byte: 0x{:02x} = {})", 
+                data_to_parse.len(),
+                version_byte,
+                version_byte
+            );
+        } else {
+            log::trace!("Attempting Borsh deserialization of {} bytes", data_to_parse.len());
+        }
         
         // Try deserialization - data_to_parse is already sliced to correct size
         let obligation: Obligation = match BorshDeserialize::try_from_slice(data_to_parse) {
@@ -148,24 +166,24 @@ impl Obligation {
                             log::error!("Borsh deserialization failed even with explicit slice: {}", e2);
                             
                             // Log detailed byte analysis
-                            if data.len() >= 200 {
-                                let hex_preview: String = data.iter()
-                                    .take(200)
-                                    .enumerate()
-                                    .map(|(i, b)| {
-                                        if i % 32 == 0 && i > 0 {
-                                            format!("\n  [{:04x}]: {:02x}", i, b)
-                                        } else {
-                                            format!(" {:02x}", b)
-                                        }
-                                    })
-                                    .collect();
-                                log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
+                if data.len() >= 200 {
+                    let hex_preview: String = data.iter()
+                        .take(200)
+                        .enumerate()
+                        .map(|(i, b)| {
+                            if i % 32 == 0 && i > 0 {
+                                format!("\n  [{:04x}]: {:02x}", i, b)
+                            } else {
+                                format!(" {:02x}", b)
                             }
-                            
+                        })
+                        .collect();
+                    log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
+                }
+                
                             log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
-                            log::error!("Actual data size: {} bytes", data.len());
-                            
+                log::error!("Actual data size: {} bytes", data.len());
+                
                             return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e2));
                         }
                     }
@@ -181,20 +199,35 @@ impl Obligation {
         log::trace!("Successfully deserialized Obligation, version={}", obligation.version);
         
         // CRITICAL: Validate version to detect layout changes
-        // Solend Obligation version 1 is the current supported version
+        // Solend Obligation versions: 0 (legacy), 1 (current)
+        // Version 0 accounts are older but still valid on mainnet
+        // Version 1 is the current standard
         // If Solend updates to v2, this will prevent silent parsing errors
         const EXPECTED_VERSION: u8 = 1;
-        if obligation.version != EXPECTED_VERSION {
-            log::error!(
-                "Version mismatch: found version {} but expected {}",
+        const LEGACY_VERSION: u8 = 0;
+        
+        if obligation.version == LEGACY_VERSION {
+            // Version 0 is legacy but still valid - log warning but allow
+            log::warn!(
+                "Obligation version {} (legacy) detected. Version {} is recommended. \
+                 Account is still valid but may have different layout.",
                 obligation.version,
                 EXPECTED_VERSION
             );
+        } else if obligation.version != EXPECTED_VERSION {
+            // Unknown version - reject
+            log::error!(
+                "Version mismatch: found version {} but expected {} or {} (legacy)",
+                obligation.version,
+                EXPECTED_VERSION,
+                LEGACY_VERSION
+            );
             return Err(anyhow::anyhow!(
-                "Unsupported Obligation version: {} (expected {}). \
+                "Unsupported Obligation version: {} (expected {} or {} for legacy). \
                  Layout may have changed, please update bot to support new version.",
                 obligation.version,
-                EXPECTED_VERSION
+                EXPECTED_VERSION,
+                LEGACY_VERSION
             ));
         }
         
@@ -283,8 +316,9 @@ impl Obligation {
             return Ok(Vec::new());
         }
         
-        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) = 56 bytes
-        const COLLATERAL_SIZE: usize = 32 + 8 + 16; // 56 bytes
+        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) + 32 (padding) = 88 bytes
+        // CRITICAL FIX: Generated layout includes _padding_56: [u8; 32] which we were missing!
+        const COLLATERAL_SIZE: usize = 32 + 8 + 16 + 32; // 88 bytes (from generated layout)
         let deposits_size = deposits_len * COLLATERAL_SIZE;
         
         if deposits_size > self.dataFlat.len() {
@@ -325,14 +359,16 @@ impl Obligation {
             return Ok(Vec::new());
         }
         
-        // Each ObligationLiquidity is 32 (Pubkey) + 16 (u128) + 16 (u128) + 16 (u128) = 80 bytes
-        const LIQUIDITY_SIZE: usize = 32 + 16 + 16 + 16; // 80 bytes
+        // Each ObligationLiquidity is 32 (Pubkey) + 16 (u128) + 16 (u128) + 16 (u128) + 32 (padding) = 112 bytes
+        // CRITICAL FIX: Generated layout includes _padding_80: [u8; 32] which we were missing!
+        const LIQUIDITY_SIZE: usize = 32 + 16 + 16 + 16 + 32; // 112 bytes (from generated layout)
         let borrows_size = borrows_len * LIQUIDITY_SIZE;
         
         // Deposits come first, then borrows
         let deposits_len = self.depositsLen as usize;
-        const COLLATERAL_SIZE: usize = 32 + 8 + 16; // 56 bytes
-        let deposits_size = deposits_len * COLLATERAL_SIZE;
+        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) + 32 (padding) = 88 bytes
+        const COLLATERAL_SIZE_FOR_BORROWS: usize = 32 + 8 + 16 + 32; // 88 bytes (must match deposits() function)
+        let deposits_size = deposits_len * COLLATERAL_SIZE_FOR_BORROWS;
         let borrows_offset = deposits_size;
         
         if borrows_offset + borrows_size > self.dataFlat.len() {
@@ -620,14 +656,14 @@ impl Reserve {
                         }
                     }
                 } else {
-                    log::error!("Borsh deserialization failed: {}", e);
+                log::error!("Borsh deserialization failed: {}", e);
                     log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
-                    if data.len() > 0 {
-                        log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
-                    }
-                    if data.len() > 1 {
-                        log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
-                    }
+                if data.len() > 0 {
+                    log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
+                }
+                if data.len() > 1 {
+                    log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                }
                     return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
                 }
             }
@@ -638,8 +674,17 @@ impl Reserve {
         // CRITICAL: Validate version to detect layout changes
         // Solend Reserve version 1 is the current supported version
         // If Solend updates to v2, this will prevent silent parsing errors
+        // NOTE: Version values like 0, 254, 255 usually indicate this is NOT a Reserve account
+        // (they're likely Obligation, LendingMarket, or other account types)
         const EXPECTED_VERSION: u8 = 1;
         if reserve.version != EXPECTED_VERSION {
+            // If version is clearly invalid (0, 254, 255), this is likely not a Reserve account
+            if reserve.version == 0 || reserve.version >= 250 {
+                return Err(anyhow::anyhow!(
+                    "Invalid Reserve version: {} (likely not a Reserve account - may be Obligation/LendingMarket)",
+                    reserve.version
+                ));
+            }
             log::error!(
                 "Version mismatch: found version {} but expected {}",
                 reserve.version,
@@ -784,9 +829,99 @@ pub fn find_usdc_mint_from_reserves(
         .map_err(|e| anyhow::anyhow!("Invalid known USDC mint: {}", e))?;
     
     // CRITICAL: Read all reserves from chain - no mock/dummy data
-    let accounts = rpc
-        .get_program_accounts(program_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get program accounts from chain: {}", e))?;
+    // Add retry mechanism for RPC errors (network issues, rate limits, etc.)
+    
+    // First, test RPC connection with a simple call
+    log::info!("🔍 Testing RPC connection...");
+    match rpc.get_slot() {
+        Ok(slot) => {
+            log::info!("✅ RPC connection OK (current slot: {})", slot);
+        },
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "RPC connection test failed: {}\n\
+                 Please check your RPC_URL in .env file and ensure the endpoint is accessible.",
+                e
+            ));
+        }
+    }
+    
+    log::info!("🔍 Fetching Solend program accounts from RPC (this may take a moment for ~300k accounts)...");
+    let accounts = {
+        const MAX_RETRIES: u32 = 5;
+        let mut retries = MAX_RETRIES;
+        let mut last_error = None;
+        
+        loop {
+            match rpc.get_program_accounts(program_id) {
+                Ok(accs) => {
+                    log::info!("✅ Successfully fetched {} accounts from RPC", accs.len());
+                    break Ok(accs);
+                },
+                Err(e) => {
+                    last_error = Some(e);
+                    retries -= 1;
+                    
+                    let error_msg = last_error.as_ref().unwrap().to_string();
+                    
+                    if retries > 0 {
+                        // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+                        let delay_secs = 2_u64.pow(MAX_RETRIES - retries);
+                        log::warn!(
+                            "⚠️  RPC error getting program accounts (retries left: {}): {}",
+                            retries,
+                            error_msg
+                        );
+                        log::info!("⏳ Retrying in {} seconds...", delay_secs);
+                        std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+                        continue;
+                    } else {
+                        // All retries exhausted
+                        log::error!("❌ All {} retry attempts failed", MAX_RETRIES);
+                        break Err(last_error.unwrap());
+                    }
+                }
+            }
+        }
+    }.map_err(|e| {
+        let error_msg = e.to_string();
+        
+        // Provide detailed diagnostic information
+        let diagnostic = if error_msg.contains("request or response body error") {
+            format!(
+                "RPC connection error: {}\n\
+                 \n\
+                 This error typically occurs when:\n\
+                 1. RPC rate limit exceeded - Helius RPC may have rate limits\n\
+                 2. Request too large - fetching ~300k accounts may exceed RPC limits\n\
+                 3. Network connectivity issues\n\
+                 4. RPC endpoint temporarily unavailable\n\
+                 \n\
+                 Troubleshooting:\n\
+                 - Wait 1-2 minutes and try again (rate limits reset)\n\
+                 - Check Helius dashboard for API usage/quota\n\
+                 - Verify RPC_URL in .env file is correct\n\
+                 - Consider using a different RPC endpoint with higher limits\n\
+                 - Check network connection",
+                error_msg
+            )
+        } else if error_msg.contains("timeout") {
+            format!(
+                "RPC timeout error: {}\n\
+                 The RPC endpoint took too long to respond. This may indicate:\n\
+                 - Network latency issues\n\
+                 - RPC endpoint is overloaded\n\
+                 - Request is too large (trying to fetch ~300k accounts at once)\n\
+                 \n\
+                 Try using a faster RPC endpoint or wait and retry.",
+                error_msg
+            )
+        } else {
+            format!("Failed to get program accounts from chain: {}", error_msg)
+        };
+        
+        anyhow::anyhow!("{}", diagnostic)
+    })?;
     
     let accounts_count = accounts.len();
     
@@ -811,12 +946,13 @@ pub fn find_usdc_mint_from_reserves(
     
     // CRITICAL: No fallback - if USDC reserve not found, it's an error
     // This ensures we're always using real chain data, not hardcoded values
+    // CRITICAL: Only mainnet is supported - no devnet/testnet
     Err(anyhow::anyhow!(
         "USDC reserve not found in chain data. \
          Found {} reserves but none match USDC mint {}. \
-         This may indicate: (1) Wrong network (mainnet vs devnet), \
-         (2) RPC connection issues, or (3) Solend program not deployed on this network. \
-         Please verify RPC_URL and network configuration.",
+         This bot only supports mainnet production. \
+         Please verify RPC_URL points to mainnet (https://api.mainnet-beta.solana.com or premium mainnet RPC) \
+         and that the Solend program is accessible on mainnet.",
         accounts_count,
         known_usdc_mint
     ))

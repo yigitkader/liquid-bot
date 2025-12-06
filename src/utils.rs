@@ -9,6 +9,7 @@ use solana_sdk::{
     system_instruction,
     transaction::Transaction,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +59,71 @@ impl JitoClient {
             tip_account,
             default_tip_amount,
         }
+    }
+
+    /// Get tip accounts dynamically from Jito Block Engine API
+    /// This is the recommended way to get tip accounts - they can change over time
+    /// Returns a list of tip account addresses that are currently active
+    pub async fn get_tip_accounts(&self) -> Result<Vec<Pubkey>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTipAccounts",
+            "params": []
+        });
+
+        log::debug!("Fetching tip accounts from Jito Block Engine...");
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&self.url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to request tip accounts from Jito")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Jito getTipAccounts failed: status={}, body={}",
+                status,
+                text
+            ));
+        }
+
+        let response_json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Jito getTipAccounts response")?;
+
+        // Parse response: {"result": ["account1", "account2", ...]}
+        if let Some(result) = response_json.get("result") {
+            if let Some(accounts_array) = result.as_array() {
+                let mut tip_accounts = Vec::new();
+                for account_str in accounts_array {
+                    if let Some(addr) = account_str.as_str() {
+                        match Pubkey::from_str(addr) {
+                            Ok(pubkey) => tip_accounts.push(pubkey),
+                            Err(e) => {
+                                log::warn!("Invalid tip account address from Jito: {} ({})", addr, e);
+                            }
+                        }
+                    }
+                }
+                if !tip_accounts.is_empty() {
+                    log::info!("✅ Fetched {} tip accounts from Jito Block Engine", tip_accounts.len());
+                    return Ok(tip_accounts);
+                }
+            }
+        }
+
+        // If error in response
+        if let Some(error) = response_json.get("error") {
+            return Err(anyhow::anyhow!("Jito getTipAccounts error: {}", error));
+        }
+
+        Err(anyhow::anyhow!("Unexpected Jito getTipAccounts response format"))
     }
 
     pub async fn send_bundle(&self, bundle: &JitoBundle) -> Result<String> {
