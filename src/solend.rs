@@ -96,53 +96,32 @@ pub fn derive_lending_market_authority(
         .ok_or_else(|| anyhow::anyhow!("Failed to derive lending market authority"))
 }
 
-/// Calculate Solend instruction discriminator
-/// Solend uses enum-based instruction encoding
+/// Calculate Solend instruction discriminator using Anchor sighash method
 /// 
-/// IMPORTANT: This discriminator must match Solend program's actual instruction encoding.
-/// Based on IDL analysis, liquidateObligation is at index 0, but the actual encoding
-/// may differ. This should be verified against Solend's program code or tested in production.
+/// CRITICAL: Solend program uses Anchor-style instruction encoding.
+/// Discriminator = sha256("global:instruction_name")[0..8]
 /// 
-/// Solend instruction enum typically looks like:
-/// ```rust
-/// pub enum LendingInstruction {
-///     InitLendingMarket { ... },
-///     InitReserve { ... },
-///     LiquidateObligation { liquidity_amount: u64 },
-///     ...
-/// }
-/// ```
-/// The discriminator is the enum variant index (u8).
-pub fn get_liquidate_obligation_discriminator() -> u8 {
-    // WARNING: This value is based on IDL structure analysis.
-    // In production, verify this matches Solend's actual instruction encoding.
-    // If Solend uses a different encoding scheme, this will need to be updated.
-    // 
-    // Based on IDL: instructions[0] = "liquidateObligation"
-    // If Solend uses enum index as discriminator, this should be 0.
-    // However, if Solend uses a different scheme (e.g., hash-based), this needs adjustment.
-    0
-}
-
-/// Derive reserve liquidity supply PDA (if needed)
-/// Note: Reserve account already contains supplyPubkey, but this can be used for verification
-pub fn derive_reserve_liquidity_supply(
-    reserve_pubkey: &Pubkey,
-    program_id: &Pubkey,
-) -> Result<Pubkey> {
-    // Solend reserve liquidity supply is typically a PDA derived from:
-    // seeds: [b"liquidity_supply", reserve_pubkey]
-    // But the actual derivation might differ - Reserve account already has the correct address
-    // This function is for verification/derivation if needed
+/// For liquidateObligation:
+/// - Preimage: "global:liquidateObligation"
+/// - SHA256 hash first 8 bytes = discriminator
+/// 
+/// This is the CORRECT method for Anchor-based programs like Solend.
+pub fn get_liquidate_obligation_discriminator() -> [u8; 8] {
+    use sha2::{Sha256, Digest};
     
-    let seeds = &[
-        b"liquidity_supply".as_ref(),
-        reserve_pubkey.as_ref(),
-    ];
+    // Anchor sighash format: sha256("global:instruction_name")
+    let instruction_name = "liquidateObligation";
+    let preimage = format!("global:{}", instruction_name);
     
-    Pubkey::try_find_program_address(seeds, program_id)
-        .map(|(pubkey, _)| pubkey)
-        .ok_or_else(|| anyhow::anyhow!("Failed to derive reserve liquidity supply"))
+    let mut hasher = Sha256::new();
+    hasher.update(preimage.as_bytes());
+    let hash = hasher.finalize();
+    
+    // Take first 8 bytes as discriminator
+    let mut discriminator = [0u8; 8];
+    discriminator.copy_from_slice(&hash[0..8]);
+    
+    discriminator
 }
 
 // Helper implementation for Reserve
