@@ -271,7 +271,79 @@ async function dumpLayouts() {
     "utf-8"
   );
 
-  // Reserve layout - from actual SDK structure (comprehensive)
+  /**
+   * Dump real Reserve layout from SDK
+   * Attempts to read actual ReserveLayout from @solendprotocol/solend-sdk
+   * 
+   * CRITICAL: No fallback to manual/mock data - must read from real SDK
+   */
+  async function dumpRealReserveLayout(): Promise<Field[]> {
+    try {
+      // Try to import and read actual SDK layout
+      const solendSdk = await import("@solendprotocol/solend-sdk");
+      
+      // Check if ReserveLayout is available
+      if (!solendSdk.ReserveLayout) {
+        throw new Error("ReserveLayout not found in @solendprotocol/solend-sdk - SDK may be outdated or incompatible");
+      }
+      
+      const reserveLayout = solendSdk.ReserveLayout;
+      const fields: Field[] = [];
+      let totalSize = 0;
+      
+      // Parse layout fields
+      if (!reserveLayout.fields || !Array.isArray(reserveLayout.fields)) {
+        throw new Error("ReserveLayout.fields is not an array - SDK structure may have changed");
+      }
+      
+      for (const field of reserveLayout.fields) {
+        const span = field.span || 0;
+        const name = field.name || field.property || "";
+        
+        if (!name || name.startsWith("_") || name === "padding") {
+          // Skip padding fields but count them for total size calculation
+          if (span > 0) {
+            fields.push({ kind: "array", name: `_padding_${totalSize}`, elementType: "u8", len: span });
+            totalSize += span;
+          }
+          continue;
+        }
+        
+        // Determine type from span
+        if (span === 32) {
+          fields.push({ kind: "scalar", name, type: "Pubkey" });
+        } else if (span === 16) {
+          fields.push({ kind: "scalar", name, type: "u128" });
+        } else if (span === 8) {
+          fields.push({ kind: "scalar", name, type: "u64" });
+        } else if (span === 1) {
+          fields.push({ kind: "scalar", name, type: "u8" });
+        } else if (span === 9) {
+          // LastUpdate struct (u64 + u8)
+          fields.push({ kind: "custom", name, type: "LastUpdate" });
+        } else if (span > 0) {
+          fields.push({ kind: "array", name, elementType: "u8", len: span });
+        }
+        
+        totalSize += span;
+      }
+      
+      if (totalSize === 0) {
+        throw new Error("ReserveLayout has no fields - SDK structure is invalid");
+      }
+      
+      console.log(`✅ Extracted Reserve layout from SDK: ${totalSize} bytes total`);
+      return fields;
+    } catch (e) {
+      console.error("❌ CRITICAL: Failed to read ReserveLayout from real SDK:", e);
+      console.error("   This script MUST read from real @solendprotocol/solend-sdk, not mock data!");
+      console.error("   Please ensure @solendprotocol/solend-sdk is installed: npm install @solendprotocol/solend-sdk");
+      throw new Error(`Cannot proceed without real SDK layout: ${e}`);
+    }
+  }
+
+  // Reserve layout - MUST get from real SDK, no fallback to mock data
+  const realReserveFields = await dumpRealReserveLayout();
   const reserveFile: LayoutFile = {
     meta: {
       sdkVersion,
@@ -347,7 +419,8 @@ async function dumpLayouts() {
     accounts: [
       {
         name: "Reserve",
-        fields: [
+        // CRITICAL: Use ONLY real SDK fields - no fallback to mock/manual data
+        fields: realReserveFields,
           { kind: "scalar", name: "version", type: "u8" },
           { kind: "custom", name: "lastUpdate", type: "LastUpdate" },
           { kind: "scalar", name: "lendingMarket", type: "Pubkey" },

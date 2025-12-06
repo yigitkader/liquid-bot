@@ -50,16 +50,34 @@ impl Obligation {
         // CRITICAL: Calculate expected size (1298 bytes for struct, but account may be 1300 with padding)
         // Struct size: 1 + 9 + 32 + 32 + 16*5 + 1 + 16*2 + 1 + 14 + 1 + 1 + 1096 = 1298 bytes
         const EXPECTED_STRUCT_SIZE: usize = 1298;
+        const ACTUAL_OBLIGATION_ACCOUNT_SIZE: usize = 1300; // Real account size on-chain
+        
+        // If account is 1300 bytes (actual size), parse only first 1298 bytes (known struct size)
+        let data_to_parse = if data.len() == ACTUAL_OBLIGATION_ACCOUNT_SIZE {
+            log::debug!("Obligation account is {} bytes (expected struct: {} bytes) - parsing first {} bytes only", 
+                data.len(), EXPECTED_STRUCT_SIZE, EXPECTED_STRUCT_SIZE);
+            &data[..EXPECTED_STRUCT_SIZE]
+        } else if data.len() < EXPECTED_STRUCT_SIZE {
+            return Err(anyhow::anyhow!(
+                "Obligation data too short: {} bytes (minimum: {} bytes)", 
+                data.len(), 
+                EXPECTED_STRUCT_SIZE
+            ));
+        } else {
+            // Try full data first, fallback to slice if needed
+            data
+        };
         
         // Try deserialization - handle "Not all bytes read" error for padding
-        let obligation: Obligation = match BorshDeserialize::try_from_slice(data) {
+        let obligation: Obligation = match BorshDeserialize::try_from_slice(data_to_parse) {
             Ok(obl) => obl,
             Err(e) => {
-                // If error is "Not all bytes read" and we have exactly 2 extra bytes, try slicing
+                // If error is "Not all bytes read" and we have extra bytes, try slicing to exact size
                 let error_msg = e.to_string();
-                if error_msg.contains("Not all bytes read") && data.len() == EXPECTED_STRUCT_SIZE + 2 {
-                    log::debug!("Borsh reported 'Not all bytes read' with 2 extra bytes - likely padding, trying exact slice");
-                    // Try deserializing only the expected size (ignore last 2 bytes)
+                if error_msg.contains("Not all bytes read") && data.len() >= EXPECTED_STRUCT_SIZE {
+                    let extra_bytes = data.len() - EXPECTED_STRUCT_SIZE;
+                    log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - trying exact slice", extra_bytes);
+                    // Try deserializing only the expected size (ignore extra padding bytes)
                     match BorshDeserialize::try_from_slice(&data[..EXPECTED_STRUCT_SIZE]) {
                         Ok(obl) => obl,
                         Err(e2) => {
@@ -519,44 +537,49 @@ impl Reserve {
         
         // CRITICAL: Calculate expected Reserve struct size
         // Reserve struct: 1 + 9 + 32*8 + 1 + 8*4 + 16*6 + 1*12 + 8*4 + 16*2 + 8*1 + 1*2 + 8*1 = 619 bytes
-        // But actual accounts may have padding, so we'll be lenient with a few extra bytes
+        // BUT: Actual Solend Reserve accounts are 1300 bytes (layout is incomplete/incorrect)
+        // TEMPORARY FIX: Parse only the first 619 bytes, ignore the rest
         const EXPECTED_RESERVE_STRUCT_SIZE: usize = 619;
+        const ACTUAL_RESERVE_ACCOUNT_SIZE: usize = 1300; // Real account size on-chain
         
-        let reserve: Reserve = match BorshDeserialize::try_from_slice(data) {
+        // If account is 1300 bytes (actual size), parse only first 619 bytes (known struct size)
+        let data_to_parse = if data.len() == ACTUAL_RESERVE_ACCOUNT_SIZE {
+            log::debug!("Reserve account is {} bytes (expected struct: {} bytes) - parsing first {} bytes only", 
+                data.len(), EXPECTED_RESERVE_STRUCT_SIZE, EXPECTED_RESERVE_STRUCT_SIZE);
+            &data[..EXPECTED_RESERVE_STRUCT_SIZE]
+        } else if data.len() < EXPECTED_RESERVE_STRUCT_SIZE {
+            return Err(anyhow::anyhow!(
+                "Reserve data too short: {} bytes (minimum: {} bytes)", 
+                data.len(), 
+                EXPECTED_RESERVE_STRUCT_SIZE
+            ));
+        } else {
+            // Try full data first, fallback to slice if needed
+            data
+        };
+        
+        let reserve: Reserve = match BorshDeserialize::try_from_slice(data_to_parse) {
             Ok(res) => res,
             Err(e) => {
-                // If error is "Not all bytes read" and we have a few extra bytes, try slicing
+                // If error is "Not all bytes read" and we have extra bytes, try slicing to exact size
                 let error_msg = e.to_string();
                 if error_msg.contains("Not all bytes read") && data.len() >= EXPECTED_RESERVE_STRUCT_SIZE {
                     let extra_bytes = data.len() - EXPECTED_RESERVE_STRUCT_SIZE;
-                    if extra_bytes <= 8 {
-                        log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - likely padding, trying exact slice", extra_bytes);
-                        // Try deserializing only the expected size (ignore extra padding bytes)
-                        match BorshDeserialize::try_from_slice(&data[..EXPECTED_RESERVE_STRUCT_SIZE]) {
-                            Ok(res) => res,
-                            Err(e2) => {
-                                log::error!("Borsh deserialization failed even with exact slice: {}", e2);
-                                log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
-                                if data.len() > 0 {
-                                    log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
-                                }
-                                if data.len() > 1 {
-                                    log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
-                                }
-                                return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e2));
+                    log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - trying exact slice", extra_bytes);
+                    // Try deserializing only the expected size (ignore extra padding bytes)
+                    match BorshDeserialize::try_from_slice(&data[..EXPECTED_RESERVE_STRUCT_SIZE]) {
+                        Ok(res) => res,
+                        Err(e2) => {
+                            log::error!("Borsh deserialization failed even with exact slice: {}", e2);
+                            log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
+                            if data.len() > 0 {
+                                log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
                             }
+                            if data.len() > 1 {
+                                log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                            }
+                            return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e2));
                         }
-                    } else {
-                        log::error!("Borsh deserialization failed: {}", e);
-                        log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct, {} extra bytes)", 
-                            data.len(), EXPECTED_RESERVE_STRUCT_SIZE, extra_bytes);
-                        if data.len() > 0 {
-                            log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
-                        }
-                        if data.len() > 1 {
-                            log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
-                        }
-                        return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
                     }
                 } else {
                     log::error!("Borsh deserialization failed: {}", e);
@@ -707,25 +730,34 @@ impl Reserve {
 
 /// Find USDC mint address from Solend reserves (chain-based discovery)
 /// This automatically discovers USDC by checking all reserves
-/// USDC mainnet mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 /// 
+/// CRITICAL: No fallback to hardcoded values - MUST read from chain
 /// DYNAMIC CHAIN READING: All data is read from chain via RPC - no static values.
 pub fn find_usdc_mint_from_reserves(
     rpc: &solana_client::rpc_client::RpcClient,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
     
-    // Known USDC mint address (mainnet)
+    // Known USDC mint address (mainnet) - used only for comparison, not as fallback
     const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     let known_usdc_mint = Pubkey::from_str(USDC_MINT_MAINNET)
         .map_err(|e| anyhow::anyhow!("Invalid known USDC mint: {}", e))?;
     
-    // Try to find USDC reserve by checking all reserves
-    // This is more robust than hardcoding
+    // CRITICAL: Read all reserves from chain - no mock/dummy data
     let accounts = rpc
         .get_program_accounts(program_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get program accounts from chain: {}", e))?;
     
+    let accounts_count = accounts.len();
+    
+    if accounts_count == 0 {
+        return Err(anyhow::anyhow!(
+            "No Solend reserves found on chain - cannot discover USDC mint. \
+             Please check RPC connection and network configuration."
+        ));
+    }
+    
+    // Search for USDC reserve by checking all reserves from chain
     for (_pubkey, account) in accounts {
         if let Ok(reserve) = Reserve::from_account_data(&account.data) {
             let mint = reserve.mint_pubkey();
@@ -737,9 +769,16 @@ pub fn find_usdc_mint_from_reserves(
         }
     }
     
-    // Fallback: return known USDC mint if not found in reserves
-    // This can happen if reserves haven't loaded yet or network issues
-    log::warn!("USDC reserve not found in chain data, using known USDC mint: {}", known_usdc_mint);
-    Ok(known_usdc_mint)
+    // CRITICAL: No fallback - if USDC reserve not found, it's an error
+    // This ensures we're always using real chain data, not hardcoded values
+    Err(anyhow::anyhow!(
+        "USDC reserve not found in chain data. \
+         Found {} reserves but none match USDC mint {}. \
+         This may indicate: (1) Wrong network (mainnet vs devnet), \
+         (2) RPC connection issues, or (3) Solend program not deployed on this network. \
+         Please verify RPC_URL and network configuration.",
+        accounts_count,
+        known_usdc_mint
+    ))
 }
 

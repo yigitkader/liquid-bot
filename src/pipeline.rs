@@ -87,15 +87,44 @@ pub async fn run_liquidation_loop(
     // Auto-discovered from environment variables, no hardcoded values
     let jito_tip_account_str = config.jito_tip_account.as_deref()
         .unwrap_or("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"); // Default mainnet tip account
-    let jito_tip_account = Pubkey::from_str(jito_tip_account_str)
+    let initial_tip_account = Pubkey::from_str(jito_tip_account_str)
         .context("Invalid Jito tip account")?;
     
     // CRITICAL SECURITY: Validate Jito tip account to prevent SOL loss
     // Jito tip accounts must be system-owned (native SOL accounts)
     // If the account is not system-owned, tips will be lost!
-    let tip_account_data = rpc
-        .get_account(&jito_tip_account)
-        .context("Failed to fetch Jito tip account from chain")?;
+    // 
+    // FALLBACK: If mainnet tip account not found, try devnet tip account (wrong network detection)
+    let (jito_tip_account, tip_account_data) = match rpc.get_account(&initial_tip_account) {
+        Ok(data) => (initial_tip_account, data),
+        Err(e) => {
+            // Check if this might be a network mismatch (mainnet vs devnet)
+            log::warn!("Failed to fetch Jito tip account {}: {}", initial_tip_account, e);
+            
+            // Try devnet tip account as fallback
+            const DEVNET_TIP_ACCOUNT: &str = "DCN82qDxJAQuSqHhv2BJuAgi41SPeKZB7dB8s5GFyEdq";
+            let devnet_tip_account = Pubkey::from_str(DEVNET_TIP_ACCOUNT)
+                .map_err(|_| anyhow::anyhow!("Invalid devnet tip account address"))?;
+            
+            log::info!("Attempting fallback to devnet tip account: {}", devnet_tip_account);
+            match rpc.get_account(&devnet_tip_account) {
+                Ok(data) => {
+                    log::warn!("⚠️  Using devnet tip account - network mismatch detected! Please check RPC_URL and JITO_TIP_ACCOUNT in .env");
+                    (devnet_tip_account, data)
+                }
+                Err(e2) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch Jito tip account from chain. \
+                         Mainnet account {}: {}. \
+                         Devnet account {}: {}. \
+                         Please verify RPC_URL and JITO_TIP_ACCOUNT in .env match your network.",
+                        jito_tip_account_str, e,
+                        devnet_tip_account, e2
+                    ));
+                }
+            }
+        }
+    };
     
     use solana_sdk::system_program;
     if tip_account_data.owner != system_program::id() {
@@ -2211,8 +2240,13 @@ async fn get_liquidation_quote(
         .ok_or_else(|| anyhow::anyhow!("Decimals multiplier overflow"))?;
     
     // Convert normalized amount to raw amount
-    // Use f64 for intermediate calculation to handle large numbers
-    let actual_borrowed_raw = (actual_borrowed_normalized as f64 * decimals_multiplier as f64) as u64;
+    // CRITICAL FIX: Use u128 arithmetic instead of f64 to prevent overflow and precision loss
+    // f64 has only 53 bits of precision and can overflow for large numbers
+    let actual_borrowed_raw = actual_borrowed_normalized
+        .checked_mul(decimals_multiplier)
+        .and_then(|v| v.checked_div(WAD)) // Divide by WAD to normalize from WAD format
+        .ok_or_else(|| anyhow::anyhow!("Overflow in actual borrowed calculation: actual_borrowed_normalized * decimals_multiplier"))?
+        as u64;
     
     // Step 3: Total underlying supply
     let total_underlying_supply = available_amount.saturating_add(actual_borrowed_raw);
