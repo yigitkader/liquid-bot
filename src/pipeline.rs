@@ -696,17 +696,21 @@ async fn validate_switchboard_oracle_if_available(
     // 
     // Alternative (not recommended): Manual Borsh parsing would require maintaining
     // the exact account layout manually, which is error-prone and breaks on SDK updates.
-    use std::cell::RefCell;
+    use std::cell::{RefCell, RefMut};
     
     // Clone account data into mutable vector for parsing
     let mut account_data = oracle_account.data.clone();
     
-    // Wrap in RefCell to provide Ref<'_, &mut [u8]> interface
+    // Wrap in RefCell to provide RefMut<'_, &mut [u8]> interface
     // This is the standard off-chain adapter pattern for on-chain APIs
     let account_data_cell = RefCell::new(account_data.as_mut_slice());
     
     // Parse using SDK - this internally uses Borsh deserialization
-    let feed = match PullFeedAccountData::parse(account_data_cell.borrow()) {
+    // RefMut::map is required because parse() expects RefMut<'_, &mut [u8]>, not Ref
+    let feed = match PullFeedAccountData::parse(RefMut::map(
+        account_data_cell.borrow_mut(),
+        |data| data
+    )) {
         Ok(feed) => feed,
         Err(e) => {
             log::debug!(
@@ -1158,12 +1162,16 @@ async fn get_liquidation_quote(
         collateral_to_seize_raw
     );
 
-    // Step 5: Get Jupiter quote: collateral token -> debt token
-    // This is the swap we'll do: sell collateral_to_seize amount of collateral to get debt token
+    // Step 5: Get Jupiter quote for liquidation swap
+    // Liquidation flow:
+    // 1. Solend gives us collateral token (e.g., 10 SOL)
+    // 2. We swap this 10 SOL to debt token (e.g., USDC) via Jupiter
+    // 3. We use the received USDC to pay off the debt (e.g., 1500 USDC)
+    // 4. Profit = collateral_value - debt_value - fees
     let quote = get_jupiter_quote(
-        &collateral_mint, // input: actual collateral token (e.g., SOL)
-        &debt_mint,       // output: actual debt token (e.g., USDC)
-        collateral_to_seize_raw, // ✅ CORRECT: collateral amount, not debt amount!
+        &collateral_mint, // input: collateral token we receive from Solend (e.g., SOL)
+        &debt_mint,       // output: debt token we need to repay (e.g., USDC)
+        collateral_to_seize_raw, // amount of collateral to swap (e.g., 10 SOL in raw units)
         50, // slippage_bps
     )
     .await
@@ -1198,13 +1206,18 @@ async fn get_liquidation_quote(
     // Note: For liquidation, we repay debt and get collateral
     // Profit = collateral_value - debt_value - fees
     
-    // 1. Calculate Jupiter swap fee
-    // Jupiter doesn't charge platform fees, but LP fees are typically 0.05-0.3%
-    // We use a conservative estimate of 0.25% (0.0025) of the swap value
-    // Swap fee is calculated on the input amount (collateral being swapped)
-    // Use Jupiter quote input amount for fee calculation (actual swap amount)
-    const JUPITER_SWAP_FEE_BPS: f64 = 25.0; // 0.25% = 25 basis points
-    let swap_fee_usd = jupiter_collateral_value_usd * (JUPITER_SWAP_FEE_BPS / 10_000.0);
+    // 1. Calculate Jupiter swap fee using price impact from quote
+    // Jupiter LP fees vary by route (0.05%-0.3%), so we use actual price impact from quote
+    // Price impact includes both LP fees and slippage, giving us the true cost
+    let price_impact_pct = crate::jup::get_price_impact_pct(&quote);
+    
+    // Use price impact if available, otherwise fallback to conservative 0.3%
+    let swap_fee_usd = if price_impact_pct > 0.0 {
+        jupiter_collateral_value_usd * (price_impact_pct / 100.0)
+    } else {
+        // Fallback: use 0.3% if price impact not available
+        jupiter_collateral_value_usd * 0.003
+    };
     
     // 2. Get SOL price for fee calculations
     let sol_price_usd = get_sol_price_usd(rpc, ctx).await
@@ -1401,15 +1414,21 @@ async fn build_liquidation_tx(
     // Verify repay reserve liquidity supply
     if let Some(derived_pda) = crate::solend::derive_reserve_liquidity_supply_pda(&borrow_reserve_pubkey, &program_id) {
         if derived_pda != repay_reserve_liquidity_supply {
-            return Err(anyhow::anyhow!(
-                "SECURITY FAILURE: Repay reserve liquidity supply PDA mismatch! \
-                 This indicates data corruption or manipulation. \
-                 Reserve: {}, Stored: {}, Derived: {}. \
-                 Transaction aborted for security.",
+            log::error!(
+                "🚨 SECURITY ALERT: PDA mismatch detected!\n\
+                 Reserve: {}\n\
+                 Stored supplyPubkey: {}\n\
+                 Derived PDA: {}\n\
+                 This may indicate:\n\
+                 - Data corruption in Reserve account\n\
+                 - Malicious account manipulation\n\
+                 - Outdated PDA derivation seeds\n\
+                 Transaction ABORTED for security.",
                 borrow_reserve_pubkey,
                 repay_reserve_liquidity_supply,
                 derived_pda
-            ));
+            );
+            return Err(anyhow::anyhow!("SECURITY FAILURE: PDA mismatch"));
         }
         log::debug!("✅ Repay reserve liquidity supply PDA verified: {}", repay_reserve_liquidity_supply);
     } else {
@@ -1491,13 +1510,14 @@ async fn build_liquidation_tx(
     
     // Instruction discriminator: LendingInstruction::LiquidateObligation tag = 12
     // CRITICAL: Solend uses enum-based encoding (tag = 12), NOT Anchor sighash
+    // Solend native program uses only 1 byte for enum tag
     let discriminator = crate::solend::get_liquidate_obligation_discriminator();
     log::debug!(
-        "Using instruction discriminator: {:?} (hex: {}) for liquidateObligation",
+        "Using instruction discriminator: {} (hex: {:02x}) for liquidateObligation",
         discriminator,
-        discriminator.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        discriminator
     );
-    instruction_data.extend_from_slice(&discriminator);
+    instruction_data.push(discriminator); // Add only 1 byte
     
     // Args: liquidityAmount (u64)
     instruction_data.extend_from_slice(&liquidity_amount.to_le_bytes());

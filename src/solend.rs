@@ -195,12 +195,10 @@ pub fn derive_reserve_collateral_supply_pda(
 /// Format: [12, 0, 0, 0, 0, 0, 0, 0]
 /// Note: Only the first byte (tag = 12) is used by Solend program.
 /// The remaining 7 bytes are padding to match [u8; 8] return type.
-pub fn get_liquidate_obligation_discriminator() -> [u8; 8] {
+pub fn get_liquidate_obligation_discriminator() -> u8 {
     // LendingInstruction::LiquidateObligation tag = 12
-    // Native Solana programs use only the first byte as discriminator
-    let mut discriminator = [0u8; 8];
-    discriminator[0] = 12u8; // LiquidateObligation enum variant tag
-    discriminator
+    // Native Solana programs use only 1 byte as enum tag discriminator
+    12u8 // LiquidateObligation enum variant tag
 }
 
 // Helper implementation for Reserve

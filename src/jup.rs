@@ -42,7 +42,7 @@ pub struct SwapInfo {
 /// Get Jupiter quote for a swap
 /// 
 /// CRITICAL: Includes timeout protection to prevent hanging on slow/down Jupiter API.
-/// Timeout is set to 5 seconds to ensure quick failure in busy markets.
+/// Timeout is set to 10 seconds to handle busy periods when Jupiter API can take 5-10 seconds.
 pub async fn get_jupiter_quote(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -56,8 +56,8 @@ pub async fn get_jupiter_quote(
 
     // Create HTTP client with timeout configuration
     // CRITICAL: Set timeout to prevent hanging on slow/down Jupiter API
-    // 5 seconds is reasonable for quote API (should be fast)
-    const REQUEST_TIMEOUT_SECS: u64 = 5;
+    // 10 seconds allows for busy periods when Jupiter API can take 5-10 seconds
+    const REQUEST_TIMEOUT_SECS: u64 = 10;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
