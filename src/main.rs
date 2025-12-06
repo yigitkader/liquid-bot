@@ -12,6 +12,7 @@ use solana_sdk::{
 };
 use spl_associated_token_account::get_associated_token_address;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,12 +23,52 @@ use pipeline::{run_liquidation_loop, Config, LiquidationMode};
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    // Initialize logger
+    // Create logs directory if it doesn't exist
+    let logs_dir = Path::new("logs");
+    if !logs_dir.exists() {
+        fs::create_dir_all(logs_dir)
+            .context("Failed to create logs directory")?;
+    }
+
+    // Generate log filename with timestamp
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let log_filename = format!("logs/liquidation_{}.log", timestamp);
+    
+    // Custom writer that writes to both file and console
+    struct DualWriter {
+        file: fs::File,
+    }
+    
+    impl Write for DualWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // Write to file
+            let written = self.file.write(buf)?;
+            // Also write to console (stderr for logs)
+            // Ignore errors writing to stderr to avoid breaking if console is unavailable
+            let _ = std::io::stderr().write_all(&buf[..written]);
+            Ok(written)
+        }
+        
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()?;
+            let _ = std::io::stderr().flush();
+            Ok(())
+        }
+    }
+    
+    let log_file = fs::File::create(&log_filename)
+        .context(format!("Failed to create log file: {}", log_filename))?;
+    
+    let dual_writer = DualWriter { file: log_file };
+
+    // Initialize logger with both console and file output
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .target(env_logger::Target::Pipe(Box::new(dual_writer)))
         .init();
 
     log::info!("🚀 Starting Solana Liquidation Bot");
+    log::info!("📝 Logging to file: {}", log_filename);
 
     // Load config
     let app_config = load_config().context("Failed to load configuration")?;

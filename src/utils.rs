@@ -170,6 +170,55 @@ impl JitoClient {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    /// Get bundle status from Jito API
+    /// Returns the status of a bundle (confirmed, pending, failed, etc.)
+    pub async fn get_bundle_status(&self, bundle_id: &str) -> Result<Option<BundleStatusResponse>> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBundleStatuses",
+            "params": [[bundle_id]]
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&self.url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to query bundle status from Jito")?;
+
+        if !response.status().is_success() {
+            log::debug!("Jito bundle status query failed: status={}", response.status());
+            return Ok(None);
+        }
+
+        let bundle_response: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Jito bundle status response")?;
+
+        if let Some(result) = bundle_response.get("result") {
+            if let Some(statuses) = result.as_array() {
+                if let Some(first_status) = statuses.get(0) {
+                    if let Ok(status) = serde_json::from_value::<BundleStatusResponse>(first_status.clone()) {
+                        return Ok(Some(status));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleStatusResponse {
+    #[serde(rename = "bundleId")]
+    pub bundle_id: String,
+    pub status: Option<String>, // "landed", "failed", "pending", etc.
+    pub slot: Option<u64>,
 }
 
 /// Sign a transaction with a keypair

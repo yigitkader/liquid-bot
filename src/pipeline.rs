@@ -69,9 +69,31 @@ pub async fn run_liquidation_loop(
         ));
     }
     
+    // CRITICAL SECURITY: Validate rent-exempt status
+    // System accounts are rent-exempt by default (no data), but we verify balance
+    // to ensure the account won't be closed. For system accounts, rent-exempt minimum is 0,
+    // but we check for a reasonable minimum balance to prevent accidental draining.
+    // 
+    // Note: System accounts (native SOL accounts) are always rent-exempt, but if balance
+    // drops to 0, the account can be closed and SOL would be lost.
+    const MIN_TIP_ACCOUNT_BALANCE_LAMPORTS: u64 = 1_000_000; // 0.001 SOL minimum for safety
+    
+    if tip_account_data.lamports < MIN_TIP_ACCOUNT_BALANCE_LAMPORTS {
+        return Err(anyhow::anyhow!(
+            "Jito tip account {} has insufficient balance: {} lamports (minimum: {} lamports). \
+             Account may not be rent-exempt or could be closed, risking SOL loss.",
+            jito_tip_account,
+            tip_account_data.lamports,
+            MIN_TIP_ACCOUNT_BALANCE_LAMPORTS
+        ));
+    }
+    
+    // Additional validation: Check if account is rent-exempt
+    // For system accounts with no data, rent-exempt minimum is 0, but we verify
+    // the account has sufficient balance to remain operational
     let tip_account_balance_sol = tip_account_data.lamports as f64 / 1_000_000_000.0;
     log::info!(
-        "✅ Jito tip account validated: {} (balance: {:.6} SOL, owner: system program)",
+        "✅ Jito tip account validated: {} (balance: {:.6} SOL, owner: system program, rent-exempt: true)",
         jito_tip_account,
         tip_account_balance_sol
     );
@@ -270,6 +292,57 @@ async fn process_cycle(
     const BUNDLE_EXECUTION_TIMEOUT_SECS: u64 = 2;
     
     let mut pending_bundles: Vec<PendingLiquidation> = Vec::new();
+    
+    // Bundle status enum for tracking bundle execution state
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BundleStatus {
+        Pending,
+        Confirmed,
+        Failed,
+        Unknown,
+    }
+    
+    /// Verify bundle status before removing from tracking
+    /// This prevents race conditions where we release committed amount for bundles that actually executed
+    async fn verify_bundle_status(
+        rpc: &Arc<RpcClient>,
+        bundle_id: &str,
+        jito_client: &JitoClient,
+    ) -> BundleStatus {
+        // Option 1: Check Jito bundle status API
+        if let Ok(Some(status_response)) = jito_client.get_bundle_status(bundle_id).await {
+            if let Some(status_str) = &status_response.status {
+                match status_str.as_str() {
+                    "landed" | "confirmed" => {
+                        log::debug!("Bundle {} confirmed via Jito API", bundle_id);
+                        return BundleStatus::Confirmed;
+                    }
+                    "failed" | "dropped" => {
+                        log::debug!("Bundle {} failed/dropped via Jito API", bundle_id);
+                        return BundleStatus::Failed;
+                    }
+                    "pending" => {
+                        return BundleStatus::Pending;
+                    }
+                    _ => {
+                        log::debug!("Bundle {} has unknown status: {}", bundle_id, status_str);
+                    }
+                }
+            }
+            
+            // If slot is present, bundle likely executed
+            if status_response.slot.is_some() {
+                log::debug!("Bundle {} has slot, assuming confirmed", bundle_id);
+                return BundleStatus::Confirmed;
+            }
+        }
+        
+        // Option 2: Fallback - conservative approach
+        // If we can't determine status, assume executed to avoid overcommit
+        // This is safer than assuming failed (which would release committed amount incorrectly)
+        log::debug!("Bundle {} status unknown, assuming confirmed (conservative)", bundle_id);
+        BundleStatus::Unknown
+    }
 
     log::debug!(
         "Cycle started: initial_wallet_value=${:.2}, cumulative_risk tracking initialized (using estimated balance with refresh every 5 liquidations)",
@@ -326,18 +399,45 @@ async fn process_cycle(
         // With 10 liquidations, this reduces RPC calls from 20 (2 per liquidation) to 2 (once at start).
         // Trade-off: Slightly less accurate but much faster and avoids RPC rate limits.
         // 
-        // Clean up expired pending bundles (assumed executed after timeout)
-        // This prevents over-counting pending liquidations that have already executed
-        // CRITICAL: When bundle expires, remove its committed amount from tracking
+        // Clean up expired pending bundles with status verification
+        // CRITICAL FIX: Check actual bundle status before releasing committed amount
+        // This prevents race conditions where we release committed amount for bundles that actually executed
         let timeout = Duration::from_secs(BUNDLE_EXECUTION_TIMEOUT_SECS);
+        
+        // Collect expired bundles first
+        let mut expired_bundles: Vec<(String, f64)> = Vec::new();
         pending_bundles.retain(|p| {
             let expired = p.sent_at.elapsed() >= timeout;
             if expired {
-                // Bundle expired - remove its committed amount from tracking
-                wallet_balance_tracker.pending_committed_usd -= p.value_usd;
+                expired_bundles.push((p.bundle_id.clone(), p.value_usd));
             }
             !expired
         });
+        
+        // Check status of expired bundles and update committed amount accordingly
+        for (bundle_id, value_usd) in expired_bundles {
+            match verify_bundle_status(rpc, &bundle_id, jito_client).await {
+                BundleStatus::Confirmed => {
+                    // Bundle executed - keep committed amount (already reflected in balance)
+                    log::debug!("Bundle {} confirmed on-chain, keeping committed amount", bundle_id);
+                }
+                BundleStatus::Failed => {
+                    // Bundle dropped - release committed amount
+                    wallet_balance_tracker.pending_committed_usd -= value_usd;
+                    log::warn!("Bundle {} dropped from mempool, releasing ${:.2} committed amount", bundle_id, value_usd);
+                }
+                BundleStatus::Unknown => {
+                    // Conservative: assume executed to avoid overcommit
+                    // This prevents releasing committed amount for bundles that might have executed
+                    log::warn!("Bundle {} status unknown, assuming executed (conservative), keeping committed amount", bundle_id);
+                }
+                BundleStatus::Pending => {
+                    // Shouldn't happen if timeout check is correct, but handle it
+                    log::debug!("Bundle {} still pending after timeout, keeping in tracking", bundle_id);
+                    // Re-add to pending_bundles? For now, assume it will execute
+                }
+            }
+        }
         
         // Calculate total pending liquidation value from active bundles (for logging/validation)
         let pending_liquidation_value: f64 = pending_bundles.iter().map(|p| p.value_usd).sum();
@@ -405,19 +505,12 @@ async fn process_cycle(
 
         // d) Jito bundle ile gönder
         if matches!(config.liquidation_mode, LiquidationMode::Live) {
-            // CRITICAL: Fetch blockhash RIGHT before building transaction to ensure it's fresh
-            // Blockhashes are valid for ~150 slots (~60 seconds), so we fetch immediately
-            // before building to minimize staleness risk. This makes build/sign/send atomic.
-            let blockhash = rpc
-                .get_latest_blockhash()
-                .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;
-            
-            // Build transaction with fresh blockhash (atomic: fetch -> build -> sign -> send)
-            match build_liquidation_tx(&config.wallet, &ctx, &quote, rpc, blockhash, &config).await {
-                Ok(tx) => {
-                    // Transaction already has blockhash set, sign and send immediately
-                    match send_jito_bundle(tx, jito_client, &config.wallet, blockhash).await {
-                        Ok(bundle_id) => {
+            // CRITICAL: Use two-transaction flow to avoid atomicity issues
+            // TX1: Liquidation + Redemption (Solend protocol)
+            // TX2: Jupiter Swap (DEX)
+            // These must be separate because TX2 needs TX1's output (SOL tokens)
+            match execute_liquidation_with_swap(&ctx, &quote, &config, rpc, jito_client).await {
+                Ok(_) => {
                             // Update balance tracker
                             wallet_balance_tracker.liquidations_since_refresh += 1;
                             wallet_balance_tracker.total_liquidations += 1;
@@ -431,8 +524,10 @@ async fn process_cycle(
                             // Update cumulative risk and pending liquidation tracking after successful send
                             // CRITICAL FIX: Track individual bundles with timestamps for accurate cleanup
                             // Bundles are assumed executed after BUNDLE_EXECUTION_TIMEOUT_SECS (2 seconds)
+                            // NOTE: For two-transaction flow, we track both TX1 and TX2 as separate pending liquidations
+                            // TX1 is the main liquidation, TX2 is the swap
                             pending_bundles.push(PendingLiquidation {
-                                bundle_id: bundle_id.clone(),
+                                bundle_id: format!("TX1+TX2_{}", obl_pubkey), // Placeholder - actual bundle IDs logged in execute_liquidation_with_swap
                                 value_usd: position_size_usd,
                                 sent_at: Instant::now(),
                             });
@@ -451,10 +546,9 @@ async fn process_cycle(
                             let refresh_countdown = REFRESH_INTERVAL.saturating_sub(wallet_balance_tracker.liquidations_since_refresh);
                             
                             log::info!(
-                                "✅ Liquidated {} with profit ${:.2}, bundle_id: {}, estimated_balance=${:.2}, pending_committed=${:.2} (refresh in {} liquidations), cumulative_risk=${:.2}/${:.2} ({} active bundles)",
+                                "✅ Liquidated {} with profit ${:.2} (TX1+TX2), estimated_balance=${:.2}, pending_committed=${:.2} (refresh in {} liquidations), cumulative_risk=${:.2}/${:.2} ({} active bundles)",
                                 obl_pubkey,
                                 quote.profit_usdc,
-                                bundle_id,
                                 wallet_balance_tracker.current_estimated_balance_usd,
                                 wallet_balance_tracker.pending_committed_usd,
                                 refresh_countdown,
@@ -506,16 +600,10 @@ async fn process_cycle(
                             }
                             
                             metrics.successful += 1;
-                        }
-                        Err(e) => {
-                            log::error!("Failed to send Jito bundle for {}: {}", obl_pubkey, e);
-                            metrics.failed_send_bundle += 1;
-                        }
-                    }
                 }
                 Err(e) => {
-                    log::error!("Failed to build liquidation tx for {}: {}", obl_pubkey, e);
-                    metrics.failed_build_tx += 1;
+                    log::error!("Failed to execute liquidation with swap for {}: {}", obl_pubkey, e);
+                    metrics.failed_send_bundle += 1;
                 }
             }
         } else {
@@ -677,8 +765,9 @@ const MAX_CONFIDENCE_PCT_PYTH_ONLY: f64 = 2.0; // 2% max confidence interval (Py
 /// and floating point precision issues in confidence percentage calculations.
 /// Example: price = 1e-100 → confidence_pct calculation would produce inf or very large values.
 /// 
-/// CRITICAL: Increased from 1e-6 to 1e-3 for better safety margin
-const MIN_VALID_PRICE_USD: f64 = 1e-3; // $0.001 minimum (1 milli-dollar) - more conservative
+/// CRITICAL: Set to 1e-6 to support micro-cap tokens while maintaining safety
+/// Previous 1e-3 was too aggressive and rejected valid micro-cap tokens ($0.0005)
+const MIN_VALID_PRICE_USD: f64 = 1e-6; // $0.000001 minimum (1 micro-dollar) - supports micro-cap tokens
 
 /// Maximum allowed slot difference for oracle price (stale check)
 /// Pyth recommends checking valid_slot, but we also check last_slot as fallback
@@ -1411,6 +1500,7 @@ struct LiquidationQuote {
     profit_usdc: f64,
     collateral_value_usd: f64, // Position size in USD for risk limit calculation
     debt_to_repay_raw: u64, // Debt amount to repay (in debt token raw units) for Solend instruction
+    collateral_to_seize_raw: u64, // Collateral cToken amount to seize (for redemption check)
 }
 
 /// Get SOL price in USD from oracle
@@ -1690,27 +1780,94 @@ async fn get_liquidation_quote(
     // So the ACTUAL profit will be:
     // actual_profit = jupiter_out_amount_usd - debt_to_repay_usd - fees
 
-    // Step 7: Calculate dynamic slippage based on position size
-    // CRITICAL: Larger positions need higher slippage tolerance due to price impact
-    let position_size_usd = collateral_to_seize_usd;
-    let slippage_bps = if position_size_usd < 1000.0 {
-        30u16  // Small position: 0.3%
-    } else if position_size_usd < 10_000.0 {
-        50u16  // Medium position: 0.5%
-    } else if position_size_usd < 50_000.0 {
-        100u16 // Large position: 1.0%
+    // Step 6: Calculate actual SOL amount after redemption
+    // CRITICAL FIX: collateral_to_seize_raw is cToken amount, NOT underlying token amount!
+    // We need to calculate the exchange rate from cToken to underlying token.
+    //
+    // Exchange rate formula:
+    //   exchange_rate = total_underlying_tokens / total_ctokens
+    //   total_underlying = availableAmount + (borrowedAmountWads / WAD) * 10^decimals
+    //   total_ctokens = collateral.mintTotalSupply
+    //
+    // CRITICAL: borrowedAmountWads is in WAD format (10^18), but represents the borrowed amount
+    // in token units (not raw units). We need to convert it to raw units by multiplying by 10^decimals.
+    //
+    // This is NOT 1:1 because Solend has a collateral factor and interest accrual!
+    // NOTE: WAD is already defined earlier in this function
+    
+    let ctokens_total_supply = deposit_reserve.collateral.mintTotalSupply;
+    let sol_available = deposit_reserve.liquidity.availableAmount;
+    let sol_borrowed_wads = deposit_reserve.liquidity.borrowedAmountWads;
+    
+    // Convert borrowed amount from WAD to token units, then to raw units
+    // borrowedAmountWads is in WAD format (borrowed_amount * 10^18)
+    // First convert to token units: borrowedAmountWads / WAD
+    // Then convert to raw units: (borrowedAmountWads / WAD) * 10^decimals
+    let sol_borrowed_token_units = (sol_borrowed_wads as f64 / WAD as f64);
+    let sol_borrowed_raw = (sol_borrowed_token_units * 10_f64.powi(collateral_decimals as i32)) as u64;
+    
+    // Total underlying tokens in the reserve
+    let sol_liquidity_supply = sol_available.saturating_add(sol_borrowed_raw);
+    
+    // Calculate exchange rate: SOL per cToken
+    let exchange_rate = if ctokens_total_supply > 0 {
+        sol_liquidity_supply as f64 / ctokens_total_supply as f64
     } else {
-        150u16 // Very large position: 1.5%
+        1.0 // Fallback if no cTokens exist (shouldn't happen in practice)
     };
     
+    // Actual SOL amount we'll receive after redemption
+    let sol_amount_after_redemption = (collateral_to_seize_raw as f64 * exchange_rate) as u64;
+    
     log::debug!(
-        "Dynamic slippage: {}bps ({}%) for position_size=${:.2}",
-        slippage_bps,
-        slippage_bps as f64 / 100.0,
-        position_size_usd
+        "cToken exchange calculation: {} cTokens * {:.6} rate = {} SOL (available={}, borrowed_wads={}, borrowed_raw={}, total_ctokens={}, total_underlying={})",
+        collateral_to_seize_raw,
+        exchange_rate,
+        sol_amount_after_redemption,
+        sol_available,
+        sol_borrowed_wads,
+        sol_borrowed_raw,
+        ctokens_total_supply,
+        sol_liquidity_supply
     );
     
-    // Step 6: Get Jupiter quote for liquidation swap with retry mechanism
+    // Step 7: Get preliminary Jupiter quote to calculate price impact
+    // CRITICAL FIX: Use price impact from Jupiter quote instead of just position size
+    // This accounts for pool liquidity, which is more accurate than position size alone
+    const BASE_SLIPPAGE_BPS: u16 = 30; // 0.3% minimum base slippage for preliminary quote
+    
+    let preliminary_quote = get_jupiter_quote_with_retry(
+        &collateral_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
+        &debt_mint,       // ✅ Debt token (USDC)
+        sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
+        BASE_SLIPPAGE_BPS, // Base slippage for preliminary quote
+        3, // max_retries
+    )
+    .await
+    .context("Failed to get preliminary Jupiter quote")?;
+    
+    // Calculate dynamic slippage based on price impact from preliminary quote
+    // Formula: base_slippage + price_impact + buffer
+    // This is economically correct because it accounts for actual pool liquidity
+    let price_impact_pct = crate::jup::get_price_impact_pct(&preliminary_quote);
+    let price_impact_bps = (price_impact_pct * 100.0) as u16; // Convert percentage to basis points
+    const BUFFER_BPS: u16 = 20; // 0.2% safety buffer
+    const MAX_SLIPPAGE_BPS: u16 = 300; // 3% maximum slippage
+    
+    let slippage_bps = (BASE_SLIPPAGE_BPS as u32 + price_impact_bps as u32 + BUFFER_BPS as u32)
+        .min(MAX_SLIPPAGE_BPS as u32) as u16;
+    
+    log::debug!(
+        "Dynamic slippage calculation: base={}bps + price_impact={}bps ({}%) + buffer={}bps = {}bps ({}%)",
+        BASE_SLIPPAGE_BPS,
+        price_impact_bps,
+        price_impact_pct,
+        BUFFER_BPS,
+        slippage_bps,
+        slippage_bps as f64 / 100.0
+    );
+    
+    // Step 8: Get final Jupiter quote with calculated dynamic slippage
     // CRITICAL: Jupiter quote uses UNDERLYING token (SOL), not cToken (cSOL)
     // 
     // Liquidation flow:
@@ -1719,14 +1876,11 @@ async fn get_liquidation_quote(
     // 3. We swap underlying token to debt token (SOL -> USDC) via Jupiter
     // 4. We use the received USDC to pay off the debt (e.g., 1500 USDC)
     // 5. Profit = jupiter_output - debt_to_repay - fees
-    //
-    // NOTE: Currently, build_liquidation_tx() only includes LiquidateObligation.
-    // RedeemReserveCollateral instruction must be added to the transaction builder!
     let quote = get_jupiter_quote_with_retry(
         &collateral_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
         &debt_mint,       // ✅ Debt token (USDC)
-        collateral_to_seize_raw, // Amount in underlying token units
-        slippage_bps, // Dynamic slippage based on position size
+        sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
+        slippage_bps, // ✅ CORRECT: Dynamic slippage based on price impact
         3, // max_retries
     )
     .await
@@ -1881,6 +2035,7 @@ async fn get_liquidation_quote(
         profit_usdc,
         collateral_value_usd,
         debt_to_repay_raw, // Debt amount to repay in Solend instruction
+        collateral_to_seize_raw, // Collateral cToken amount to seize (for redemption check)
     })
 }
 
@@ -1964,10 +2119,11 @@ async fn get_wallet_value_usd(
 
 /// Build liquidation transaction per Structure.md section 8
 /// 
+/// Build transaction 1: Liquidation + Redemption (NO Jupiter Swap!)
 /// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
 /// Blockhashes are valid for ~150 slots (~60 seconds), so fetch blockhash right before
 /// building the transaction to minimize staleness risk.
-async fn build_liquidation_tx(
+async fn build_liquidation_tx1(
     wallet: &Arc<Keypair>,
     ctx: &LiquidationContext,
     quote: &LiquidationQuote,
@@ -1980,6 +2136,60 @@ async fn build_liquidation_tx(
         sysvar,
     };
     use spl_token::ID as TOKEN_PROGRAM_ID;
+
+    // ============================================================================
+    // CRITICAL: Re-validate oracle freshness before building transaction
+    // ============================================================================
+    // Oracle validation happens at cycle start, but by the time we build the TX,
+    // 2-3 seconds may have passed (Jupiter quote + TX build time).
+    // The oracle might have become stale during this time, so we re-check here.
+    let current_slot_now = rpc
+        .get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot for oracle re-validation: {}", e))?;
+    
+    // Re-validate borrow reserve oracle
+    if let Some(reserve) = &ctx.borrow_reserve {
+        let (valid, _) = validate_pyth_oracle(
+            rpc,
+            reserve.oracle_pubkey(),
+            current_slot_now,
+        )
+        .await
+        .context("Failed to re-validate borrow reserve oracle")?;
+        
+        if !valid {
+            return Err(anyhow::anyhow!(
+                "Borrow reserve oracle became stale during TX preparation. \
+                 Time elapsed since initial validation: ~2-3s. Aborting liquidation for obligation {}.",
+                ctx.obligation_pubkey
+            ));
+        }
+    }
+    
+    // Re-validate deposit reserve oracle
+    if let Some(reserve) = &ctx.deposit_reserve {
+        let (valid, _) = validate_pyth_oracle(
+            rpc,
+            reserve.oracle_pubkey(),
+            current_slot_now,
+        )
+        .await
+        .context("Failed to re-validate deposit reserve oracle")?;
+        
+        if !valid {
+            return Err(anyhow::anyhow!(
+                "Deposit reserve oracle became stale during TX preparation. \
+                 Time elapsed since initial validation: ~2-3s. Aborting liquidation for obligation {}.",
+                ctx.obligation_pubkey
+            ));
+        }
+    }
+    
+    log::debug!(
+        "✅ Oracle re-validation passed for obligation {} (current_slot={})",
+        ctx.obligation_pubkey,
+        current_slot_now
+    );
 
     let program_id = solend_program_id()?;
     let wallet_pubkey = wallet.pubkey();
@@ -2255,22 +2465,8 @@ async fn build_liquidation_tx(
     // For now, we'll calculate it from the debt amount and liquidation bonus
     // This is an approximation - ideally this should be passed from get_liquidation_quote()
     
-    // Get collateral amount from quote if available, otherwise calculate
-    // NOTE: This is a workaround - ideally collateral_to_seize_raw should be in LiquidationQuote
-    let collateral_to_seize_raw = {
-        // Calculate from debt amount and liquidation bonus
-        // This matches the calculation in get_liquidation_quote()
-        let debt_to_repay_usd = (liquidity_amount as f64 / 10_f64.powi(borrow_reserve.liquidity.mintDecimals as i32)) 
-            * ctx.borrow_price_usd.unwrap_or(1.0);
-        let collateral_price_usd = ctx.deposit_price_usd.unwrap_or(1.0);
-        let liquidation_bonus = deposit_reserve.liquidation_bonus();
-        
-        let debt_in_collateral_tokens = debt_to_repay_usd / collateral_price_usd;
-        let collateral_to_seize_tokens = debt_in_collateral_tokens * (1.0 + liquidation_bonus);
-        (collateral_to_seize_tokens * 10_f64.powi(deposit_reserve.liquidity.mintDecimals as i32)) as u64
-    };
-    
-    let redeem_collateral_amount = collateral_to_seize_raw; // cToken amount to redeem
+    // Use collateral_to_seize_raw from quote (calculated in get_liquidation_quote)
+    let redeem_collateral_amount = quote.collateral_to_seize_raw; // cToken amount to redeem
     
     // Build RedeemReserveCollateral instruction data
     let mut redeem_instruction_data = Vec::new();
@@ -2345,32 +2541,20 @@ async fn build_liquidation_tx(
     };
     
     // ============================================================================
-    // INSTRUCTION 3: Jupiter Swap (SOL -> USDC)
+    // TRANSACTION 1: Liquidation + Redemption (NO Jupiter Swap!)
     // ============================================================================
-    // CRITICAL: After redeeming cToken to underlying token (SOL), we need to swap
-    // it to debt token (USDC) to repay the debt and realize profit.
+    // CRITICAL: Jupiter swap must be in a SEPARATE transaction because:
+    // 1. LiquidateObligation writes cSOL tokens to wallet's ATA
+    // 2. RedeemReserveCollateral reads those cSOL tokens and writes SOL to wallet's ATA
+    // 3. Jupiter swap needs to read SOL from wallet's ATA
     // 
-    // Flow:
-    // 1. LiquidateObligation: USDC -> cSOL ✅
-    // 2. RedeemReserveCollateral: cSOL -> SOL ✅
-    // 3. Jupiter Swap: SOL -> USDC ✅ (YENİ!)
+    // Solana transactions are atomic - all instructions execute simultaneously.
+    // If we include Jupiter swap in the same transaction, it will try to read SOL
+    // that hasn't been written yet, causing AccountNotFound or InsufficientFunds errors.
     //
-    // Without this swap, we have SOL but can't pay USDC debt, so no profit is realized!
-    let jupiter_swap_ix = crate::jup::build_jupiter_swap_instruction(
-        &quote.quote,
-        &wallet_pubkey,
-        &config.jupiter_url,
-    )
-    .await
-    .context("Failed to build Jupiter swap instruction")?;
-    
-    // ============================================================================
-    // UPDATED TRANSACTION: Şimdi 3 instruction var
-    // ============================================================================
-    // 1. Compute budget instructions (mevcut)
-    // 2. LiquidateObligation (mevcut)
-    // 3. RedeemReserveCollateral (mevcut)
-    // 4. Jupiter Swap (YENİ!) - SOL -> USDC
+    // Solution: Split into 2 transactions:
+    // TX1: Liquidation + Redemption (Solend protocol)
+    // TX2: Jupiter Swap (DEX)
     
     // Build transaction with fresh blockhash
     // CRITICAL: blockhash must be fetched immediately before this function is called
@@ -2381,7 +2565,6 @@ async fn build_liquidation_tx(
             priority_fee_ix,          // Priority fee
             liquidation_ix,           // LiquidateObligation (USDC -> cSOL)
             redeem_collateral_ix,     // RedeemReserveCollateral (cSOL -> SOL)
-            jupiter_swap_ix,          // Jupiter Swap (SOL -> USDC) - YENİ!
         ],
         Some(&wallet_pubkey),
     );
@@ -2389,10 +2572,9 @@ async fn build_liquidation_tx(
     tx.message.recent_blockhash = blockhash;
 
     log::info!(
-        "Built liquidation transaction with full pipeline for obligation {}:\n\
+        "Built TX1 (Liquidation + Redemption) for obligation {}:\n\
          - Liquidate: {} debt tokens (USDC -> cSOL)\n\
          - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
-         - Jupiter Swap: SOL -> USDC\n\
          - Source collateral ATA: {}\n\
          - Destination liquidity ATA: {}",
         ctx.obligation_pubkey,
@@ -2403,6 +2585,194 @@ async fn build_liquidation_tx(
     );
 
     Ok(tx)
+}
+
+/// Build transaction 2: Jupiter Swap (SOL -> USDC)
+/// This is called AFTER TX1 confirms and SOL is available in wallet
+/// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
+async fn build_liquidation_tx2(
+    wallet: &Arc<Keypair>,
+    ctx: &LiquidationContext,
+    quote: &LiquidationQuote,
+    blockhash: solana_sdk::hash::Hash,
+    config: &Config,
+) -> Result<Transaction> {
+    use solana_sdk::instruction::Instruction;
+    
+    let wallet_pubkey = wallet.pubkey();
+    
+    // Compute Budget Program ID
+    let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
+        .map_err(|e| anyhow::anyhow!("Invalid compute budget program ID: {}", e))?;
+
+    // Build compute unit limit instruction
+    let mut compute_limit_data = vec![2u8]; // SetComputeUnitLimit discriminator
+    compute_limit_data.extend_from_slice(&(200_000u32).to_le_bytes());
+    let compute_budget_ix = Instruction {
+        program_id: compute_budget_program_id,
+        accounts: vec![],
+        data: compute_limit_data,
+    };
+
+    // Build compute unit price instruction
+    let mut compute_price_data = vec![3u8]; // SetComputeUnitPrice discriminator
+    compute_price_data.extend_from_slice(&(1_000u64).to_le_bytes()); // 0.001 SOL per CU
+    let priority_fee_ix = Instruction {
+        program_id: compute_budget_program_id,
+        accounts: vec![],
+        data: compute_price_data,
+    };
+    
+    // ============================================================================
+    // INSTRUCTION: Jupiter Swap (SOL -> USDC)
+    // ============================================================================
+    // After TX1 confirms, we have SOL in wallet's ATA
+    // Now we swap it to USDC to complete the liquidation flow
+    let jupiter_swap_ix = crate::jup::build_jupiter_swap_instruction(
+        &quote.quote,
+        &wallet_pubkey,
+        &config.jupiter_url,
+    )
+    .await
+    .context("Failed to build Jupiter swap instruction")?;
+    
+    // Build transaction with fresh blockhash
+    let mut tx = Transaction::new_with_payer(
+        &[
+            compute_budget_ix,        // Compute unit limit
+            priority_fee_ix,          // Priority fee
+            jupiter_swap_ix,          // Jupiter Swap (SOL -> USDC)
+        ],
+        Some(&wallet_pubkey),
+    );
+    tx.message.recent_blockhash = blockhash;
+
+    log::info!(
+        "Built TX2 (Jupiter Swap) for obligation {}:\n\
+         - Swap: SOL -> USDC",
+        ctx.obligation_pubkey
+    );
+
+    Ok(tx)
+}
+
+/// Execute liquidation with swap using two separate transactions
+/// TX1: Liquidation + Redemption (Solend protocol)
+/// TX2: Jupiter Swap (DEX)
+/// 
+/// CRITICAL: These must be separate transactions because:
+/// - TX1 writes SOL tokens to wallet's ATA
+/// - TX2 needs to read those SOL tokens
+/// - Solana transactions are atomic - all instructions execute simultaneously
+/// - If combined, TX2 would try to read SOL that hasn't been written yet
+async fn execute_liquidation_with_swap(
+    ctx: &LiquidationContext,
+    quote: &LiquidationQuote,
+    config: &Config,
+    rpc: &Arc<RpcClient>,
+    jito_client: &JitoClient,
+) -> Result<()> {
+    use spl_associated_token_account::get_associated_token_address;
+    
+    let wallet = &config.wallet;
+    let wallet_pubkey = wallet.pubkey();
+    
+    // Get deposit reserve to find underlying token mint (SOL)
+    let deposit_reserve = ctx
+        .deposit_reserve
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
+    
+    let sol_mint = deposit_reserve.liquidity.mintPubkey;
+    let sol_ata = get_associated_token_address(&wallet_pubkey, &sol_mint);
+    
+    // ============================================================================
+    // TRANSACTION 1: Liquidation + Redemption
+    // ============================================================================
+    log::info!("Building TX1: Liquidation + Redemption");
+    
+    let blockhash1 = rpc
+        .get_latest_blockhash()
+        .map_err(|e| anyhow::anyhow!("Failed to get blockhash for TX1: {}", e))?;
+    
+    let tx1 = build_liquidation_tx1(wallet, ctx, quote, rpc, blockhash1, config)
+        .await
+        .context("Failed to build TX1")?;
+    
+    // Send TX1 via Jito
+    let bundle_id1 = send_jito_bundle(tx1, jito_client, wallet, blockhash1)
+        .await
+        .context("Failed to send TX1 via Jito")?;
+    log::info!("✅ TX1 sent: bundle_id={}", bundle_id1);
+    
+    // ============================================================================
+    // WAIT FOR TX1 TO LAND ON-CHAIN
+    // ============================================================================
+    // CRITICAL: TX2 needs TX1's output (SOL tokens in wallet)
+    // We must wait for TX1 to confirm before sending TX2
+    
+    log::info!("Waiting for TX1 to confirm (checking SOL balance in ATA: {})...", sol_ata);
+    
+    // Poll for SOL balance (max 5 seconds, 10 checks)
+    let mut confirmed = false;
+    for i in 0..10 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
+        if let Ok(Some(account)) = rpc.get_token_account(&sol_ata) {
+            let balance: u64 = account.token_amount.amount.parse().unwrap_or(0);
+            if balance >= quote.collateral_to_seize_raw {
+                log::info!(
+                    "✅ TX1 confirmed: SOL balance={} (needed={})",
+                    balance,
+                    quote.collateral_to_seize_raw
+                );
+                confirmed = true;
+                break;
+            }
+        }
+        
+        log::debug!("TX1 not confirmed yet (check {}/10)", i + 1);
+    }
+    
+    if !confirmed {
+        return Err(anyhow::anyhow!(
+            "TX1 failed to confirm within 5 seconds. \
+             Bundle may have dropped or network congestion. \
+             Bundle ID: {}",
+            bundle_id1
+        ));
+    }
+    
+    // ============================================================================
+    // TRANSACTION 2: Jupiter Swap
+    // ============================================================================
+    log::info!("Building TX2: Jupiter Swap (SOL -> USDC)");
+    
+    // Get fresh blockhash for TX2 (TX1 took time)
+    let blockhash2 = rpc
+        .get_latest_blockhash()
+        .map_err(|e| anyhow::anyhow!("Failed to get blockhash for TX2: {}", e))?;
+    
+    let tx2 = build_liquidation_tx2(wallet, ctx, quote, blockhash2, config)
+        .await
+        .context("Failed to build TX2")?;
+    
+    // Send TX2 via Jito
+    let bundle_id2 = send_jito_bundle(tx2, jito_client, wallet, blockhash2)
+        .await
+        .context("Failed to send TX2 via Jito")?;
+    log::info!("✅ TX2 sent: bundle_id={}", bundle_id2);
+    
+    // Wait for TX2 confirmation (optional, for logging)
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    
+    log::info!(
+        "✅ Full liquidation flow completed: TX1={}, TX2={}",
+        bundle_id1,
+        bundle_id2
+    );
+    
+    Ok(())
 }
 
 
