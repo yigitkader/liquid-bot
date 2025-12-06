@@ -1553,22 +1553,53 @@ async fn validate_switchboard_oracle_if_available(
     let switchboard_program_id_v3 = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID_V3)
         .map_err(|e| anyhow::anyhow!("Invalid Switchboard v3 program ID: {}", e))?;
 
+    // CRITICAL SECURITY: Verify account owner BEFORE parsing
+    // Prevents parsing malicious accounts that claim to be oracles
     if oracle_account.owner != switchboard_program_id_v2 
         && oracle_account.owner != switchboard_program_id_v3 {
         log::debug!(
-            "Switchboard oracle account {} does not belong to Switchboard v2 or v3 program (owner: {})",
+            "❌ Switchboard oracle account {} rejected: invalid owner\n\
+             - Expected: {} (v2) or {} (v3)\n\
+             - Found: {}\n\
+             - This may indicate: wrong oracle type, malicious account, or data corruption",
             switchboard_oracle_pubkey,
+            switchboard_program_id_v2,
+            switchboard_program_id_v3,
             oracle_account.owner
+        );
+        return Ok(None);
+    }
+    
+    // Additional validation: Check account size is reasonable
+    // Switchboard PullFeedAccountData should be ~512 bytes
+    const EXPECTED_FEED_SIZE_MIN: usize = 400;
+    const EXPECTED_FEED_SIZE_MAX: usize = 2000;
+    let account_size = oracle_account.data.len();
+    
+    if account_size < EXPECTED_FEED_SIZE_MIN || account_size > EXPECTED_FEED_SIZE_MAX {
+        log::warn!(
+            "⚠️  Switchboard feed {} has unusual size: {} bytes (expected: {}-{} bytes)\n\
+             This may indicate wrong account type or data corruption",
+            switchboard_oracle_pubkey,
+            account_size,
+            EXPECTED_FEED_SIZE_MIN,
+            EXPECTED_FEED_SIZE_MAX
         );
         return Ok(None);
     }
     
     // Log which version we're using for debugging
     if oracle_account.owner == switchboard_program_id_v3 {
-        log::trace!("Using Switchboard On-Demand v3 oracle");
+        log::trace!("✅ Using Switchboard On-Demand v3 oracle (account size: {} bytes)", account_size);
     } else {
-        log::trace!("Using Switchboard v2 oracle");
+        log::trace!("✅ Using Switchboard v2 oracle (account size: {} bytes)", account_size);
     }
+    
+    log::trace!(
+        "✅ Switchboard account validation passed: owner={}, size={} bytes",
+        oracle_account.owner,
+        account_size
+    );
 
     // 3. Parse using Switchboard On-Demand SDK (Solana 2.0 compatible)
     // 

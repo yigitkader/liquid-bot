@@ -8,9 +8,15 @@ use std::time::Duration;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
-// CRITICAL: Increased timeout from 10 to 15 seconds to handle busy periods
-// when Jupiter API can take 10+ seconds to respond
-const REQUEST_TIMEOUT_SECS: u64 = 15;
+// CRITICAL FIX: Adaptive timeout for blockhash freshness
+// Bundle expires in ~60 seconds, blockhash can go stale if Jupiter takes too long
+// Primary timeout: 8 seconds (normal conditions - fast fail to preserve blockhash)
+// Fallback timeout: 15 seconds (busy periods - only for retries)
+const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 8;  // First attempt - preserve blockhash freshness
+const REQUEST_TIMEOUT_RETRY_SECS: u64 = 15;   // Retries - allow more time during busy periods
+
+// Legacy constant for backward compatibility (use REQUEST_TIMEOUT_RETRY_SECS)
+const REQUEST_TIMEOUT_SECS: u64 = REQUEST_TIMEOUT_RETRY_SECS;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JupiterQuote {
@@ -46,15 +52,16 @@ pub struct SwapInfo {
     pub output_mint: Option<String>,
 }
 
-/// Get Jupiter quote for a swap
+/// Internal: Get Jupiter quote with specific timeout
 /// 
-/// CRITICAL: Includes timeout protection to prevent hanging on slow/down Jupiter API.
-/// Timeout is set to 10 seconds to handle busy periods when Jupiter API can take 5-10 seconds.
-pub async fn get_jupiter_quote(
+/// CRITICAL: This is the core function that makes the actual API call.
+/// Timeout is configurable to allow adaptive timeout strategy.
+async fn get_jupiter_quote_with_timeout(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
     amount: u64,
     slippage_bps: u16,
+    timeout_secs: u64,
 ) -> Result<JupiterQuote> {
     let url = format!(
         "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}",
@@ -66,7 +73,7 @@ pub async fn get_jupiter_quote(
     // Reqwest timeout handles both connection and read timeouts, including JSON parsing
     // This is cleaner and avoids conflicts between two timeout layers
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .context("Failed to create HTTP client")?;
 
@@ -77,7 +84,7 @@ pub async fn get_jupiter_quote(
         .await
         .context(format!(
             "Jupiter API request failed or timed out after {} seconds",
-            REQUEST_TIMEOUT_SECS
+            timeout_secs
         ))?;
 
     if !response.status().is_success() {
@@ -96,11 +103,35 @@ pub async fn get_jupiter_quote(
     Ok(quote)
 }
 
-/// Get Jupiter quote with retry mechanism
+/// Get Jupiter quote for a swap (backward compatibility wrapper)
 /// 
-/// CRITICAL: Retries failed requests with exponential backoff to handle
-/// transient Jupiter API failures and timeouts. This prevents missing
-/// liquidation opportunities due to temporary API issues.
+/// Uses default timeout (15 seconds). For adaptive timeout, use get_jupiter_quote_with_retry().
+#[allow(dead_code)] // Kept for backward compatibility, but get_jupiter_quote_with_retry is preferred
+pub async fn get_jupiter_quote(
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount: u64,
+    slippage_bps: u16,
+) -> Result<JupiterQuote> {
+    get_jupiter_quote_with_timeout(
+        input_mint,
+        output_mint,
+        amount,
+        slippage_bps,
+        REQUEST_TIMEOUT_SECS,
+    ).await
+}
+
+/// Get Jupiter quote with retry mechanism and adaptive timeout
+/// 
+/// CRITICAL: Uses adaptive timeout strategy to preserve blockhash freshness:
+/// - First attempt: 8 seconds (fast fail to preserve blockhash)
+/// - Retries: 15 seconds (allow more time during busy periods)
+/// 
+/// Blockhash is valid for ~60 seconds. Bundle expires in ~60 seconds.
+/// If Jupiter takes 10+ seconds on first attempt, blockhash may go stale.
+/// This adaptive strategy maximizes blockhash freshness while still allowing
+/// retries during busy periods.
 pub async fn get_jupiter_quote_with_retry(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -111,25 +142,69 @@ pub async fn get_jupiter_quote_with_retry(
     let mut last_error = None;
     
     for attempt in 1..=max_retries {
-        match get_jupiter_quote(input_mint, output_mint, amount, slippage_bps).await {
+        // CRITICAL: Use shorter timeout on first attempt to preserve blockhash freshness
+        // Blockhash is valid for ~60 seconds, we need to complete liquidation within this window
+        let timeout_secs = if attempt == 1 {
+            REQUEST_TIMEOUT_NORMAL_SECS // 8s for first attempt - fast fail
+        } else {
+            REQUEST_TIMEOUT_RETRY_SECS  // 15s for retries - allow more time
+        };
+        
+        log::debug!(
+            "Jupiter quote attempt {}/{} with {} second timeout",
+            attempt,
+            max_retries,
+            timeout_secs
+        );
+        
+        match get_jupiter_quote_with_timeout(
+            input_mint, 
+            output_mint, 
+            amount, 
+            slippage_bps,
+            timeout_secs
+        ).await {
             Ok(quote) => {
-                log::debug!("Jupiter quote succeeded on attempt {}/{}", attempt, max_retries);
+                log::debug!(
+                    "✅ Jupiter quote succeeded on attempt {}/{} ({} second timeout)",
+                    attempt,
+                    max_retries,
+                    timeout_secs
+                );
                 return Ok(quote);
             }
             Err(e) => {
                 last_error = Some(e);
-                if attempt < max_retries {
-                    // ✅ FIXED: Exponential backoff with jitter
-                    // Base delay: 500ms * attempt (500ms, 1000ms, 1500ms...)
-                    // Jitter: random 0-200ms to prevent thundering herd
-                    use rand::Rng;
-                    let base_delay_ms = 500 * attempt as u64;
-                    let jitter_ms = rand::thread_rng().gen_range(0..200);
-                    let delay_ms = base_delay_ms + jitter_ms;
+                
+                // Check if timeout error
+                let error_msg = last_error.as_ref().unwrap().to_string();
+                if error_msg.contains("timeout") || error_msg.contains("timed out") {
                     log::warn!(
-                        "Jupiter quote attempt {}/{} failed, retrying in {}ms (base: {}ms + jitter: {}ms)...",
+                        "⏱️  Jupiter quote timeout on attempt {}/{} ({} second timeout)",
                         attempt,
                         max_retries,
+                        timeout_secs
+                    );
+                } else {
+                    log::warn!(
+                        "⚠️  Jupiter quote failed on attempt {}/{}: {}",
+                        attempt,
+                        max_retries,
+                        error_msg
+                    );
+                }
+                
+                if attempt < max_retries {
+                    // Exponential backoff with jitter
+                    // Base delay: 300ms * attempt (300ms, 600ms, 900ms...)
+                    // Jitter: random 0-200ms to prevent thundering herd
+                    use rand::Rng;
+                    let base_delay_ms = 300 * attempt as u64;
+                    let jitter_ms = rand::thread_rng().gen_range(0..200);
+                    let delay_ms = base_delay_ms + jitter_ms;
+                    
+                    log::debug!(
+                        "Retrying Jupiter quote in {}ms (base: {}ms + jitter: {}ms)...",
                         delay_ms,
                         base_delay_ms,
                         jitter_ms

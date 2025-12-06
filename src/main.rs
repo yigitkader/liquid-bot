@@ -75,6 +75,15 @@ async fn main() -> Result<()> {
     log::info!("✅ Configuration loaded");
 
     // Runtime layout validation per Structure.md section 11.6
+    // CRITICAL: Log RPC URL for debugging (masked for security)
+    let rpc_url_display = if app_config.rpc_url.len() > 50 {
+        format!("{}...{}", &app_config.rpc_url[..25], &app_config.rpc_url[app_config.rpc_url.len()-25..])
+    } else {
+        app_config.rpc_url.clone()
+    };
+    log::info!("🔗 RPC URL: {} (masked)", rpc_url_display);
+    log::info!("   Full RPC URL length: {} characters", app_config.rpc_url.len());
+    
     let rpc = Arc::new(RpcClient::new(app_config.rpc_url.clone()));
     
     // CRITICAL: Verify we're connected to mainnet, not devnet/testnet
@@ -411,6 +420,13 @@ async fn validate_wallet_balances(
     log::info!("🔍 Discovering USDC mint from Solend reserves...");
     let program_id = solend::solend_program_id()?;
     log::info!("   Solend program ID: {}", program_id);
+    
+    // CRITICAL: Verify we're using the correct Solend program
+    if solend::is_valid_solend_program(&program_id) {
+        log::info!("   ✅ Program ID verified as known Solend program");
+    } else {
+        log::warn!("   ⚠️  Program ID not in known Solend programs list - proceed with caution");
+    }
     
     let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)
         .context("Failed to discover USDC mint from chain")?;

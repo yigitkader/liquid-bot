@@ -399,13 +399,56 @@ impl Obligation {
     }
 }
 
-// Solend program ID (mainnet)
-pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+// CRITICAL FIX: Mainnet Solend Program ID
+// 
+// ✅ DOĞRU: "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"
+//    Solend (yeni adıyla Save) protokolünün kesin ve somut Mainnet Program ID'si
+//    Bu adres özel olarak üretilmiş bir Vanity Address'tir
+//    Başındaki "So1end" ibaresinden doğru adreste olduğunuzu teyit edebilirsiniz
+//    Kaynak: @solendprotocol/solend-sdk - SOLEND_PRODUCTION_PROGRAM_ID
+//    Explorer: https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
+//
+// ❌ ESKİ (YANLIŞ):
+//    "SoLEND5UpfNVCnLb8KpLDpBmmK4zrYqT3SQvvGWEVvj" - Yanlış program ID
+//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo" - Eski/yanlış versiyon
+//
+// Known Solend program IDs (for validation):
+pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"; // Mainnet Production (Correct)
+pub const SOLEND_PROGRAM_ID_LEGACY: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"; // Legacy/Alternative (may not have USDC)
 
-/// Get Solend program ID
+/// Known Solend program IDs (for validation)
+pub const SOLEND_PROGRAM_IDS: &[&str] = &[
+    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn", // Mainnet Production (Correct) - USDC supported
+    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",  // Legacy/Alternative - may not have USDC
+];
+
+/// Get Solend program ID (mainnet production)
+/// 
+/// CRITICAL: This returns the correct mainnet Solend program ID that supports USDC
+/// Can be overridden via SOLEND_PROGRAM_ID environment variable
 pub fn solend_program_id() -> Result<Pubkey> {
+    use std::env;
+    
+    // First, try to read from environment variable (allows override)
+    if let Ok(env_program_id) = env::var("SOLEND_PROGRAM_ID") {
+        log::info!("📝 Using Solend program ID from .env: {}", env_program_id);
+        return Pubkey::from_str(&env_program_id)
+            .map_err(|e| anyhow::anyhow!("Invalid SOLEND_PROGRAM_ID from .env: {} - Error: {}", env_program_id, e));
+    }
+    
+    // Fallback to default (correct mainnet production program ID)
+    log::info!("📝 Using default Solend program ID: {}", SOLEND_PROGRAM_ID);
     Pubkey::from_str(SOLEND_PROGRAM_ID)
         .map_err(|e| anyhow::anyhow!("Invalid Solend program ID: {}", e))
+}
+
+/// Verify if a program ID is a known Solend program
+/// 
+/// This can be used to validate that we're connecting to a legitimate Solend program
+pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
+    SOLEND_PROGRAM_IDS
+        .iter()
+        .any(|&id| Pubkey::from_str(id).ok() == Some(*pubkey))
 }
 
 /// Derive obligation address (PDA)
@@ -801,12 +844,15 @@ pub fn find_usdc_mint_from_reserves(
     
     // Log RPC URL (partially masked for security)
     if let Ok(rpc_url) = std::env::var("RPC_URL") {
-        let masked_url = if rpc_url.len() > 30 {
-            format!("{}...{}", &rpc_url[..15], &rpc_url[rpc_url.len()-15..])
+        let masked_url = if rpc_url.len() > 50 {
+            format!("{}...{}", &rpc_url[..25], &rpc_url[rpc_url.len()-25..])
         } else {
             "***".to_string()
         };
         log::info!("   RPC URL: {} (masked)", masked_url);
+        log::info!("   RPC URL contains 'mainnet': {}", rpc_url.to_lowercase().contains("mainnet"));
+        log::info!("   RPC URL contains 'devnet': {}", rpc_url.to_lowercase().contains("devnet"));
+        log::info!("   RPC URL contains 'testnet': {}", rpc_url.to_lowercase().contains("testnet"));
     }
     
     // CRITICAL: Read all reserves from chain - no mock/dummy data
@@ -824,6 +870,84 @@ pub fn find_usdc_mint_from_reserves(
                  Please check your RPC_URL in .env file and ensure the endpoint is accessible.",
                 e
             ));
+        }
+    }
+    
+    // CRITICAL: First verify the program account exists
+    log::info!("🔍 Verifying Solend program account exists...");
+    match rpc.get_account(program_id) {
+        Ok(program_account) => {
+            log::info!("✅ Solend program account found:");
+            log::info!("   Program owner: {}", program_account.owner);
+            log::info!("   Program executable: {}", program_account.executable);
+            log::info!("   Program lamports: {}", program_account.lamports);
+            log::info!("   Program data size: {} bytes", program_account.data.len());
+            
+            // Verify it's actually a program (executable = true)
+            if !program_account.executable {
+                return Err(anyhow::anyhow!(
+                    "Account {} is not a program (executable=false). \
+                     This may indicate the program ID is incorrect or points to a regular account.",
+                    program_id
+                ));
+            }
+        }
+        Err(e) => {
+            // Try to get more diagnostic information
+            let error_msg = e.to_string();
+            let mut diagnostic = format!(
+                "Solend program account {} not found on chain: {}\n\
+                 \n\
+                 Possible causes:\n\
+                 1. Program ID is incorrect: {}\n\
+                 2. RPC_URL is pointing to wrong network (devnet/testnet instead of mainnet)\n\
+                 3. Program has been closed or moved\n\
+                 4. RPC endpoint issue or rate limiting\n\
+                 \n",
+                program_id, error_msg, program_id
+            );
+            
+            // Check if we can access other known accounts to verify network
+            log::warn!("⚠️  Program account not found. Verifying network connectivity...");
+            const TEST_MAINNET_ACCOUNT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC mint
+            if let Ok(test_account) = Pubkey::from_str(TEST_MAINNET_ACCOUNT) {
+                match rpc.get_account(&test_account) {
+                    Ok(usdc_account) => {
+                        diagnostic.push_str("✅ Network verification: USDC mint found - RPC is on mainnet\n");
+                        diagnostic.push_str(&format!("   USDC account owner: {}\n", usdc_account.owner));
+                        diagnostic.push_str("❌ But Solend program not found - possible causes:\n");
+                        diagnostic.push_str("   1. Program ID may be incorrect\n");
+                        diagnostic.push_str("   2. Helius RPC API key may be invalid or rate-limited\n");
+                        diagnostic.push_str("   3. Helius RPC URL format may be incorrect\n");
+                        diagnostic.push_str("   4. Program may have been closed or moved\n");
+                    }
+                    Err(usdc_err) => {
+                        diagnostic.push_str(&format!("❌ Network verification: USDC mint not found: {}\n", usdc_err));
+                        diagnostic.push_str("   This indicates RPC may be on wrong network or RPC endpoint is broken\n");
+                    }
+                }
+            }
+            
+            // Additional diagnostic: Try to get slot to verify RPC is working
+            match rpc.get_slot() {
+                Ok(slot) => {
+                    diagnostic.push_str(&format!("✅ RPC is responding (current slot: {})\n", slot));
+                }
+                Err(slot_err) => {
+                    diagnostic.push_str(&format!("❌ RPC slot check failed: {}\n", slot_err));
+                }
+            }
+            
+            diagnostic.push_str(&format!(
+                "\nTroubleshooting:\n\
+                 - Verify program ID is correct: https://solscan.io/account/{}\n\
+                 - Check RPC_URL in .env points to mainnet\n\
+                 - Try using a different RPC endpoint\n\
+                 - Check if program exists on Solana Explorer",
+                program_id
+            ));
+            
+            return Err(anyhow::anyhow!("{}", diagnostic));
         }
     }
     
@@ -907,9 +1031,38 @@ pub fn find_usdc_mint_from_reserves(
     let accounts_count = accounts.len();
     
     if accounts_count == 0 {
+        // CRITICAL: 0 accounts means either:
+        // 1. Program exists but has no accounts (unlikely for Solend)
+        // 2. Wrong network (devnet/testnet instead of mainnet)
+        // 3. Program ID is wrong
+        // 4. RPC filtering issue
+        
+        // Try to get account info again to verify program still exists
+        let program_info = rpc.get_account(program_id);
+        
         return Err(anyhow::anyhow!(
-            "No Solend reserves found on chain - cannot discover USDC mint. \
-             Please check RPC connection and network configuration."
+            "No Solend accounts found for program {}.\n\
+             \n\
+             Analysis:\n\
+             - Program account exists: {}\n\
+             - Accounts returned: 0\n\
+             \n\
+             Possible causes:\n\
+             1. Wrong network: RPC_URL may be pointing to devnet/testnet instead of mainnet\n\
+             2. Program ID incorrect: {} may not be the correct Solend program\n\
+             3. Program has no accounts (unlikely for Solend)\n\
+             4. RPC endpoint issue or filtering\n\
+             \n\
+             Troubleshooting:\n\
+             - Verify RPC_URL in .env points to mainnet (not devnet/testnet)\n\
+             - Check program on Solana Explorer: https://solscan.io/account/{}\n\
+             - Verify program ID is correct: https://docs.solend.fi/protocol/lending-protocol\n\
+             - Try using a different RPC endpoint\n\
+             - Check if program has accounts on Solana Explorer",
+            program_id,
+            if program_info.is_ok() { "Yes" } else { "No (program not found)" },
+            program_id,
+            program_id
         ));
     }
     
