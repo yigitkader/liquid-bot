@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
+use serde::{Deserialize, Serialize};
+use solana_sdk::{
+    pubkey::Pubkey,
+    instruction::Instruction,
+};
 use std::time::Duration;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
@@ -9,7 +12,7 @@ const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 // when Jupiter API can take 10+ seconds to respond
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JupiterQuote {
     #[serde(rename = "inputMint")]
     pub input_mint: String,
@@ -25,14 +28,14 @@ pub struct JupiterQuote {
     pub route_plan: Option<Vec<RoutePlan>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutePlan {
     #[serde(rename = "swapInfo")]
     pub swap_info: Option<SwapInfo>,
     pub percent: Option<u8>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SwapInfo {
     #[serde(rename = "ammKey")]
     pub amm_key: Option<String>,
@@ -166,5 +169,95 @@ pub fn get_hop_count(quote: &JupiterQuote) -> u8 {
         .as_ref()
         .map(|plan| plan.len() as u8)
         .unwrap_or(1)
+}
+
+/// Build Jupiter swap instruction from quote
+/// Returns instruction that swaps input_mint -> output_mint
+/// 
+/// CRITICAL: This function calls Jupiter's swap-instructions endpoint to get
+/// the actual swap instruction that can be included in a transaction.
+pub async fn build_jupiter_swap_instruction(
+    quote: &JupiterQuote,
+    user_pubkey: &Pubkey,
+    jupiter_url: &str,
+) -> Result<Instruction> {
+    let swap_url = format!("{}/v6/swap-instructions", jupiter_url);
+    
+    // Jupiter v6 swap-instructions API expects:
+    // - quoteResponse: The full quote object
+    // - userPublicKey: User's wallet public key
+    // - wrapAndUnwrapSol: Whether to wrap/unwrap SOL automatically
+    // - dynamicComputeUnitLimit: Whether to use dynamic compute unit limits
+    let payload = serde_json::json!({
+        "quoteResponse": quote,
+        "userPublicKey": user_pubkey.to_string(),
+        "wrapAndUnwrapSol": true,
+        "dynamicComputeUnitLimit": true,
+    });
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .context("Failed to create HTTP client")?;
+    
+    let response = client
+        .post(&swap_url)
+        .json(&payload)
+        .send()
+        .await
+        .context("Jupiter swap instruction request failed")?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Jupiter swap instruction failed: {} - {}",
+            status,
+            error_text
+        ));
+    }
+    
+    // Jupiter v6 API returns instructions in different formats
+    // Try to parse as the standard format first
+    #[derive(Deserialize)]
+    struct SwapInstructionsResponse {
+        #[serde(rename = "swapInstruction")]
+        swap_instruction: Option<String>, // Base64 encoded
+        #[serde(rename = "setupInstructions")]
+        setup_instructions: Option<Vec<String>>,
+        #[serde(rename = "cleanupInstruction")]
+        cleanup_instruction: Option<String>,
+    }
+    
+    let swap_response: SwapInstructionsResponse = response
+        .json()
+        .await
+        .context("Failed to parse Jupiter swap instruction response")?;
+    
+    // Get the main swap instruction (base64 encoded)
+    let swap_instruction_b64 = swap_response
+        .swap_instruction
+        .ok_or_else(|| anyhow::anyhow!("Jupiter response missing swapInstruction field"))?;
+    
+    // Decode base64 instruction
+    use base64::Engine;
+    let instruction_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&swap_instruction_b64)
+        .context("Failed to decode swap instruction from base64")?;
+    
+    // Deserialize instruction
+    // CRITICAL: Jupiter returns instructions in a specific format
+    // The instruction bytes might be in a wrapper format, so we need to handle it properly
+    let instruction: Instruction = bincode::deserialize(&instruction_bytes)
+        .context("Failed to deserialize swap instruction from bytes")?;
+    
+    log::debug!(
+        "✅ Jupiter swap instruction built: program_id={}, accounts={}, data_len={}",
+        instruction.program_id,
+        instruction.accounts.len(),
+        instruction.data.len()
+    );
+    
+    Ok(instruction)
 }
 

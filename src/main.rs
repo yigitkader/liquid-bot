@@ -246,6 +246,19 @@ async fn ensure_required_atas_exist(
     
     log::info!("Found {} unique token mints in Solend reserves", token_mints.len());
     
+    // CRITICAL: Ensure wrapped SOL (WSOL) ATA exists for Jupiter swaps
+    // Jupiter swaps often use SOL as intermediate token (e.g., SOL-USDC swap)
+    // WSOL mint: So11111111111111111111111111111111111111112
+    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .map_err(|e| anyhow::anyhow!("Invalid WSOL mint address: {}", e))?;
+    let wsol_ata = get_associated_token_address(wallet_pubkey, &wsol_mint);
+    if rpc.get_account(&wsol_ata).is_err() {
+        log::info!("WSOL ATA missing (required for Jupiter swaps), will create: {}", wsol_ata);
+        token_mints.insert(wsol_mint); // Add to set so it gets created with other ATAs
+    } else {
+        log::debug!("WSOL ATA already exists: {}", wsol_ata);
+    }
+    
     // Check and create missing ATAs
     let mut missing_atas = Vec::new();
     for token_mint in &token_mints {

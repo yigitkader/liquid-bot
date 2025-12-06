@@ -223,6 +223,9 @@ async fn process_cycle(
     struct WalletBalanceTracker {
         initial_balance_usd: f64,
         current_estimated_balance_usd: f64,
+        // CRITICAL: Track pending committed amount to prevent overcommit
+        // This represents capital that has been committed to pending liquidations
+        pending_committed_usd: f64,
         last_refresh_balance_usd: f64,
         liquidations_since_refresh: u32,
         total_liquidations: u32,
@@ -231,6 +234,7 @@ async fn process_cycle(
     let mut wallet_balance_tracker = WalletBalanceTracker {
         initial_balance_usd: 0.0,
         current_estimated_balance_usd: 0.0,
+        pending_committed_usd: 0.0,
         last_refresh_balance_usd: 0.0,
         liquidations_since_refresh: 0,
         total_liquidations: 0,
@@ -324,29 +328,35 @@ async fn process_cycle(
         // 
         // Clean up expired pending bundles (assumed executed after timeout)
         // This prevents over-counting pending liquidations that have already executed
-        // Note: We don't adjust wallet balance here because the actual balance change
-        // (debt paid - collateral received) is complex. Pending tracking already accounts
-        // for capital tied up. When bundle expires, we simply stop counting it as pending.
-        // The wallet balance will be refreshed at the start of the next cycle.
+        // CRITICAL: When bundle expires, remove its committed amount from tracking
         let timeout = Duration::from_secs(BUNDLE_EXECUTION_TIMEOUT_SECS);
-        pending_bundles.retain(|p| p.sent_at.elapsed() < timeout);
+        pending_bundles.retain(|p| {
+            let expired = p.sent_at.elapsed() >= timeout;
+            if expired {
+                // Bundle expired - remove its committed amount from tracking
+                wallet_balance_tracker.pending_committed_usd -= p.value_usd;
+            }
+            !expired
+        });
         
-        // Calculate total pending liquidation value from active bundles
+        // Calculate total pending liquidation value from active bundles (for logging/validation)
         let pending_liquidation_value: f64 = pending_bundles.iter().map(|p| p.value_usd).sum();
         
         // Account for pending liquidations when calculating available liquidity
-        // CRITICAL FIX: Use estimated wallet balance (updated after each liquidation)
-        // Pending liquidations are sent but not yet executed, so they reduce available capital
-        let available_liquidity = wallet_balance_tracker.current_estimated_balance_usd - pending_liquidation_value;
+        // CRITICAL FIX: Use pending_committed_usd for consistent tracking
+        // This ensures we don't overcommit capital that's already tied up in pending liquidations
+        let available_liquidity = wallet_balance_tracker.current_estimated_balance_usd 
+            - wallet_balance_tracker.pending_committed_usd;
         let current_max_position_usd = available_liquidity * config.max_position_pct;
         
         let position_size_usd = quote.collateral_value_usd;
         
         log::debug!(
-            "Risk calculation: estimated_wallet=${:.2}, pending=${:.2} ({} bundles), available=${:.2}, max_position=${:.2}",
+            "Risk calculation: estimated_wallet=${:.2}, pending_committed=${:.2} ({} bundles, sum=${:.2}), available=${:.2}, max_position=${:.2}",
             wallet_balance_tracker.current_estimated_balance_usd,
-            pending_liquidation_value,
+            wallet_balance_tracker.pending_committed_usd,
             pending_bundles.len(),
+            pending_liquidation_value,
             available_liquidity,
             current_max_position_usd
         );
@@ -403,7 +413,7 @@ async fn process_cycle(
                 .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;
             
             // Build transaction with fresh blockhash (atomic: fetch -> build -> sign -> send)
-            match build_liquidation_tx(&config.wallet, &ctx, &quote, rpc, blockhash).await {
+            match build_liquidation_tx(&config.wallet, &ctx, &quote, rpc, blockhash, &config).await {
                 Ok(tx) => {
                     // Transaction already has blockhash set, sign and send immediately
                     match send_jito_bundle(tx, jito_client, &config.wallet, blockhash).await {
@@ -427,6 +437,10 @@ async fn process_cycle(
                                 sent_at: Instant::now(),
                             });
                             
+                            // CRITICAL: Track committed amount to prevent overcommit
+                            // This capital is now tied up in the pending liquidation
+                            wallet_balance_tracker.pending_committed_usd += position_size_usd;
+                            
                             cumulative_risk_usd += position_size_usd;
                             
                             // Calculate current pending value for logging
@@ -437,15 +451,15 @@ async fn process_cycle(
                             let refresh_countdown = REFRESH_INTERVAL.saturating_sub(wallet_balance_tracker.liquidations_since_refresh);
                             
                             log::info!(
-                                "✅ Liquidated {} with profit ${:.2}, bundle_id: {}, estimated_balance=${:.2} (refresh in {} liquidations), cumulative_risk=${:.2}/${:.2} (pending=${:.2}, {} active bundles)",
+                                "✅ Liquidated {} with profit ${:.2}, bundle_id: {}, estimated_balance=${:.2}, pending_committed=${:.2} (refresh in {} liquidations), cumulative_risk=${:.2}/${:.2} ({} active bundles)",
                                 obl_pubkey,
                                 quote.profit_usdc,
                                 bundle_id,
                                 wallet_balance_tracker.current_estimated_balance_usd,
+                                wallet_balance_tracker.pending_committed_usd,
                                 refresh_countdown,
                                 cumulative_risk_usd,
                                 current_max_position_usd,
-                                current_pending_value,
                                 pending_bundles.len()
                             );
                             
@@ -668,7 +682,9 @@ const MIN_VALID_PRICE_USD: f64 = 1e-3; // $0.001 minimum (1 milli-dollar) - more
 
 /// Maximum allowed slot difference for oracle price (stale check)
 /// Pyth recommends checking valid_slot, but we also check last_slot as fallback
-const MAX_SLOT_DIFFERENCE: u64 = 150; // ~1 minute at 400ms per slot
+/// CRITICAL: Pyth feeds update ~400ms, so 25 slots = ~10 seconds is sufficient
+/// Previous 150 slots (~60s) was too lenient and could accept manipulated prices
+const MAX_SLOT_DIFFERENCE: u64 = 25; // ~10 seconds at 400ms per slot (Pyth recommended)
 
 /// Maximum allowed price deviation between Pyth and Switchboard (as percentage)
 const MAX_ORACLE_DEVIATION_PCT: f64 = 2.0; // 2% max deviation
@@ -936,25 +952,46 @@ async fn validate_switchboard_oracle_if_available(
         return Ok(None);
     }
     
+    // CRITICAL: Solana RPC account data is NOT guaranteed to be aligned.
+    // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
+    // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
     let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
         Ok(feed) => *feed,
         Err(PodCastError::AlignmentMismatch { .. }) => {
-            // Fallback: Copy to properly aligned buffer for unaligned data
-            // Vec<u8> allocates with proper alignment, but to be extra safe,
-            // we ensure the buffer is properly aligned by using a Vec that's
-            // guaranteed to be aligned to at least the struct's alignment requirements.
-            let mut aligned_buffer = vec![0u8; feed_size];
-            aligned_buffer.copy_from_slice(&oracle_account.data[..feed_size]);
+            // Fallback: Create explicitly aligned buffer (16-byte alignment for safety)
+            // This ensures proper alignment regardless of the original data's alignment.
+            // Strategy: Allocate extra space, find aligned pointer, copy data to aligned location.
+            let alignment = 16; // 16-byte alignment (safe for most structs, including SIMD)
+            let mut aligned_buffer = vec![0u8; feed_size + alignment]; // +16 for alignment padding
             
-            // Vec allocations are typically aligned to at least 8 bytes on most platforms,
-            // which should be sufficient for most structs. If this still fails, it indicates
-            // a more serious issue with the data structure itself.
-            match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_buffer) {
+            // Find the first 16-byte aligned address within the buffer
+            // Formula: (ptr + 15) & !15 rounds up to next 16-byte boundary
+            let buffer_ptr = aligned_buffer.as_ptr() as usize;
+            let aligned_ptr = (buffer_ptr + alignment - 1) & !(alignment - 1); // 16-byte align
+            let offset = aligned_ptr - buffer_ptr;
+            
+            // Ensure we have enough space after alignment
+            if offset + feed_size > aligned_buffer.len() {
+                log::warn!(
+                    "Switchboard feed alignment calculation failed for {}: insufficient buffer space",
+                    switchboard_oracle_pubkey
+                );
+                return Ok(None);
+            }
+            
+            // Copy data to the aligned location
+            let aligned_slice = &mut aligned_buffer[offset..offset + feed_size];
+            aligned_slice.copy_from_slice(&oracle_account.data[..feed_size]);
+            
+            // Now try parsing from the explicitly aligned slice
+            // SAFETY: aligned_slice is guaranteed to be 16-byte aligned, which is sufficient
+            // for any struct alignment requirement (most structs require 8-byte or less)
+            match bytemuck::try_from_bytes::<PullFeedAccountData>(aligned_slice) {
                 Ok(feed) => *feed,
                 Err(e) => {
                     log::warn!(
-                        "Switchboard feed parsing failed after alignment fix for {}: {}. \
-                         This may indicate a data structure alignment issue. \
+                        "Switchboard feed parsing failed after explicit alignment fix for {}: {}. \
+                         This may indicate a data structure issue or incompatible SDK version. \
                          Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
                         switchboard_oracle_pubkey,
                         e,
@@ -1279,6 +1316,19 @@ async fn validate_pyth_oracle(
         return Ok((false, None));
     }
 
+    // COMBINED CHECK: Old feed + high confidence = suspicious
+    // If slot difference is > 15 slots (~6 seconds) AND confidence > 1.0%, reject
+    // This prevents accepting manipulated prices that are slightly stale but have high confidence
+    if slot_diff_last > 15 && confidence_pct > 1.0 {
+        log::warn!(
+            "Suspicious oracle: old_feed ({} slots, ~{:.1}s) + high_confidence ({:.2}%) - rejecting",
+            slot_diff_last,
+            slot_diff_last as f64 * 0.4, // Convert slots to seconds (400ms per slot)
+            confidence_pct
+        );
+        return Ok((false, None));
+    }
+
     log::debug!(
         "✅ Pyth oracle validation passed for {} (price: {}, confidence: {:.2}%, status: {})",
         oracle_pubkey,
@@ -1510,15 +1560,20 @@ async fn get_liquidation_quote(
     // 2. cumulativeBorrowRateWads: Interest rate accumulator (WAD format)
     // 3. Token decimals: Mint's actual decimals (e.g., USDC = 6, SOL = 9)
     //
-    // Formula: actual_debt_tokens = (borrowedAmountWad * cumulativeBorrowRateWads / WAD) * 10^(-decimals)
-    // Meaning: WAD format must be converted to the token's actual decimals
+    // Formula: actual_debt = borrowedAmountWad * cumulativeBorrowRateWads / WAD / WAD
+    // Why two divisions? Both inputs are WAD (10^18), product is 10^36, need two divisions to normalize
+    // Result is normalized amount (not in WAD format), then multiply by 10^decimals to get raw amount
     const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
     const CLOSE_FACTOR: u128 = WAD / 2; // 0.5 = WAD/2
     
-    // Step 2a: Calculate actual debt in WAD format (interest included)
+    // Step 2a: Calculate actual debt in normalized format (interest included)
+    // CRITICAL: Both borrowedAmountWad and cumulativeBorrowRateWads are in WAD format (10^18)
+    // When multiplied: 10^36, so we need to divide by WAD twice to get normalized amount
+    // Formula: actual_debt = borrowedAmountWad * cumulativeBorrowRateWads / WAD / WAD
     let actual_debt_wad: u128 = borrow.borrowedAmountWad
         .checked_mul(borrow.cumulativeBorrowRateWads)
         .and_then(|v| v.checked_div(WAD))
+        .and_then(|v| v.checked_div(WAD))  // ✅ İKİNCİ DIVISION - CRITICAL FIX
         .ok_or_else(|| anyhow::anyhow!("Debt calculation overflow: borrowedAmountWad * cumulativeBorrowRateWads"))?;
     
     // Step 2b: Apply close factor (50%)
@@ -1527,26 +1582,22 @@ async fn get_liquidation_quote(
         .and_then(|v| v.checked_div(WAD))
         .ok_or_else(|| anyhow::anyhow!("Close factor calculation overflow"))?;
     
-    // Step 2c: Convert WAD to actual token amount with decimals
-    // CRITICAL: Solend stores amounts in a "normalized" format without decimals
-    // We need to scale by the token's actual decimals
+    // Step 2c: Convert normalized amount to raw token amount with decimals
+    // After the double WAD division, actual_debt_wad and debt_to_repay_wad are normalized (not in WAD format)
+    // We just need to multiply by 10^decimals to get the raw token amount
     // 
     // Example for USDC (6 decimals):
-    // - debt_to_repay_wad = 1500 * WAD (1500 USDC in WAD format)
-    // - debt_to_repay_raw = (1500 * WAD * 10^6) / WAD = 1500 * 10^6 = 1500000000
-    //
-    // CRITICAL INSIGHT: Solend's borrowedAmountWad is already "normalized" 
-    // (meaning it's the actual token amount scaled to WAD, not including decimals)
-    // So we DON'T divide by 10^decimals, we MULTIPLY!
+    // - actual_debt_wad = 1575 (normalized, after double WAD division)
+    // - debt_to_repay_wad = 787 (normalized, after close factor)
+    // - debt_to_repay_raw = 787 * 10^6 = 787000000 (raw USDC amount)
     let decimals_multiplier = 10_u128
         .checked_pow(debt_decimals as u32)
         .ok_or_else(|| anyhow::anyhow!("Decimals multiplier overflow: 10^{}", debt_decimals))?;
     
-    // CORRECT FORMULA: Convert WAD normalized amount to raw token amount
-    // debt_to_repay_raw = (debt_to_repay_wad * 10^decimals) / WAD
+    // CORRECT FORMULA: debt_to_repay_wad is already normalized, just multiply by decimals
+    // debt_to_repay_raw = debt_to_repay_wad * 10^decimals
     let debt_to_repay_raw = debt_to_repay_wad
         .checked_mul(decimals_multiplier)
-        .and_then(|v| v.checked_div(WAD))
         .ok_or_else(|| anyhow::anyhow!("Raw amount conversion overflow"))?
         as u64;
     
@@ -1922,6 +1973,7 @@ async fn build_liquidation_tx(
     quote: &LiquidationQuote,
     rpc: &Arc<RpcClient>,
     blockhash: solana_sdk::hash::Hash,
+    config: &Config,
 ) -> Result<Transaction> {
     use solana_sdk::{
         instruction::{AccountMeta, Instruction},
@@ -2293,11 +2345,32 @@ async fn build_liquidation_tx(
     };
     
     // ============================================================================
-    // UPDATED TRANSACTION: Şimdi 2 instruction var
+    // INSTRUCTION 3: Jupiter Swap (SOL -> USDC)
+    // ============================================================================
+    // CRITICAL: After redeeming cToken to underlying token (SOL), we need to swap
+    // it to debt token (USDC) to repay the debt and realize profit.
+    // 
+    // Flow:
+    // 1. LiquidateObligation: USDC -> cSOL ✅
+    // 2. RedeemReserveCollateral: cSOL -> SOL ✅
+    // 3. Jupiter Swap: SOL -> USDC ✅ (YENİ!)
+    //
+    // Without this swap, we have SOL but can't pay USDC debt, so no profit is realized!
+    let jupiter_swap_ix = crate::jup::build_jupiter_swap_instruction(
+        &quote.quote,
+        &wallet_pubkey,
+        &config.jupiter_url,
+    )
+    .await
+    .context("Failed to build Jupiter swap instruction")?;
+    
+    // ============================================================================
+    // UPDATED TRANSACTION: Şimdi 3 instruction var
     // ============================================================================
     // 1. Compute budget instructions (mevcut)
     // 2. LiquidateObligation (mevcut)
-    // 3. RedeemReserveCollateral (YENİ!)
+    // 3. RedeemReserveCollateral (mevcut)
+    // 4. Jupiter Swap (YENİ!) - SOL -> USDC
     
     // Build transaction with fresh blockhash
     // CRITICAL: blockhash must be fetched immediately before this function is called
@@ -2306,8 +2379,9 @@ async fn build_liquidation_tx(
         &[
             compute_budget_ix,        // Compute unit limit
             priority_fee_ix,          // Priority fee
-            liquidation_ix,           // LiquidateObligation (cToken alırız)
-            redeem_collateral_ix,     // RedeemReserveCollateral (cToken -> underlying token)
+            liquidation_ix,           // LiquidateObligation (USDC -> cSOL)
+            redeem_collateral_ix,     // RedeemReserveCollateral (cSOL -> SOL)
+            jupiter_swap_ix,          // Jupiter Swap (SOL -> USDC) - YENİ!
         ],
         Some(&wallet_pubkey),
     );
@@ -2315,9 +2389,10 @@ async fn build_liquidation_tx(
     tx.message.recent_blockhash = blockhash;
 
     log::info!(
-        "Built liquidation transaction with RedeemReserveCollateral for obligation {}:\n\
-         - Liquidate: {} debt tokens\n\
-         - Redeem: {} cTokens -> underlying tokens\n\
+        "Built liquidation transaction with full pipeline for obligation {}:\n\
+         - Liquidate: {} debt tokens (USDC -> cSOL)\n\
+         - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
+         - Jupiter Swap: SOL -> USDC\n\
          - Source collateral ATA: {}\n\
          - Destination liquidity ATA: {}",
         ctx.obligation_pubkey,
