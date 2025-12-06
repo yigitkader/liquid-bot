@@ -5,6 +5,10 @@ use std::time::Duration;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
+// CRITICAL: Increased timeout from 10 to 15 seconds to handle busy periods
+// when Jupiter API can take 10+ seconds to respond
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct JupiterQuote {
     #[serde(rename = "inputMint")]
@@ -56,8 +60,7 @@ pub async fn get_jupiter_quote(
 
     // Create HTTP client with timeout configuration
     // CRITICAL: Set timeout to prevent hanging on slow/down Jupiter API
-    // 10 seconds allows for busy periods when Jupiter API can take 5-10 seconds
-    const REQUEST_TIMEOUT_SECS: u64 = 10;
+    // 15 seconds allows for busy periods when Jupiter API can take 10+ seconds
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
@@ -118,6 +121,45 @@ pub async fn get_jupiter_quote(
     };
 
     Ok(quote)
+}
+
+/// Get Jupiter quote with retry mechanism
+/// 
+/// CRITICAL: Retries failed requests with exponential backoff to handle
+/// transient Jupiter API failures and timeouts. This prevents missing
+/// liquidation opportunities due to temporary API issues.
+pub async fn get_jupiter_quote_with_retry(
+    input_mint: &Pubkey,
+    output_mint: &Pubkey,
+    amount: u64,
+    slippage_bps: u16,
+    max_retries: u32,
+) -> Result<JupiterQuote> {
+    let mut last_error = None;
+    
+    for attempt in 1..=max_retries {
+        match get_jupiter_quote(input_mint, output_mint, amount, slippage_bps).await {
+            Ok(quote) => {
+                log::debug!("Jupiter quote succeeded on attempt {}/{}", attempt, max_retries);
+                return Ok(quote);
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < max_retries {
+                    let delay_ms = 500 * attempt as u64;
+                    log::warn!(
+                        "Jupiter quote attempt {}/{} failed, retrying in {}ms...",
+                        attempt,
+                        max_retries,
+                        delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+    
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All Jupiter quote attempts failed")))
 }
 
 /// Calculate profit from Jupiter quote
