@@ -169,31 +169,37 @@ pub fn derive_reserve_collateral_supply_pda(
     None
 }
 
-/// Calculate Solend instruction discriminator using Anchor sighash method
+/// Get Solend instruction discriminator for liquidateObligation
 /// 
-/// CRITICAL: Solend program uses Anchor-style instruction encoding.
-/// Discriminator = sha256("global:instruction_name")[0..8]
+/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
+/// Solend uses enum-based instruction encoding via LendingInstruction enum.
 /// 
-/// For liquidateObligation:
-/// - Preimage: "global:liquidateObligation"
-/// - SHA256 hash first 8 bytes = discriminator
+/// Reference: solend-sdk crate, instruction.rs
+/// LendingInstruction enum tag mapping:
+///   tag 0  => InitLendingMarket
+///   tag 1  => SetLendingMarketOwner
+///   tag 2  => InitReserve
+///   tag 3  => RefreshReserve
+///   tag 4  => DepositReserveLiquidity
+///   tag 5  => RedeemReserveCollateral
+///   tag 6  => InitObligation
+///   tag 7  => RefreshObligation
+///   tag 8  => DepositObligationCollateral
+///   tag 9  => WithdrawObligationCollateral
+///   tag 10 => BorrowObligationLiquidity
+///   tag 11 => RepayObligationLiquidity
+///   tag 12 => LiquidateObligation  <-- THIS ONE
+///   tag 13 => FlashLoan
+///   ... (see solend-sdk/src/instruction.rs for full enum)
 /// 
-/// This is the CORRECT method for Anchor-based programs like Solend.
+/// Format: [12, 0, 0, 0, 0, 0, 0, 0]
+/// Note: Only the first byte (tag = 12) is used by Solend program.
+/// The remaining 7 bytes are padding to match [u8; 8] return type.
 pub fn get_liquidate_obligation_discriminator() -> [u8; 8] {
-    use sha2::{Sha256, Digest};
-    
-    // Anchor sighash format: sha256("global:instruction_name")
-    let instruction_name = "liquidateObligation";
-    let preimage = format!("global:{}", instruction_name);
-    
-    let mut hasher = Sha256::new();
-    hasher.update(preimage.as_bytes());
-    let hash = hasher.finalize();
-    
-    // Take first 8 bytes as discriminator
+    // LendingInstruction::LiquidateObligation tag = 12
+    // Native Solana programs use only the first byte as discriminator
     let mut discriminator = [0u8; 8];
-    discriminator.copy_from_slice(&hash[0..8]);
-    
+    discriminator[0] = 12u8; // LiquidateObligation enum variant tag
     discriminator
 }
 

@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
+use std::time::Duration;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
@@ -39,6 +40,9 @@ pub struct SwapInfo {
 }
 
 /// Get Jupiter quote for a swap
+/// 
+/// CRITICAL: Includes timeout protection to prevent hanging on slow/down Jupiter API.
+/// Timeout is set to 5 seconds to ensure quick failure in busy markets.
 pub async fn get_jupiter_quote(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -50,12 +54,42 @@ pub async fn get_jupiter_quote(
         JUPITER_QUOTE_API, input_mint, output_mint, amount, slippage_bps
     );
 
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Jupiter API request failed: {}", e))?;
+    // Create HTTP client with timeout configuration
+    // CRITICAL: Set timeout to prevent hanging on slow/down Jupiter API
+    // 5 seconds is reasonable for quote API (should be fast)
+    const REQUEST_TIMEOUT_SECS: u64 = 5;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    // Wrap the entire request in a tokio timeout for additional safety
+    // This ensures we fail fast even if reqwest timeout doesn't work
+    let timeout_duration = Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    
+    let response_result = tokio::time::timeout(timeout_duration, async {
+        client
+            .get(&url)
+            .send()
+            .await
+    })
+    .await;
+
+    let response = match response_result {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "Jupiter API request failed: {}",
+                e
+            ));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Jupiter API request timed out after {} seconds",
+                REQUEST_TIMEOUT_SECS
+            ));
+        }
+    };
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
@@ -64,10 +98,24 @@ pub async fn get_jupiter_quote(
         ));
     }
 
-    let quote: JupiterQuote = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse Jupiter quote: {}", e))?;
+    // Parse JSON with timeout protection
+    let quote_result = tokio::time::timeout(timeout_duration, response.json::<JupiterQuote>()).await;
+    
+    let quote: JupiterQuote = match quote_result {
+        Ok(Ok(q)) => q,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "Failed to parse Jupiter quote: {}",
+                e
+            ));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Jupiter API response parsing timed out after {} seconds",
+                REQUEST_TIMEOUT_SECS
+            ));
+        }
+    };
 
     Ok(quote)
 }
