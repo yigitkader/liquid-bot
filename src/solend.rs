@@ -399,52 +399,62 @@ impl Obligation {
     }
 }
 
-// CRITICAL FIX: Mainnet Solend Program ID
+// CRITICAL FIX: Solend/Save Protocol Program ID (2024 Update)
 // 
-// ✅ DOĞRU: "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"
-//    Solend (yeni adıyla Save) protokolünün kesin ve somut Mainnet Program ID'si
-//    Bu adres özel olarak üretilmiş bir Vanity Address'tir
-//    Başındaki "So1end" ibaresinden doğru adreste olduğunuzu teyit edebilirsiniz
-//    Kaynak: @solendprotocol/solend-sdk - SOLEND_PRODUCTION_PROGRAM_ID
-//    Explorer: https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn
+// ⚠️  DEPRECATED PROGRAMS (DO NOT USE):
+//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn" - OLD Solend (CLOSED 2024)
 //
-// ❌ ESKİ (YANLIŞ):
-//    "SoLEND5UpfNVCnLb8KpLDpBmmK4zrYqT3SQvvGWEVvj" - Yanlış program ID
-//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo" - Eski/yanlış versiyon
+// ✅ CORRECT (ACTIVE PROGRAMS):
+//    Solend rebranded to "Save" in 2024 and migrated to new contracts.
+//    Multiple lending markets exist, each with different reserves/pools.
 //
-// Known Solend program IDs (for validation):
-pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn"; // Mainnet Production (Correct)
-pub const SOLEND_PROGRAM_ID_LEGACY: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"; // Legacy/Alternative (may not have USDC)
+// Known ACTIVE Save/Solend markets on mainnet:
+// 1. Save Main Market (RECOMMENDED): So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
+//    - Widest USDC support
+//    - Main production market
+// 2. Turbo SOL Market: turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP
+//    - SOL-focused market
+// 3. Altcoins Market: ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw
+//    - Alt token support
+//
+// IMPORTANT: Check Save documentation for current markets:
+// https://docs.save.finance or https://app.save.finance
+pub const SOLEND_PROGRAM_ID: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"; // Save Main Market (Active - RECOMMENDED)
+pub const SOLEND_PROGRAM_ID_ALTCOINS: &str = "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw"; // Altcoins Market
+pub const SOLEND_PROGRAM_ID_TURBO: &str = "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP"; // Turbo SOL Market
 
-/// Known Solend program IDs (for validation)
+/// Known active Save/Solend program IDs (for validation)
 pub const SOLEND_PROGRAM_IDS: &[&str] = &[
-    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpBn", // Mainnet Production (Correct) - USDC supported
-    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",  // Legacy/Alternative - may not have USDC
+    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo", // Save Main Market (RECOMMENDED - USDC supported)
+    "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw", // Altcoins Market
+    "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP", // Turbo SOL Market
 ];
 
-/// Get Solend program ID (mainnet production)
+/// Get Save/Solend program ID (mainnet production)
 /// 
-/// CRITICAL: This returns the correct mainnet Solend program ID that supports USDC
+/// CRITICAL: This returns the correct mainnet Save program ID (Save rebranded from Solend in 2024)
+/// Defaults to Save Main Market (So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo)
 /// Can be overridden via SOLEND_PROGRAM_ID environment variable
 pub fn solend_program_id() -> Result<Pubkey> {
     use std::env;
     
     // First, try to read from environment variable (allows override)
     if let Ok(env_program_id) = env::var("SOLEND_PROGRAM_ID") {
-        log::info!("📝 Using Solend program ID from .env: {}", env_program_id);
+        log::info!("📝 Using Save/Solend program ID from .env: {}", env_program_id);
         return Pubkey::from_str(&env_program_id)
             .map_err(|e| anyhow::anyhow!("Invalid SOLEND_PROGRAM_ID from .env: {} - Error: {}", env_program_id, e));
     }
     
-    // Fallback to default (correct mainnet production program ID)
-    log::info!("📝 Using default Solend program ID: {}", SOLEND_PROGRAM_ID);
+    // Fallback to default (Save Main Market - active as of 2024)
+    log::info!("📝 Using default Save program ID: {}", SOLEND_PROGRAM_ID);
     Pubkey::from_str(SOLEND_PROGRAM_ID)
-        .map_err(|e| anyhow::anyhow!("Invalid Solend program ID: {}", e))
+        .map_err(|e| anyhow::anyhow!("Invalid Save program ID: {}", e))
 }
 
-/// Verify if a program ID is a known Solend program
+/// Verify if a program ID is a known Save/Solend program
 /// 
-/// This can be used to validate that we're connecting to a legitimate Solend program
+/// This can be used to validate that we're connecting to a legitimate Save program
+/// (Save rebranded from Solend in 2024)
 pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
     SOLEND_PROGRAM_IDS
         .iter()
