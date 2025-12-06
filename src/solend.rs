@@ -266,6 +266,23 @@ pub fn get_liquidate_obligation_discriminator() -> u8 {
     12u8 // LiquidateObligation enum variant tag
 }
 
+/// Get Solend instruction discriminator for RedeemReserveCollateral
+/// 
+/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
+/// Solend uses enum-based instruction encoding via LendingInstruction enum.
+/// 
+/// Reference: solend-sdk crate, instruction.rs
+/// LendingInstruction enum tag mapping:
+///   tag 5  => RedeemReserveCollateral  <-- THIS ONE
+/// 
+/// Format: [5, 0, 0, 0, 0, 0, 0, 0]
+/// Note: Only the first byte (tag = 5) is used by Solend program.
+pub fn get_redeem_reserve_collateral_discriminator() -> u8 {
+    // LendingInstruction::RedeemReserveCollateral tag = 5
+    // Native Solana programs use only 1 byte as enum tag discriminator
+    5u8 // RedeemReserveCollateral enum variant tag
+}
+
 // Helper implementation for Reserve
 impl Reserve {
     /// Parse reserve from account data using Borsh
