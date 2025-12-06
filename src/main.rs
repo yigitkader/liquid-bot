@@ -50,6 +50,12 @@ async fn main() -> Result<()> {
         .await
         .context("Wallet balance validation failed")?;
 
+    // CRITICAL: Ensure all required ATAs exist at startup
+    // This prevents transaction failures during liquidation
+    ensure_required_atas_exist(&rpc, &wallet_pubkey, &wallet)
+        .await
+        .context("Failed to ensure required ATAs exist")?;
+
     // Create pipeline config per Structure.md section 6.2
     // All values are automatically discovered from chain or environment
     let pipeline_config = Config {
@@ -193,6 +199,119 @@ async fn validate_wallet_balances(
     Ok(())
 }
 
+/// Ensure all required ATAs exist at startup
+/// This prevents transaction failures during liquidation
+/// 
+/// CRITICAL: Creates ATAs for all token mints used in Solend reserves
+/// (both debt tokens and collateral tokens)
+async fn ensure_required_atas_exist(
+    rpc: &Arc<RpcClient>,
+    wallet_pubkey: &Pubkey,
+    wallet: &Keypair,
+) -> Result<()> {
+    use solana_sdk::{
+        instruction::Instruction,
+        transaction::Transaction,
+    };
+    use spl_associated_token_account::{
+        get_associated_token_address,
+        instruction::create_associated_token_account,
+    };
+    use spl_token::ID as TOKEN_PROGRAM_ID;
+    
+    log::info!("🔍 Checking required ATAs...");
+    
+    // Get all Solend reserves to discover token mints
+    let program_id = solend::solend_program_id()?;
+    let accounts = rpc
+        .get_program_accounts(&program_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
+    
+    // Collect all unique token mints from reserves
+    let mut token_mints = std::collections::HashSet::new();
+    
+    for (_pubkey, account) in accounts {
+        if let Ok(reserve) = solend::Reserve::from_account_data(&account.data) {
+            // Add liquidity mint (debt tokens)
+            token_mints.insert(reserve.liquidity.mintPubkey);
+            // Note: We don't need collateral mints (cTokens) for liquidation
+            // We only need the actual token mints (liquidity.mintPubkey)
+        }
+    }
+    
+    if token_mints.is_empty() {
+        log::warn!("No reserves found - skipping ATA creation");
+        return Ok(());
+    }
+    
+    log::info!("Found {} unique token mints in Solend reserves", token_mints.len());
+    
+    // Check and create missing ATAs
+    let mut missing_atas = Vec::new();
+    for token_mint in &token_mints {
+        let ata = get_associated_token_address(wallet_pubkey, token_mint);
+        if rpc.get_account(&ata).is_err() {
+            missing_atas.push((*token_mint, ata));
+        }
+    }
+    
+    if missing_atas.is_empty() {
+        log::info!("✅ All required ATAs already exist");
+        return Ok(());
+    }
+    
+    log::info!("📝 Creating {} missing ATAs...", missing_atas.len());
+    
+    // Create ATAs in batches (max 5 per transaction to avoid size limits)
+    const BATCH_SIZE: usize = 5;
+    for chunk in missing_atas.chunks(BATCH_SIZE) {
+        let mut instructions = Vec::new();
+        
+        for (token_mint, ata) in chunk {
+            log::info!("Creating ATA: {} for token {}", ata, token_mint);
+            
+            let create_ata_ix = create_associated_token_account(
+                wallet_pubkey,  // payer
+                wallet_pubkey,  // owner
+                token_mint,      // mint
+                &TOKEN_PROGRAM_ID,
+            );
+            instructions.push(create_ata_ix);
+        }
+        
+        // Build and send transaction
+        let recent_blockhash = rpc
+            .get_latest_blockhash()
+            .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
+        
+        let mut tx = Transaction::new_with_payer(&instructions, Some(wallet_pubkey));
+        tx.sign(&[wallet], recent_blockhash);
+        
+        // Send transaction
+        match rpc.send_and_confirm_transaction(&tx) {
+            Ok(sig) => {
+                log::info!("✅ Successfully created {} ATAs (tx: {})", chunk.len(), sig);
+            }
+            Err(e) => {
+                // Check if ATA already exists (race condition or already created)
+                if e.to_string().contains("already in use") {
+                    log::debug!("ATA already exists (race condition), continuing...");
+                } else {
+                    return Err(anyhow::anyhow!("Failed to create ATAs: {}", e));
+                }
+            }
+        }
+        
+        // Small delay between batches to avoid rate limits
+        if chunk.len() == BATCH_SIZE {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+    
+    log::info!("✅ All required ATAs created successfully");
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct AppConfig {
     rpc_url: String,
@@ -220,6 +339,23 @@ fn load_config() -> Result<AppConfig> {
             .unwrap_or_else(|_| format!("{}", default))
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid {}: {}", key, e))
+    }
+    
+    // CRITICAL: Validate configuration values
+    let min_profit_usdc = env_parse("MIN_PROFIT_USDC", 5.0f64)?;
+    if min_profit_usdc < 0.0 {
+        return Err(anyhow::anyhow!(
+            "Invalid MIN_PROFIT_USDC: {} (must be >= 0)",
+            min_profit_usdc
+        ));
+    }
+    
+    let max_position_pct = env_parse("MAX_POSITION_PCT", 0.05f64)?;
+    if max_position_pct <= 0.0 || max_position_pct > 1.0 {
+        return Err(anyhow::anyhow!(
+            "Invalid MAX_POSITION_PCT: {} (must be > 0 and <= 1.0)",
+            max_position_pct
+        ));
     }
 
     let dry_run_str = env_str("DRY_RUN", "true");

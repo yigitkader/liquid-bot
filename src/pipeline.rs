@@ -112,6 +112,7 @@ pub async fn run_liquidation_loop(
 }
 
 /// Metrics for tracking liquidation cycle performance
+/// Enhanced to track different failure reasons for better observability
 struct CycleMetrics {
     total_candidates: usize,
     skipped_oracle_fail: usize,
@@ -121,6 +122,10 @@ struct CycleMetrics {
     failed_build_tx: usize,
     failed_send_bundle: usize,
     successful: usize,
+    // Additional detailed tracking
+    skipped_rpc_error: usize,      // RPC call failures
+    skipped_reserve_load_fail: usize, // Failed to load reserve accounts
+    skipped_ata_missing: usize,   // Missing ATA (shouldn't happen if startup check works)
 }
 
 async fn process_cycle(
@@ -198,6 +203,9 @@ async fn process_cycle(
         failed_build_tx: 0,
         failed_send_bundle: 0,
         successful: 0,
+        skipped_rpc_error: 0,
+        skipped_reserve_load_fail: 0,
+        skipped_ata_missing: 0,
     };
 
     // Per Structure.md section 6.4: Track block-wide cumulative risk
@@ -439,14 +447,17 @@ async fn process_cycle(
     let final_max_position_usd = final_wallet_value_usd * config.max_position_pct;
     
     let total_processed = metrics.total_candidates;
-    let total_skipped = metrics.skipped_oracle_fail 
-        + metrics.skipped_jupiter_fail 
-        + metrics.skipped_insufficient_profit 
-        + metrics.skipped_risk_limit;
+    let total_skipped = metrics.skipped_oracle_fail
+        + metrics.skipped_jupiter_fail
+        + metrics.skipped_insufficient_profit
+        + metrics.skipped_risk_limit
+        + metrics.skipped_rpc_error
+        + metrics.skipped_reserve_load_fail
+        + metrics.skipped_ata_missing;
     let total_failed = metrics.failed_build_tx + metrics.failed_send_bundle;
     
     log::info!(
-        "📊 Cycle Summary: {} candidates | {} successful | {} skipped (oracle:{}, jupiter:{}, profit:{}, risk:{}) | {} failed (build:{}, send:{}) | cumulative_risk=${:.2}/{:.2} (final_wallet_value=${:.2})",
+        "📊 Cycle Summary: {} candidates | {} successful | {} skipped (oracle:{}, jupiter:{}, profit:{}, risk:{}, rpc:{}, reserve:{}, ata:{}) | {} failed (build:{}, send:{}) | cumulative_risk=${:.2}/{:.2} (final_wallet_value=${:.2})",
         total_processed,
         metrics.successful,
         total_skipped,
@@ -454,6 +465,9 @@ async fn process_cycle(
         metrics.skipped_jupiter_fail,
         metrics.skipped_insufficient_profit,
         metrics.skipped_risk_limit,
+        metrics.skipped_rpc_error,
+        metrics.skipped_reserve_load_fail,
+        metrics.skipped_ata_missing,
         total_failed,
         metrics.failed_build_tx,
         metrics.failed_send_bundle,

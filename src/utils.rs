@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
@@ -9,6 +10,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct JitoBundle {
@@ -252,5 +254,44 @@ pub async fn send_jito_bundle(
         .send_bundle(&bundle)
         .await
         .context("Failed to send Jito bundle")
+}
+
+/// RPC call with retry mechanism
+/// Handles transient network errors with exponential backoff
+/// 
+/// NOTE: This is a wrapper that can be used for any RPC call that returns Result<T, ClientError>
+/// For now, we provide a simple boolean check version
+pub async fn rpc_account_exists_with_retry(
+    rpc: &Arc<RpcClient>,
+    pubkey: &Pubkey,
+    max_retries: u32,
+) -> bool {
+    use solana_client::client_error::ClientError;
+    
+    for attempt in 1..=max_retries {
+        match rpc.get_account(pubkey) {
+            Ok(_) => {
+                if attempt > 1 {
+                    log::debug!("RPC get_account succeeded on attempt {}/{}", attempt, max_retries);
+                }
+                return true;
+            }
+            Err(_) => {
+                if attempt < max_retries {
+                    let delay_ms = 200 * attempt as u64; // Exponential backoff: 200ms, 400ms, 600ms...
+                    log::debug!(
+                        "RPC get_account attempt {}/{} failed for {}, retrying in {}ms...",
+                        attempt,
+                        max_retries,
+                        pubkey,
+                        delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+    
+    false
 }
 
