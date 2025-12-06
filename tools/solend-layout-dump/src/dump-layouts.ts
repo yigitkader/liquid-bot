@@ -458,6 +458,7 @@ async function dumpLayouts() {
           { kind: "custom", name: "superUnhealthyBorrowValue", type: "Number" },
           { kind: "custom", name: "unweightedBorrowValue", type: "Number" },
           { kind: "scalar", name: "closeable", type: "u8" },
+          { kind: "array", name: "_padding", elementType: "u8", len: 14 }, // 14-byte padding from SDK
           { kind: "scalar", name: "depositsLen", type: "u8" },
           { kind: "scalar", name: "borrowsLen", type: "u8" },
           { kind: "array", name: "dataFlat", elementType: "u8", len: 1096 },

@@ -81,7 +81,8 @@ async fn main() -> Result<()> {
         .context("Solend layout validation failed - please rebuild the bot")?;
 
     // Load wallet - per Structure.md section 6.1: secret/main.json
-    let keypair_path = std::path::PathBuf::from("secret/main.json");
+    // Try multiple path resolutions to handle different working directories
+    let keypair_path = resolve_wallet_path("secret/main.json")?;
     let wallet = load_keypair(&keypair_path).context("Failed to load wallet")?;
     let wallet_pubkey = wallet.pubkey();
     log::info!("✅ Wallet loaded: {}", wallet_pubkey);
@@ -136,38 +137,168 @@ async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
     // RESERVE_SIZE ~ 600 bytes
     // LENDING_MARKET_SIZE ~ 300 bytes
 
+    log::info!("🔍 Validating Solend layouts from {} accounts...", accounts.len());
+
     let mut obligation_count = 0;
     let mut reserve_count = 0;
+    let mut lending_market_count = 0;
+    let mut unknown_count = 0;
 
-    for (_pubkey, account) in accounts.iter().take(10) {
+    for (pubkey, account) in accounts.iter().take(20) {
         let size = account.data.len();
+        let account_type = if size > 1000 {
+            "Obligation"
+        } else if size > 500 {
+            "Reserve"
+        } else if size > 200 {
+            "LendingMarket"
+        } else {
+            "Unknown"
+        };
+
+        log::debug!(
+            "Account {}: size={} bytes, type={} (estimated)",
+            pubkey,
+            size,
+            account_type
+        );
 
         // Obligation accounts are typically larger
         if size > 1000 {
             obligation_count += 1;
+            log::debug!("  Attempting to parse as Obligation...");
+            
+            // Log first few bytes for debugging
+            let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
+            let hex_preview = preview_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::debug!("  First 32 bytes (hex): {}", hex_preview);
+            
             // Try to parse as Obligation to validate
-            if solend::Obligation::from_account_data(&account.data).is_err() {
-                return Err(anyhow::anyhow!(
-                    "Solend account size mismatch. Found account with size {} bytes that doesn't match expected Obligation layout. \
-                     Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.",
-                    size
-                ));
+            match solend::Obligation::from_account_data(&account.data) {
+                Ok(obligation) => {
+                    log::debug!(
+                        "  ✅ Successfully parsed Obligation: version={}, owner={}, depositsLen={}, borrowsLen={}",
+                        obligation.version,
+                        obligation.owner,
+                        obligation.depositsLen,
+                        obligation.borrowsLen
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "  ❌ Failed to parse Obligation account {}: {}",
+                        pubkey,
+                        e
+                    );
+                    log::error!(
+                        "  Account details: size={} bytes, owner={}, lamports={}",
+                        size,
+                        account.owner,
+                        account.lamports
+                    );
+                    log::error!(
+                        "  First 64 bytes (hex): {}",
+                        account.data.iter()
+                            .take(64)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    
+                    // Try to read version byte if possible
+                    if account.data.len() > 0 {
+                        let version_byte = account.data[0];
+                        log::error!("  First byte (version?): {} (0x{:02x})", version_byte, version_byte);
+                    }
+                    
+                    return Err(anyhow::anyhow!(
+                        "Solend account size mismatch. Found account {} with size {} bytes that doesn't match expected Obligation layout.\n\
+                         Error: {}\n\
+                         Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.\n\
+                         \n\
+                         Debug info:\n\
+                         - Account pubkey: {}\n\
+                         - Account size: {} bytes\n\
+                         - Account owner: {}\n\
+                         - First 32 bytes: {}",
+                        pubkey,
+                        size,
+                        e,
+                        pubkey,
+                        size,
+                        account.owner,
+                        hex_preview
+                    ));
+                }
             }
         } else if size > 500 {
             reserve_count += 1;
+            log::debug!("  Attempting to parse as Reserve...");
+            
             // Try to parse as Reserve to validate
-            if solend::Reserve::from_account_data(&account.data).is_err() {
-                return Err(anyhow::anyhow!(
-                    "Solend account size mismatch. Found account with size {} bytes that doesn't match expected Reserve layout. \
-                     Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.",
-                    size
-                ));
+            match solend::Reserve::from_account_data(&account.data) {
+                Ok(reserve) => {
+                    log::debug!(
+                        "  ✅ Successfully parsed Reserve: version={}, liquidityMint={}",
+                        reserve.version,
+                        reserve.liquidityMintPubkey
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "  ❌ Failed to parse Reserve account {}: {}",
+                        pubkey,
+                        e
+                    );
+                    log::error!(
+                        "  Account details: size={} bytes, owner={}, lamports={}",
+                        size,
+                        account.owner,
+                        account.lamports
+                    );
+                    
+                    return Err(anyhow::anyhow!(
+                        "Solend account size mismatch. Found account {} with size {} bytes that doesn't match expected Reserve layout.\n\
+                         Error: {}\n\
+                         Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.\n\
+                         \n\
+                         Debug info:\n\
+                         - Account pubkey: {}\n\
+                         - Account size: {} bytes\n\
+                         - Account owner: {}",
+                        pubkey,
+                        size,
+                        e,
+                        pubkey,
+                        size,
+                        account.owner
+                    ));
+                }
             }
+        } else if size > 200 {
+            lending_market_count += 1;
+            log::debug!("  Account appears to be LendingMarket (size={} bytes), skipping validation", size);
+        } else {
+            unknown_count += 1;
+            log::debug!("  Unknown account type (size={} bytes), skipping", size);
         }
     }
 
+    log::info!(
+        "📊 Layout validation summary: {} obligations, {} reserves, {} lending markets, {} unknown",
+        obligation_count,
+        reserve_count,
+        lending_market_count,
+        unknown_count
+    );
+
     if obligation_count == 0 && reserve_count == 0 {
-        log::warn!("Could not identify Solend account types - layout validation skipped");
+        log::warn!("⚠️  Could not identify Solend account types - layout validation skipped");
+        log::warn!("   This may indicate that Solend program accounts are not accessible or layout has changed significantly");
     } else {
         log::info!(
             "✅ Solend layout validation passed (found {} obligations, {} reserves)",
@@ -270,18 +401,41 @@ async fn ensure_required_atas_exist(
     
     // Collect all unique token mints from reserves
     let mut token_mints = std::collections::HashSet::new();
+    let mut reserve_parse_errors = 0;
+    let mut reserve_parse_success = 0;
     
     for (_pubkey, account) in accounts {
-        if let Ok(reserve) = solend::Reserve::from_account_data(&account.data) {
-            // Add liquidity mint (debt tokens)
-            token_mints.insert(reserve.liquidity().mintPubkey);
-            // Note: We don't need collateral mints (cTokens) for liquidation
-            // We only need the actual token mints (liquidity.mintPubkey)
+        // Try to parse as Reserve - be lenient, log errors but continue
+        match solend::Reserve::from_account_data(&account.data) {
+            Ok(reserve) => {
+                reserve_parse_success += 1;
+                // Add liquidity mint (debt tokens)
+                token_mints.insert(reserve.liquidity().mintPubkey);
+                // Note: We don't need collateral mints (cTokens) for liquidation
+                // We only need the actual token mints (liquidity.mintPubkey)
+            }
+            Err(e) => {
+                // Only count as error if account size suggests it might be a Reserve
+                // Reserves are typically 500-600 bytes
+                if account.data.len() > 400 && account.data.len() < 700 {
+                    reserve_parse_errors += 1;
+                    log::debug!("Failed to parse potential Reserve account (size: {} bytes): {}", account.data.len(), e);
+                }
+                // Ignore other account types (Obligations, LendingMarkets, etc.)
+            }
         }
     }
     
+    if reserve_parse_success > 0 {
+        log::info!("Successfully parsed {} reserves, found {} unique token mints", reserve_parse_success, token_mints.len());
+    }
+    
     if token_mints.is_empty() {
-        log::warn!("No reserves found - skipping ATA creation");
+        if reserve_parse_errors > 0 {
+            log::warn!("No reserves found - {} potential reserves failed to parse. This may indicate a layout mismatch.", reserve_parse_errors);
+        } else {
+            log::warn!("No reserves found - skipping ATA creation");
+        }
         return Ok(());
     }
     
@@ -445,6 +599,80 @@ fn load_config() -> Result<AppConfig> {
         jito_tip_account,
         jito_tip_amount_lamports,
     })
+}
+
+/// Resolve wallet path - tries multiple locations to handle different working directories
+fn resolve_wallet_path(relative_path: &str) -> Result<std::path::PathBuf> {
+    use std::env;
+    
+    // 1. Try environment variable first
+    if let Ok(env_path) = env::var("WALLET_PATH") {
+        let path = Path::new(&env_path);
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    
+    // 2. Try relative to current working directory
+    let path = Path::new(relative_path);
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    
+    // 3. Try relative to executable directory
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let path = exe_dir.join(relative_path);
+            if path.exists() {
+                return Ok(path);
+            }
+            // Also try going up one level (for target/debug/ case)
+            if let Some(parent) = exe_dir.parent() {
+                let path = parent.join(relative_path);
+                if path.exists() {
+                    return Ok(path);
+                }
+                // Try going up two levels (for target/debug/liquid-bot case)
+                if let Some(grandparent) = parent.parent() {
+                    let path = grandparent.join(relative_path);
+                    if path.exists() {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+    }
+    
+    // 4. Try absolute path from workspace root (if CARGO_MANIFEST_DIR is set during build)
+    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+        let path = Path::new(&manifest_dir).join(relative_path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    
+    // 5. Try common project root locations
+    let current_dir = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let mut search_dir = current_dir.as_path();
+    
+    // Walk up the directory tree looking for the file
+    for _ in 0..5 {
+        let path = search_dir.join(relative_path);
+        if path.exists() {
+            return Ok(path);
+        }
+        if let Some(parent) = search_dir.parent() {
+            search_dir = parent;
+        } else {
+            break;
+        }
+    }
+    
+    Err(anyhow::anyhow!(
+        "Wallet file not found: {}. Tried:\n  - Current directory: {}\n  - Environment variable WALLET_PATH\n  - Relative to executable\n  - Walking up directory tree",
+        relative_path,
+        current_dir.display()
+    ))
 }
 
 /// Load keypair from file per Structure.md section 6.1

@@ -196,6 +196,8 @@ fn generate_struct_from_layout(
     for field in fields {
         if let Some(field_name) = field.get("name").and_then(|n| n.as_str()) {
             let rust_type = layout_field_to_rust(field, all_types, all_accounts);
+            // Padding fields should NOT be skipped - Borsh needs to read them
+            // to match the exact byte layout from the SDK
             code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
         }
     }

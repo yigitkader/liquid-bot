@@ -24,21 +24,116 @@ impl Obligation {
     /// CRITICAL SECURITY: Validates version field to detect layout changes.
     /// If Solend updates their layout (e.g., v1 -> v2), this will catch it early.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
+        log::trace!("Parsing Obligation from {} bytes of data", data.len());
+        
+        // Log first few bytes for debugging
+        if data.len() >= 32 {
+            let preview: String = data.iter()
+                .take(32)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::trace!("First 32 bytes (hex): {}", preview);
+        }
+        
         // Skip discriminator (first 8 bytes) if present
         let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
+            log::trace!("Skipping 8-byte discriminator (all zeros)");
             &data[8..]
         } else {
+            log::trace!("No discriminator detected, using full data");
             data
         };
         
-        let obligation: Obligation = BorshDeserialize::try_from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Obligation: {}", e))?;
+        log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
+        
+        // CRITICAL: Calculate expected size (1298 bytes for struct, but account may be 1300 with padding)
+        // Struct size: 1 + 9 + 32 + 32 + 16*5 + 1 + 16*2 + 1 + 14 + 1 + 1 + 1096 = 1298 bytes
+        const EXPECTED_STRUCT_SIZE: usize = 1298;
+        
+        // Try deserialization - handle "Not all bytes read" error for padding
+        let obligation: Obligation = match BorshDeserialize::try_from_slice(data) {
+            Ok(obl) => obl,
+            Err(e) => {
+                // If error is "Not all bytes read" and we have exactly 2 extra bytes, try slicing
+                let error_msg = e.to_string();
+                if error_msg.contains("Not all bytes read") && data.len() == EXPECTED_STRUCT_SIZE + 2 {
+                    log::debug!("Borsh reported 'Not all bytes read' with 2 extra bytes - likely padding, trying exact slice");
+                    // Try deserializing only the expected size (ignore last 2 bytes)
+                    match BorshDeserialize::try_from_slice(&data[..EXPECTED_STRUCT_SIZE]) {
+                        Ok(obl) => obl,
+                        Err(e2) => {
+                            log::error!("Borsh deserialization failed even with exact slice: {}", e2);
+                            log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
+                            return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}", e2));
+                        }
+                    }
+                } else {
+                    log::error!("Borsh deserialization failed: {}", e);
+                    log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
+                
+                // Log byte-by-byte analysis for first 200 bytes
+                if data.len() >= 200 {
+                    let hex_preview: String = data.iter()
+                        .take(200)
+                        .enumerate()
+                        .map(|(i, b)| {
+                            if i % 32 == 0 && i > 0 {
+                                format!("\n  [{:04x}]: {:02x}", i, b)
+                            } else {
+                                format!(" {:02x}", b)
+                            }
+                        })
+                        .collect();
+                    log::error!("First 200 bytes (hex, 32-byte groups):\n  [0000]:{}", hex_preview);
+                }
+                
+                // Calculate expected size
+                log::error!("Expected Obligation struct size: {} bytes", EXPECTED_STRUCT_SIZE);
+                log::error!("Actual data size: {} bytes", data.len());
+                
+                if data.len() < EXPECTED_STRUCT_SIZE {
+                    log::error!("Size mismatch! Data is too small (truncated).");
+                } else if data.len() > EXPECTED_STRUCT_SIZE {
+                    log::warn!("Data has {} extra bytes (likely padding/discriminator)", data.len() - EXPECTED_STRUCT_SIZE);
+                }
+                
+                // Try to manually calculate where deserialization might fail
+                let mut offset = 0;
+                offset += 1; // version
+                offset += 9; // lastUpdate
+                offset += 32; // lendingMarket
+                offset += 32; // owner
+                offset += 16 * 5; // 5x u128 (depositedValue, borrowedValue, etc.)
+                offset += 1; // borrowingIsolatedAsset
+                offset += 16 * 2; // 2x u128 (superUnhealthyBorrowValue, unweightedBorrowValue)
+                offset += 1; // closeable
+                log::error!("Expected offset before _padding: {} bytes", offset);
+                log::error!("Actual bytes at offset {}: {:02x} {:02x} {:02x} {:02x}", 
+                    offset, 
+                    data.get(offset).copied().unwrap_or(0),
+                    data.get(offset+1).copied().unwrap_or(0),
+                    data.get(offset+2).copied().unwrap_or(0),
+                    data.get(offset+3).copied().unwrap_or(0)
+                );
+                
+                    return Err(anyhow::anyhow!("Failed to deserialize Obligation: {}. See logs for detailed byte analysis.", e));
+                }
+            }
+        };
+        
+        log::trace!("Successfully deserialized Obligation, version={}", obligation.version);
         
         // CRITICAL: Validate version to detect layout changes
         // Solend Obligation version 1 is the current supported version
         // If Solend updates to v2, this will prevent silent parsing errors
         const EXPECTED_VERSION: u8 = 1;
         if obligation.version != EXPECTED_VERSION {
+            log::error!(
+                "Version mismatch: found version {} but expected {}",
+                obligation.version,
+                EXPECTED_VERSION
+            );
             return Err(anyhow::anyhow!(
                 "Unsupported Obligation version: {} (expected {}). \
                  Layout may have changed, please update bot to support new version.",
@@ -399,21 +494,96 @@ impl Reserve {
     /// CRITICAL SECURITY: Validates version field to detect layout changes.
     /// If Solend updates their layout (e.g., v1 -> v2), this will catch it early.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
+        log::trace!("Parsing Reserve from {} bytes of data", data.len());
+        
+        // Log first few bytes for debugging
+        if data.len() >= 32 {
+            let preview: String = data.iter()
+                .take(32)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::trace!("First 32 bytes (hex): {}", preview);
+        }
+        
         // Skip discriminator (first 8 bytes) if present
         let data = if data.len() > 8 && data[0..8] == [0u8; 8] {
+            log::trace!("Skipping 8-byte discriminator (all zeros)");
             &data[8..]
         } else {
+            log::trace!("No discriminator detected, using full data");
             data
         };
         
-        let reserve: Reserve = BorshDeserialize::try_from_slice(data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Reserve: {}", e))?;
+        log::trace!("Attempting Borsh deserialization of {} bytes", data.len());
+        
+        // CRITICAL: Calculate expected Reserve struct size
+        // Reserve struct: 1 + 9 + 32*8 + 1 + 8*4 + 16*6 + 1*12 + 8*4 + 16*2 + 8*1 + 1*2 + 8*1 = 619 bytes
+        // But actual accounts may have padding, so we'll be lenient with a few extra bytes
+        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 619;
+        
+        let reserve: Reserve = match BorshDeserialize::try_from_slice(data) {
+            Ok(res) => res,
+            Err(e) => {
+                // If error is "Not all bytes read" and we have a few extra bytes, try slicing
+                let error_msg = e.to_string();
+                if error_msg.contains("Not all bytes read") && data.len() >= EXPECTED_RESERVE_STRUCT_SIZE {
+                    let extra_bytes = data.len() - EXPECTED_RESERVE_STRUCT_SIZE;
+                    if extra_bytes <= 8 {
+                        log::debug!("Borsh reported 'Not all bytes read' with {} extra bytes - likely padding, trying exact slice", extra_bytes);
+                        // Try deserializing only the expected size (ignore extra padding bytes)
+                        match BorshDeserialize::try_from_slice(&data[..EXPECTED_RESERVE_STRUCT_SIZE]) {
+                            Ok(res) => res,
+                            Err(e2) => {
+                                log::error!("Borsh deserialization failed even with exact slice: {}", e2);
+                                log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
+                                if data.len() > 0 {
+                                    log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
+                                }
+                                if data.len() > 1 {
+                                    log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                                }
+                                return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e2));
+                            }
+                        }
+                    } else {
+                        log::error!("Borsh deserialization failed: {}", e);
+                        log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct, {} extra bytes)", 
+                            data.len(), EXPECTED_RESERVE_STRUCT_SIZE, extra_bytes);
+                        if data.len() > 0 {
+                            log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
+                        }
+                        if data.len() > 1 {
+                            log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                        }
+                        return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
+                    }
+                } else {
+                    log::error!("Borsh deserialization failed: {}", e);
+                    log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
+                    if data.len() > 0 {
+                        log::error!("First byte: {} (0x{:02x})", data[0], data[0]);
+                    }
+                    if data.len() > 1 {
+                        log::error!("Second byte: {} (0x{:02x})", data[1], data[1]);
+                    }
+                    return Err(anyhow::anyhow!("Failed to deserialize Reserve: {}", e));
+                }
+            }
+        };
+        
+        log::trace!("Successfully deserialized Reserve, version={}", reserve.version);
         
         // CRITICAL: Validate version to detect layout changes
         // Solend Reserve version 1 is the current supported version
         // If Solend updates to v2, this will prevent silent parsing errors
         const EXPECTED_VERSION: u8 = 1;
         if reserve.version != EXPECTED_VERSION {
+            log::error!(
+                "Version mismatch: found version {} but expected {}",
+                reserve.version,
+                EXPECTED_VERSION
+            );
             return Err(anyhow::anyhow!(
                 "Unsupported Reserve version: {} (expected {}). \
                  Layout may have changed, please update bot to support new version.",
