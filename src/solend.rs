@@ -1084,6 +1084,31 @@ pub fn find_usdc_mint_from_reserves(
         log::info!("   RPC URL contains 'testnet': {}", rpc_url.to_lowercase().contains("testnet"));
     }
     
+    // Check if we should skip the full scan (optimization for production)
+    // CRITICAL: Startup optimization for production
+    // Scanning 300k+ accounts takes time and RPC quota. 
+    // If we trust the .env configuration, we can skip this check.
+    let skip_scan = env::var("SKIP_STARTUP_SCAN")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+        
+    if skip_scan {
+        log::info!("🚀 startup optimization: Skipping full chain scan (SKIP_STARTUP_SCAN=true)");
+        log::info!("   Using configured USDC mint: {}", known_usdc_mint);
+        
+        // Verify we can at least fetch the USDC mint account (basic network check)
+        if let Err(e) = rpc.get_account(&known_usdc_mint) {
+            return Err(anyhow::anyhow!(
+                "Network validation failed: Cannot fetch USDC mint {}. \
+                 RPC may be on wrong network or endpoint is down. Error: {}",
+                known_usdc_mint, e
+            ));
+        }
+        log::info!("   ✅ USDC mint account verified on chain");
+        
+        return Ok(known_usdc_mint);
+    }
+    
     // CRITICAL: Read all reserves from chain - no mock/dummy data
     // Add retry mechanism for RPC errors (network issues, rate limits, etc.)
     
@@ -1205,7 +1230,10 @@ pub fn find_usdc_mint_from_reserves(
                     last_error = Some(e);
                     retries -= 1;
                     
-                    let error_msg = last_error.as_ref().unwrap().to_string();
+                    let error_msg = match last_error.as_ref() {
+                        Some(e) => e.to_string(),
+                        None => "Unknown error".to_string(),
+                    };
                     
                     if retries > 0 {
                         // Exponential backoff with initial delay from .env
@@ -1225,7 +1253,7 @@ pub fn find_usdc_mint_from_reserves(
                     } else {
                         // All retries exhausted
                         log::error!("❌ All {} retry attempts failed", max_retries);
-                        break Err(last_error.unwrap());
+                        break Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error during RPC retry")));
                     }
                 }
             }
@@ -1425,15 +1453,28 @@ pub fn find_usdc_mint_from_reserves(
     if susd_found {
         log::warn!("⚠️  USDC not found, but SUSD reserve found!");
         log::warn!("   This program uses SUSD (Save Protocol stablecoin), not USDC");
-        log::warn!("   Bot requires USDC for liquidation operations");
-        if let Some(mint) = susd_mint {
-            return Err(anyhow::anyhow!(
-                "SUSD reserve found but USDC required. \
-                 This program ({}) uses SUSD, not USDC. \
-                 Bot requires USDC reserve for liquidation operations. \
-                 Please use Legacy Solend program: So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
-                program_id
-            ));
+        
+        // Check if SUSD is allowed via .env
+        let allow_susd = env::var("ALLOW_SUSD")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+            
+        if allow_susd {
+            if let Some(mint) = susd_mint {
+                log::info!("✅ SUSD accepted as quote token (ALLOW_SUSD=true)");
+                log::info!("   Using SUSD mint: {}", mint);
+                return Ok(mint);
+            }
+        } else {
+            log::warn!("   Bot default requires USDC. Set ALLOW_SUSD=true in .env to enable SUSD.");
+            if let Some(mint) = susd_mint {
+                return Err(anyhow::anyhow!(
+                    "SUSD reserve found but USDC required. \
+                     This program ({}) uses SUSD, not USDC. \
+                     Set ALLOW_SUSD=true in .env to support this protocol, or use Legacy Solend: So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+                    program_id
+                ));
+            }
         }
     }
     

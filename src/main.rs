@@ -408,52 +408,52 @@ async fn validate_wallet_balances(
     let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
     log::info!("   USDC ATA address: {}", usdc_ata);
 
-    // Check USDC balance
-    log::info!("   Checking USDC token account...");
+    // Check USDC/SUSD balance
+    log::info!("   Checking Quote Token (USDC/SUSD) account...");
+    let mut quote_decimals = 6; // Default to 6 (USDC standard)
+    
     let usdc_balance = match rpc.get_token_account(&usdc_ata) {
         Ok(Some(account)) => {
-            log::info!("   USDC token account found");
-            log::info!("   Token account owner: {}", account.owner);
-            log::info!("   Token account mint: {}", account.mint);
-            log::info!("   Token account decimals: {}", account.token_amount.decimals);
-            log::info!("   Raw token amount: {}", account.token_amount.amount);
-            // Parse token amount from UI account
+            log::info!("   Quote token account found");
+            log::info!("   Mint: {}", account.mint);
+            log::info!("   Decimals: {}", account.token_amount.decimals);
+            quote_decimals = account.token_amount.decimals; // Use actual decimals
             account.token_amount.amount.parse::<u64>().unwrap_or(0)
         }
         Ok(None) => {
-            log::warn!("   USDC token account does not exist (will be created if needed)");
+            log::warn!("   Quote token account does not exist (will be created if needed)");
             0 // ATA doesn't exist
         }
         Err(e) => {
-            log::warn!("   Error getting USDC token account: {} (assuming 0 balance)", e);
+            log::warn!("   Error getting token account: {} (assuming 0 balance)", e);
             0   // Error getting account, assume 0
         }
     };
 
-    let usdc_balance_decimal = usdc_balance as f64 / 1_000_000.0; // USDC has 6 decimals
+    let quote_divisor = 10_u64.pow(quote_decimals as u32) as f64;
+    let usdc_balance_decimal = usdc_balance as f64 / quote_divisor;
     
-    // Minimum USDC for strategy (10 USDC = 10_000_000 with 6 decimals)
-    // This is a reasonable minimum for liquidation operations
-    const MIN_USDC_AMOUNT: u64 = 10_000_000; // 10 USDC
-    let min_usdc_decimal = MIN_USDC_AMOUNT as f64 / 1_000_000.0;
+    // Minimum amount for strategy (10 USD)
+    const MIN_USD_AMOUNT: u64 = 10; 
+    let min_required_raw = MIN_USD_AMOUNT * (quote_divisor as u64);
     
-    log::info!("   USDC balance: {} (raw)", usdc_balance);
-    log::info!("   USDC balance: {:.6} USDC", usdc_balance_decimal);
-    log::info!("   Minimum required: {:.6} USDC", min_usdc_decimal);
+    log::info!("   Balance: {} (raw)", usdc_balance);
+    log::info!("   Balance: {:.2} (decimal)", usdc_balance_decimal);
+    log::info!("   Minimum required: ${:.2}", MIN_USD_AMOUNT as f64);
     
-    if usdc_balance < MIN_USDC_AMOUNT {
-        panic!("Insufficient USDC balance. Required: {} ({:.6} USDC), Available: {} ({:.6} USDC)", 
-            MIN_USDC_AMOUNT,
-            min_usdc_decimal,
-            usdc_balance,
-            usdc_balance_decimal);
+    if usdc_balance < min_required_raw {
+        panic!("Insufficient Quote Token balance. Required: ${} ({}), Available: ${:.2} ({})", 
+            MIN_USD_AMOUNT,
+            min_required_raw,
+            usdc_balance_decimal,
+            usdc_balance);
     }
 
-    log::info!("✅ USDC balance sufficient: {:.6} USDC", usdc_balance_decimal);
+    log::info!("✅ Quote Token balance sufficient: ${:.2}", usdc_balance_decimal);
     
     // Calculate total wallet value
     let total_wallet_value_usd = sol_balance_usd + usdc_balance_decimal;
-    log::info!("💰 Total wallet value: ~${:.2} USD (SOL: ${:.2} + USDC: ${:.2})", 
+    log::info!("💰 Total wallet value: ~${:.2} USD (SOL: ${:.2} + Stable: ${:.2})", 
                total_wallet_value_usd, sol_balance_usd, usdc_balance_decimal);
 
     Ok(())
@@ -478,99 +478,60 @@ async fn ensure_required_atas_exist(
         instruction::create_associated_token_account,
     };
     use spl_token::ID as TOKEN_PROGRAM_ID;
+    use std::env;
     
     log::info!("🔍 Checking required ATAs...");
     
-    // Get all Solend reserves to discover token mints
-    let program_id = solend::solend_program_id()?;
-    let accounts = rpc
-        .get_program_accounts(&program_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
-    
-    // Collect all unique token mints from reserves
+    // OPTIMIZATION: Check if we should skip full scan
+    let skip_scan = env::var("SKIP_STARTUP_SCAN")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+        
     let mut token_mints = std::collections::HashSet::new();
-    let mut reserve_parse_errors = 0;
-    let mut reserve_parse_success = 0;
     
-    for (_pubkey, account) in accounts {
-        // CRITICAL: Pre-filter by account size to avoid parsing non-Reserve accounts
-        // Reserves are typically 500-700 bytes (actual on-chain: ~1300 bytes with padding)
-        // Obligations are ~1300 bytes, LendingMarkets are ~200 bytes
-        let account_size = account.data.len();
+    if skip_scan {
+        log::info!("🚀 Startup optimization: Skipping full ATA check (SKIP_STARTUP_SCAN=true)");
+        log::info!("   Only checking essential ATAs (Quote Token + WSOL)");
+        // We will add essential mints later
+    } else {
+        // Get all Solend reserves to discover token mints
+        let program_id = solend::solend_program_id()?;
+        log::info!("   Scanning all reserves for token mints (this may take a while)...");
+        let accounts = rpc
+            .get_program_accounts(&program_id)
+            .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
         
-        // Skip accounts that are clearly not Reserves
-        if account_size < 400 || account_size > 1500 {
-            // Too small (LendingMarket) or too large (Obligation with extra data)
-            continue;
-        }
+        // Collect all unique token mints from reserves
+        let mut reserve_parse_success = 0;
         
-        // Try to parse as Reserve - be lenient, log errors but continue
-        match solend::Reserve::from_account_data(&account.data) {
-            Ok(reserve) => {
-                reserve_parse_success += 1;
-                // Add liquidity mint (debt tokens)
-                token_mints.insert(reserve.liquidity().mintPubkey);
-                // Note: We don't need collateral mints (cTokens) for liquidation
-                // We only need the actual token mints (liquidity.mintPubkey)
-            }
-            Err(e) => {
-                // Only log if error message suggests it might have been a Reserve
-                // Version mismatch with invalid versions (0, 254, 255) are likely not Reserves
-                let error_msg = e.to_string();
-                if !error_msg.contains("likely not a Reserve") && 
-                   !error_msg.contains("Invalid Reserve version") {
-                    // This might have been a Reserve that failed to parse
-                    if account_size > 400 && account_size < 1500 {
-                        reserve_parse_errors += 1;
-                        if reserve_parse_errors <= 5 {
-                            log::debug!("Failed to parse potential Reserve account (size: {} bytes): {}", account_size, e);
-                        }
-                    }
+        for (_pubkey, account) in accounts {
+            let account_size = account.data.len();
+            if account_size < 400 || account_size > 1500 { continue; }
+            
+            match solend::Reserve::from_account_data(&account.data) {
+                Ok(reserve) => {
+                    reserve_parse_success += 1;
+                    token_mints.insert(reserve.liquidity().mintPubkey);
                 }
-                // Silently ignore other account types (Obligations, LendingMarkets, etc.)
+                Err(_) => {}
             }
         }
+        log::info!("Found {} unique token mints in {} reserves", token_mints.len(), reserve_parse_success);
     }
     
-    if reserve_parse_success > 0 {
-        log::info!("Successfully parsed {} reserves, found {} unique token mints", reserve_parse_success, token_mints.len());
-    }
+    // Always add required mints (Quote Token + WSOL)
+    let program_id = solend::solend_program_id()?;
+    let quote_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)?;
+    token_mints.insert(quote_mint);
     
-    if token_mints.is_empty() {
-        if reserve_parse_errors > 0 {
-            log::warn!("No reserves found - {} potential reserves failed to parse. This may indicate a layout mismatch.", reserve_parse_errors);
-        } else {
-            log::warn!("No reserves found - skipping ATA creation");
-        }
-        return Ok(());
-    }
+    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+    token_mints.insert(wsol_mint);
     
-    log::info!("Found {} unique token mints in Solend reserves", token_mints.len());
+    log::info!("🔍 Checking ATAs for {} tokens...", token_mints.len());
     
-    // CRITICAL OPTIMIZATION: Only check ATAs for tokens actually needed for liquidation
-    // We don't need ATAs for all 277k+ tokens - only for:
-    // 1. USDC (for repaying debt)
-    // 2. WSOL (for Jupiter swaps)
-    // Other token ATAs will be created on-demand during liquidation if needed
-    
-    let mut required_mints = std::collections::HashSet::new();
-    
-    // 1. USDC mint (required for repaying debt)
-    let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)?;
-    required_mints.insert(usdc_mint);
-    log::debug!("USDC mint added to required ATAs: {}", usdc_mint);
-    
-    // 2. WSOL mint (required for Jupiter swaps)
-    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .map_err(|e| anyhow::anyhow!("Invalid WSOL mint address: {}", e))?;
-    required_mints.insert(wsol_mint);
-    log::debug!("WSOL mint added to required ATAs: {}", wsol_mint);
-    
-    log::info!("🔍 Checking ATAs for {} required tokens (USDC + WSOL)...", required_mints.len());
-    
-    // Check and create missing ATAs (only for required tokens)
+    // Check and create missing ATAs
     let mut missing_atas = Vec::new();
-    for token_mint in &required_mints {
+    for token_mint in &token_mints {
         let ata = get_associated_token_address(wallet_pubkey, token_mint);
         if rpc.get_account(&ata).is_err() {
             missing_atas.push((*token_mint, ata));
@@ -584,7 +545,7 @@ async fn ensure_required_atas_exist(
     
     log::info!("📝 Creating {} missing ATAs...", missing_atas.len());
     
-    // Create ATAs in batches (max 5 per transaction to avoid size limits)
+    // Create ATAs in batches
     const BATCH_SIZE: usize = 5;
     for chunk in missing_atas.chunks(BATCH_SIZE) {
         let mut instructions = Vec::new();
@@ -593,41 +554,30 @@ async fn ensure_required_atas_exist(
             log::info!("Creating ATA: {} for token {}", ata, token_mint);
             
             let create_ata_ix = create_associated_token_account(
-                wallet_pubkey,  // payer
-                wallet_pubkey,  // owner
-                token_mint,      // mint
+                wallet_pubkey,
+                wallet_pubkey,
+                token_mint,
                 &TOKEN_PROGRAM_ID,
             );
             instructions.push(create_ata_ix);
         }
         
-        // Build and send transaction
-        let recent_blockhash = rpc
-            .get_latest_blockhash()
-            .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
-        
+        let recent_blockhash = rpc.get_latest_blockhash()?;
         let mut tx = Transaction::new_with_payer(&instructions, Some(wallet_pubkey));
         tx.sign(&[wallet], recent_blockhash);
         
-        // Send transaction
         match rpc.send_and_confirm_transaction(&tx) {
-            Ok(sig) => {
-                log::info!("✅ Successfully created {} ATAs (tx: {})", chunk.len(), sig);
-            }
+            Ok(sig) => log::info!("✅ Created batch of ATAs (tx: {})", sig),
             Err(e) => {
-                // Check if ATA already exists (race condition or already created)
-                if e.to_string().contains("already in use") {
-                    log::debug!("ATA already exists (race condition), continuing...");
-                } else {
+                 if e.to_string().contains("already in use") {
+                    log::debug!("ATA already exists, continuing...");
+                 } else {
                     return Err(anyhow::anyhow!("Failed to create ATAs: {}", e));
-                }
+                 }
             }
         }
         
-        // Small delay between batches to avoid rate limits
-        if chunk.len() == BATCH_SIZE {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     
     log::info!("✅ All required ATAs created successfully");

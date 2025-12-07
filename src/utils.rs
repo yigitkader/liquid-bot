@@ -214,10 +214,10 @@ impl JitoClient {
         sign_transaction(&mut tip_tx, wallet.as_ref())
             .context("Failed to sign Jito tip transaction")?;
 
-        bundle.transactions.insert(0, tip_tx);
+        bundle.transactions.push(tip_tx);
 
         log::debug!(
-            "Jito: Added tip transaction: {} lamports to {}",
+            "Jito: Appended tip transaction: {} lamports to {}",
             bundle.tip_amount,
             bundle.tip_account
         );
@@ -356,14 +356,23 @@ pub async fn send_jito_bundle(
         jito_client.default_tip_amount(),
     );
 
-    jito_client
-        .add_tip_transaction(&mut bundle, wallet, blockhash)
-        .context("Failed to add tip transaction")?;
-
+    // Sign main transaction first
     sign_transaction(&mut tx, wallet.as_ref())
         .context("Failed to sign main transaction")?;
 
+    // Add main transaction to bundle (FIRST)
     bundle.add_transaction(tx);
+
+    // Add tip transaction to bundle (LAST)
+    // CRITICAL: Tip transaction should be the last instruction in the bundle
+    // This ensures that if the main transaction fails (e.g. simulation error),
+    // the tip is NOT paid (since the whole bundle fails atomically).
+    // However, for Jito specifically, bundles are atomic "all or nothing", so order
+    // matters less for atomicity but matters for sequential dependency.
+    // Placing tip last is the standard practice.
+    jito_client
+        .add_tip_transaction(&mut bundle, wallet, blockhash)
+        .context("Failed to add tip transaction")?;
 
     jito_client
         .send_bundle(&bundle)

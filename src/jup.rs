@@ -177,7 +177,11 @@ pub async fn get_jupiter_quote_with_retry(
                 last_error = Some(e);
                 
                 // Check if timeout error
-                let error_msg = last_error.as_ref().unwrap().to_string();
+                let error_msg = match last_error.as_ref() {
+                    Some(e) => e.to_string(),
+                    None => "Unknown error".to_string(),
+                };
+                
                 if error_msg.contains("timeout") || error_msg.contains("timed out") {
                     log::warn!(
                         "⏱️  Jupiter quote timeout on attempt {}/{} ({} second timeout)",
@@ -254,16 +258,18 @@ pub fn get_hop_count(quote: &JupiterQuote) -> u8 {
         .unwrap_or(1)
 }
 
-/// Build Jupiter swap instruction from quote
-/// Returns instruction that swaps input_mint -> output_mint
+/// Build Jupiter swap instructions from quote
+/// Returns a vector of instructions that swap input_mint -> output_mint
+/// Includes setup instructions (ATA creation), swap instruction, and cleanup instruction (WSOL close)
 /// 
 /// CRITICAL: This function calls Jupiter's swap-instructions endpoint to get
-/// the actual swap instruction that can be included in a transaction.
+/// the actual swap instructions that can be included in a transaction.
+/// Returns Vec<Instruction> to support setup and cleanup instructions.
 pub async fn build_jupiter_swap_instruction(
     quote: &JupiterQuote,
     user_pubkey: &Pubkey,
     jupiter_url: &str,
-) -> Result<Instruction> {
+) -> Result<Vec<Instruction>> {
     let swap_url = format!("{}/v6/swap-instructions", jupiter_url);
     
     // Jupiter v6 swap-instructions API expects:
@@ -301,7 +307,6 @@ pub async fn build_jupiter_swap_instruction(
     }
     
     // Jupiter v6 API returns instructions in different formats
-    // Try to parse as the standard format first
     #[derive(Deserialize)]
     struct SwapInstructionsResponse {
         #[serde(rename = "swapInstruction")]
@@ -317,30 +322,49 @@ pub async fn build_jupiter_swap_instruction(
         .await
         .context("Failed to parse Jupiter swap instruction response")?;
     
-    // Get the main swap instruction (base64 encoded)
+    let mut instructions = Vec::new();
+    
+    // 1. Setup Instructions (e.g. create ATAs)
+    if let Some(setup_ixs_b64) = swap_response.setup_instructions {
+        for ix_b64 in setup_ixs_b64 {
+            let ix_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&ix_b64)
+                .context("Failed to decode setup instruction from base64")?;
+            let ix: Instruction = bincode::deserialize(&ix_bytes)
+                .context("Failed to deserialize setup instruction")?;
+            instructions.push(ix);
+        }
+    }
+    
+    // 2. Main Swap Instruction
     let swap_instruction_b64 = swap_response
         .swap_instruction
         .ok_or_else(|| anyhow::anyhow!("Jupiter response missing swapInstruction field"))?;
     
-    // Decode base64 instruction
     use base64::Engine;
     let instruction_bytes = base64::engine::general_purpose::STANDARD
         .decode(&swap_instruction_b64)
         .context("Failed to decode swap instruction from base64")?;
     
-    // Deserialize instruction
-    // CRITICAL: Jupiter returns instructions in a specific format
-    // The instruction bytes might be in a wrapper format, so we need to handle it properly
     let instruction: Instruction = bincode::deserialize(&instruction_bytes)
         .context("Failed to deserialize swap instruction from bytes")?;
+    instructions.push(instruction);
+    
+    // 3. Cleanup Instruction (e.g. close WSOL account)
+    if let Some(cleanup_ix_b64) = swap_response.cleanup_instruction {
+        let ix_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&cleanup_ix_b64)
+            .context("Failed to decode cleanup instruction from base64")?;
+        let ix: Instruction = bincode::deserialize(&ix_bytes)
+            .context("Failed to deserialize cleanup instruction")?;
+        instructions.push(ix);
+    }
     
     log::debug!(
-        "✅ Jupiter swap instruction built: program_id={}, accounts={}, data_len={}",
-        instruction.program_id,
-        instruction.accounts.len(),
-        instruction.data.len()
+        "✅ Jupiter swap instructions built: {} instructions total",
+        instructions.len()
     );
     
-    Ok(instruction)
+    Ok(instructions)
 }
 

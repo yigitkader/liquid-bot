@@ -1508,7 +1508,15 @@ async fn validate_oracles_with_twap(
     // Only apply TWAP protection if Switchboard is NOT available (Pyth-only mode)
     if !borrow_has_switchboard || !deposit_has_switchboard {
         let caches = get_price_caches();
-        let mut caches_guard = caches.write().unwrap();
+        // Replace unwrap() with proper error handling
+        let mut caches_guard = match caches.write() {
+            Ok(guard) => guard,
+            Err(e) => {
+                log::error!("Failed to acquire write lock on price caches: {}", e);
+                // Fail safe - if we can't check oracle safety, assume unsafe
+                return Ok((false, None, None));
+            }
+        };
         
         // Get or create price cache for borrow reserve
         let (_, _, twap_max_age_secs, twap_min_samples, _, twap_anomaly_threshold_pct) = get_oracle_config();
@@ -3729,7 +3737,9 @@ async fn build_liquidation_tx2(
     // ============================================================================
     // After TX1 confirms, we have SOL in wallet's ATA
     // Now we swap it to USDC to complete the liquidation flow
-    let jupiter_swap_ix = crate::jup::build_jupiter_swap_instruction(
+    // CRITICAL: Jupiter returns a vector of instructions (Setup + Swap + Cleanup)
+    // We must include all of them in the transaction to handle ATAs correctly
+    let jupiter_swap_ixs = crate::jup::build_jupiter_swap_instruction(
         &quote.quote,
         &wallet_pubkey,
         &config.jupiter_url,
@@ -3737,21 +3747,26 @@ async fn build_liquidation_tx2(
     .await
     .context("Failed to build Jupiter swap instruction")?;
     
+    // Build instruction list
+    let mut instructions = vec![
+        compute_budget_ix,        // Compute unit limit
+        priority_fee_ix,          // Priority fee
+    ];
+    // Add all Jupiter instructions (setup + swap + cleanup)
+    instructions.extend(jupiter_swap_ixs);
+    
     // Build transaction with fresh blockhash
     let mut tx = Transaction::new_with_payer(
-        &[
-            compute_budget_ix,        // Compute unit limit
-            priority_fee_ix,          // Priority fee
-            jupiter_swap_ix,          // Jupiter Swap (SOL -> USDC)
-        ],
+        &instructions,
         Some(&wallet_pubkey),
     );
     tx.message.recent_blockhash = blockhash;
 
     log::info!(
         "Built TX2 (Jupiter Swap) for obligation {}:\n\
-         - Swap: SOL -> USDC",
-        ctx.obligation_pubkey
+         - Swap: SOL -> USDC ({} instructions)",
+        ctx.obligation_pubkey,
+        instructions.len() - 2 // Subtract compute budget instructions
     );
 
     Ok(tx)
@@ -3949,7 +3964,9 @@ async fn build_flashloan_liquidation_tx(
     // ============================================================================
     // INSTRUCTION 4: Jupiter Swap (SOL -> USDC)
     // ============================================================================
-    let jupiter_swap_ix = crate::jup::build_jupiter_swap_instruction(
+    // CRITICAL: Jupiter returns a vector of instructions (Setup + Swap + Cleanup)
+    // We must include all of them in the transaction to handle ATAs correctly
+    let jupiter_swap_ixs = crate::jup::build_jupiter_swap_instruction(
         &quote.quote,
         &wallet_pubkey,
         &config.jupiter_url,
@@ -4033,31 +4050,41 @@ async fn build_flashloan_liquidation_tx(
     // ============================================================================
     // All instructions in ONE transaction - atomicity guaranteed!
     // CRITICAL: FlashLoan requires explicit repayment instruction (FlashRepayReserveLiquidity)
+    
+    // Build instruction list in correct order
+    let mut instructions = vec![
+        compute_budget_ix,        // Compute unit limit
+        priority_fee_ix,          // Priority fee
+        flashloan_ix,             // 1. FlashBorrow: Borrow USDC (flash)
+        liquidation_ix,           // 2. Liquidate: USDC -> cSOL
+        redeem_ix,                // 3. Redeem: cSOL -> SOL
+    ];
+    
+    // Add Jupiter instructions (Setup + Swap + Cleanup)
+    // CRITICAL: Must be inserted after Redeem (to have SOL) and before Repay (to have USDC)
+    instructions.extend(jupiter_swap_ixs);
+    
+    // Add Repay instruction
+    instructions.push(repay_ix); // 5. FlashRepay: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
+    
     let mut tx = Transaction::new_with_payer(
-        &[
-            compute_budget_ix,        // Compute unit limit
-            priority_fee_ix,          // Priority fee
-            flashloan_ix,             // 1. FlashBorrow: Borrow USDC (flash)
-            liquidation_ix,           // 2. Liquidate: USDC -> cSOL
-            redeem_ix,                 // 3. Redeem: cSOL -> SOL
-            jupiter_swap_ix,           // 4. Jupiter Swap: SOL -> USDC
-            repay_ix,                  // 5. FlashRepay: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
-        ],
+        &instructions,
         Some(&wallet_pubkey),
     );
     tx.message.recent_blockhash = blockhash;
     
-                log::info!(
+    log::info!(
         "Built atomic flashloan liquidation transaction for obligation {}:\n\
          - FlashBorrow: {} USDC (flash)\n\
          - Liquidate: {} debt tokens (USDC -> cSOL)\n\
          - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
-         - Jupiter Swap: SOL -> USDC\n\
+         - Jupiter Swap: SOL -> USDC ({} instructions)\n\
          - FlashRepay: {} USDC (borrowed: {} + fee: {}) (EXPLICIT - REQUIRED!)",
         ctx.obligation_pubkey,
         flashloan_amount,
         quote.debt_to_repay_raw,
         quote.collateral_to_seize_raw,
+        instructions.len() - 5, // Subtract other instructions
         repay_amount,
         flashloan_amount,
         flashloan_fee_amount
