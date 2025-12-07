@@ -821,18 +821,34 @@ impl Reserve {
             data
         };
         
-        // STEP 3: Validate size
-        if data_without_discriminator.len() < EXPECTED_RESERVE_STRUCT_SIZE {
+        // STEP 3: Handle SDK struct size (619 bytes) vs on-chain size (1300 bytes)
+        // CRITICAL FIX: Some RPC methods return only struct data (619 bytes) without padding
+        // On-chain accounts are 1300 bytes with padding, but SDK struct is 619 bytes
+        const SDK_STRUCT_SIZE: usize = 619; // SDK struct size without padding
+        let data_to_parse: Vec<u8> = if data_without_discriminator.len() == SDK_STRUCT_SIZE {
+            // This is SDK struct size - pad to expected size
+            log::debug!(
+                "Reserve account is {} bytes (SDK struct size), padding to {} bytes (on-chain size)",
+                SDK_STRUCT_SIZE,
+                EXPECTED_RESERVE_STRUCT_SIZE
+            );
+            let mut padded = data_without_discriminator.to_vec();
+            padded.resize(EXPECTED_RESERVE_STRUCT_SIZE, 0);
+            padded
+        } else if data_without_discriminator.len() < EXPECTED_RESERVE_STRUCT_SIZE {
             return Err(anyhow::anyhow!(
-                "Reserve data too short: {} bytes (need {} bytes). \
+                "Reserve data too short: {} bytes (need {} bytes or {} bytes for SDK struct). \
                  Account may be corrupted or layout may have changed.",
                 data_without_discriminator.len(),
-                EXPECTED_RESERVE_STRUCT_SIZE
+                EXPECTED_RESERVE_STRUCT_SIZE,
+                SDK_STRUCT_SIZE
             ));
-        }
+        } else {
+            // Account is >= EXPECTED_RESERVE_STRUCT_SIZE bytes - take exactly what we need
+            data_without_discriminator[..EXPECTED_RESERVE_STRUCT_SIZE].to_vec()
+        };
         
-        // STEP 4: Take exactly EXPECTED_RESERVE_STRUCT_SIZE bytes
-        let data_to_parse = &data_without_discriminator[..EXPECTED_RESERVE_STRUCT_SIZE];
+        // STEP 4: Parse the data (now guaranteed to be EXPECTED_RESERVE_STRUCT_SIZE bytes)
         
         // STEP 5: Pre-check version byte (early validation)
         // Reserve version must be 1 (unlike Obligation which can be 0 or 1)
@@ -860,7 +876,7 @@ impl Reserve {
         );
         
         // STEP 6: Parse with Borsh
-        let reserve: Reserve = BorshDeserialize::try_from_slice(data_to_parse)
+        let reserve: Reserve = BorshDeserialize::try_from_slice(&data_to_parse)
             .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
                 log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);

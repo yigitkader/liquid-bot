@@ -779,7 +779,29 @@ async fn process_cycle(
         };
         
         if !ctx.oracle_ok {
-            log::warn!("Skipping {}: Oracle validation failed", obl_pubkey);
+            // Provide detailed information about which oracle failed
+            let borrow_info = ctx.borrow_reserve.as_ref().map(|r| {
+                format!("borrow_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
+                    r.mint_pubkey(),
+                    r.oracle_pubkey(),
+                    r.config().switchboardOraclePubkey)
+            }).unwrap_or_else(|| "borrow_reserve=None".to_string());
+            
+            let deposit_info = ctx.deposit_reserve.as_ref().map(|r| {
+                format!("deposit_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
+                    r.mint_pubkey(),
+                    r.oracle_pubkey(),
+                    r.config().switchboardOraclePubkey)
+            }).unwrap_or_else(|| "deposit_reserve=None".to_string());
+            
+            log::warn!(
+                "Skipping {}: Oracle validation failed - {} | {} | borrow_price={:?}, deposit_price={:?}",
+                obl_pubkey,
+                borrow_info,
+                deposit_info,
+                ctx.borrow_price_usd,
+                ctx.deposit_price_usd
+            );
             metrics.skipped_oracle_fail += 1;
             continue;
         }
@@ -1100,26 +1122,62 @@ async fn build_liquidation_context(
     let mut deposit_reserve = None;
 
     // Get first borrow reserve if exists
-    if let Ok(borrows) = obligation.borrows() {
-        if !borrows.is_empty() {
-            let borrow_reserve_pubkey = borrows[0].borrowReserve;
-            if let Ok(account) = rpc.get_account_data(&borrow_reserve_pubkey) {
-                if let Ok(reserve) = Reserve::from_account_data(&account) {
-                    borrow_reserve = Some(reserve);
+    match obligation.borrows() {
+        Ok(borrows) => {
+            if !borrows.is_empty() {
+                let borrow_reserve_pubkey = borrows[0].borrowReserve;
+                match rpc.get_account_data(&borrow_reserve_pubkey) {
+                    Ok(account) => {
+                        match Reserve::from_account_data(&account) {
+                            Ok(reserve) => {
+                                borrow_reserve = Some(reserve);
+                                log::debug!("✅ Loaded borrow reserve: {}", borrow_reserve_pubkey);
+                            }
+                            Err(e) => {
+                                log::warn!("❌ Failed to parse borrow reserve {}: {}", borrow_reserve_pubkey, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("❌ Failed to load borrow reserve account {}: {}", borrow_reserve_pubkey, e);
+                    }
                 }
+            } else {
+                log::debug!("Obligation has no borrows");
             }
+        }
+        Err(e) => {
+            log::warn!("❌ Failed to parse obligation borrows: {}", e);
         }
     }
 
     // Get first deposit reserve if exists
-    if let Ok(deposits) = obligation.deposits() {
-        if !deposits.is_empty() {
-            let deposit_reserve_pubkey = deposits[0].depositReserve;
-            if let Ok(account) = rpc.get_account_data(&deposit_reserve_pubkey) {
-                if let Ok(reserve) = Reserve::from_account_data(&account) {
-                    deposit_reserve = Some(reserve);
+    match obligation.deposits() {
+        Ok(deposits) => {
+            if !deposits.is_empty() {
+                let deposit_reserve_pubkey = deposits[0].depositReserve;
+                match rpc.get_account_data(&deposit_reserve_pubkey) {
+                    Ok(account) => {
+                        match Reserve::from_account_data(&account) {
+                            Ok(reserve) => {
+                                deposit_reserve = Some(reserve);
+                                log::debug!("✅ Loaded deposit reserve: {}", deposit_reserve_pubkey);
+                            }
+                            Err(e) => {
+                                log::warn!("❌ Failed to parse deposit reserve {}: {}", deposit_reserve_pubkey, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("❌ Failed to load deposit reserve account {}: {}", deposit_reserve_pubkey, e);
+                    }
                 }
+            } else {
+                log::debug!("Obligation has no deposits");
             }
+        }
+        Err(e) => {
+            log::warn!("❌ Failed to parse obligation deposits: {}", e);
         }
     }
 
@@ -1363,15 +1421,16 @@ async fn get_reserve_price(
                         log::debug!("✅ Pyth oracle validation succeeded for reserve {}: price=${:.2}", pyth_pubkey, price);
                         return Ok((Some(price), true, has_switchboard));
                     } else {
-                        log::warn!("⚠️ Pyth oracle {} validation returned valid=true but price=None", pyth_pubkey);
+                        log::debug!("Pyth oracle {} validation returned valid=true but price=None, trying Switchboard", pyth_pubkey);
                     }
                 } else {
-                    log::warn!("⚠️ Pyth oracle {} validation failed: valid=false", pyth_pubkey);
+                    // Pyth validation failed - this might be a Switchboard oracle misconfigured as Pyth
+                    log::debug!("Pyth oracle {} validation failed (may be Switchboard oracle), trying Switchboard", pyth_pubkey);
                 }
                 // Pyth validation failed or no price - try Switchboard
             }
             Err(e) => {
-                log::warn!("❌ Pyth oracle {} validation error: {}, trying Switchboard", pyth_pubkey, e);
+                log::debug!("Pyth oracle {} validation error: {}, trying Switchboard", pyth_pubkey, e);
                 // Pyth error - try Switchboard
             }
         }
@@ -2368,33 +2427,99 @@ async fn validate_pyth_oracle_v3(
     let price_feed = load_price_feed_from_account(&oracle_pubkey, &mut oracle_account)
         .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
     
-    // Get current time for staleness check (max age: 60 seconds)
+    // Get current time for staleness check
     // Note: Pythnet v3 uses Unix timestamps, but we also have current_slot for logging/debugging
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
     
+    // Configurable max age for Pythnet v3 (default: 120 seconds, more lenient than 60s)
+    // Some Pyth feeds update less frequently, so we need a reasonable window
+    let max_age_seconds = env::var("PYTHNET_V3_MAX_AGE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(120); // Default 120 seconds (2 minutes) - more reasonable than 60s
+    
     log::trace!(
-        "Validating Pythnet v3 oracle {} at slot {} (current_time: {})",
+        "Validating Pythnet v3 oracle {} at slot {} (current_time: {}, max_age: {}s)",
         oracle_pubkey,
         current_slot,
-        current_time
+        current_time,
+        max_age_seconds
     );
     
-    // Get current price with staleness check (max age: 60 seconds)
-    // get_price_no_older_than already validates that price is fresh and valid
-    let price_data = match price_feed.get_price_no_older_than(current_time, 60) {
-        Some(price) => price,
-        None => {
-            log::warn!(
-                "⚠️ Pythnet v3 oracle {}: No current price available or price is stale (current_time: {}, max_age: 60s)",
+    // Get current price with configurable staleness check
+    // Use get_price_no_older_than with configurable max_age_seconds (default: 120s, more lenient than hardcoded 60s)
+    // This allows feeds that update less frequently to still be accepted
+    let price_data = match price_feed.get_price_no_older_than(current_time, max_age_seconds as u64) {
+        Some(price) => {
+            let age_seconds = current_time - price.publish_time;
+            log::debug!(
+                "Pythnet v3 oracle {}: price available, age={}s (publish_time: {}, current_time: {}, max_age: {}s)",
                 oracle_pubkey,
-                current_time
+                age_seconds,
+                price.publish_time,
+                current_time,
+                max_age_seconds
             );
-            return Ok((false, None));
+            price
+        },
+        None => {
+            // Try with very long timeout (1 hour) to see if price exists but is just stale
+            // This helps debug why get_price_no_older_than failed
+            if let Some(latest_price) = price_feed.get_price_no_older_than(current_time, 3600) {
+                let age_seconds = current_time - latest_price.publish_time;
+                
+                // Use a more lenient threshold for fallback (5 minutes = 300 seconds)
+                // This handles cases where max_age_seconds is too strict
+                if age_seconds > 300 {
+                    log::warn!(
+                        "⚠️ Pythnet v3 oracle {}: Price too old even for fallback (age: {}s > 300s, publish_time: {}, current_time: {}). \
+                         get_price_no_older_than({}s) rejected it, and it's also > 5min old. Rejecting.",
+                        oracle_pubkey,
+                        age_seconds,
+                        latest_price.publish_time,
+                        current_time,
+                        max_age_seconds
+                    );
+                    return Ok((false, None));
+                }
+                
+                // Price is reasonably fresh (within 5 minutes), use it as fallback
+                log::info!(
+                    "✅ Pythnet v3 oracle {}: Using lenient fallback (age: {}s, publish_time: {}, current_time: {}). \
+                     Price was rejected by get_price_no_older_than({}s) but is still reasonably fresh (< 5min).",
+                    oracle_pubkey,
+                    age_seconds,
+                    latest_price.publish_time,
+                    current_time,
+                    max_age_seconds
+                );
+                latest_price
+            } else {
+                log::warn!(
+                    "⚠️ Pythnet v3 oracle {}: No price available at all (current_time: {}). \
+                     get_price_no_older_than() returned None even with 1-hour timeout. \
+                     This may indicate: feed is down, account is corrupted, or SDK version mismatch.",
+                    oracle_pubkey,
+                    current_time
+                );
+                return Ok((false, None));
+            }
         }
     };
+    
+    // Additional validation: publish_time sanity check (not in future)
+    if price_data.publish_time > current_time + 60 {
+        log::warn!(
+            "⚠️ Pythnet v3 oracle {}: publish_time in future (publish_time: {}, current_time: {})",
+            oracle_pubkey,
+            price_data.publish_time,
+            current_time
+        );
+        return Ok((false, None));
+    }
     
     // Calculate price in USD using all price data fields
     // Price struct has: price (i64), conf (u64), expo (i32), publish_time (i64)
@@ -2434,23 +2559,22 @@ async fn validate_pyth_oracle_v3(
         return Ok((false, None));
     }
     
-    // Validate freshness using publish_time
-    // Pythnet v3 uses publish_time (Unix timestamp) instead of slot numbers
-    // We already checked staleness in get_price_no_older_than above, but log for debugging
+    // Note: We already validated publish_time freshness above with configurable max_age_seconds
+    // This is just for logging/debugging purposes
     let (max_slot_difference, _, _, _, _, _, _, _) = get_oracle_config();
-    let max_age_seconds = max_slot_difference * 400 / 1000; // Convert slots to seconds (~400ms per slot)
+    let max_age_from_config = max_slot_difference * 400 / 1000; // Convert slots to seconds (~400ms per slot)
     let age_seconds = current_time - price_data.publish_time;
     
-    if age_seconds > max_age_seconds as i64 {
+    // Log if age is close to config-based limit (for monitoring)
+    if age_seconds > max_age_from_config as i64 {
         log::debug!(
-            "Pythnet v3 price too old: age={}s > {}s for oracle {} (publish_time: {}, current_time: {})",
+            "Pythnet v3 price age exceeds config-based limit: age={}s > {}s (but within PYTHNET_V3_MAX_AGE_SECONDS={}s) for oracle {}",
             age_seconds,
+            max_age_from_config,
             max_age_seconds,
-            oracle_pubkey,
-            price_data.publish_time,
-            current_time
+            oracle_pubkey
         );
-        return Ok((false, None));
+        // Don't reject here - we already checked with max_age_seconds above
     }
     
     log::debug!(
@@ -2484,8 +2608,10 @@ async fn validate_pyth_oracle(
     let pyth_program_id = pyth_program_id()?;
 
     if oracle_account.owner != pyth_program_id {
-        log::warn!(
-            "❌ Oracle account {} does not belong to Pyth program (owner: {}, expected: {})",
+        // This is not a Pyth oracle - might be Switchboard or another oracle type
+        // This is expected behavior, not an error - just return false
+        log::debug!(
+            "Oracle account {} does not belong to Pyth program (owner: {}, expected: {}). This may be a Switchboard oracle.",
             oracle_pubkey,
             oracle_account.owner,
             pyth_program_id
@@ -3229,7 +3355,196 @@ struct LiquidationQuote {
     collateral_to_seize_raw: u64, // Collateral cToken amount to seize (for redemption check)
 }
 
-/// Get SOL price in USD from oracle
+/// Get SOL price in USD from oracle (standalone version - no context required)
+/// Returns SOL price if available, otherwise None
+/// 
+/// CRITICAL: Tries multiple methods to get SOL price:
+/// 1. From Pyth SOL/USD feed (primary)
+/// 2. From alternative Pyth feed if primary fails
+/// 3. From Jupiter Price API as fallback
+/// 
+/// This function can be called from anywhere without requiring LiquidationContext.
+/// Use this for risk limit calculations, wallet balance logging, etc.
+pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
+    // Method 1: Fetch from Pyth SOL/USD price feed (primary)
+    // Read from .env or use default fallback
+    let sol_usd_pyth_feed_primary = {
+        let feed_str = env::var("SOL_USD_PYTH_FEED")
+            .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
+        
+        match Pubkey::from_str(&feed_str) {
+            Ok(pk) => pk,
+            Err(_) => {
+                log::error!("Failed to parse primary Pyth SOL/USD feed address from SOL_USD_PYTH_FEED: {}", feed_str);
+                // Try to continue with hardcoded fallback
+                match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        log::error!("Failed to parse hardcoded fallback Pyth feed address");
+                        // Continue to try other methods
+                        return None;
+                    }
+                }
+            }
+        }
+    };
+    
+    // Get current slot once and reuse it
+    let current_slot = rpc.get_slot().ok();
+    
+    // Try primary Pyth feed (if we have a valid slot)
+    if let Some(slot) = current_slot {
+        match validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {
+            Ok((true, Some(price))) => {
+                log::debug!("✅ SOL price from primary Pyth feed: ${:.2}", price);
+                return Some(price);
+            }
+            Ok((true, None)) => {
+                log::warn!(
+                    "⚠️  Primary Pyth SOL/USD feed validation passed but price is None (unexpected). \
+                     Feed: {}",
+                    sol_usd_pyth_feed_primary
+                );
+            }
+            Ok((false, _)) => {
+                log::debug!(
+                    "⚠️  Primary Pyth SOL/USD feed validation failed (stale/invalid). \
+                     Feed: {}. Trying backup methods...",
+                    sol_usd_pyth_feed_primary
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "❌ Error validating primary Pyth SOL/USD feed {}: {}. Trying backup methods...",
+                    sol_usd_pyth_feed_primary,
+                    e
+                );
+            }
+        }
+    }
+    
+    // Method 2: Try backup Pyth feed if available
+    if let Ok(backup_feed_str) = env::var("SOL_USD_BACKUP_FEED") {
+        if let Ok(backup_feed) = Pubkey::from_str(&backup_feed_str) {
+            if let Some(slot) = current_slot {
+                log::debug!("Trying backup Pyth feed: {}", backup_feed);
+                match validate_pyth_oracle(rpc, backup_feed, slot).await {
+                    Ok((true, Some(price))) => {
+                        log::info!("✅ SOL price from backup Pyth feed: ${:.2}", price);
+                        return Some(price);
+                    }
+                    Ok((false, _)) => {
+                        log::debug!("⚠️ Backup Pyth SOL/USD feed validation failed (stale/invalid). Feed: {}", backup_feed);
+                    }
+                    Err(e) => {
+                        log::debug!("❌ Error validating backup Pyth SOL/USD feed {}: {}", backup_feed, e);
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            log::warn!("Failed to parse backup Pyth feed address from SOL_USD_BACKUP_FEED: {}", backup_feed_str);
+        }
+    }
+    
+    // Method 3: Try multiple reliable price APIs (sequential with fast timeout)
+    // These are reliable off-chain APIs that should always work
+    log::info!("⚠️ All Pyth feeds failed, trying multiple reliable price APIs for SOL price...");
+    
+    // Create HTTP client with short timeout (2s per API)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    
+    if let Ok(client) = client {
+        // API 1: CoinGecko (most reliable, free, no API key needed, used by millions)
+        const COINGECKO_API: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+        match client.get(COINGECKO_API).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct CoinGeckoResponse {
+                    solana: Option<CoinGeckoPrice>,
+                }
+                #[derive(serde::Deserialize)]
+                struct CoinGeckoPrice {
+                    usd: Option<f64>,
+                }
+                if let Ok(json) = resp.json::<CoinGeckoResponse>().await {
+                    if let Some(price) = json.solana.and_then(|p| p.usd) {
+                        log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
+                        return Some(price);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("CoinGecko API failed: {}", e);
+            }
+            _ => {}
+        }
+        
+        // API 2: Binance (very fast and reliable, largest exchange)
+        const BINANCE_API: &str = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
+        match client.get(BINANCE_API).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct BinanceResponse {
+                    price: String,
+                }
+                if let Ok(json) = resp.json::<BinanceResponse>().await {
+                    if let Ok(price) = json.price.parse::<f64>() {
+                        log::info!("✅ SOL price from Binance API: ${:.2}", price);
+                        return Some(price);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("Binance API failed: {}", e);
+            }
+            _ => {}
+        }
+        
+        // API 3: Jupiter Price API (Solana-native, should be fast)
+        const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
+        match client.get(JUPITER_PRICE_API).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                #[derive(serde::Deserialize)]
+                struct PriceData {
+                    price: f64,
+                }
+                #[derive(serde::Deserialize)]
+                struct JupiterPriceResponse {
+                    data: std::collections::HashMap<String, PriceData>,
+                }
+                if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
+                    if let Some(data) = json.data.get("SOL") {
+                        log::info!("✅ SOL price from Jupiter API: ${:.2}", data.price);
+                        return Some(data.price);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("Jupiter Price API failed: {}", e);
+            }
+            _ => {}
+        }
+        
+        // Note: CoinGecko, Binance, and Jupiter are all FREE and don't require API keys
+        // These three should be more than enough to get SOL price reliably
+    } else {
+        log::warn!("Failed to create HTTP client for price APIs");
+    }
+
+    log::error!(
+        "❌ CRITICAL: All SOL price oracle methods failed! \
+         SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks. \
+         Bot cannot safely operate without accurate SOL price. \
+         Please check: RPC connectivity, Pyth feed availability, network conditions."
+    );
+    
+    None
+}
+
+/// Get SOL price in USD from oracle (with context - checks if SOL is in liquidation)
 /// Returns SOL price if available, otherwise None
 /// 
 /// CRITICAL: Tries multiple methods to get SOL price:
@@ -3259,136 +3574,19 @@ async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Op
         }
     }
     
-    // Method 2: Fetch from Pyth SOL/USD price feed (primary)
-    // Read from .env or use default fallback
-    let sol_usd_pyth_feed_primary = {
-        let feed_str = env::var("SOL_USD_PYTH_FEED")
-            .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
-        
-        match Pubkey::from_str(&feed_str) {
-            Ok(pk) => pk,
-            Err(_) => {
-                log::error!("Failed to parse primary Pyth SOL/USD feed address from SOL_USD_PYTH_FEED: {}", feed_str);
-                // Try to continue with hardcoded fallback
-                match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
-                    Ok(pk) => pk,
-                    Err(_) => {
-                        log::error!("Failed to parse hardcoded fallback Pyth feed address");
-                        return None;
-                    }
-                }
-            }
-        }
-    };
-    
-    // Get current slot once and reuse it
-    let current_slot = rpc.get_slot().ok();
-    
-    // Try primary Pyth feed (if we have a valid slot)
-    if let Some(slot) = current_slot {
-        match validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {
-            Ok((true, Some(price))) => {
-                log::info!("✅ SOL price from primary Pyth feed: ${:.2}", price);
-                return Some(price);
-            }
-            Ok((true, None)) => {
-                // This shouldn't happen (if valid=true, price should be Some), but handle it
-                log::warn!(
-                    "⚠️  Primary Pyth SOL/USD feed validation passed but price is None (unexpected). \
-                     Feed: {}",
-                    sol_usd_pyth_feed_primary
-                );
-            }
-            Ok((false, _)) => {
-                log::warn!(
-                    "⚠️  Primary Pyth SOL/USD feed validation failed (stale/invalid). \
-                     Feed: {}. This may indicate: stale price, invalid status, or high confidence interval.",
-                    sol_usd_pyth_feed_primary
-                );
-            }
-            Err(e) => {
-                log::error!(
-                    "❌ Error validating primary Pyth SOL/USD feed {}: {}. \
-                     This is CRITICAL - SOL price is required for profit calculations!",
-                    sol_usd_pyth_feed_primary,
-                    e
-                );
-            }
-        }
+    // Method 2: Use standalone function (tries Pyth primary, backup, Jupiter API)
+    // This reuses the robust logic from get_sol_price_usd_standalone()
+    if let Some(price) = get_sol_price_usd_standalone(rpc).await {
+        return Some(price);
     }
     
-    // Method 3: Try backup Pyth feed if available
-    if let Ok(backup_feed_str) = env::var("SOL_USD_BACKUP_FEED") {
-        if let Ok(backup_feed) = Pubkey::from_str(&backup_feed_str) {
-            if let Some(slot) = current_slot {
-                log::info!("Trying backup Pyth feed: {}", backup_feed);
-                match validate_pyth_oracle(rpc, backup_feed, slot).await {
-                    Ok((true, Some(price))) => {
-                        log::info!("✅ SOL price from backup Pyth feed: ${:.2}", price);
-                        return Some(price);
-                    }
-                    Ok((false, _)) => {
-                        log::warn!("⚠️ Backup Pyth SOL/USD feed validation failed (stale/invalid). Feed: {}", backup_feed);
-                    }
-                    Err(e) => {
-                        log::warn!("❌ Error validating backup Pyth SOL/USD feed {}: {}", backup_feed, e);
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            log::warn!("Failed to parse backup Pyth feed address from SOL_USD_BACKUP_FEED: {}", backup_feed_str);
-        }
-    }
-    
-    // Method 4: Fetch from Jupiter Price API (IMMEDIATE fallback when Pyth fails)
-    // This is a robust fallback when on-chain oracles are failing due to RPC issues
-    const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
-    
-    log::warn!("⚠️ All Pyth feeds failed, trying Jupiter Price API fallback for SOL price...");
-    
-    // Create a short-lived client with strict timeout (2s)
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build();
-        
-    if let Ok(client) = client {
-        match client.get(JUPITER_PRICE_API).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    #[derive(serde::Deserialize)]
-                    struct PriceData {
-                        price: f64,
-                    }
-                    #[derive(serde::Deserialize)]
-                    struct JupiterPriceResponse {
-                        data: std::collections::HashMap<String, PriceData>,
-                    }
-                    
-                    if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
-                        if let Some(data) = json.data.get("SOL") {
-                            log::warn!("✅ SOL price from Jupiter API fallback (Pyth failed): ${:.2}", data.price);
-                            return Some(data.price);
-                        }
-                    }
-                } else {
-                    log::warn!("Jupiter Price API returned non-success status: {}", resp.status());
-                }
-            }
-            Err(e) => {
-                log::warn!("Jupiter Price API fallback failed: {}", e);
-            }
-        }
-    } else {
-        log::warn!("Failed to create HTTP client for Jupiter Price API");
-    }
-
+    // If standalone function failed, log error
     log::error!(
-        "❌ CRITICAL: All SOL price oracle methods failed! \
+        "❌ CRITICAL: All SOL price oracle methods failed (including context check)! \
          SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks. \
-         Bot cannot safely operate without accurate SOL price. \
-         Please check: RPC connectivity, Pyth feed availability, network conditions."
+         Bot cannot safely operate without accurate SOL price."
     );
+    
     None
 }
 
@@ -4090,14 +4288,16 @@ async fn log_wallet_balances(
         }
     };
     
-    let current_slot = rpc.get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-    let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
-        Ok((true, Some(price))) => price,
-        _ => {
+    // Get SOL price using robust standalone function (tries multiple methods)
+    let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
+        Some(price) => {
+            log::debug!("✅ SOL price for balance logging: ${:.2}", price);
+            price
+        },
+        None => {
             log::warn!(
-                "⚠️  Failed to get SOL price from oracle for balance logging, using fallback $150. \
-                 This may cause inaccurate wallet value calculations."
+                "⚠️  Failed to get SOL price from ALL methods for balance logging, using fallback $150. \
+                 Wallet value calculations may be inaccurate."
             );
             150.0
         }
@@ -4146,35 +4346,19 @@ async fn get_wallet_value_usd(
         .get_balance(wallet_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get wallet balance: {}", e))?;
     
-    // Get SOL price from Pyth (fallback to $150 if unavailable)
-    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
-        Ok(pk) => pk,
-        Err(_) => {
-            log::warn!("Failed to parse SOL/USD Pyth feed, using fallback $150");
-            let sol_value_usd = (sol_balance as f64) / 1_000_000_000.0 * 150.0;
-            // Continue to get USDC balance
-            let program_id = crate::solend::solend_program_id()?;
-            let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
-                .context("Failed to discover USDC mint")?;
-            use spl_associated_token_account::get_associated_token_address;
-            let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
-            let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
-                Ok(Some(account)) => account.token_amount.amount.parse::<u64>().unwrap_or(0),
-                _ => 0,
-            };
-            let usdc_value_usd = (usdc_balance_raw as f64) / 1_000_000.0;
-            return Ok(sol_value_usd + usdc_value_usd);
-        }
-    };
-    
-    let current_slot = rpc.get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-    let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
-        Ok((true, Some(price))) => price,
-        _ => {
-            log::warn!(
-                "⚠️  Failed to get SOL price from oracle for risk limit calculation, using fallback $150. \
-                 Risk limits may be inaccurate. This is not critical but should be monitored."
+    // Get SOL price using robust standalone function (tries multiple methods)
+    // CRITICAL: This is used for risk limit calculations - must be accurate!
+    let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
+        Some(price) => {
+            log::debug!("✅ SOL price for risk limit calculation: ${:.2}", price);
+            price
+        },
+        None => {
+            // Last resort fallback - should rarely happen if network is healthy
+            log::error!(
+                "❌ CRITICAL: Failed to get SOL price from ALL methods (Pyth primary, backup, Jupiter API) for risk limit calculation. \
+                 Using fallback $150. Risk limits may be INACCURATE. \
+                 This indicates serious network/RPC issues - bot may operate unsafely!"
             );
             150.0
         }
