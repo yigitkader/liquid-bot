@@ -470,7 +470,6 @@ async fn ensure_required_atas_exist(
     wallet: &Keypair,
 ) -> Result<()> {
     use solana_sdk::{
-        instruction::Instruction,
         transaction::Transaction,
     };
     use spl_associated_token_account::{

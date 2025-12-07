@@ -1253,7 +1253,9 @@ pub fn find_usdc_mint_from_reserves(
                     } else {
                         // All retries exhausted
                         log::error!("❌ All {} retry attempts failed", max_retries);
-                        break Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error during RPC retry")));
+                        // CRITICAL: Use expect() instead of unwrap() for safety
+                        // We know last_error is Some because we are in the Err branch
+                        break Err(last_error.expect("RPC error guaranteed to exist"));
                     }
                 }
             }

@@ -390,7 +390,6 @@ pub async fn rpc_account_exists_with_retry(
     pubkey: &Pubkey,
     max_retries: u32,
 ) -> bool {
-    use solana_client::client_error::ClientError;
     
     for attempt in 1..=max_retries {
         match rpc.get_account(pubkey) {

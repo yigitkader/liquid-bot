@@ -590,7 +590,7 @@ async fn process_cycle(
     /// Verify bundle status before removing from tracking
     /// This prevents race conditions where we release committed amount for bundles that actually executed
     async fn verify_bundle_status(
-        rpc: &Arc<RpcClient>,
+        _rpc: &Arc<RpcClient>,
         bundle_id: &str,
         jito_client: &JitoClient,
     ) -> BundleStatus {
@@ -800,11 +800,12 @@ async fn process_cycle(
                             let refresh_countdown = REFRESH_INTERVAL.saturating_sub(wallet_balance_tracker.liquidations_since_refresh);
                             
                             log::info!(
-                                "✅ Liquidated {} with profit ${:.2} (FLASHLOAN), estimated_balance=${:.2}, pending_committed=${:.2} (refresh in {} liquidations), cumulative_risk=${:.2}/${:.2} (real-time tracking)",
+                                "✅ Liquidated {} with profit ${:.2} (FLASHLOAN), estimated_balance=${:.2}, pending_committed=${:.2} (real-time: ${:.2}, refresh in {} liquidations), cumulative_risk=${:.2}/${:.2}",
                                 obl_pubkey,
                                 quote.profit_usdc,
                                 wallet_balance_tracker.current_estimated_balance_usd,
                                 wallet_balance_tracker.pending_committed_usd,
+                                current_pending_value,
                                 refresh_countdown,
                                 cumulative_risk_usd,
                                 current_max_position_usd
@@ -1967,7 +1968,40 @@ async fn validate_pyth_oracle(
     let aggregate_status = u64::from_le_bytes(aggregate_status_bytes);
     
     const AGGREGATE_STATUS_TRADING: u64 = 1;
-    if aggregate_status != AGGREGATE_STATUS_TRADING {
+    
+    // CRITICAL: Accept Trading status (1) normally.
+    // RELAXED: Also accept Unknown (0) IF the price is very fresh (within 5 slots ~2 seconds).
+    // This handles cases where Pyth status might flicker or RPC is slightly behind but data is fresh.
+    let is_status_ok = if aggregate_status == AGGREGATE_STATUS_TRADING {
+        true
+    } else if aggregate_status == 0 {
+        // Parse last_slot early for this check
+        let last_slot_bytes: [u8; 8] = oracle_account.data[56..64]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse last_slot"))?;
+        let last_slot = u64::from_le_bytes(last_slot_bytes);
+        let slot_diff = current_slot.saturating_sub(last_slot);
+        
+        if slot_diff <= 5 {
+            log::warn!(
+                "Pyth aggregate status is 0 (Unknown) but price is FRESH (diff={} slots) - ACCEPTING oracle for {}",
+                slot_diff,
+                oracle_pubkey
+            );
+            true
+        } else {
+            log::warn!(
+                "Pyth aggregate status is 0 (Unknown) and stale (diff={} slots) - REJECTING oracle for {}",
+                slot_diff,
+                oracle_pubkey
+            );
+            false
+        }
+    } else {
+        false
+    };
+
+    if !is_status_ok {
         let status_name = match aggregate_status {
             0 => "Unknown",
             1 => "Trading",
@@ -2158,7 +2192,7 @@ async fn validate_pyth_confidence_strict(
     rpc: &Arc<RpcClient>,
     oracle_pubkey: Pubkey,
     price_value: f64,
-    current_slot: u64,
+    _current_slot: u64,
 ) -> Result<bool> {
     let oracle_account = rpc
         .get_account(&oracle_pubkey)
@@ -2310,6 +2344,44 @@ async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Op
     // Alternative: SOL/USD price feed (if different feed exists)
     // Note: For now, we only have one feed, but this structure allows easy addition of alternatives
     
+    // Method 4: Fetch from Jupiter Price API (External fallback - "kesin çalışmalı")
+    // This is a robust fallback when on-chain oracles are failing due to RPC issues
+    const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
+    
+    log::warn!("Trying Jupiter Price API fallback for SOL price...");
+    
+    // Create a short-lived client with strict timeout (2s)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+        
+    if let Ok(client) = client {
+        match client.get(JUPITER_PRICE_API).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    #[derive(serde::Deserialize)]
+                    struct PriceData {
+                        price: f64,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct JupiterPriceResponse {
+                        data: std::collections::HashMap<String, PriceData>,
+                    }
+                    
+                    if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
+                        if let Some(data) = json.data.get("SOL") {
+                            log::info!("✅ SOL price from Jupiter API fallback: ${:.2}", data.price);
+                            return Some(data.price);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Jupiter Price API fallback failed: {}", e);
+            }
+        }
+    }
+
     log::error!(
         "❌ CRITICAL: All SOL price oracle methods failed! \
          SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks. \
@@ -3218,7 +3290,7 @@ async fn build_liquidation_tx1(
     quote: &LiquidationQuote,
     rpc: &Arc<RpcClient>,
     blockhash: solana_sdk::hash::Hash,
-    config: &Config,
+    _config: &Config,
 ) -> Result<Transaction> {
     use solana_sdk::{
         instruction::{AccountMeta, Instruction},
