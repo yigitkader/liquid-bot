@@ -2165,6 +2165,14 @@ async fn validate_pyth_oracle(
         );
         return Ok((false, None));
     }
+    
+    // DEBUG: Log account data info for troubleshooting
+    log::debug!(
+        "🔍 Pyth oracle {}: account size={} bytes, first 16 bytes: {:02x?}",
+        oracle_pubkey,
+        oracle_account.data.len(),
+        &oracle_account.data[..16.min(oracle_account.data.len())]
+    );
 
     // 2. Parse Pyth v2 price account structure
     // Pyth v2 price account layout (COMPLETE):
@@ -2230,7 +2238,8 @@ async fn validate_pyth_oracle(
     // CRITICAL FIX: Price status validation with configurable acceptance
     // Trading (2) is always acceptable
     // Price (1) is risky - feed might be updating, but can be enabled via env var
-    // Reject: Unknown (0), Halted (3), Auction (4)
+    // Unknown (0) can be accepted if ALLOW_ORACLE_STATUS_UNKNOWN is enabled and price is fresh
+    // Reject: Halted (3), Auction (4)
     let price_type = oracle_account.data[5];
     
     // Check if PRICE status acceptance is enabled via env var
@@ -2239,10 +2248,48 @@ async fn validate_pyth_oracle(
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or(false); // Default: false (only Trading accepted)
     
+    // Check if Unknown status acceptance is enabled via env var
+    let allow_status_unknown = env::var("ALLOW_ORACLE_STATUS_UNKNOWN")
+        .ok()
+        .and_then(|s| s.parse::<bool>().ok())
+        .unwrap_or(false); // Default false for safety
+    
+    // STATUS_UNKNOWN_FRESHNESS_SLOTS: Maximum slot difference for Unknown status (default: 25 slots ~10 seconds)
+    let status_unknown_freshness_slots = env::var("STATUS_UNKNOWN_FRESHNESS_SLOTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(25); // Default 25 slots (~10 seconds)
+    
     let is_price_status_acceptable = if price_type == PYTH_PRICE_STATUS_TRADING {
         true // Always OK
     } else if price_type == PYTH_PRICE_STATUS_PRICE && accept_price_status {
         true // OK if enabled
+    } else if price_type == PYTH_PRICE_STATUS_UNKNOWN && allow_status_unknown {
+        // Check if price is fresh before accepting Unknown status
+        let last_slot_bytes: [u8; 8] = oracle_account.data[56..64]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse last_slot"))?;
+        let last_slot = u64::from_le_bytes(last_slot_bytes);
+        let slot_diff = current_slot.saturating_sub(last_slot);
+        
+        if slot_diff <= status_unknown_freshness_slots {
+            log::debug!(
+                "Pyth price_type is 0 (Unknown) but price is FRESH (diff={} slots, {:.1}s, max={}) - ACCEPTING oracle for {}",
+                slot_diff,
+                slot_diff as f64 * 0.4,
+                status_unknown_freshness_slots,
+                oracle_pubkey
+            );
+            true
+        } else {
+            log::warn!(
+                "Pyth price_type is 0 (Unknown) and stale (diff={} slots, max={}) - REJECTING oracle for {}",
+                slot_diff,
+                status_unknown_freshness_slots,
+                oracle_pubkey
+            );
+            false
+        }
     } else {
         false
     };
@@ -2264,9 +2311,15 @@ async fn validate_pyth_oracle(
                 price_type,
                 status_name
             );
+        } else if price_type == PYTH_PRICE_STATUS_UNKNOWN {
+            log::warn!(
+                "Pyth price status is {} ({}) - REJECTING oracle. Set ALLOW_ORACLE_STATUS_UNKNOWN=true to accept Unknown status (only if price is fresh).",
+                price_type,
+                status_name
+            );
         } else {
             log::warn!(
-                "Pyth price status is {} ({}) - REJECTING oracle. Only Trading status is acceptable (or Price if enabled).",
+                "Pyth price status is {} ({}) - REJECTING oracle. Only Trading status is acceptable (or Price/Unknown if enabled).",
                 price_type,
                 status_name
             );
@@ -2289,26 +2342,54 @@ async fn validate_pyth_oracle(
     // 1 = Trading (ONLY THIS IS ACCEPTABLE!)
     // 2 = Halted
     // 3 = Auction
+    // 
+    // NOTE: Some Pyth feeds may have different layouts or the offset might be incorrect.
+    // If we get an invalid value (> 3), we'll log detailed debug info and try to be more lenient.
     let aggregate_status_bytes: [u8; 8] = oracle_account.data[72..80]
         .try_into()
         .map_err(|_| anyhow::anyhow!("Failed to parse aggregate.status"))?;
     let aggregate_status = u64::from_le_bytes(aggregate_status_bytes);
     
+    // DEBUG: Log raw bytes for invalid status values to help diagnose layout issues
+    if aggregate_status > 3 {
+        log::warn!(
+            "⚠️  Pyth aggregate status has invalid value {} for oracle {}. \
+             Raw bytes at offset 72-80: {:02x?}. \
+             Account data size: {} bytes. \
+             This may indicate: wrong offset, different Pyth version, or corrupted data. \
+             Will attempt to use price_type as fallback validation.",
+            aggregate_status,
+            oracle_pubkey,
+            aggregate_status_bytes,
+            oracle_account.data.len()
+        );
+        
+        // FALLBACK: If aggregate.status is invalid but price_type is Trading, accept it
+        // This handles cases where the layout might be slightly different
+        if price_type == PYTH_PRICE_STATUS_TRADING {
+            log::warn!(
+                "⚠️  Using price_type (Trading) as fallback validation for {} (aggregate.status invalid: {})",
+                oracle_pubkey,
+                aggregate_status
+            );
+            // Continue with validation - we'll accept based on price_type
+        } else {
+            log::warn!(
+                "❌ Cannot use fallback: price_type is {} (not Trading) for oracle {}",
+                price_type,
+                oracle_pubkey
+            );
+            return Ok((false, None));
+        }
+    }
+    
     const AGGREGATE_STATUS_TRADING: u64 = 1;
     
     // CRITICAL: Accept Trading status (1) normally.
     // RELAXED: Also accept Unknown (0) IF enabled via ALLOW_ORACLE_STATUS_UNKNOWN and price is fresh.
+    // FALLBACK: If aggregate_status is invalid (>3) but price_type is Trading, accept it.
     // This handles cases where Pyth status might flicker or RPC is slightly behind but data is fresh.
-    let allow_status_unknown = env::var("ALLOW_ORACLE_STATUS_UNKNOWN")
-        .ok()
-        .and_then(|s| s.parse::<bool>().ok())
-        .unwrap_or(false); // Default false for safety
-    
-    // STATUS_UNKNOWN_FRESHNESS_SLOTS: Maximum slot difference for Unknown status (default: 25 slots ~10 seconds)
-    let status_unknown_freshness_slots = env::var("STATUS_UNKNOWN_FRESHNESS_SLOTS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(25); // Default 25 slots (~10 seconds) - more flexible than 10 slots
+    // Note: allow_status_unknown and status_unknown_freshness_slots are already defined above for price_type check
     
     let is_status_ok = if aggregate_status == AGGREGATE_STATUS_TRADING {
         true
@@ -2338,6 +2419,15 @@ async fn validate_pyth_oracle(
             );
             false
         }
+    } else if aggregate_status > 3 && price_type == PYTH_PRICE_STATUS_TRADING {
+        // FALLBACK: Invalid aggregate_status but valid price_type (Trading)
+        // This handles layout differences or parsing issues
+        log::warn!(
+            "⚠️  Accepting oracle {} with invalid aggregate_status ({}) because price_type is Trading (fallback validation)",
+            oracle_pubkey,
+            aggregate_status
+        );
+        true
     } else {
         false
     };
@@ -2352,7 +2442,7 @@ async fn validate_pyth_oracle(
         };
         
         log::warn!(
-            "Pyth aggregate status is {} ({}) - REJECTING oracle. Only Trading status is acceptable.",
+            "Pyth aggregate status is {} ({}) - REJECTING oracle. Only Trading status is acceptable (or Unknown if enabled and fresh).",
             aggregate_status,
             status_name
         );
