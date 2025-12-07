@@ -476,7 +476,7 @@ async fn process_cycle(
             let bundle_ids_to_check: Vec<String> = self.bundles.iter()
                 .filter(|(_, info)| {
                     !info.confirmed && 
-                    now.duration_since(info.last_status_check) >= Duration::from_millis(200)
+                    now.duration_since(info.last_status_check) >= Duration::from_millis(300)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -784,14 +784,14 @@ async fn process_cycle(
                 format!("borrow_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
                     r.mint_pubkey(),
                     r.oracle_pubkey(),
-                    r.config().switchboardOraclePubkey)
+                    r.liquidity().liquiditySwitchboardOracle)
             }).unwrap_or_else(|| "borrow_reserve=None".to_string());
             
             let deposit_info = ctx.deposit_reserve.as_ref().map(|r| {
                 format!("deposit_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
                     r.mint_pubkey(),
                     r.oracle_pubkey(),
-                    r.config().switchboardOraclePubkey)
+                    r.liquidity().liquiditySwitchboardOracle)
             }).unwrap_or_else(|| "deposit_reserve=None".to_string());
             
             log::warn!(
@@ -1402,7 +1402,9 @@ async fn get_reserve_price(
     current_slot: u64,
 ) -> Result<(Option<f64>, bool, bool)> {
     let pyth_pubkey = reserve.oracle_pubkey();
-    let switchboard_pubkey = reserve.config().switchboardOraclePubkey;
+    // ✅ FIXED: Use liquiditySwitchboardOracle (primary Switchboard oracle for liquidity pricing)
+    // instead of config().switchboardOraclePubkey (which uses extraOracle and may be different)
+    let switchboard_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
     
     // Try Pyth first if available
     if pyth_pubkey != Pubkey::default() {
@@ -1463,6 +1465,7 @@ async fn validate_oracles(
     deposit_reserve: &Option<Reserve>,
 ) -> Result<(bool, Option<f64>, Option<f64>)> {
     // ✅ FIXED: Check if reserves exist and have EITHER Pyth OR Switchboard oracle
+    // Use liquiditySwitchboardOracle (primary Switchboard oracle) instead of config().switchboardOraclePubkey
     let borrow_ok = borrow_reserve
         .as_ref()
         .map(|r| {
@@ -1470,8 +1473,8 @@ async fn validate_oracles(
             if r.oracle_pubkey() != Pubkey::default() {
                 return true;
             }
-            // Check if Switchboard oracle exists
-            if r.config().switchboardOraclePubkey != Pubkey::default() {
+            // Check if Switchboard oracle exists (use liquiditySwitchboardOracle)
+            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
                 return true;
             }
             false
@@ -1485,8 +1488,8 @@ async fn validate_oracles(
             if r.oracle_pubkey() != Pubkey::default() {
                 return true;
             }
-            // Check if Switchboard oracle exists
-            if r.config().switchboardOraclePubkey != Pubkey::default() {
+            // Check if Switchboard oracle exists (use liquiditySwitchboardOracle)
+            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
                 return true;
             }
             false
@@ -1814,8 +1817,10 @@ async fn validate_switchboard_oracle_if_available(
     // Use new Switchboard On-Demand SDK (Solana 2.0 compatible)
     use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
     
-    // 1. Get switchboard_oracle_pubkey from reserve.config (DYNAMIC - from chain)
-    let switchboard_oracle_pubkey = reserve.config().switchboardOraclePubkey;
+    // ✅ FIXED: Use liquiditySwitchboardOracle (primary Switchboard oracle for liquidity pricing)
+    // This is the correct field per Problems.md - liquiditySwitchboardOracle is the primary oracle
+    // config().switchboardOraclePubkey uses extraOracle which may be a different oracle
+    let switchboard_oracle_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
     if switchboard_oracle_pubkey == Pubkey::default() {
         // No Switchboard oracle configured for this reserve
         return Ok(None);
@@ -2649,6 +2654,8 @@ async fn validate_pyth_oracle(
     }
     
     // Legacy v2 format (deprecated, but keep for compatibility)
+    // Check account size for v2 format
+    let account_size = oracle_account.data.len();
     if account_size < 84 {
         log::warn!(
             "❌ Oracle account {} data too short: {} bytes (need at least 84 for Pyth v2)",
@@ -3936,14 +3943,24 @@ async fn get_liquidation_quote(
     );
     
     // VERIFICATION: Check if exchange rate is reasonable
-    // Solend exchange rate typically 1.0 - 1.5 range
-    if exchange_rate < 0.8 || exchange_rate > 2.0 {
-        log::warn!(
-            "⚠️  Abnormal cToken exchange rate detected: {:.6}. \
-             This may indicate data corruption or extreme market conditions.",
-            exchange_rate
+    // Solend exchange rate typically 0.9 - 1.5 range (per Problems.md)
+    // Stricter validation to catch edge cases and data corruption
+    if exchange_rate < 0.9 || exchange_rate > 1.5 {
+        log::error!(
+            "❌ Abnormal cToken exchange rate: {:.6}. \
+             Details: available={}, borrowed_wads={}, cumulative_rate={}, \
+             ctokens_supply={}, calculated_borrowed={}",
+            exchange_rate,
+            available_amount,
+            borrowed_amount_wads,
+            cumulative_borrow_rate,
+            ctokens_total_supply,
+            actual_borrowed_raw
         );
-        return Err(anyhow::anyhow!("Abnormal exchange rate: {:.6}", exchange_rate));
+        return Err(anyhow::anyhow!(
+            "Suspicious exchange rate: {:.6} (expected 0.9-1.5)", 
+            exchange_rate
+        ));
     }
     
     // Step 7: Get Jupiter quote with calculated dynamic slippage
