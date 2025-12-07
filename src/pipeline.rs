@@ -86,13 +86,17 @@ pub async fn run_liquidation_loop(
     // Initialize Jito client with tip account from config or env
     // No hardcoded defaults - must be set in .env file
     use std::env;
-    let jito_tip_account_str = config.jito_tip_account.as_deref()
-        .or_else(|| env::var("JITO_TIP_ACCOUNT").ok().as_deref())
-        .ok_or_else(|| anyhow::anyhow!(
+    let jito_tip_account_str = if let Some(tip_account) = config.jito_tip_account.as_deref() {
+        tip_account.to_string()
+    } else if let Ok(tip_account) = env::var("JITO_TIP_ACCOUNT") {
+        tip_account
+    } else {
+        return Err(anyhow::anyhow!(
             "JITO_TIP_ACCOUNT not found in .env file or config. \
              Please set JITO_TIP_ACCOUNT in .env file. \
              Example: JITO_TIP_ACCOUNT=96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"
-        ))?;
+        ));
+    };
     
     // CRITICAL: Validate Jito tip account address format
     // 
@@ -110,7 +114,7 @@ pub async fn run_liquidation_loop(
     //
     // Bot will work even if tip account not found in RPC, but tip account address
     // must be valid for tip transaction to be created successfully.
-    let jito_tip_account = Pubkey::from_str(jito_tip_account_str)
+    let jito_tip_account = Pubkey::from_str(&jito_tip_account_str)
         .context(format!(
             "CRITICAL: Invalid Jito tip account address format: {}. \
              Jito is REQUIRED for bot operation (all transactions sent via Jito bundles). \
@@ -240,8 +244,16 @@ pub async fn run_liquidation_loop(
             }
         }
 
-        // Default poll interval per Structure.md
-        sleep(Duration::from_millis(500)).await;
+        // Poll interval from .env (no hardcoded values)
+        use std::env;
+        let poll_interval_ms = env::var("POLL_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                log::warn!("POLL_INTERVAL_MS not found in .env, using default 500ms");
+                500 // Default 500ms if not set
+            });
+        sleep(Duration::from_millis(poll_interval_ms)).await;
     }
 }
 
@@ -297,8 +309,14 @@ async fn process_cycle(
                 // This looks like an Obligation - try to parse it
                 match Obligation::from_account_data(&acc.data) {
                     Ok(obligation) => {
+                        // Read health factor threshold from .env (no hardcoded values)
+                        let hf_threshold = std::env::var("HF_LIQUIDATION_THRESHOLD")
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(1.0); // Default 1.0 if not set
+                        
                         let hf = obligation.health_factor();
-                        if hf < 1.0 {
+                        if hf < hf_threshold {
                             candidates.push((pk, obligation));
                         }
                     }
@@ -1053,21 +1071,33 @@ const MAX_CONFIDENCE_PCT_PYTH_ONLY: f64 = 2.0; // 2% max confidence interval (Py
 /// Previous 1e-3 was too aggressive and rejected valid micro-cap tokens ($0.0005)
 const MIN_VALID_PRICE_USD: f64 = 1e-6; // $0.000001 minimum (1 micro-dollar) - supports micro-cap tokens
 
-/// Maximum allowed slot difference for oracle price (stale check)
-/// Pyth recommends checking valid_slot, but we also check last_slot as fallback
-/// CRITICAL: Pyth feeds update ~400ms, so 25 slots = ~10 seconds is sufficient
-/// Previous 150 slots (~60s) was too lenient and could accept manipulated prices
-const MAX_SLOT_DIFFERENCE: u64 = 25; // ~10 seconds at 400ms per slot (Pyth recommended)
-
-/// Maximum allowed price deviation between Pyth and Switchboard (as percentage)
-const MAX_ORACLE_DEVIATION_PCT: f64 = 2.0; // 2% max deviation
-
-/// TWAP (Time-Weighted Average Price) configuration for oracle manipulation protection
-/// Used when Switchboard is not available (Pyth-only mode)
-const TWAP_MAX_AGE_SECS: u64 = 30; // 30 second window for TWAP calculation
-const TWAP_MIN_SAMPLES: usize = 5; // Minimum 5 price samples required for TWAP
-const TWAP_MAX_SAMPLES: usize = 50; // Maximum 50 samples for better TWAP accuracy (especially for low-liquidity tokens)
-const TWAP_ANOMALY_THRESHOLD_PCT: f64 = 3.0; // 3% deviation from TWAP triggers anomaly
+/// Get oracle configuration from .env (no hardcoded values)
+fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64) {
+    use std::env;
+    
+    // MAX_ORACLE_AGE_SECONDS: Maximum age of oracle price in seconds
+    let max_oracle_age_secs = env::var("MAX_ORACLE_AGE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120); // Default 120 seconds if not set
+    
+    // Convert to slots (assuming ~400ms per slot)
+    let max_slot_difference = (max_oracle_age_secs * 1000 / 400).max(25); // Minimum 25 slots
+    
+    // MAX_ORACLE_DEVIATION_PCT: Maximum price deviation between Pyth and Switchboard
+    let max_oracle_deviation_pct = env::var("MAX_ORACLE_DEVIATION_PCT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(2.0); // Default 2% if not set
+    
+    // TWAP configuration
+    let twap_max_age_secs = max_oracle_age_secs.min(30); // Use oracle age or 30s, whichever is smaller
+    let twap_min_samples = 5; // Minimum samples for TWAP (fixed for reliability)
+    let twap_max_samples = 50; // Maximum samples for TWAP (fixed for memory efficiency)
+    let twap_anomaly_threshold_pct = 3.0; // 3% deviation from TWAP triggers anomaly (fixed)
+    
+    (max_slot_difference, max_oracle_deviation_pct, twap_max_age_secs, twap_min_samples, twap_max_samples, twap_anomaly_threshold_pct)
+}
 
 /// Oracle price cache for TWAP calculation
 /// Protects against oracle manipulation when only Pyth is available
@@ -1100,7 +1130,8 @@ impl OraclePriceCache {
         // ✅ FIXED: Size-based limit (memory kontrolü)
         // Increased from 20 to 50 samples for better TWAP accuracy on low-liquidity tokens
         // Use while loop to ensure we stay under limit even if multiple samples are added quickly
-        while self.prices.len() > TWAP_MAX_SAMPLES {
+        let (_, _, _, _, twap_max_samples, _) = get_oracle_config();
+        while self.prices.len() > twap_max_samples {
             self.prices.pop_front();
         }
     }
@@ -1315,6 +1346,7 @@ async fn validate_oracles(
     // This mitigates the risk of Pyth oracle manipulation when no cross-validation exists.
     
     // Cross-validate: If we have both Pyth and Switchboard, compare them
+    let (_, max_oracle_deviation_pct, _, _, _, _) = get_oracle_config();
     if borrow_has_pyth && borrow_has_switchboard_for_crossval {
         if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
             if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
@@ -1326,11 +1358,11 @@ async fn validate_oracles(
             {
                 // Compare Pyth and Switchboard prices
                 let deviation_pct = ((borrow_price - switchboard_price).abs() / borrow_price) * 100.0;
-                if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
+                if deviation_pct > max_oracle_deviation_pct {
                     log::warn!(
                         "Oracle deviation too high for borrow reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
                         deviation_pct,
-                        MAX_ORACLE_DEVIATION_PCT,
+                        max_oracle_deviation_pct,
                         borrow_price,
                         switchboard_price
                     );
@@ -1356,11 +1388,11 @@ async fn validate_oracles(
             .await?
             {
                 let deviation_pct = ((deposit_price - switchboard_price).abs() / deposit_price) * 100.0;
-                if deviation_pct > MAX_ORACLE_DEVIATION_PCT {
+                if deviation_pct > max_oracle_deviation_pct {
                     log::warn!(
                         "Oracle deviation too high for deposit reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
                         deviation_pct,
-                        MAX_ORACLE_DEVIATION_PCT,
+                        max_oracle_deviation_pct,
                         deposit_price,
                         switchboard_price
                     );
@@ -1479,18 +1511,19 @@ async fn validate_oracles_with_twap(
         let mut caches_guard = caches.write().unwrap();
         
         // Get or create price cache for borrow reserve
+        let (_, _, twap_max_age_secs, twap_min_samples, _, twap_anomaly_threshold_pct) = get_oracle_config();
         if let (Some(reserve), Some(price)) = (borrow_reserve.as_ref(), borrow_price) {
             if !borrow_has_switchboard {
                 let oracle_pubkey = reserve.oracle_pubkey();
                 let borrow_cache = caches_guard
                     .entry(oracle_pubkey)
-                    .or_insert_with(|| OraclePriceCache::new(TWAP_MAX_AGE_SECS, TWAP_MIN_SAMPLES));
+                    .or_insert_with(|| OraclePriceCache::new(twap_max_age_secs, twap_min_samples));
                 
                 // Add current price to cache
                 borrow_cache.add_price(price);
                 
                 // Check for manipulation
-                if borrow_cache.is_price_anomaly(price, TWAP_ANOMALY_THRESHOLD_PCT) {
+                if borrow_cache.is_price_anomaly(price, twap_anomaly_threshold_pct) {
                     if let Some(twap) = borrow_cache.calculate_twap() {
                         log::warn!(
                             "⚠️  Borrow price anomaly detected! Current: ${:.6}, TWAP: ${:.6}, Deviation: {:.2}%",
@@ -1515,13 +1548,13 @@ async fn validate_oracles_with_twap(
                 let oracle_pubkey = reserve.oracle_pubkey();
                 let deposit_cache = caches_guard
                     .entry(oracle_pubkey)
-                    .or_insert_with(|| OraclePriceCache::new(TWAP_MAX_AGE_SECS, TWAP_MIN_SAMPLES));
+                    .or_insert_with(|| OraclePriceCache::new(twap_max_age_secs, twap_min_samples));
                 
                 // Add current price to cache
                 deposit_cache.add_price(price);
                 
                 // Check for manipulation
-                if deposit_cache.is_price_anomaly(price, TWAP_ANOMALY_THRESHOLD_PCT) {
+                if deposit_cache.is_price_anomaly(price, twap_anomaly_threshold_pct) {
                     if let Some(twap) = deposit_cache.calculate_twap() {
                         log::warn!(
                             "⚠️  Deposit price anomaly detected! Current: ${:.6}, TWAP: ${:.6}, Deviation: {:.2}%",
@@ -2004,14 +2037,15 @@ async fn validate_pyth_oracle(
 
     // PRIMARY CHECK: last_slot based staleness (when price was last updated)
     // This is the most reliable indicator of price freshness
+    let (max_slot_difference, _, _, _, _, _) = get_oracle_config();
     let slot_diff_last = current_slot.saturating_sub(last_slot);
-    if slot_diff_last > MAX_SLOT_DIFFERENCE {
+    if slot_diff_last > max_slot_difference {
         log::debug!(
             "Pyth oracle price too old: last_slot={}, current_slot={}, diff={} > {}",
             last_slot,
             current_slot,
             slot_diff_last,
-            MAX_SLOT_DIFFERENCE
+            max_slot_difference
         );
         return Ok((false, None));
     }
@@ -2628,14 +2662,32 @@ async fn get_liquidation_quote(
     
     // Step 7: Get preliminary Jupiter quote to calculate price impact
     // CRITICAL FIX: Use price impact from Jupiter quote instead of just position size
-    // This accounts for pool liquidity, which is more accurate than position size alone
-    const BASE_SLIPPAGE_BPS: u16 = 30; // 0.3% minimum base slippage for preliminary quote
+    // Read slippage settings from .env (no hardcoded values)
+    use std::env;
+    let base_slippage_bps = env::var("MIN_PROFIT_MARGIN_BPS")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(30); // Default 0.3% if not set
     
+    let buffer_bps = env::var("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(20); // Default 0.2% if not set
+    
+    let max_slippage_bps = env::var("MAX_SLIPPAGE_BPS")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            log::warn!("MAX_SLIPPAGE_BPS not found in .env, using default 300 (3%)");
+            300 // Default 3% if not set
+        });
+    
+    // This accounts for pool liquidity, which is more accurate than position size alone
     let preliminary_quote = get_jupiter_quote_with_retry(
         &collateral_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
         &debt_mint,       // ✅ Debt token (USDC)
         sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
-        BASE_SLIPPAGE_BPS, // Base slippage for preliminary quote
+        base_slippage_bps, // Base slippage for preliminary quote (from .env)
         3, // max_retries
     )
     .await
@@ -2652,11 +2704,9 @@ async fn get_liquidation_quote(
     // 3. Additional buffer for high price impact scenarios
     let price_impact_pct = crate::jup::get_price_impact_pct(&preliminary_quote);
     let price_impact_bps = (price_impact_pct * 100.0) as u16; // Convert percentage to basis points
-    const BUFFER_BPS: u16 = 20; // 0.2% base safety buffer
-    const MAX_SLIPPAGE_BPS: u16 = 300; // 3% maximum slippage
     
-    // Calculate base slippage
-    let mut slippage_bps = BASE_SLIPPAGE_BPS as u32 + price_impact_bps as u32 + BUFFER_BPS as u32;
+    // Calculate base slippage (using values from .env)
+    let mut slippage_bps = base_slippage_bps as u32 + price_impact_bps as u32 + buffer_bps as u32;
     
     // Add trade size multiplier for large trades (proxy for pool depth)
     // Larger trades relative to position size indicate higher slippage risk
@@ -2696,17 +2746,17 @@ async fn get_liquidation_quote(
         );
     }
     
-    // Cap at maximum slippage
-    slippage_bps = slippage_bps.min(MAX_SLIPPAGE_BPS as u32);
+    // Cap at maximum slippage (from .env)
+    slippage_bps = slippage_bps.min(max_slippage_bps as u32);
     let slippage_bps_final = slippage_bps as u16;
     
     log::debug!(
         "Dynamic slippage calculation (ENHANCED): base={}bps + price_impact={}bps ({}%) + buffer={}bps = {}bps base, trade_size_mult={:.2}x, final={}bps ({}%)",
-        BASE_SLIPPAGE_BPS,
+        base_slippage_bps,
         price_impact_bps,
         price_impact_pct,
-        BUFFER_BPS,
-        BASE_SLIPPAGE_BPS as u32 + price_impact_bps as u32 + BUFFER_BPS as u32,
+        buffer_bps,
+        base_slippage_bps as u32 + price_impact_bps as u32 + buffer_bps as u32,
         trade_size_multiplier,
         slippage_bps_final,
         slippage_bps_final as f64 / 100.0
@@ -2814,12 +2864,35 @@ async fn get_liquidation_quote(
     let jito_tip_sol = jito_tip_lamports as f64 / 1_000_000_000.0;
     
     // Single transaction fees (Flashloan approach - all operations in one TX)
-    // Higher compute units needed for flashloan transaction (~500k vs 200k per TX)
-    const TX_BASE_FEE_LAMPORTS: u64 = 5_000; // Base transaction fee
-    const TX_COMPUTE_UNITS: u64 = 500_000; // Higher limit for flashloan (FlashBorrow + Liquidate + Redeem + Swap + FlashRepay)
-    const TX_PRIORITY_FEE_PER_CU: u64 = 1_000; // micro-lamports per compute unit
-    let tx_priority_fee_lamports = (TX_COMPUTE_UNITS * TX_PRIORITY_FEE_PER_CU) / 1_000_000;
-    let tx_total_fee_lamports = TX_BASE_FEE_LAMPORTS + tx_priority_fee_lamports;
+    // Read from .env (no hardcoded values)
+    // Note: std::env already imported above
+    let tx_base_fee_lamports = std::env::var("BASE_TRANSACTION_FEE_LAMPORTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000); // Default 5000 lamports if not set
+    
+    let tx_compute_units = std::env::var("LIQUIDATION_COMPUTE_UNITS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("DEFAULT_COMPUTE_UNITS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(500_000); // Default 500k for flashloan if not set
+    
+    let tx_priority_fee_per_cu = std::env::var("DEFAULT_PRIORITY_FEE_PER_CU")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("PRIORITY_FEE_PER_CU")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(1_000); // Default 1000 micro-lamports per CU if not set
+    
+    let tx_priority_fee_lamports = (tx_compute_units * tx_priority_fee_per_cu) / 1_000_000;
+    let tx_total_fee_lamports = tx_base_fee_lamports + tx_priority_fee_lamports;
     
     // ✅ FIXED: Flashloan fee calculation
     // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)

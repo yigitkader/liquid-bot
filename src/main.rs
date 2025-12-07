@@ -178,7 +178,7 @@ async fn validate_mainnet_connection(rpc: &Arc<RpcClient>) -> Result<()> {
                  This bot only supports mainnet production. \
                  Please verify RPC_URL points to mainnet (https://api.mainnet-beta.solana.com or premium mainnet RPC). \
                  Current RPC_URL may be pointing to devnet/testnet.",
-                MAINNET_USDC_MINT, e
+                usdc_mint_str, e
             ))
         }
     }

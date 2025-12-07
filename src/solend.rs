@@ -874,6 +874,14 @@ impl Reserve {
 
     /// Get liquidation bonus (as f64, 0-1 range)
     pub fn liquidation_bonus(&self) -> f64 {
+        // Allow override from .env if set
+        use std::env;
+        if let Ok(bonus_str) = env::var("LIQUIDATION_BONUS") {
+            if let Ok(bonus) = bonus_str.parse::<f64>() {
+                return bonus; // Use .env value if valid
+            }
+        }
+        // Otherwise use chain value
         self.liquidationBonus as f64 / 100.0
     }
 
@@ -889,6 +897,16 @@ impl Reserve {
     /// 
     /// Returns: Close factor as f64 (e.g., 0.5 = 50%)
     pub fn close_factor(&self) -> f64 {
+        // Allow override from .env if set
+        use std::env;
+        if let Ok(cf_str) = env::var("CLOSE_FACTOR") {
+            if let Ok(cf) = cf_str.parse::<f64>() {
+                if cf > 0.0 && cf <= 1.0 {
+                    return cf; // Use .env value if valid (0-1 range)
+                }
+            }
+        }
+        
         // TODO: When Solend adds closeFactor to ReserveConfig, uncomment this:
         // let config = self.config();
         // if let Some(cf) = config.closeFactor {
@@ -1087,19 +1105,20 @@ pub fn find_usdc_mint_from_reserves(
             // Use USDC_MINT from env for network verification
             if let Ok(usdc_mint_str) = env::var("USDC_MINT") {
                 if let Ok(test_account) = Pubkey::from_str(&usdc_mint_str) {
-                match rpc.get_account(&test_account) {
-                    Ok(usdc_account) => {
-                        diagnostic.push_str("✅ Network verification: USDC mint found - RPC is on mainnet\n");
-                        diagnostic.push_str(&format!("   USDC account owner: {}\n", usdc_account.owner));
-                        diagnostic.push_str("❌ But Solend program not found - possible causes:\n");
-                        diagnostic.push_str("   1. Program ID may be incorrect\n");
-                        diagnostic.push_str("   2. Helius RPC API key may be invalid or rate-limited\n");
-                        diagnostic.push_str("   3. Helius RPC URL format may be incorrect\n");
-                        diagnostic.push_str("   4. Program may have been closed or moved\n");
-                    }
-                    Err(usdc_err) => {
-                        diagnostic.push_str(&format!("❌ Network verification: USDC mint not found: {}\n", usdc_err));
-                        diagnostic.push_str("   This indicates RPC may be on wrong network or RPC endpoint is broken\n");
+                    match rpc.get_account(&test_account) {
+                        Ok(usdc_account) => {
+                            diagnostic.push_str("✅ Network verification: USDC mint found - RPC is on mainnet\n");
+                            diagnostic.push_str(&format!("   USDC account owner: {}\n", usdc_account.owner));
+                            diagnostic.push_str("❌ But Solend program not found - possible causes:\n");
+                            diagnostic.push_str("   1. Program ID may be incorrect\n");
+                            diagnostic.push_str("   2. Helius RPC API key may be invalid or rate-limited\n");
+                            diagnostic.push_str("   3. Helius RPC URL format may be incorrect\n");
+                            diagnostic.push_str("   4. Program may have been closed or moved\n");
+                        }
+                        Err(usdc_err) => {
+                            diagnostic.push_str(&format!("❌ Network verification: USDC mint not found: {}\n", usdc_err));
+                            diagnostic.push_str("   This indicates RPC may be on wrong network or RPC endpoint is broken\n");
+                        }
                     }
                 }
             }
@@ -1129,8 +1148,15 @@ pub fn find_usdc_mint_from_reserves(
     
     log::info!("🔍 Fetching Solend program accounts from RPC (this may take a moment for ~300k accounts)...");
     let accounts = {
-        const MAX_RETRIES: u32 = 5;
-        let mut retries = MAX_RETRIES;
+        // Read MAX_RETRIES from .env (no hardcoded values)
+        let max_retries = env::var("MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or_else(|| {
+                log::warn!("MAX_RETRIES not found in .env, using default 5");
+                5 // Default 5 retries if not set
+            });
+        let mut retries = max_retries;
         let mut last_error = None;
         
         loop {
@@ -1146,8 +1172,12 @@ pub fn find_usdc_mint_from_reserves(
                     let error_msg = last_error.as_ref().unwrap().to_string();
                     
                     if retries > 0 {
-                        // Exponential backoff: 2s, 4s, 8s, 16s, 32s
-                        let delay_secs = 2_u64.pow(MAX_RETRIES - retries);
+                        // Exponential backoff with initial delay from .env
+                        let initial_delay_ms = env::var("INITIAL_RETRY_DELAY_MS")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(1000); // Default 1 second
+                        let delay_secs = (initial_delay_ms / 1000) * 2_u64.pow(max_retries - retries);
                         log::warn!(
                             "⚠️  RPC error getting program accounts (retries left: {}): {}",
                             retries,
@@ -1158,7 +1188,7 @@ pub fn find_usdc_mint_from_reserves(
                         continue;
                     } else {
                         // All retries exhausted
-                        log::error!("❌ All {} retry attempts failed", MAX_RETRIES);
+                        log::error!("❌ All {} retry attempts failed", max_retries);
                         break Err(last_error.unwrap());
                     }
                 }
@@ -1430,7 +1460,7 @@ pub fn find_usdc_mint_from_reserves(
     
     // Add protocol-specific recommendations
     if is_save_protocol {
-        error_msg.push_str(
+        error_msg.push_str(&format!(
             "\n\
          ⚠️  PROGRAM ID ANALYSIS:\n\
          - You are using Save Protocol (SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh)\n\
@@ -1442,7 +1472,7 @@ pub fn find_usdc_mint_from_reserves(
          - Legacy Solend has USDC reserve\n\
          - Set in .env: SOLEND_PROGRAM_ID=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo\n",
             if susd_found { "FOUND" } else { "NOT FOUND" }
-        );
+        ));
     } else if is_legacy_solend {
         error_msg.push_str(
             "\n\
@@ -1457,13 +1487,13 @@ pub fn find_usdc_mint_from_reserves(
          3. USDC reserve may have been removed\n",
         );
     } else {
-        error_msg.push_str(
+        error_msg.push_str(&format!(
             "\n\
          ⚠️  PROGRAM ID ANALYSIS:\n\
          - Unknown program ID: {}\n\
          - Verify this is a valid Solend/Save program\n",
             program_id
-        );
+        ));
     }
     
     error_msg.push_str(&format!(
