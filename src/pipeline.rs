@@ -2104,10 +2104,157 @@ async fn validate_switchboard_oracle_if_available(
             return Ok(None);
         }
         
+        // CRITICAL: Parse and use additional Switchboard v2 fields for enhanced validation
+        // These fields are available but were not being used - now we use them properly
+        
+        // Parse timestamp (offset 64-72) - Unix timestamp when aggregator was last updated
+        let timestamp_bytes: [u8; 8] = oracle_account.data[64..72]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse timestamp"))?;
+        let timestamp = i64::from_le_bytes(timestamp_bytes);
+        
+        // Parse round_id (offset 72-80) - current round ID
+        let round_id_bytes: [u8; 8] = oracle_account.data[72..80]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse round_id"))?;
+        let round_id = u64::from_le_bytes(round_id_bytes);
+        
+        // Validate timestamp for staleness
+        if timestamp > 0 {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let timestamp_age_seconds = current_time - timestamp;
+            let max_age_seconds = 60; // 60 seconds max age for Switchboard v2
+            
+            if timestamp_age_seconds > max_age_seconds {
+                log::debug!(
+                    "Switchboard v2 oracle timestamp too old: timestamp={}, current_time={}, age={}s > {}s for oracle {}",
+                    timestamp,
+                    current_time,
+                    timestamp_age_seconds,
+                    max_age_seconds,
+                    switchboard_oracle_pubkey
+                );
+                return Ok(None);
+            }
+            
+            // Validate timestamp is reasonable (not in future)
+            if timestamp > current_time + 60 {
+                log::debug!(
+                    "Switchboard v2 oracle timestamp in future: timestamp={}, current_time={} for oracle {}",
+                    timestamp,
+                    current_time,
+                    switchboard_oracle_pubkey
+                );
+                return Ok(None);
+            }
+        }
+        
+        // Parse latest_round fields (offset 80+)
+        // latest_round structure:
+        // - num_success (u32, 4 bytes) at offset 80
+        // - num_error (u32, 4 bytes) at offset 84
+        // - round_open_slot (u64, 8 bytes) at offset 88
+        // - round_open_timestamp (i64, 8 bytes) at offset 96
+        // - result (SwitchboardDecimal, 20 bytes) at offset 104
+        const LATEST_ROUND_OFFSET: usize = 80;
+        if oracle_account.data.len() < LATEST_ROUND_OFFSET + 124 {
+            log::error!(
+                "❌ Switchboard v2 account {} too small for latest_round fields: {} bytes",
+                switchboard_oracle_pubkey,
+                oracle_account.data.len()
+            );
+            return Ok(None);
+        }
+        
+        // Parse num_success and num_error for quorum validation
+        let num_success_bytes: [u8; 4] = oracle_account.data[LATEST_ROUND_OFFSET..LATEST_ROUND_OFFSET + 4]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse num_success"))?;
+        let num_success = u32::from_le_bytes(num_success_bytes);
+        
+        let num_error_bytes: [u8; 4] = oracle_account.data[LATEST_ROUND_OFFSET + 4..LATEST_ROUND_OFFSET + 8]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse num_error"))?;
+        let num_error = u32::from_le_bytes(num_error_bytes);
+        
+        // Validate quorum: need at least some successful updates
+        const MIN_SUCCESS_COUNT: u32 = 1;
+        if num_success < MIN_SUCCESS_COUNT {
+            log::debug!(
+                "Switchboard v2 oracle {} has insufficient successful updates: num_success={}, num_error={}",
+                switchboard_oracle_pubkey,
+                num_success,
+                num_error
+            );
+            return Ok(None);
+        }
+        
+        // Parse round_open_slot for staleness check
+        let round_open_slot_bytes: [u8; 8] = oracle_account.data[LATEST_ROUND_OFFSET + 8..LATEST_ROUND_OFFSET + 16]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse round_open_slot"))?;
+        let round_open_slot = u64::from_le_bytes(round_open_slot_bytes);
+        
+        // Parse round_open_timestamp for additional validation
+        let round_open_timestamp_bytes: [u8; 8] = oracle_account.data[LATEST_ROUND_OFFSET + 16..LATEST_ROUND_OFFSET + 24]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse round_open_timestamp"))?;
+        let round_open_timestamp = i64::from_le_bytes(round_open_timestamp_bytes);
+        
+        // Validate round_open_timestamp is reasonable (not in future, not too old)
+        if round_open_timestamp > 0 {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let timestamp_age_seconds = current_time - round_open_timestamp;
+            let max_age_seconds = 60; // 60 seconds max age
+            
+            if timestamp_age_seconds > max_age_seconds {
+                log::debug!(
+                    "Switchboard v2 oracle round_open_timestamp too old: timestamp={}, current_time={}, age={}s > {}s for oracle {}",
+                    round_open_timestamp,
+                    current_time,
+                    timestamp_age_seconds,
+                    max_age_seconds,
+                    switchboard_oracle_pubkey
+                );
+                return Ok(None);
+            }
+            
+            if round_open_timestamp > current_time + 60 {
+                log::debug!(
+                    "Switchboard v2 oracle round_open_timestamp in future: timestamp={}, current_time={} for oracle {}",
+                    round_open_timestamp,
+                    current_time,
+                    switchboard_oracle_pubkey
+                );
+                return Ok(None);
+            }
+        }
+        
+        // Validate round_open_slot staleness
+        let (max_slot_difference, _, _, _, _, _, _, _) = get_oracle_config();
+        let slot_diff = current_slot.saturating_sub(round_open_slot);
+        if slot_diff > max_slot_difference {
+            log::debug!(
+                "Switchboard v2 oracle round too old: round_open_slot={}, current_slot={}, diff={} > {} for oracle {}",
+                round_open_slot,
+                current_slot,
+                slot_diff,
+                max_slot_difference,
+                switchboard_oracle_pubkey
+            );
+            return Ok(None);
+        }
+        
         // Parse latest_round.result (SwitchboardDecimal)
-        // Result is at offset ~152 (80 + 72 for latest_round fields)
+        // Result is at offset 104 (80 + 24 for latest_round fields before result)
         // SwitchboardDecimal: mantissa (i128, 16 bytes) + scale (u32, 4 bytes) = 20 bytes
-        const RESULT_OFFSET: usize = 152;
+        const RESULT_OFFSET: usize = LATEST_ROUND_OFFSET + 24; // 104
         if oracle_account.data.len() < RESULT_OFFSET + 20 {
             log::error!(
                 "❌ Switchboard v2 account {} too small for result field: {} bytes",
@@ -2128,6 +2275,16 @@ async fn validate_switchboard_oracle_if_available(
             .try_into()
             .map_err(|_| anyhow::anyhow!("Failed to parse scale"))?;
         let scale = u32::from_le_bytes(scale_bytes);
+        
+        log::debug!(
+            "Switchboard v2 oracle {} validation: round_id={}, num_success={}, num_error={}, round_open_slot={}, timestamp={}",
+            switchboard_oracle_pubkey,
+            round_id,
+            num_success,
+            num_error,
+            round_open_slot,
+            timestamp
+        );
         
         // Validate scale (reasonable range: 0-18 for token decimals)
         if scale > 18 {
@@ -2212,10 +2369,18 @@ async fn validate_pyth_oracle_v3(
         .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
     
     // Get current time for staleness check (max age: 60 seconds)
+    // Note: Pythnet v3 uses Unix timestamps, but we also have current_slot for logging/debugging
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    
+    log::trace!(
+        "Validating Pythnet v3 oracle {} at slot {} (current_time: {})",
+        oracle_pubkey,
+        current_slot,
+        current_time
+    );
     
     // Get current price with staleness check (max age: 60 seconds)
     // get_price_no_older_than already validates that price is fresh and valid
@@ -2715,6 +2880,7 @@ async fn validate_pyth_oracle(
     }
     
     let price = Some(price_raw as f64 * price_multiplier);
+    let price_value = price.ok_or_else(|| anyhow::anyhow!("Price calculation failed"))?;
 
     // 3. Check if price is stale (last_slot and valid_slot check)
     // CRITICAL FIX: last_slot is the PRIMARY staleness check (when price was last updated)
@@ -2770,8 +2936,119 @@ async fn validate_pyth_oracle(
         slot_diff_valid
     );
 
+    // CRITICAL: Parse and use additional Pyth v2 fields for enhanced validation
+    // These fields are available but were not being used - now we use them properly
+    
+    // Parse timestamp (offset 24-32) - Unix timestamp when price was published
+    let timestamp_bytes: [u8; 8] = oracle_account.data[24..32]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse timestamp"))?;
+    let timestamp = i64::from_le_bytes(timestamp_bytes);
+    
+    // Parse prev_publish_time (offset 32-40) - previous publish timestamp
+    let prev_publish_time_bytes: [u8; 8] = oracle_account.data[32..40]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse prev_publish_time"))?;
+    let prev_publish_time = i64::from_le_bytes(prev_publish_time_bytes);
+    
+    // Parse prev_price (offset 40-48) - previous price for change detection
+    let prev_price_bytes: [u8; 8] = oracle_account.data[40..48]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse prev_price"))?;
+    let prev_price_raw = i64::from_le_bytes(prev_price_bytes);
+    
+    // Validate timestamp field - use for additional staleness check
+    // Convert timestamp to approximate slot (Unix timestamp / 400ms per slot)
+    if timestamp > 0 {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let timestamp_age_seconds = current_time - timestamp;
+        let max_age_seconds = max_slot_difference * 400 / 1000; // Convert slots to seconds
+        
+        if timestamp_age_seconds > max_age_seconds as i64 {
+            log::debug!(
+                "Pyth oracle timestamp too old: timestamp={}, current_time={}, age={}s > {}s for oracle {}",
+                timestamp,
+                current_time,
+                timestamp_age_seconds,
+                max_age_seconds,
+                oracle_pubkey
+            );
+            return Ok((false, None));
+        }
+        
+        // Validate timestamp is reasonable (not in future, not too old)
+        if timestamp > current_time + 60 {
+            log::debug!(
+                "Pyth oracle timestamp in future: timestamp={}, current_time={} for oracle {}",
+                timestamp,
+                current_time,
+                oracle_pubkey
+            );
+            return Ok((false, None));
+        }
+    }
+    
+    // Validate prev_publish_time is reasonable (should be <= current timestamp)
+    if prev_publish_time > 0 && timestamp > 0 && prev_publish_time > timestamp {
+        log::debug!(
+            "Pyth oracle prev_publish_time > timestamp: prev={}, current={} for oracle {}",
+            prev_publish_time,
+            timestamp,
+            oracle_pubkey
+        );
+        // Don't reject, but log for monitoring
+    }
+    
+    // Price change detection using prev_price - detect sudden jumps (potential manipulation)
+    if prev_price_raw != 0 && prev_price_raw != i64::MAX && prev_price_raw != i64::MIN {
+        let prev_price_value = (prev_price_raw as f64) * 10_f64.powi(exponent);
+        
+        if prev_price_value.abs() >= MIN_VALID_PRICE_USD && prev_price_value.is_finite() && price_value.abs() >= MIN_VALID_PRICE_USD {
+            let price_change_pct = ((price_value - prev_price_value).abs() / prev_price_value.abs()) * 100.0;
+            
+            // Configurable threshold for price change detection (default: 10% sudden change)
+            let max_price_change_pct = env::var("PYTH_MAX_PRICE_CHANGE_PCT")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(10.0); // Default 10% max change
+            
+            if price_change_pct > max_price_change_pct {
+                log::warn!(
+                    "⚠️ Pyth oracle {} detected large price change: {:.2}% (prev: {}, current: {}, threshold: {:.2}%)",
+                    oracle_pubkey,
+                    price_change_pct,
+                    prev_price_value,
+                    price_value,
+                    max_price_change_pct
+                );
+                // Don't reject by default, but log warning for monitoring
+                // Can be made strict by setting PYTH_REJECT_LARGE_PRICE_CHANGE=true
+                let reject_large_change = env::var("PYTH_REJECT_LARGE_PRICE_CHANGE")
+                    .ok()
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false);
+                
+                if reject_large_change {
+                    log::warn!("Rejecting oracle due to large price change (PYTH_REJECT_LARGE_PRICE_CHANGE=true)");
+                    return Ok((false, None));
+                }
+            } else {
+                log::trace!(
+                    "Pyth oracle {} price change: {:.2}% (prev: {}, current: {})",
+                    oracle_pubkey,
+                    price_change_pct,
+                    prev_price_value,
+                    price_value
+                );
+            }
+        }
+    }
+
     // 4. Check confidence interval
-    let price_value = price.ok_or_else(|| anyhow::anyhow!("Price not parsed"))?;
+    // price_value is already defined above
     
     // CRITICAL: Check minimum price threshold and finite check to prevent division by zero and floating point issues
     // Edge case: price_value = 1e-100 → price_value.abs() > 0.0 check passes, but
