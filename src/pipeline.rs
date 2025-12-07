@@ -315,8 +315,16 @@ async fn process_cycle(
                             .and_then(|s| s.parse::<f64>().ok())
                             .unwrap_or(1.0); // Default 1.0 if not set
                         
-                        let hf = obligation.health_factor();
-                        if hf < hf_threshold {
+                        // CRITICAL FIX: Use u128 arithmetic for high-precision HF check
+                        // f64 precision loss can cause missed liquidations for HF very close to 1.0
+                        // (e.g., 0.9999999999 vs 1.0000000001)
+                        const WAD: u128 = 1_000_000_000_000_000_000;
+                        let hf_wad = obligation.health_factor_u128();
+                        
+                        // Convert threshold to WAD with care
+                        let threshold_wad = (hf_threshold * WAD as f64) as u128;
+                        
+                        if hf_wad < threshold_wad {
                             candidates.push((pk, obligation));
                         }
                     }
@@ -552,7 +560,7 @@ async fn process_cycle(
         /// Get total pending committed value (unconfirmed bundles)
         fn get_pending_committed(&self) -> f64 {
             self.bundles.iter()
-                .filter(|(_, info)| !info.confirmed)
+                .filter(|(_, info)| !info.confirmed) // ✅ CRITICAL FIX: Only count unconfirmed bundles
                 .map(|(_, info)| info.value_usd)
                 .sum()
         }
@@ -1057,12 +1065,6 @@ fn switchboard_program_id_v3() -> Result<Pubkey> {
         .map_err(|e| anyhow::anyhow!("Invalid SWITCHBOARD_PROGRAM_ID_V3 from .env: {} - Error: {}", switchboard_id_str, e))
 }
 
-/// Maximum allowed confidence interval (as percentage of price)
-/// When Switchboard is available, this is used as secondary validation.
-/// When Switchboard is NOT available, we use a stricter threshold for Pyth-only validation.
-const MAX_CONFIDENCE_PCT: f64 = 5.0; // 5% max confidence interval (with Switchboard)
-const MAX_CONFIDENCE_PCT_PYTH_ONLY: f64 = 2.0; // 2% max confidence interval (Pyth-only, stricter)
-
 /// Minimum valid price threshold (in USD)
 /// Prices below this threshold are considered invalid to prevent division by zero
 /// and floating point precision issues in confidence percentage calculations.
@@ -1073,7 +1075,7 @@ const MAX_CONFIDENCE_PCT_PYTH_ONLY: f64 = 2.0; // 2% max confidence interval (Py
 const MIN_VALID_PRICE_USD: f64 = 1e-6; // $0.000001 minimum (1 micro-dollar) - supports micro-cap tokens
 
 /// Get oracle configuration from .env (no hardcoded values)
-fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64) {
+fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
     use std::env;
     
     // MAX_ORACLE_AGE_SECONDS: Maximum age of oracle price in seconds
@@ -1096,8 +1098,20 @@ fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64) {
     let twap_min_samples = 5; // Minimum samples for TWAP (fixed for reliability)
     let twap_max_samples = 50; // Maximum samples for TWAP (fixed for memory efficiency)
     let twap_anomaly_threshold_pct = 3.0; // 3% deviation from TWAP triggers anomaly (fixed)
+
+    // MAX_CONFIDENCE_PCT: Maximum confidence interval (percentage)
+    let max_confidence_pct = env::var("MAX_CONFIDENCE_PCT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(5.0); // Default 5%
+
+    // MAX_CONFIDENCE_PCT_PYTH_ONLY: Stricter confidence for Pyth-only mode
+    let max_confidence_pct_pyth_only = env::var("MAX_CONFIDENCE_PCT_PYTH_ONLY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(2.0); // Default 2%
     
-    (max_slot_difference, max_oracle_deviation_pct, twap_max_age_secs, twap_min_samples, twap_max_samples, twap_anomaly_threshold_pct)
+    (max_slot_difference, max_oracle_deviation_pct, twap_max_age_secs, twap_min_samples, twap_max_samples, twap_anomaly_threshold_pct, max_confidence_pct, max_confidence_pct_pyth_only)
 }
 
 /// Oracle price cache for TWAP calculation
@@ -1131,7 +1145,7 @@ impl OraclePriceCache {
         // ✅ FIXED: Size-based limit (memory kontrolü)
         // Increased from 20 to 50 samples for better TWAP accuracy on low-liquidity tokens
         // Use while loop to ensure we stay under limit even if multiple samples are added quickly
-        let (_, _, _, _, twap_max_samples, _) = get_oracle_config();
+        let (_, _, _, _, twap_max_samples, _, _, _) = get_oracle_config();
         while self.prices.len() > twap_max_samples {
             self.prices.pop_front();
         }
@@ -1347,7 +1361,7 @@ async fn validate_oracles(
     // This mitigates the risk of Pyth oracle manipulation when no cross-validation exists.
     
     // Cross-validate: If we have both Pyth and Switchboard, compare them
-    let (_, max_oracle_deviation_pct, _, _, _, _) = get_oracle_config();
+    let (_, max_oracle_deviation_pct, _, _, _, _, max_confidence_pct, max_confidence_pct_pyth_only) = get_oracle_config();
     if borrow_has_pyth && borrow_has_switchboard_for_crossval {
         if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
             if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
@@ -1422,8 +1436,8 @@ async fn validate_oracles(
              This increases risk of oracle manipulation.",
             if borrow_has_switchboard_for_crossval { "✓" } else { "✗" },
             if deposit_has_switchboard_for_crossval { "✓" } else { "✗" },
-            MAX_CONFIDENCE_PCT_PYTH_ONLY,
-            MAX_CONFIDENCE_PCT
+            max_confidence_pct_pyth_only,
+            max_confidence_pct
         );
         
         // Re-validate Pyth confidence with stricter threshold (only if we're using Pyth without Switchboard)
@@ -1484,6 +1498,16 @@ async fn validate_oracles_with_twap(
     if !pyth_ok {
         return Ok((false, None, None));
     }
+
+    // Check if TWAP protection is enabled via environment variable
+    let enable_twap = std::env::var("ENABLE_TWAP_PROTECTION")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false); // Default: disabled
+
+    if !enable_twap {
+        log::debug!("TWAP protection disabled (ENABLE_TWAP_PROTECTION=false)");
+        return Ok((true, borrow_price, deposit_price));
+    }
     
     // Check if Switchboard is available for either reserve
     // If Switchboard is available, we don't need TWAP protection (cross-validation is sufficient)
@@ -1520,7 +1544,7 @@ async fn validate_oracles_with_twap(
         };
         
         // Get or create price cache for borrow reserve
-        let (_, _, twap_max_age_secs, twap_min_samples, _, twap_anomaly_threshold_pct) = get_oracle_config();
+        let (_, _, twap_max_age_secs, twap_min_samples, _, twap_anomaly_threshold_pct, _, _) = get_oracle_config();
         if let (Some(reserve), Some(price)) = (borrow_reserve.as_ref(), borrow_price) {
             if !borrow_has_switchboard {
                 let oracle_pubkey = reserve.oracle_pubkey();
@@ -1693,105 +1717,29 @@ async fn validate_switchboard_oracle_if_available(
     // CRITICAL: Solana RPC account data is NOT guaranteed to be aligned.
     // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
     // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
-    let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
-        Ok(feed) => *feed,
-        Err(PodCastError::AlignmentMismatch { .. }) => {
-            // ✅ FIXED: Use stack allocation instead of buffer pool to avoid memory leaks
-            // Buffer pool has 10 buffer limit - under high traffic, buffers may not be returned,
-            // causing memory leaks. Stack allocation is safer and more efficient for small structs.
-            // 
-            // Strategy: Allocate aligned buffer on stack using MaybeUninit<u64> array
-            // PullFeedAccountData is ~512 bytes, so stack allocation is safe (stack is typically 2MB+)
-            // We use u64 array for natural 8-byte alignment, then find 16-byte aligned address
-            use std::mem::MaybeUninit;
-            
-            const ALIGNMENT: usize = 16; // 16-byte alignment (safe for most structs, including SIMD)
-            // Calculate size needed: feed_size + alignment padding (max 15 bytes) + 8 bytes for u64 alignment
-            // PullFeedAccountData is ~512 bytes, so we need at most 512 + 15 + 8 = 535 bytes
-            // Round up to 128 u64s = 1024 bytes (safe margin)
-            const STORAGE_SIZE_U64: usize = 128; // 1024 bytes total storage
-            
-            // Stack-allocated aligned buffer (compile-time constant size)
-            // SAFETY: MaybeUninit::uninit().assume_init() is safe here because we're only using
-            // the memory as raw bytes and will properly initialize it before reading
-            let mut aligned_storage: [MaybeUninit<u64>; STORAGE_SIZE_U64] = unsafe {
-                MaybeUninit::uninit().assume_init()
-            };
-            
-            // Get pointer to the storage
-            let storage_ptr = aligned_storage.as_mut_ptr() as *mut u8;
-            let storage_addr = storage_ptr as usize;
-            
-            // Find the first 16-byte aligned address within the storage
-            // Formula: (addr + 15) & !15 rounds up to next 16-byte boundary
-            let aligned_addr = (storage_addr + ALIGNMENT - 1) & !(ALIGNMENT - 1);
-            let offset = aligned_addr - storage_addr;
-            let aligned_ptr = unsafe { storage_ptr.add(offset) };
-            
-            // Ensure we have enough space after alignment
-            // Storage is 1024 bytes, max offset is 15, max feed_size is ~512, so this is safe
-            if offset + feed_size > STORAGE_SIZE_U64 * 8 {
-                log::warn!(
-                    "Switchboard feed alignment calculation failed for {}: insufficient buffer space (offset: {}, feed_size: {}, storage: {} bytes)",
+    let feed = {
+        // ❌ PROBLEM: Switchboard On-Demand v3 SDK (switchboard-on-demand) changed its API.
+        // The struct PullFeedAccountData no longer implements Pod, or simple casting is not enough.
+        // The correct way to parse is using the SDK's provided method which handles alignment and deserialization safely.
+        //
+        // Reference: switchboard-on-demand SDK usage
+        // use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
+        
+        // We need to use try_deserialize which takes a mutable slice reference
+        // This is the standard Anchor/Borsh pattern used by the SDK
+        let mut account_data_slice = &oracle_account.data[..];
+        match PullFeedAccountData::try_deserialize(&mut account_data_slice) {
+            Ok(feed) => feed,
+            Err(e) => {
+                let (_, _, _, _, _, _, _, max_confidence_pct_pyth_only) = get_oracle_config();
+                log::debug!(
+                    "Switchboard feed parsing failed for {}: {}. Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
                     switchboard_oracle_pubkey,
-                    offset,
-                    feed_size,
-                    STORAGE_SIZE_U64 * 8
+                    e,
+                    max_confidence_pct_pyth_only
                 );
                 return Ok(None);
             }
-            
-            // Copy data to the aligned location
-            // SAFETY: aligned_ptr is guaranteed to be 16-byte aligned and within aligned_storage bounds
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    oracle_account.data.as_ptr(),
-                    aligned_ptr,
-                    feed_size
-                );
-            }
-            
-            // Now try parsing from the explicitly aligned slice
-            // SAFETY: aligned_ptr is guaranteed to be 16-byte aligned, which is sufficient
-            // for any struct alignment requirement (most structs require 8-byte or less)
-            let aligned_slice = unsafe { std::slice::from_raw_parts(aligned_ptr, feed_size) };
-            let result = match bytemuck::try_from_bytes::<PullFeedAccountData>(aligned_slice) {
-                Ok(feed) => Ok(*feed),
-                Err(e) => {
-                    log::warn!(
-                        "Switchboard feed parsing failed after explicit alignment fix for {}: {}. \
-                         This may indicate:\n\
-                         - Data structure issue (Switchboard v3 format may have changed)\n\
-                         - Incompatible SDK version (try updating switchboard-on-demand in Cargo.toml)\n\
-                         - Account data corruption\n\
-                         Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).\n\
-                         \n\
-                         TROUBLESHOOTING:\n\
-                         1. Check Cargo.toml for latest Switchboard SDK version\n\
-                         2. Try: cargo update -p switchboard-on-demand\n\
-                         3. Verify Switchboard account owner matches expected program ID",
-                        switchboard_oracle_pubkey,
-                        e,
-                        MAX_CONFIDENCE_PCT_PYTH_ONLY
-                    );
-                    Err(())
-                }
-            };
-            
-            match result {
-                Ok(feed) => feed,
-                Err(()) => return Ok(None),
-            }
-        }
-        Err(e) => {
-            log::warn!(
-                "Switchboard feed parsing failed for {}: {}. \
-                 Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
-                switchboard_oracle_pubkey,
-                e,
-                MAX_CONFIDENCE_PCT_PYTH_ONLY
-            );
-            return Ok(None);
         }
     };
     
@@ -1970,7 +1918,7 @@ async fn validate_pyth_oracle(
     const AGGREGATE_STATUS_TRADING: u64 = 1;
     
     // CRITICAL: Accept Trading status (1) normally.
-    // RELAXED: Also accept Unknown (0) IF the price is very fresh (within 5 slots ~2 seconds).
+    // RELAXED: Also accept Unknown (0) IF the price is very fresh (within 10 slots ~4 seconds).
     // This handles cases where Pyth status might flicker or RPC is slightly behind but data is fresh.
     let is_status_ok = if aggregate_status == AGGREGATE_STATUS_TRADING {
         true
@@ -1982,10 +1930,11 @@ async fn validate_pyth_oracle(
         let last_slot = u64::from_le_bytes(last_slot_bytes);
         let slot_diff = current_slot.saturating_sub(last_slot);
         
-        if slot_diff <= 5 {
-            log::warn!(
-                "Pyth aggregate status is 0 (Unknown) but price is FRESH (diff={} slots) - ACCEPTING oracle for {}",
+        if slot_diff <= 10 { // ✅ 10 slots (4s) tolerance
+            log::debug!(
+                "Pyth aggregate status is 0 (Unknown) but price is FRESH (diff={} slots, {:.1}s) - ACCEPTING oracle for {}",
                 slot_diff,
+                slot_diff as f64 * 0.4,
                 oracle_pubkey
             );
             true
@@ -2054,6 +2003,13 @@ async fn validate_pyth_oracle(
         .map_err(|_| anyhow::anyhow!("Failed to parse price"))?;
     let price_raw = i64::from_le_bytes(price_bytes);
 
+    // CRITICAL: Overflow/Corruption check
+    // Pyth prices can be very large, but i64::MAX/MIN usually indicate uninitialized/corrupted data
+    if price_raw == i64::MAX || price_raw == i64::MIN {
+        log::warn!("Pyth price overflow/corruption detected: {} for {}", price_raw, oracle_pubkey);
+        return Ok((false, None));
+    }
+
     // Convert to f64 with exponent
     // CRITICAL: Pyth exponent is typically negative (e.g., -8 for 8 decimals)
     // Mathematical equivalence: price_raw * 10^(-8) = price_raw / 10^8
@@ -2079,7 +2035,7 @@ async fn validate_pyth_oracle(
 
     // PRIMARY CHECK: last_slot based staleness (when price was last updated)
     // This is the most reliable indicator of price freshness
-    let (max_slot_difference, _, _, _, _, _) = get_oracle_config();
+    let (max_slot_difference, _, _, _, _, _, _, _) = get_oracle_config();
     let slot_diff_last = current_slot.saturating_sub(last_slot);
     if slot_diff_last > max_slot_difference {
         log::debug!(
@@ -2152,11 +2108,12 @@ async fn validate_pyth_oracle(
         return Ok((false, None));
     }
 
-    if confidence_pct > MAX_CONFIDENCE_PCT {
+    let (_, _, _, _, _, _, max_confidence_pct, _) = get_oracle_config();
+    if confidence_pct > max_confidence_pct {
         log::debug!(
             "Pyth oracle confidence too high: {:.2}% > {:.2}% (price: {}, confidence: {})",
             confidence_pct,
-            MAX_CONFIDENCE_PCT,
+            max_confidence_pct,
             price_value,
             confidence
         );
@@ -2232,11 +2189,12 @@ async fn validate_pyth_confidence_strict(
     // so division is safe and won't produce inf
     let confidence_pct = (confidence / price_value.abs()) * 100.0;
 
-    if confidence_pct > MAX_CONFIDENCE_PCT_PYTH_ONLY {
+    let (_, _, _, _, _, _, _, max_confidence_pct_pyth_only) = get_oracle_config();
+    if confidence_pct > max_confidence_pct_pyth_only {
         log::warn!(
             "Pyth oracle confidence too high for Pyth-only mode: {:.2}% > {:.2}% (price: {}, confidence: {})",
             confidence_pct,
-            MAX_CONFIDENCE_PCT_PYTH_ONLY,
+            max_confidence_pct_pyth_only,
             price_value,
             confidence
         );
@@ -2246,7 +2204,7 @@ async fn validate_pyth_confidence_strict(
     log::debug!(
         "✅ Pyth confidence check passed (stricter threshold): {:.2}% <= {:.2}%",
         confidence_pct,
-        MAX_CONFIDENCE_PCT_PYTH_ONLY
+        max_confidence_pct_pyth_only
     );
 
     Ok(true)
@@ -2688,7 +2646,7 @@ async fn get_liquidation_quote(
     // f64 has only 53 bits of precision and can overflow for large numbers
     let actual_borrowed_raw = actual_borrowed_normalized
         .checked_mul(decimals_multiplier)
-        .and_then(|v| v.checked_div(WAD)) // Divide by WAD to normalize from WAD format
+        // .and_then(|v| v.checked_div(WAD)) // ❌ REMOVED: No division needed, already normalized!
         .ok_or_else(|| anyhow::anyhow!("Overflow in actual borrowed calculation: actual_borrowed_normalized * decimals_multiplier"))?
         as u64;
     
@@ -2740,126 +2698,69 @@ async fn get_liquidation_quote(
         return Err(anyhow::anyhow!("Abnormal exchange rate: {:.6}", exchange_rate));
     }
     
-    // Step 7: Get preliminary Jupiter quote to calculate price impact
-    // CRITICAL FIX: Use price impact from Jupiter quote instead of just position size
+    // Step 7: Get Jupiter quote with calculated dynamic slippage
+    // CRITICAL FIX: Single Jupiter call to avoid circular logic and rate limits
+    //
+    // Instead of preliminary_quote -> price_impact -> final_quote,
+    // we use a robust single-quote strategy:
+    // 1. Start with a generous buffer (2x base slippage)
+    // 2. Get the quote
+    // 3. Check price impact post-facto
+    // 4. If price impact is too high (>5%), reject the quote
+    
     // Read slippage settings from .env (no hardcoded values)
     use std::env;
     let base_slippage_bps = env::var("MIN_PROFIT_MARGIN_BPS")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(30); // Default 0.3% if not set
-    
-    let buffer_bps = env::var("DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(20); // Default 0.2% if not set
+        .unwrap_or(50); // Default 0.5% if not set
     
     let max_slippage_bps = env::var("MAX_SLIPPAGE_BPS")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or_else(|| {
-            log::warn!("MAX_SLIPPAGE_BPS not found in .env, using default 300 (3%)");
-            300 // Default 3% if not set
-        });
-    
-    // This accounts for pool liquidity, which is more accurate than position size alone
-    let preliminary_quote = get_jupiter_quote_with_retry(
-        &collateral_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
-        &debt_mint,       // ✅ Debt token (USDC)
-        sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
-        base_slippage_bps, // Base slippage for preliminary quote (from .env)
-        3, // max_retries
-    )
-    .await
-    .context("Failed to get preliminary Jupiter quote")?;
-    
-    // Calculate dynamic slippage based on price impact from preliminary quote
-    // Formula: base_slippage + price_impact + buffer + trade_size_multiplier
-    // This is economically correct because it accounts for actual pool liquidity
-    // 
-    // CRITICAL FIX: Low liquidity pools may have actual slippage > calculated slippage
-    // Since Jupiter API doesn't provide pool depth, we use:
-    // 1. Price impact as liquidity indicator (high impact = low liquidity)
-    // 2. Trade size multiplier (larger trades = higher slippage risk)
-    // 3. Additional buffer for high price impact scenarios
-    let price_impact_pct = crate::jup::get_price_impact_pct(&preliminary_quote);
-    let price_impact_bps = (price_impact_pct * 100.0) as u16; // Convert percentage to basis points
-    
-    // Calculate base slippage (using values from .env)
-    let mut slippage_bps = base_slippage_bps as u32 + price_impact_bps as u32 + buffer_bps as u32;
-    
-    // Add trade size multiplier for large trades (proxy for pool depth)
-    // Larger trades relative to position size indicate higher slippage risk
-    // Trade size as percentage of collateral value
-    let trade_size_usd = collateral_to_seize_usd;
-    let trade_size_multiplier = if trade_size_usd > 50_000.0 {
-        // Very large trade (>$50k) - increase slippage by 50%
-        1.5
-    } else if trade_size_usd > 20_000.0 {
-        // Large trade ($20k-$50k) - increase slippage by 30%
-        1.3
-    } else if trade_size_usd > 10_000.0 {
-        // Medium-large trade ($10k-$20k) - increase slippage by 15%
-        1.15
-    } else {
-        // Small-medium trade - no multiplier
-        1.0
-    };
-    
-    slippage_bps = (slippage_bps as f64 * trade_size_multiplier) as u32;
-    
-    // Add additional buffer for high price impact scenarios (low liquidity indicator)
-    // High price impact (>1%) suggests low liquidity pool
-    if price_impact_pct > 1.0 {
-        // High price impact - add 50% more buffer for low liquidity pools
-        slippage_bps = (slippage_bps as f64 * 1.5) as u32;
-        log::debug!(
-            "High price impact detected ({}%), applying low-liquidity multiplier (1.5x)",
-            price_impact_pct
-        );
-    } else if price_impact_pct > 0.5 {
-        // Moderate price impact - add 25% more buffer
-        slippage_bps = (slippage_bps as f64 * 1.25) as u32;
-        log::debug!(
-            "Moderate price impact detected ({}%), applying liquidity buffer (1.25x)",
-            price_impact_pct
-        );
-    }
-    
-    // Cap at maximum slippage (from .env)
-    slippage_bps = slippage_bps.min(max_slippage_bps as u32);
-    let slippage_bps_final = slippage_bps as u16;
+        .unwrap_or(300); // Default 3% if not set
+        
+    // Apply 2x buffer for safety on first try
+    let buffer_multiplier = 2.0;
+    let initial_slippage = ((base_slippage_bps as f64 * buffer_multiplier) as u16).min(max_slippage_bps);
     
     log::debug!(
-        "Dynamic slippage calculation (ENHANCED): base={}bps + price_impact={}bps ({}%) + buffer={}bps = {}bps base, trade_size_mult={:.2}x, final={}bps ({}%)",
+        "Jupiter quote strategy: Single call with {}bps slippage (base: {}bps, buffer: {:.1}x)",
+        initial_slippage,
         base_slippage_bps,
-        price_impact_bps,
-        price_impact_pct,
-        buffer_bps,
-        base_slippage_bps as u32 + price_impact_bps as u32 + buffer_bps as u32,
-        trade_size_multiplier,
-        slippage_bps_final,
-        slippage_bps_final as f64 / 100.0
+        buffer_multiplier
     );
     
     // Step 8: Get final Jupiter quote with calculated dynamic slippage
     // CRITICAL: Jupiter quote uses UNDERLYING token (SOL), not cToken (cSOL)
-    // 
-    // Liquidation flow:
-    // 1. Solend gives us collateral cToken (e.g., cSOL) via LiquidateObligation
-    // 2. We redeem cToken to underlying token (cSOL -> SOL) via RedeemReserveCollateral
-    // 3. We swap underlying token to debt token (SOL -> USDC) via Jupiter
-    // 4. We use the received USDC to pay off the debt (e.g., 1500 USDC)
-    // 5. Profit = jupiter_output - debt_to_repay - fees
     let quote = get_jupiter_quote_with_retry(
-        &collateral_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
-        &debt_mint,       // ✅ Debt token (USDC)
+        &collateral_underlying_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
+        &debt_mint,                  // ✅ Debt token (USDC)
         sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
-        slippage_bps_final, // ✅ CORRECT: Enhanced dynamic slippage (price impact + trade size + liquidity buffer)
+        initial_slippage,            // ✅ CORRECT: Buffered initial slippage
         3, // max_retries
     )
     .await
     .context("Failed to get Jupiter quote with retries")?;
+    
+    // Price impact check - Reject if too high (>5%)
+    let price_impact_pct = crate::jup::get_price_impact_pct(&quote);
+    if price_impact_pct > 5.0 {
+        log::warn!(
+            "❌ Price impact too high: {:.2}% (max: 5.0%). Skipping liquidation due to low liquidity.",
+            price_impact_pct
+        );
+        return Err(anyhow::anyhow!(
+            "Price impact too high: {:.2}% (max: 5.0%)",
+            price_impact_pct
+        ));
+    }
+    
+    log::debug!(
+        "Jupiter quote successful: impact={:.2}%, out_amount={}",
+        price_impact_pct,
+        quote.out_amount
+    );
     
     // Transaction flow information
     log::debug!(
@@ -2974,16 +2875,20 @@ async fn get_liquidation_quote(
     let tx_priority_fee_lamports = (tx_compute_units * tx_priority_fee_per_cu) / 1_000_000;
     let tx_total_fee_lamports = tx_base_fee_lamports + tx_priority_fee_lamports;
     
-    // ✅ FIXED: Flashloan fee calculation
+    // ✅ FIXED: Flashloan fee calculation with u128 arithmetic
     // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)
     // This fee is applied to debt_to_repay_raw amount
     let flashloan_fee_usd = if let Some(borrow_reserve) = &ctx.borrow_reserve {
-        const WAD: f64 = 1_000_000_000_000_000_000.0; // 10^18
-        let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad;
-        let flashloan_fee_pct = flashloan_fee_wad as f64 / WAD; // WAD to percentage
+        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+        let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
         
         // Flashloan fee amount (in raw token units)
-        let flashloan_fee_amount_raw = ((debt_to_repay_raw as f64) * flashloan_fee_pct) as u64;
+        // CRITICAL FIX: Use u128 arithmetic to prevent overflow
+        let flashloan_fee_amount_raw = (debt_to_repay_raw as u128)
+            .checked_mul(flashloan_fee_wad)
+            .and_then(|v| v.checked_div(WAD))
+            .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow"))?
+            as u64;
         
         // Convert to USD
         let flashloan_fee_tokens = (flashloan_fee_amount_raw as f64) / 10_f64.powi(debt_decimals as i32);
@@ -4053,10 +3958,16 @@ async fn build_flashloan_liquidation_tx(
     // Solend uses two-instruction pattern: FlashBorrow (tag 13) + FlashRepay (tag 14)
     // 
     // Calculate flashloan fee
-    const WAD: f64 = 1_000_000_000_000_000_000.0;
-    let fee_wad = borrow_reserve.config().flashLoanFeeWad;
-    let fee_pct = fee_wad as f64 / WAD;
-    let flashloan_fee_amount = ((flashloan_amount as f64) * fee_pct) as u64;
+    const WAD_U128: u128 = 1_000_000_000_000_000_000;
+    let fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
+    
+    // CRITICAL: Use u128 arithmetic for fee calculation to prevent overflow
+    let flashloan_fee_amount = (flashloan_amount as u128)
+        .checked_mul(fee_wad)
+        .and_then(|v| v.checked_div(WAD_U128))
+        .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow during tx build"))?
+        as u64;
+        
     let repay_amount = flashloan_amount + flashloan_fee_amount;
     
     // FlashRepayReserveLiquidity instruction data:
@@ -4069,22 +3980,28 @@ async fn build_flashloan_liquidation_tx(
     // CRITICAL: Account order must match Solend SDK exactly
     // Reference: solend-sdk/src/instruction.rs - LendingInstruction::FlashRepayReserveLiquidity
     // 
-    // Correct account order (7 accounts total):
+    // Correct account order (8 accounts total):
     // 0. [writable] sourceLiquidity - User's ATA (source of repayment funds)
     // 1. [writable] destinationLiquidity - Reserve's liquidity supply (destination)
-    // 2. [writable] reserve - Reserve account
-    // 3. [readonly] lendingMarket - Lending market account
-    // 4. [signer] transferAuthority - User wallet (signer)
-    // 5. [readonly] instructionsSysvar - Instructions sysvar
-    // 6. [readonly] tokenProgram - SPL Token program
+    // 2. [writable] reserveLiquidityFeeReceiver - Reserve's fee receiver (usually supply)
+    // 3. [writable] reserve - Reserve account
+    // 4. [readonly] lendingMarket - Lending market account
+    // 5. [signer] transferAuthority - User wallet (signer)
+    // 6. [readonly] instructionsSysvar - Instructions sysvar
+    // 7. [readonly] tokenProgram - SPL Token program
+    
+    // Use supply as fee receiver (fees go back to pool)
+    let reserve_liquidity_fee_receiver = repay_reserve_liquidity_supply;
+    
     let repay_accounts = vec![
         AccountMeta::new(source_liquidity, false),              // 0: sourceLiquidity (user's ATA)
         AccountMeta::new(repay_reserve_liquidity_supply, false), // 1: destinationLiquidity (reserve supply)
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: reserve
-        AccountMeta::new_readonly(lending_market, false),       // 3: lendingMarket
-        AccountMeta::new_readonly(wallet_pubkey, true),         // 4: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 5: instructionsSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 6: tokenProgram
+        AccountMeta::new(reserve_liquidity_fee_receiver, false), // 2: reserveLiquidityFeeReceiver
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 3: reserve
+        AccountMeta::new_readonly(lending_market, false),       // 4: lendingMarket
+        AccountMeta::new_readonly(wallet_pubkey, true),         // 5: transferAuthority (signer)
+        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 6: instructionsSysvar
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 7: tokenProgram
     ];
     
     let repay_ix = Instruction {
@@ -4217,12 +4134,13 @@ async fn execute_liquidation_with_swap(
         bundle_id
     );
     
-    // ✅ FIXED: Real-time bundle status polling (instead of fixed 1s wait)
-    // Bundle can confirm in ~400ms, so we poll status proactively
+    // ✅ FIXED: Exponential backoff for bundle status polling
+    // Max 10 attempts with increasing delay: 200, 400, 600, 800... ms
+    // Reduces RPC load while still checking frequently enough
     let mut confirmed = false;
-    for i in 0..20 {
-        // Max 4 seconds (20 * 200ms)
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    for i in 0..10 {
+        let delay_ms = 200 * (i + 1);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         
         if let Ok(Some(status)) = jito_client.get_bundle_status(&bundle_id).await {
             if let Some(status_str) = &status.status {

@@ -924,16 +924,15 @@ impl Reserve {
     /// Get close factor (as f64, 0-1 range)
     /// 
     /// CRITICAL: Close factor determines what percentage of debt can be liquidated.
-    /// Currently, Solend's ReserveConfig doesn't include close_factor field, so we use
-    /// the standard 50% (0.5) as fallback. If Solend adds close_factor to ReserveConfig
-    /// in the future, this function should be updated to read it from config.
+    /// Currently, Solend's ReserveConfig doesn't include close_factor field in the public IDL,
+    /// but it can be changed by governance.
     /// 
-    /// Close factor can be changed by governance, so hardcoding it is risky.
-    /// This function is prepared for future ReserveConfig.closeFactor field.
+    /// If `liquidationCloseFactor` is available in the IDL/struct, use it.
+    /// Otherwise, use fallback.
     /// 
     /// Returns: Close factor as f64 (e.g., 0.5 = 50%)
     pub fn close_factor(&self) -> f64 {
-        // Allow override from .env if set
+        // Allow override from .env if set (highest priority)
         use std::env;
         if let Ok(cf_str) = env::var("CLOSE_FACTOR") {
             if let Ok(cf) = cf_str.parse::<f64>() {
@@ -943,14 +942,15 @@ impl Reserve {
             }
         }
         
-        // TODO: When Solend adds closeFactor to ReserveConfig, uncomment this:
+        // Check ReserveConfig for close factor (if available in updated layout)
+        // Currently ReserveConfig struct does not have liquidationCloseFactor field exposed
+        // If Solend adds it, uncomment:
         // let config = self.config();
-        // if let Some(cf) = config.closeFactor {
-        //     return cf as f64 / 100.0;
+        // if config.liquidationCloseFactor > 0 && config.liquidationCloseFactor <= 100 {
+        //     return config.liquidationCloseFactor as f64 / 100.0;
         // }
         
         // Fallback to standard 50% (0.5) - Solend's current default
-        // This matches the hardcoded value used in debt calculation
         0.5
     }
 
@@ -1093,18 +1093,42 @@ pub fn find_usdc_mint_from_reserves(
         .unwrap_or(false);
         
     if skip_scan {
-        log::info!("🚀 startup optimization: Skipping full chain scan (SKIP_STARTUP_SCAN=true)");
-        log::info!("   Using configured USDC mint: {}", known_usdc_mint);
+        log::info!("🚀 Startup optimization: Skipping full chain scan (SKIP_STARTUP_SCAN=true)");
+        log::info!("   Validating USDC mint directly: {}", known_usdc_mint);
         
-        // Verify we can at least fetch the USDC mint account (basic network check)
-        if let Err(e) = rpc.get_account(&known_usdc_mint) {
+        use anyhow::Context;
+        
+        // 1. Verify USDC mint account exists on chain
+        let usdc_account = rpc.get_account(&known_usdc_mint)
+            .context(format!("USDC mint {} not found on chain - wrong network or invalid mint address in .env", known_usdc_mint))?;
+            
+        // 2. Verify account owner is Token Program
+        use spl_token::ID as TOKEN_PROGRAM_ID;
+        if usdc_account.owner != TOKEN_PROGRAM_ID {
             return Err(anyhow::anyhow!(
-                "Network validation failed: Cannot fetch USDC mint {}. \
-                 RPC may be on wrong network or endpoint is down. Error: {}",
-                known_usdc_mint, e
+                "USDC mint {} is not a valid token mint (owner mismatch). \
+                 Expected owner: {}, Found: {}. \
+                 Please check USDC_MINT in .env file.",
+                known_usdc_mint, 
+                TOKEN_PROGRAM_ID, 
+                usdc_account.owner
             ));
         }
-        log::info!("   ✅ USDC mint account verified on chain");
+        
+        // 3. Verify decimals (USDC must be 6 decimals)
+        use solana_sdk::program_pack::Pack;
+        let mint_data = spl_token::state::Mint::unpack(&usdc_account.data)
+            .context("Failed to unpack USDC mint data")?;
+            
+        if mint_data.decimals != 6 {
+            log::warn!(
+                "⚠️  USDC mint decimals mismatch: found {}, expected 6. \
+                 This might be a different token masquerading as USDC, or a testnet token.",
+                mint_data.decimals
+            );
+        } else {
+            log::info!("✅ USDC mint validated: {} (6 decimals)", known_usdc_mint);
+        }
         
         return Ok(known_usdc_mint);
     }

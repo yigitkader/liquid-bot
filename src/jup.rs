@@ -142,12 +142,21 @@ pub async fn get_jupiter_quote_with_retry(
     let mut last_error = None;
     
     for attempt in 1..=max_retries {
-        // CRITICAL: Use shorter timeout on first attempt to preserve blockhash freshness
-        // Blockhash is valid for ~60 seconds, we need to complete liquidation within this window
+        // CRITICAL: Use configurable timeout strategy
+        // Default: 15s first attempt, 30s for retries
+        // Read from environment variables to allow runtime configuration
+        use std::env;
+        
         let timeout_secs = if attempt == 1 {
-            REQUEST_TIMEOUT_NORMAL_SECS // 8s for first attempt - fast fail
+            env::var("JUPITER_TIMEOUT_NORMAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(15) // ✅ FIX: 15s default (was 8s)
         } else {
-            REQUEST_TIMEOUT_RETRY_SECS  // 15s for retries - allow more time
+            env::var("JUPITER_TIMEOUT_RETRY_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30) // ✅ FIX: 30s retry default (was 15s)
         };
         
         log::debug!(
