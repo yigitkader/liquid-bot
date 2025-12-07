@@ -501,7 +501,7 @@ pub fn identify_solend_account_type(data: &[u8]) -> SolendAccountType {
     const DISCRIMINATOR_SIZE: usize = 8;
     
     // STEP 1: Determine if discriminator exists based on size
-    let (has_discriminator, actual_data) = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
+    let (_has_discriminator, actual_data) = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
         // Account is 1308 bytes - likely has Anchor discriminator
         if data.len() < DISCRIMINATOR_SIZE {
             return SolendAccountType::Unknown;
@@ -1493,7 +1493,7 @@ pub fn find_usdc_mint_from_reserves(
             }
         } else {
             log::warn!("   Bot default requires USDC. Set ALLOW_SUSD=true in .env to enable SUSD.");
-            if let Some(mint) = susd_mint {
+            if let Some(_mint) = susd_mint {
                 return Err(anyhow::anyhow!(
                     "SUSD reserve found but USDC required. \
                      This program ({}) uses SUSD, not USDC. \

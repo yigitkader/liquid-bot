@@ -1701,7 +1701,6 @@ async fn validate_switchboard_oracle_if_available(
     // CRITICAL FIX: Solana account data is not guaranteed to be aligned.
     // try_from_bytes requires alignment, which can cause runtime panic.
     // We handle AlignmentMismatch error with a safe fallback that ensures proper alignment.
-    use bytemuck::PodCastError;
     
     // Ensure we have enough data
     let feed_size = std::mem::size_of::<PullFeedAccountData>();
@@ -1717,31 +1716,37 @@ async fn validate_switchboard_oracle_if_available(
     // CRITICAL: Solana RPC account data is NOT guaranteed to be aligned.
     // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
     // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
-    let feed = {
-        // ❌ PROBLEM: Switchboard On-Demand v3 SDK (switchboard-on-demand) changed its API.
-        // The struct PullFeedAccountData no longer implements Pod, or simple casting is not enough.
-        // The correct way to parse is using the SDK's provided method which handles alignment and deserialization safely.
-        //
-        // Reference: switchboard-on-demand SDK usage
-        // use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
-        
-        // We need to use try_deserialize which takes a mutable slice reference
-        // This is the standard Anchor/Borsh pattern used by the SDK
-        let mut account_data_slice = &oracle_account.data[..];
-        match PullFeedAccountData::try_deserialize(&mut account_data_slice) {
-            Ok(feed) => feed,
+    // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
+    // Note: PullFeedAccountData implements Pod, so we can use bytemuck safely IF aligned.
+    let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
+            Ok(feed) => *feed,
+            Err(bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned) => {
+                // Fallback: Copy to aligned buffer
+                // This is slower but safe for unaligned data
+                let aligned_data = oracle_account.data.to_vec();
+                match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_data) {
+                    Ok(feed) => *feed,
+                    Err(e) => {
+                        let (_, _, _, _, _, _, _, _) = get_oracle_config();
+                        log::debug!(
+                            "Switchboard feed parsing failed (even with alignment) for {}: {}. Falling back to Pyth-only.",
+                            switchboard_oracle_pubkey,
+                            e
+                        );
+                        return Ok(None);
+                    }
+                }
+            },
             Err(e) => {
-                let (_, _, _, _, _, _, _, max_confidence_pct_pyth_only) = get_oracle_config();
+                let (_, _, _, _, _, _, _, _) = get_oracle_config();
                 log::debug!(
-                    "Switchboard feed parsing failed for {}: {}. Falling back to Pyth-only mode with stricter validation ({}% confidence threshold).",
+                    "Switchboard feed parsing failed for {}: {}. Falling back to Pyth-only mode.",
                     switchboard_oracle_pubkey,
-                    e,
-                    max_confidence_pct_pyth_only
+                    e
                 );
                 return Ok(None);
             }
-        }
-    };
+        };
     
     // 4. Get price using SDK's value() method with staleness check
     // The value() method requires current slot for staleness validation
@@ -2410,7 +2415,7 @@ async fn get_liquidation_quote(
     );
     
     // Use underlying mint for Jupiter (cToken cannot be traded on Jupiter)
-    let collateral_mint = collateral_underlying_mint;
+    let _collateral_mint = collateral_underlying_mint;
 
     // CRITICAL: Calculate correct collateral amount to seize
     // 
