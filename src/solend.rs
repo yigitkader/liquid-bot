@@ -1290,13 +1290,9 @@ pub fn find_usdc_mint_from_reserves(
                     break Ok(accs);
                 },
                 Err(e) => {
+                    let error_msg = e.to_string();
                     last_error = Some(e);
                     retries -= 1;
-                    
-                    let error_msg = match last_error.as_ref() {
-                        Some(e) => e.to_string(),
-                        None => "Unknown error".to_string(),
-                    };
                     
                     if retries > 0 {
                         // Exponential backoff with initial delay from .env

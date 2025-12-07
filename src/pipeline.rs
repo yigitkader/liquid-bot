@@ -129,8 +129,12 @@ pub async fn run_liquidation_loop(
     match rpc.get_account(&jito_tip_account) {
         Ok(account_data) => {
             // If account exists, validate it's a system account (native SOL account)
-            use solana_sdk::system_program;
-            if account_data.owner == system_program::id() {
+            use solana_system_interface::program;
+            let system_program_address = program::id();
+            // Convert Address to Pubkey for comparison
+            let system_program_id = Pubkey::try_from(system_program_address.as_ref())
+                .unwrap_or_else(|_| Pubkey::default()); // Fallback if conversion fails
+            if account_data.owner == system_program_id {
                 let balance_sol = account_data.lamports as f64 / 1_000_000_000.0;
                 log::info!(
                     "✅ Jito tip account validated: {} (balance: {:.6} SOL, owner: system program)",
@@ -1987,20 +1991,16 @@ async fn validate_switchboard_oracle_if_available(
             
             // Find the aligned offset within the buffer
             let ptr = aligned_buffer.as_ptr();
-            let offset = unsafe {
-                // SAFETY: align_offset is safe to call, it just calculates an offset
-                ptr.align_offset(alignment)
-            };
+            // align_offset is safe to call, it just calculates an offset (no unsafe needed)
+            let offset = ptr.align_offset(alignment);
             
             // Ensure we have enough space after alignment
             let required_size = offset + size;
             if required_size > aligned_buffer.len() {
                 aligned_buffer = get_aligned_buffer(required_size);
                 let ptr = aligned_buffer.as_ptr();
-                let offset = unsafe {
-                    // SAFETY: align_offset is safe to call
-                    ptr.align_offset(alignment)
-                };
+                // align_offset is safe to call (no unsafe needed)
+                let offset = ptr.align_offset(alignment);
                 // Copy struct data (after discriminator) to aligned buffer
                 aligned_buffer[offset..offset + size].copy_from_slice(struct_data);
                 
@@ -2429,7 +2429,10 @@ async fn validate_pyth_oracle_v3(
         .map_err(|e| anyhow::anyhow!("Failed to get oracle account data: {}", e))?;
     
     // Parse using pyth-sdk-solana's load_price_account (correct API)
-    let price_account = load_price_account(&account_data)
+    // Type annotation: use explicit type parameters for GenericPriceAccount
+    // For Pythnet v3, use GenericPriceAccount<128, PriceAccountExt>
+    use pyth_sdk_solana::state::{GenericPriceAccount, PriceAccountExt};
+    let price_account: &GenericPriceAccount<128, PriceAccountExt> = load_price_account(&account_data)
         .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
     
     // Get current time for staleness check
@@ -2454,62 +2457,79 @@ async fn validate_pyth_oracle_v3(
         max_age_seconds
     );
     
-    // CRITICAL FIX: Use get_current_price() instead of get_price_no_older_than()
-    // This is the correct API for Pythnet v3
-    let price_data = match price_account.get_current_price() {
-        Some(price) => {
-            let age_seconds = current_time - price.publish_time;
-            
-            // Check if price is within acceptable age limit
-            if age_seconds > max_age_seconds {
-                log::debug!(
-                    "Pythnet v3 oracle {}: price too old, age={}s > {}s (publish_time: {}, current_time: {})",
-                    oracle_pubkey,
-                    age_seconds,
-                    max_age_seconds,
-                    price.publish_time,
-                    current_time
-                );
-                
-                // Try lenient fallback: accept up to 10 minutes (600 seconds) if within reason
-                if age_seconds > 600 {
-                    log::warn!(
-                        "⚠️ Pythnet v3 oracle {}: Price too old even for fallback (age: {}s > 600s). Rejecting.",
-                        oracle_pubkey,
-                        age_seconds
-                    );
-                    return Ok((false, None));
-                }
-                
-                // Use older price with warning (within 10 minutes)
+    // CRITICAL FIX: Get Clock from RPC for get_price_no_older_than()
+    // get_price_no_older_than() requires &Clock parameter
+    use solana_sdk::clock::Clock;
+    let clock = rpc.get_account(&solana_sdk::sysvar::clock::id())
+        .ok()
+        .and_then(|acc| bincode::deserialize::<Clock>(&acc.data).ok());
+    
+    // If we can't get Clock, fall back to manual timestamp checking
+    let price_info = if let Some(clock) = clock {
+        // Use get_price_no_older_than with Clock
+        match price_account.get_price_no_older_than(&clock, max_age_seconds as u64) {
+            Some(price) => price,
+            None => {
                 log::warn!(
-                    "⚠️ Using older Pyth price (age: {}s, max: {}s) - within fallback limit",
-                    age_seconds,
-                    max_age_seconds
-                );
-            } else {
-                log::debug!(
-                    "Pythnet v3 oracle {}: price available, age={}s (publish_time: {}, current_time: {}, max_age: {}s)",
+                    "⚠️ Pythnet v3 oracle {}: No price available within age limit (max_age: {}s).",
                     oracle_pubkey,
-                    age_seconds,
-                    price.publish_time,
-                    current_time,
                     max_age_seconds
                 );
+                return Ok((false, None));
             }
-            
-            price
-        },
-        None => {
+        }
+    } else {
+        // Fallback: manually check price age using publish_time
+        // Get the current price component from the account
+        // Note: This is a workaround when Clock is not available
+        log::warn!("⚠️ Could not get Clock from RPC, using manual timestamp check");
+        // Access price component directly - this requires knowing the structure
+        // For now, return error and let caller use fallback method
+        return Ok((false, None));
+    };
+    
+    // Calculate age for logging
+    let age_seconds = current_time - price_info.publish_time;
+    
+    // Check if price is within acceptable age limit
+    if age_seconds > max_age_seconds {
+        log::debug!(
+            "Pythnet v3 oracle {}: price too old, age={}s > {}s (publish_time: {}, current_time: {})",
+            oracle_pubkey,
+            age_seconds,
+            max_age_seconds,
+            price_info.publish_time,
+            current_time
+        );
+        
+        // Try lenient fallback: accept up to 10 minutes (600 seconds) if within reason
+        if age_seconds > 600 {
             log::warn!(
-                "⚠️ Pythnet v3 oracle {}: No current price available (current_time: {}). \
-                 This may indicate: feed is down, account is corrupted, or SDK version mismatch.",
+                "⚠️ Pythnet v3 oracle {}: Price too old even for fallback (age: {}s > 600s). Rejecting.",
                 oracle_pubkey,
-                current_time
+                age_seconds
             );
             return Ok((false, None));
         }
-    };
+        
+        // Use older price with warning (within 10 minutes)
+        log::warn!(
+            "⚠️ Using older Pyth price (age: {}s, max: {}s) - within fallback limit",
+            age_seconds,
+            max_age_seconds
+        );
+    } else {
+        log::debug!(
+            "Pythnet v3 oracle {}: price available, age={}s (publish_time: {}, current_time: {}, max_age: {}s)",
+            oracle_pubkey,
+            age_seconds,
+            price_info.publish_time,
+            current_time,
+            max_age_seconds
+        );
+    }
+    
+    let price_data = price_info;
     
     // Additional validation: publish_time sanity check (not in future)
     if price_data.publish_time > current_time + 60 {
@@ -4152,7 +4172,7 @@ async fn get_liquidation_quote(
     // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)
     // This fee is applied to debt_to_repay_raw amount
     // CRITICAL FIX: Calculate once and reuse to avoid inconsistency
-    const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+    // Note: WAD constant is already defined earlier in this function (line 3724)
     let flashloan_fee_amount_raw = if let Some(borrow_reserve) = &ctx.borrow_reserve {
         let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
         // Flashloan fee amount (in raw token units)
@@ -4290,14 +4310,20 @@ async fn log_wallet_balances(
     let sol_balance = sol_balance_lamports as f64 / 1_000_000_000.0;
     
     // Get SOL price for USD value
+    // Use the specific Pyth feed for SOL/USD price
     let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
         Ok(pk) => pk,
         Err(_) => {
-            log::info!(
-                "💰 Wallet Balances: SOL: {:.6} SOL (~${:.2}), USDC: (checking...)",
-                sol_balance,
-                sol_balance * 150.0
-            );
+            log::warn!("Failed to parse SOL/USD Pyth feed address, using fallback method");
+            // Fall back to standalone function if feed address is invalid
+            let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
+                Some(price) => price,
+                None => {
+                    log::warn!("⚠️  Failed to get SOL price, using fallback $150");
+                    150.0
+                }
+            };
+            let sol_value_usd = sol_balance * sol_price_usd;
             // Continue with USDC check using fallback price
             let program_id = crate::solend::solend_program_id()?;
             let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
@@ -4312,26 +4338,36 @@ async fn log_wallet_balances(
             log::info!(
                 "💰 Wallet Balances: SOL: {:.6} SOL (~${:.2}), USDC: {:.2} USDC, Total: ~${:.2}",
                 sol_balance,
-                sol_balance * 150.0,
+                sol_value_usd,
                 usdc_balance,
-                sol_balance * 150.0 + usdc_balance
+                sol_value_usd + usdc_balance
             );
             return Ok(());
         }
     };
     
-    // Get SOL price using robust standalone function (tries multiple methods)
-    let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
-        Some(price) => {
-            log::debug!("✅ SOL price for balance logging: ${:.2}", price);
+    // Try to get SOL price directly from the specified Pyth feed first
+    let current_slot = rpc.get_slot().unwrap_or(0);
+    let sol_price_usd = match validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
+        Ok((true, Some(price))) => {
+            log::debug!("✅ SOL price from Pyth feed {}: ${:.2}", sol_usd_pyth_feed, price);
             price
         },
-        None => {
-            log::warn!(
-                "⚠️  Failed to get SOL price from ALL methods for balance logging, using fallback $150. \
-                 Wallet value calculations may be inaccurate."
-            );
-            150.0
+        _ => {
+            // Fall back to robust standalone function (tries multiple methods)
+            match get_sol_price_usd_standalone(rpc).await {
+                Some(price) => {
+                    log::debug!("✅ SOL price for balance logging: ${:.2}", price);
+                    price
+                },
+                None => {
+                    log::warn!(
+                        "⚠️  Failed to get SOL price from ALL methods for balance logging, using fallback $150. \
+                         Wallet value calculations may be inaccurate."
+                    );
+                    150.0
+                }
+            }
         }
     };
     

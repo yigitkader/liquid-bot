@@ -6,9 +6,9 @@ use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    system_instruction,
     transaction::Transaction,
 };
+use solana_sdk::system_instruction;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;

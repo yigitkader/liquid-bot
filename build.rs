@@ -159,10 +159,28 @@ fn main() {
     
     // Write generated code
     let output_path = out_dir.join("solend_layout.rs");
-    fs::write(&output_path, rust_code)
-        .expect("Failed to write solend_layout.rs");
     
-    println!("cargo:warning=Generated Solend layouts at {:?} (SDK version: {})", output_path, sdk_version);
+    // Calculate hash of generated code for validation/caching
+    let code_hash = calculate_hash(&rust_code);
+    
+    // Use name fields from structs in logging
+    let type_names: Vec<&String> = all_types.values().map(|t| &t.name).collect();
+    let account_names: Vec<&String> = all_accounts.values().map(|a| &a.name).collect();
+    
+    fs::write(&output_path, rust_code)
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to write solend_layout.rs: {}. \
+                 Generated {} types: {:?} and {} accounts: {:?}",
+                e,
+                type_names.len(),
+                type_names,
+                account_names.len(),
+                account_names
+            );
+        });
+    
+    println!("cargo:warning=Generated Solend layouts at {:?} (SDK version: {}, code hash: {})", output_path, sdk_version, code_hash);
 }
 
 struct LayoutType {

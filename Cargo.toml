@@ -43,3 +43,5 @@ rand = "0.8"
 # Note: Legacy Pyth v2 parsing is kept in code for backward compatibility,
 # but Pythnet v3 is now the standard format on mainnet
 pyth-sdk-solana = "0.10"
+# Solana System Interface (replaces deprecated system_program/system_instruction)
+solana-system-interface = "2.0"

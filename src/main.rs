@@ -782,14 +782,14 @@ fn load_keypair(path: &std::path::Path) -> Result<Keypair> {
     // Try JSON array format (standard Solana keypair format)
     if let Ok(keypair) = serde_json::from_slice::<Vec<u8>>(&keypair_bytes) {
         if keypair.len() == 64 {
-            return Keypair::from_bytes(&keypair)
+            return Keypair::try_from(&keypair[..])
                 .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
         }
     }
 
     // Try raw 64 bytes
     if keypair_bytes.len() == 64 {
-        return Keypair::from_bytes(&keypair_bytes)
+        return Keypair::try_from(&keypair_bytes[..])
             .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
     }
 
@@ -797,7 +797,7 @@ fn load_keypair(path: &std::path::Path) -> Result<Keypair> {
     if let Ok(keypair_str) = String::from_utf8(keypair_bytes.clone()) {
         if let Ok(keypair_bytes_decoded) = bs58::decode(keypair_str.trim()).into_vec() {
             if keypair_bytes_decoded.len() == 64 {
-                return Keypair::from_bytes(&keypair_bytes_decoded)
+                return Keypair::try_from(&keypair_bytes_decoded[..])
                     .map_err(|e| anyhow::anyhow!("Failed to parse keypair: {}", e));
             }
         }
