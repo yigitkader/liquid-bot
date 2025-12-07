@@ -3,13 +3,16 @@
 ## 📋 İçindekiler
 
 1. [Proje Özeti](#proje-özeti)
-2. [Sistem Mimarisi](#sistem-mimarisi)
-3. [Teknoloji Stack](#teknoloji-stack)
-4. [Oracle Entegrasyonları](#oracle-entegrasyonları)
-5. [Liquidation Algoritması](#liquidation-algoritması)
-6. [Güvenlik Mekanizmaları](#güvenlik-mekanizmaları)
-7. [Yapılan İyileştirmeler](#yapılan-iyileştirmeler)
-8. [Kritik Kararlar ve Tasarım Seçimleri](#kritik-kararlar-ve-tasarım-seçimleri)
+2. [Hızlı Başlangıç](#hızlı-başlangıç)
+3. [Sistem Mimarisi](#sistem-mimarisi)
+4. [Konfigürasyon](#konfigürasyon)
+5. [Teknoloji Stack](#teknoloji-stack)
+6. [Oracle Entegrasyonları](#oracle-entegrasyonları)
+7. [Liquidation Algoritması](#liquidation-algoritması)
+8. [Solend Account Parsing Sistemi](#solend-account-parsing-sistemi)
+9. [Güvenlik Mekanizmaları](#güvenlik-mekanizmaları)
+10. [Yapılan İyileştirmeler](#yapılan-iyileştirmeler)
+11. [Kritik Kararlar ve Tasarım Seçimleri](#kritik-kararlar-ve-tasarım-seçimleri)
 
 ---
 
@@ -25,6 +28,112 @@
 - ✅ **Risk Yönetimi**: Wallet bazlı risk limitleri ve cumulative risk tracking
 - ✅ **MEV Koruması**: Jito bundle ile transaction'ları güvenli şekilde gönderir
 - ✅ **Dinamik Slippage**: Pozisyon büyüklüğüne göre otomatik slippage ayarlama
+
+---
+
+## 🚀 Hızlı Başlangıç
+
+### Gereksinimler
+
+- Rust 1.70+ (Solana 2.0 uyumlu)
+- Solana CLI (wallet yönetimi için)
+- Mainnet RPC endpoint (premium RPC önerilir)
+- Jito API erişimi
+
+### Kurulum
+
+```bash
+# Projeyi klonlayın
+git clone <repo-url>
+cd liqid-bot
+
+# Bağımlılıkları yükleyin
+cargo build --release
+
+# .env dosyasını oluşturun (aşağıdaki şablonu kullanın)
+cp .env.example .env
+# .env dosyasını düzenleyin
+
+# Wallet keypair'ı hazırlayın
+# secret/main.json dosyasına wallet keypair'ınızı kaydedin
+```
+
+### .env Dosyası Konfigürasyonu
+
+**ZORUNLU** environment variable'lar:
+
+```bash
+# RPC ve Jito
+RPC_URL=https://api.mainnet-beta.solana.com  # Premium RPC önerilir
+JITO_URL=https://mainnet.block-engine.jito.wtf
+JITO_TIP_ACCOUNT=96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3
+JITO_TIP_AMOUNT_LAMPORTS=10000000  # 0.01 SOL (opsiyonel, default: 10000000)
+
+# Solend Program
+SOLEND_PROGRAM_ID=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo  # Legacy Solend (USDC destekli)
+
+# Token Mints
+USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+
+# Oracle Program IDs
+PYTH_PROGRAM_ID=FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH
+SWITCHBOARD_PROGRAM_ID=SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f
+SWITCHBOARD_PROGRAM_ID_V3=SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f
+
+# Risk Yönetimi
+MIN_PROFIT_USDC=5.0  # Minimum kâr (USD)
+MAX_POSITION_PCT=0.05  # Wallet'ın %5'i max risk
+
+# Mod
+DRY_RUN=true  # true = test modu, false = canlı liquidation
+```
+
+**OPSİYONEL** environment variable'lar:
+
+```bash
+# Retry ve Timeout Ayarları
+MAX_RETRIES=5
+INITIAL_RETRY_DELAY_MS=1000
+POLL_INTERVAL_MS=200
+
+# Oracle Ayarları
+MAX_ORACLE_AGE_SECONDS=60
+MAX_ORACLE_DEVIATION_PCT=2.0
+HF_LIQUIDATION_THRESHOLD=1.0
+
+# Slippage Ayarları
+MIN_PROFIT_MARGIN_BPS=50
+DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS=20
+MAX_SLIPPAGE_BPS=150
+
+# Transaction Fee Ayarları
+BASE_TRANSACTION_FEE_LAMPORTS=5000
+LIQUIDATION_COMPUTE_UNITS=200000
+DEFAULT_PRIORITY_FEE_PER_CU=1000
+
+# Solend Override'ları (opsiyonel)
+LIQUIDATION_BONUS=0.05  # %5 (default: Reserve'den okunur)
+CLOSE_FACTOR=0.5  # %50 (default: Reserve'den okunur)
+
+# Save Protocol (opsiyonel, USDC yerine SUSD kullanıyorsa)
+SUSD_MINT_CANDIDATES=...  # Comma-separated list
+SOLEND_PROGRAM_ID_SAVE=SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
+SOLEND_PROGRAM_ID_LEGACY=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
+```
+
+### Çalıştırma
+
+```bash
+# Test modu (DRY_RUN=true)
+cargo run --release
+
+# Canlı mod (DRY_RUN=false) - DİKKAT: Gerçek işlemler yapılır!
+DRY_RUN=false cargo run --release
+```
+
+### Log Dosyaları
+
+Bot, her çalıştırmada `logs/liquidation_YYYY-MM-DD_HH-MM-SS.log` dosyası oluşturur. Loglar hem dosyaya hem de konsola yazılır.
 
 ---
 
@@ -78,6 +187,60 @@ liqid-bot/
 - Jito bundle client
 - Wallet utilities
 - Logging helpers
+
+---
+
+## ⚙️ Konfigürasyon
+
+### Environment Variable Yönetimi
+
+Bot, **tüm konfigürasyonu environment variable'lardan** okur. Hardcoded değer yoktur. Bu yaklaşım:
+
+- ✅ **Güvenlik**: Sensitive bilgiler kodda saklanmaz
+- ✅ **Esneklik**: Farklı ortamlar için farklı config'ler
+- ✅ **Maintainability**: Kod değişikliği olmadan config güncellemesi
+
+### Konfigürasyon Kategorileri
+
+#### 1. RPC ve Infrastructure
+- `RPC_URL`: Solana mainnet RPC endpoint (premium RPC önerilir)
+- `JITO_URL`: Jito block engine endpoint
+- `JITO_TIP_ACCOUNT`: Jito tip account (MEV koruması için)
+- `JITO_TIP_AMOUNT_LAMPORTS`: Jito tip miktarı (default: 0.01 SOL)
+
+#### 2. Solend Protokol
+- `SOLEND_PROGRAM_ID`: Solend program ID (Legacy Solend önerilir - USDC destekli)
+- `USDC_MINT`: USDC token mint address
+- `SUSD_MINT_CANDIDATES`: Save Protocol için SUSD mint'leri (opsiyonel)
+
+#### 3. Oracle Program IDs
+- `PYTH_PROGRAM_ID`: Pyth Network program ID
+- `SWITCHBOARD_PROGRAM_ID`: Switchboard program ID
+- `SWITCHBOARD_PROGRAM_ID_V3`: Switchboard v3 program ID
+
+#### 4. Risk Yönetimi
+- `MIN_PROFIT_USDC`: Minimum kâr threshold (USD)
+- `MAX_POSITION_PCT`: Wallet'ın maksimum yüzdesi (0.05 = %5)
+- `HF_LIQUIDATION_THRESHOLD`: Health Factor threshold (default: 1.0)
+
+#### 5. Oracle Ayarları
+- `MAX_ORACLE_AGE_SECONDS`: Oracle'ın maksimum yaşı (saniye)
+- `MAX_ORACLE_DEVIATION_PCT`: İki oracle arası maksimum sapma (%)
+
+#### 6. Slippage ve Fee Ayarları
+- `MIN_PROFIT_MARGIN_BPS`: Minimum kâr marjı (basis points)
+- `DEFAULT_ORACLE_CONFIDENCE_SLIPPAGE_BPS`: Oracle confidence için slippage
+- `MAX_SLIPPAGE_BPS`: Maksimum slippage tolerance
+
+### Runtime Validation
+
+Bot başlangıçta şu kontrolleri yapar:
+
+1. **Mainnet Connection**: Devnet/testnet URL'leri reddedilir
+2. **Solend Layout Validation**: Account layout'ları runtime'da doğrulanır
+3. **Wallet Balance**: Minimum SOL balance kontrolü
+4. **ATA Existence**: Gerekli Associated Token Account'lar oluşturulur
+5. **Program ID Validation**: Solend program ID geçerliliği
 
 ---
 
@@ -232,6 +395,89 @@ const MAX_ORACLE_DEVIATION_PCT: f64 = 2.0; // %2 max sapma
 - Oracle manipülasyon riskini azaltır
 - Çift doğrulama ile güvenilirlik artar
 - Tek oracle source'a bağımlılığı azaltır
+
+---
+
+## 📦 Solend Account Parsing Sistemi
+
+### Size-Based Discriminator Detection
+
+**KRİTİK DÜZELTME (2025-12-07)**: Solend Legacy hesapları için discriminator tespiti boyut bazlı yapılır.
+
+#### Problem
+
+Eski sistem, ilk 8 byte'ın sıfır olup olmadığına bakarak discriminator varlığını tespit ediyordu. Ancak Solend Legacy hesapları:
+- Tam olarak **1300 byte** boyutundadır
+- **Anchor discriminator kullanmaz** (veri doğrudan başlar)
+- İlk byte **version byte**'dır (0 veya 1), discriminator değil
+
+Eski kod, version byte'ı 1 olan bir hesabı görünce "discriminator var" sanıp 8 byte atlıyor ve 1292 byte ile 1300 byte'lık yapıyı okumaya çalışıyordu → **Hata!**
+
+#### Çözüm: Size-Based Detection
+
+```rust
+const EXPECTED_STRUCT_SIZE: usize = 1300; // Legacy Obligation/Reserve boyutu
+const DISCRIMINATOR_SIZE: usize = 8;      // Anchor discriminator boyutu
+
+// Boyut bazlı tespit
+let has_discriminator = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
+    // 1308 byte = Anchor account (discriminator var)
+    true
+} else if data.len() == EXPECTED_STRUCT_SIZE {
+    // 1300 byte = Legacy account (discriminator yok)
+    false
+} else {
+    // Edge case: Fallback to old logic
+    // ...
+};
+```
+
+#### Solend Account Formatları
+
+**Legacy Format (Native Solend)**:
+- Boyut: **1300 byte** (exact)
+- Discriminator: **Yok**
+- Version byte: İlk byte (0 veya 1)
+- Kullanım: Mainnet'te aktif olan format
+
+**Anchor Format (Save Protocol - gelecekte)**:
+- Boyut: **1308 byte** (1300 + 8 byte discriminator)
+- Discriminator: **Var** (ilk 8 byte)
+- Version byte: 9. byte (discriminator'dan sonra)
+- Kullanım: Save Protocol (2024 rebrand) için hazırlık
+
+#### Fonksiyonlar
+
+**`identify_solend_account_type()`**:
+- Boyut bazlı discriminator tespiti
+- Version byte kontrolü
+- Account type tahmini (Obligation/Reserve/LendingMarket)
+
+**`Obligation::from_account_data()`**:
+- Size-based discriminator detection
+- 1300 byte → Legacy format (discriminator yok)
+- 1308 byte → Anchor format (discriminator var)
+- Borsh deserialization
+
+**`Reserve::from_account_data()`**:
+- Aynı size-based detection mantığı
+- Version byte validation (Reserve için version = 1 zorunlu)
+
+### Account Layout Validation
+
+Bot, başlangıçta tüm Solend account'larını tarayarak layout doğrulaması yapar:
+
+```rust
+validate_solend_layouts(&rpc).await?;
+```
+
+Bu validation:
+- ✅ Account boyutlarını kontrol eder
+- ✅ Version byte'larını doğrular
+- ✅ Borsh deserialization test eder
+- ✅ Layout değişikliklerini erken tespit eder
+
+Eğer layout uyumsuzluğu tespit edilirse, bot hata verir ve IDL JSON'larının güncellenmesi gerektiğini bildirir.
 
 ---
 
@@ -653,6 +899,39 @@ let feed = bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data)
 
 **Etki**: Switchboard oracle validation aktif, cross-validation çalışıyor
 
+### 8. Size-Based Discriminator Detection (KRİTİK - 2025-12-07)
+
+**Problem**: Solend Legacy hesapları (1300 byte) yanlış parse ediliyordu
+- Eski kod: İlk 8 byte'ın sıfır olup olmadığına bakıyordu
+- Version byte (1) görünce "discriminator var" sanıp 8 byte atlıyordu
+- 1292 byte ile 1300 byte'lık yapıyı okumaya çalışıyordu → **Hata!**
+
+**Çözüm**: Boyut bazlı discriminator tespiti
+
+```rust
+// ÖNCE (YANLIŞ):
+let has_discriminator = !data[0..8].iter().all(|&b| b == 0);
+
+// SONRA (DOĞRU):
+let has_discriminator = if data.len() == 1308 {
+    true  // Anchor format (discriminator var)
+} else if data.len() == 1300 {
+    false // Legacy format (discriminator yok)
+} else {
+    // Fallback logic
+};
+```
+
+**Etki**: 
+- ✅ Solend Legacy hesapları doğru parse ediliyor
+- ✅ 1300 byte hesaplar artık hata vermiyor
+- ✅ Hem Legacy hem Anchor format desteği
+
+**Dosyalar**:
+- `src/solend.rs::identify_solend_account_type()`
+- `src/solend.rs::Obligation::from_account_data()`
+- `src/solend.rs::Reserve::from_account_data()`
+
 ---
 
 ## 🎯 Kritik Kararlar ve Tasarım Seçimleri
@@ -698,6 +977,13 @@ let feed = bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data)
 - **Solend Native Program**: Anchor değil, Borsh kullanır
 - **Layout Compatibility**: Solend'in account layout'u Borsh formatında
 - **Performance**: Borsh, binary format, hızlı parsing
+
+### 8. Neden Size-Based Discriminator Detection?
+
+- **Legacy Format**: Solend Legacy hesapları 1300 byte, discriminator yok
+- **Version Byte**: İlk byte version byte (0 veya 1), discriminator değil
+- **Anchor Compatibility**: Gelecekte Anchor format (1308 byte) desteği için hazırlık
+- **Reliability**: Boyut bazlı tespit daha güvenilir (zero-check yanıltıcı olabilir)
 
 ---
 
@@ -753,6 +1039,21 @@ Bot her cycle'da şu metrikleri toplar:
 
 Bu dokümantasyon, projenin teknik mimarisini ve tasarım kararlarını detaylı olarak açıklar. Gelecekte yeni geliştiriciler veya projeye geri dönen ekip üyeleri için referans olarak kullanılabilir.
 
-**Son Güncelleme**: 2025-01-XX
-**Versiyon**: 1.0.0
+**Son Güncelleme**: 2025-12-07
+**Versiyon**: 1.1.0
+
+### Versiyon Geçmişi
+
+#### v1.1.0 (2025-12-07)
+- ✅ Size-based discriminator detection (Solend Legacy account parsing düzeltmesi)
+- ✅ 1300 byte account desteği (discriminator olmadan)
+- ✅ Runtime layout validation iyileştirmeleri
+- ✅ Environment variable dokümantasyonu
+
+#### v1.0.0 (2025-01-XX)
+- ✅ İlk stabil sürüm
+- ✅ Pyth + Switchboard oracle entegrasyonu
+- ✅ Jupiter DEX entegrasyonu
+- ✅ Jito bundle desteği
+- ✅ Risk yönetimi sistemi
 
