@@ -17,13 +17,16 @@ const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 // Total worst case: 10s (first) + 20s (retry) = 30s, leaving 30s for TX build + send
 // 
 // NOTE: These values can be overridden via environment variables:
-// - JUPITER_TIMEOUT_NORMAL_SECS (default: 10)
-// - JUPITER_TIMEOUT_RETRY_SECS (default: 20)
+// - JUPITER_TIMEOUT_NORMAL_SECS (default: 6)
+// - JUPITER_TIMEOUT_RETRY_SECS (default: 12)
 // 
-// Trade-off: Longer timeouts may cause some opportunities to be missed due to blockhash staleness,
-// but shorter timeouts cause more missed opportunities due to Jupiter API slowness.
-const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 10;   // First attempt - balance speed and reliability
-const REQUEST_TIMEOUT_RETRY_SECS: u64 = 20;    // Retries - allow more time for high-load scenarios
+// CRITICAL FIX: Reduced timeouts to prevent blockhash expiry
+// Blockhash expires in ~60s, so we need: Jupiter (6+12=18s) + TX build (20-30s) = 38-48s total
+// This leaves 12-22s buffer for blockhash freshness
+// Trade-off: Shorter timeouts may cause some opportunities to be missed due to Jupiter API slowness,
+// but longer timeouts cause more missed opportunities due to blockhash staleness.
+const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 6;    // First attempt - reduced from 10s to preserve blockhash
+const REQUEST_TIMEOUT_RETRY_SECS: u64 = 12;   // Retries - reduced from 20s to preserve blockhash
 
 // Legacy constant for backward compatibility (use REQUEST_TIMEOUT_RETRY_SECS)
 const REQUEST_TIMEOUT_SECS: u64 = REQUEST_TIMEOUT_RETRY_SECS;

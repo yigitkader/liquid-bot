@@ -549,7 +549,7 @@ async fn process_cycle(
             let expiry_timeout_secs = env::var("BUNDLE_EXPIRY_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2); // Default: 2 seconds (was 5s) - more aggressive
+                .unwrap_or(5); // Default: 5 seconds - Jito bundles can take 400ms-2s to confirm, need buffer
             
             // Find expired bundles (unconfirmed and older than timeout)
             let expired_bundle_ids: Vec<String> = self.bundles.iter()
@@ -2409,22 +2409,22 @@ async fn validate_switchboard_oracle_if_available(
 /// Account size: ~3312 bytes (much larger than v2's 84 bytes)
 ///
 /// Use pyth-sdk-solana crate for proper parsing
+/// CRITICAL FIX: Use load_price_account() instead of load_price_feed_from_account()
+/// to properly parse Pythnet v3 oracle data
 async fn validate_pyth_oracle_v3(
     rpc: &Arc<RpcClient>,
     oracle_pubkey: Pubkey,
     current_slot: u64,
 ) -> Result<(bool, Option<f64>)> {
-    use pyth_sdk_solana::load_price_feed_from_account;
-
-    // Get account data
-    let mut oracle_account = rpc
-        .get_account(&oracle_pubkey)
-        .map_err(|e| anyhow::anyhow!("Failed to get oracle account: {}", e))?;
+    use pyth_sdk_solana::state::load_price_account;
     
-    // Parse using pyth-sdk-solana
-    // Use load_price_feed_from_account which accepts Account directly (simpler than AccountInfo)
-    // Note: This function is deprecated but still works and is simpler to use
-    let price_feed = load_price_feed_from_account(&oracle_pubkey, &mut oracle_account)
+    // Get account data directly
+    let account_data = rpc
+        .get_account_data(&oracle_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get oracle account data: {}", e))?;
+    
+    // Parse using pyth-sdk-solana's load_price_account (correct API)
+    let price_account = load_price_account(&account_data)
         .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
     
     // Get current time for staleness check
@@ -2434,12 +2434,12 @@ async fn validate_pyth_oracle_v3(
         .unwrap()
         .as_secs() as i64;
     
-    // Configurable max age for Pythnet v3 (default: 120 seconds, more lenient than 60s)
+    // Configurable max age for Pythnet v3 (default: 300 seconds = 5 minutes)
     // Some Pyth feeds update less frequently, so we need a reasonable window
     let max_age_seconds = env::var("PYTHNET_V3_MAX_AGE_SECONDS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(120); // Default 120 seconds (2 minutes) - more reasonable than 60s
+        .unwrap_or(300); // Default 300 seconds (5 minutes) - more lenient to reduce opportunity loss
     
     log::trace!(
         "Validating Pythnet v3 oracle {} at slot {} (current_time: {}, max_age: {}s)",
@@ -2449,64 +2449,60 @@ async fn validate_pyth_oracle_v3(
         max_age_seconds
     );
     
-    // Get current price with configurable staleness check
-    // Use get_price_no_older_than with configurable max_age_seconds (default: 120s, more lenient than hardcoded 60s)
-    // This allows feeds that update less frequently to still be accepted
-    let price_data = match price_feed.get_price_no_older_than(current_time, max_age_seconds as u64) {
+    // CRITICAL FIX: Use get_current_price() instead of get_price_no_older_than()
+    // This is the correct API for Pythnet v3
+    let price_data = match price_account.get_current_price() {
         Some(price) => {
             let age_seconds = current_time - price.publish_time;
-            log::debug!(
-                "Pythnet v3 oracle {}: price available, age={}s (publish_time: {}, current_time: {}, max_age: {}s)",
-                oracle_pubkey,
-                age_seconds,
-                price.publish_time,
-                current_time,
-                max_age_seconds
-            );
-            price
-        },
-        None => {
-            // Try with very long timeout (1 hour) to see if price exists but is just stale
-            // This helps debug why get_price_no_older_than failed
-            if let Some(latest_price) = price_feed.get_price_no_older_than(current_time, 3600) {
-                let age_seconds = current_time - latest_price.publish_time;
+            
+            // Check if price is within acceptable age limit
+            if age_seconds > max_age_seconds {
+                log::debug!(
+                    "Pythnet v3 oracle {}: price too old, age={}s > {}s (publish_time: {}, current_time: {})",
+                    oracle_pubkey,
+                    age_seconds,
+                    max_age_seconds,
+                    price.publish_time,
+                    current_time
+                );
                 
-                // Use a more lenient threshold for fallback (5 minutes = 300 seconds)
-                // This handles cases where max_age_seconds is too strict
-                if age_seconds > 300 {
+                // Try lenient fallback: accept up to 10 minutes (600 seconds) if within reason
+                if age_seconds > 600 {
                     log::warn!(
-                        "⚠️ Pythnet v3 oracle {}: Price too old even for fallback (age: {}s > 300s, publish_time: {}, current_time: {}). \
-                         get_price_no_older_than({}s) rejected it, and it's also > 5min old. Rejecting.",
+                        "⚠️ Pythnet v3 oracle {}: Price too old even for fallback (age: {}s > 600s). Rejecting.",
                         oracle_pubkey,
-                        age_seconds,
-                        latest_price.publish_time,
-                        current_time,
-                        max_age_seconds
+                        age_seconds
                     );
                     return Ok((false, None));
                 }
                 
-                // Price is reasonably fresh (within 5 minutes), use it as fallback
-                log::info!(
-                    "✅ Pythnet v3 oracle {}: Using lenient fallback (age: {}s, publish_time: {}, current_time: {}). \
-                     Price was rejected by get_price_no_older_than({}s) but is still reasonably fresh (< 5min).",
+                // Use older price with warning (within 10 minutes)
+                log::warn!(
+                    "⚠️ Using older Pyth price (age: {}s, max: {}s) - within fallback limit",
+                    age_seconds,
+                    max_age_seconds
+                );
+            } else {
+                log::debug!(
+                    "Pythnet v3 oracle {}: price available, age={}s (publish_time: {}, current_time: {}, max_age: {}s)",
                     oracle_pubkey,
                     age_seconds,
-                    latest_price.publish_time,
+                    price.publish_time,
                     current_time,
                     max_age_seconds
                 );
-                latest_price
-            } else {
-                log::warn!(
-                    "⚠️ Pythnet v3 oracle {}: No price available at all (current_time: {}). \
-                     get_price_no_older_than() returned None even with 1-hour timeout. \
-                     This may indicate: feed is down, account is corrupted, or SDK version mismatch.",
-                    oracle_pubkey,
-                    current_time
-                );
-                return Ok((false, None));
             }
+            
+            price
+        },
+        None => {
+            log::warn!(
+                "⚠️ Pythnet v3 oracle {}: No current price available (current_time: {}). \
+                 This may indicate: feed is down, account is corrupted, or SDK version mismatch.",
+                oracle_pubkey,
+                current_time
+            );
+            return Ok((false, None));
         }
     };
     
@@ -2600,45 +2596,55 @@ async fn validate_pyth_oracle(
     oracle_pubkey: Pubkey,
     current_slot: u64,
 ) -> Result<(bool, Option<f64>)> {
-    // 1. Verify oracle account belongs to Pyth program ID
+    // 1. Get oracle account and check program ID (CRITICAL: check by owner, not by size!)
     let oracle_account = rpc
         .get_account(&oracle_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get oracle account: {}", e))?;
 
-    let pyth_program_id = pyth_program_id()?;
-
-    if oracle_account.owner != pyth_program_id {
+    // CRITICAL FIX: Check program ID by owner, not by account size
+    // Pyth v2 program ID (legacy)
+    let pyth_v2_program = Pubkey::from_str("FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH")
+        .map_err(|e| anyhow::anyhow!("Failed to parse Pyth v2 program ID: {}", e))?;
+    
+    // Pythnet v3 program ID (current mainnet standard)
+    let pythnet_v3_program = Pubkey::from_str("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ")
+        .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 program ID: {}", e))?;
+    
+    // Also check env variable (for flexibility, but prefer hardcoded known IDs)
+    let pyth_program_id_env = pyth_program_id().ok();
+    
+    // Check if account belongs to Pyth program (v2 or v3)
+    let is_pyth_v2 = oracle_account.owner == pyth_v2_program;
+    let is_pythnet_v3 = oracle_account.owner == pythnet_v3_program;
+    let is_pyth_env = pyth_program_id_env.map(|id| oracle_account.owner == id).unwrap_or(false);
+    
+    if !is_pyth_v2 && !is_pythnet_v3 && !is_pyth_env {
         // This is not a Pyth oracle - might be Switchboard or another oracle type
         // This is expected behavior, not an error - just return false
         log::debug!(
-            "Oracle account {} does not belong to Pyth program (owner: {}, expected: {}). This may be a Switchboard oracle.",
+            "Oracle account {} does not belong to Pyth program (owner: {}). Expected: v2={}, v3={}, env={:?}. This may be a Switchboard oracle.",
             oracle_pubkey,
             oracle_account.owner,
-            pyth_program_id
+            pyth_v2_program,
+            pythnet_v3_program,
+            pyth_program_id_env
         );
         return Ok((false, None));
     }
     
     // DEBUG: Log account data info for troubleshooting
     log::debug!(
-        "🔍 Pyth oracle {}: account size={} bytes, first 16 bytes: {:02x?}",
+        "🔍 Pyth oracle {}: account size={} bytes, owner={}, version={}",
         oracle_pubkey,
         oracle_account.data.len(),
-        &oracle_account.data[..16.min(oracle_account.data.len())]
+        oracle_account.owner,
+        if is_pythnet_v3 { "v3" } else if is_pyth_v2 { "v2" } else { "env" }
     );
 
-    // 2. Auto-detect Pyth version from account size
-    // Pyth v2: ~84 bytes (legacy)
-    // Pythnet v3: 3312+ bytes (current mainnet standard)
-    let account_size = oracle_account.data.len();
-    
-    // CRITICAL: Pythnet v3 format (3312 bytes) is now standard on mainnet
-    // Old v2 format (84 bytes) is deprecated
-    let is_pythnet_v3 = account_size >= 3000;
-    
+    // 2. Route to correct parser based on program ID (not account size!)
     if is_pythnet_v3 {
         // Use Pythnet v3 parser (pyth-sdk-solana crate)
-        log::debug!("✅ Detected Pythnet v3 format ({} bytes) for oracle {} - using v3 parser", account_size, oracle_pubkey);
+        log::debug!("✅ Detected Pythnet v3 oracle (program ID match) for {} - using v3 parser", oracle_pubkey);
         return validate_pyth_oracle_v3(rpc, oracle_pubkey, current_slot).await;
     }
     
@@ -3353,6 +3359,7 @@ struct LiquidationQuote {
     collateral_value_usd: f64, // Position size in USD for risk limit calculation
     debt_to_repay_raw: u64, // Debt amount to repay (in debt token raw units) for Solend instruction
     collateral_to_seize_raw: u64, // Collateral cToken amount to seize (for redemption check)
+    flashloan_fee_raw: u64, // Flashloan fee amount (in raw token units) - CRITICAL: Store to avoid recalculation inconsistency
 }
 
 /// Get SOL price in USD from oracle (standalone version - no context required)
@@ -3975,12 +3982,12 @@ async fn get_liquidation_quote(
     // Step 8: Get final Jupiter quote with calculated dynamic slippage
     // CRITICAL: Jupiter quote uses UNDERLYING token (SOL), not cToken (cSOL)
     // CRITICAL: Limit retries to preserve blockhash freshness
-    // Blockhash expires in ~60s, Jupiter timeout: 6s + 10s = 16s worst case
-    // Reducing retries from 3 to 2 to minimize time spent on Jupiter
+    // Blockhash expires in ~60s, Jupiter timeout: 6s + 12s = 18s worst case
+    // Reduced retries from 2 to 1 to minimize time spent on Jupiter (total 2 attempts: 1 initial + 1 retry)
     let max_retries = env::var("JUPITER_MAX_RETRIES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(2); // Default: 2 retries (total 3 attempts: 1 initial + 2 retries)
+        .unwrap_or(1); // Default: 1 retry (total 2 attempts: 1 initial + 1 retry)
     
     let quote = get_jupiter_quote_with_retry(
         &collateral_underlying_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
@@ -4127,23 +4134,27 @@ async fn get_liquidation_quote(
     // ✅ FIXED: Flashloan fee calculation with u128 arithmetic
     // Solend flashloan fee: reserve.config().flashLoanFeeWad (typically 0.003 = 0.3%)
     // This fee is applied to debt_to_repay_raw amount
-    let flashloan_fee_usd = if let Some(borrow_reserve) = &ctx.borrow_reserve {
-        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+    // CRITICAL FIX: Calculate once and reuse to avoid inconsistency
+    const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+    let flashloan_fee_amount_raw = if let Some(borrow_reserve) = &ctx.borrow_reserve {
         let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
-        
         // Flashloan fee amount (in raw token units)
         // CRITICAL FIX: Use u128 arithmetic to prevent overflow
-        let flashloan_fee_amount_raw = (debt_to_repay_raw as u128)
+        (debt_to_repay_raw as u128)
             .checked_mul(flashloan_fee_wad)
             .and_then(|v| v.checked_div(WAD))
             .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow"))?
-            as u64;
-        
-        // Convert to USD
+            as u64
+    } else {
+        0 // No flashloan fee if borrow reserve not available (shouldn't happen)
+    };
+    
+    // Convert to USD for profit calculation
+    let flashloan_fee_usd = if flashloan_fee_amount_raw > 0 {
         let flashloan_fee_tokens = (flashloan_fee_amount_raw as f64) / 10_f64.powi(debt_decimals as i32);
         flashloan_fee_tokens * debt_price_usd
     } else {
-        0.0 // No flashloan fee if borrow reserve not available (shouldn't happen)
+        0.0
     };
     
     // Total fees in USD (single transaction approach)
@@ -4236,12 +4247,16 @@ async fn get_liquidation_quote(
     // collateral_value_usd is used for risk limit calculations (position size)
     let collateral_value_usd = collateral_to_seize_usd;
     
+    // CRITICAL FIX: flashloan_fee_amount_raw is already calculated above and reused here
+    // This ensures the fee used in profit calculation matches the fee used in TX build
+    
     Ok(LiquidationQuote {
         quote,
         profit_usdc,
         collateral_value_usd,
         debt_to_repay_raw, // Debt amount to repay in Solend instruction
         collateral_to_seize_raw, // Collateral cToken amount to seize (for redemption check)
+        flashloan_fee_raw: flashloan_fee_amount_raw, // Store calculated fee to reuse in TX build (calculated once above)
     })
 }
 
@@ -5241,16 +5256,9 @@ async fn build_flashloan_liquidation_tx(
     // CRITICAL: FlashLoan requires explicit repayment instruction - NOT automatic!
     // Solend uses two-instruction pattern: FlashBorrow (tag 13) + FlashRepay (tag 14)
     // 
-    // Calculate flashloan fee
-    const WAD_U128: u128 = 1_000_000_000_000_000_000;
-    let fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
-    
-    // CRITICAL: Use u128 arithmetic for fee calculation to prevent overflow
-    let flashloan_fee_amount = (flashloan_amount as u128)
-        .checked_mul(fee_wad)
-        .and_then(|v| v.checked_div(WAD_U128))
-        .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow during tx build"))?
-        as u64;
+    // CRITICAL FIX: Use flashloan_fee_raw from quote instead of recalculating
+    // This ensures consistency between profit calculation and TX build
+    let flashloan_fee_amount = quote.flashloan_fee_raw;
         
     let repay_amount = flashloan_amount + flashloan_fee_amount;
     
