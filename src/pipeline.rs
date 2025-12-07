@@ -6,6 +6,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -541,18 +542,145 @@ async fn process_cycle(
                 !info.confirmed || now.duration_since(info.sent_at) < Duration::from_secs(10)
             });
             
-            // Remove expired unconfirmed bundles (older than 5s - definitely dropped)
-            let expired: Vec<String> = self.bundles.iter()
+            // CRITICAL: Release expired unconfirmed bundles (more aggressive timeout)
+            // Timeout configurable via BUNDLE_EXPIRY_TIMEOUT_SECS (default: 2s)
+            // This prevents overcommit by releasing dropped bundles quickly
+            use std::env;
+            let expiry_timeout_secs = env::var("BUNDLE_EXPIRY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2); // Default: 2 seconds (was 5s) - more aggressive
+            
+            // Find expired bundles (unconfirmed and older than timeout)
+            let expired_bundle_ids: Vec<String> = self.bundles.iter()
                 .filter(|(_, info)| {
-                    !info.confirmed && now.duration_since(info.sent_at) >= Duration::from_secs(5)
+                    !info.confirmed && 
+                    now.duration_since(info.sent_at) >= Duration::from_secs(expiry_timeout_secs)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
             
-            for bundle_id in &expired {
-                self.bundles.remove(bundle_id);
-                log::warn!("Bundle {} expired (not confirmed in 5s), assuming dropped", bundle_id);
+            // Verify bundle status before releasing (to avoid false positives)
+            let mut expired_to_release: Vec<(String, f64)> = Vec::new();
+            for bundle_id in expired_bundle_ids {
+                // Check bundle status one more time before releasing
+                match jito_client.get_bundle_status(&bundle_id).await {
+                    Ok(Some(status)) => {
+                        if let Some(status_str) = &status.status {
+                            match status_str.as_str() {
+                                "landed" | "confirmed" => {
+                                    // Bundle actually confirmed - mark as confirmed instead of releasing
+                                    if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                                        if !info.confirmed {
+                                            info.confirmed = true;
+                                            newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                            log::debug!(
+                                                "✅ Bundle {} confirmed during expiry check (was about to expire)",
+                                                bundle_id
+                                            );
+                                        }
+                                    }
+                                    continue; // Don't release - it's confirmed
+                                }
+                                "failed" | "dropped" => {
+                                    // Bundle definitely failed - safe to release
+                                    if let Some(info) = self.bundles.get(&bundle_id) {
+                                        expired_to_release.push((bundle_id.clone(), info.value_usd));
+                                        log::warn!(
+                                            "⏰ Releasing expired bundle {} (${:.2}) after {}s - status: {}",
+                                            bundle_id,
+                                            info.value_usd,
+                                            expiry_timeout_secs,
+                                            status_str
+                                        );
+                                    }
+                                }
+                                "pending" => {
+                                    // Still pending - give it more time (don't release yet)
+                                    log::debug!(
+                                        "Bundle {} still pending after {}s - keeping for now",
+                                        bundle_id,
+                                        expiry_timeout_secs
+                                    );
+                                    continue; // Don't release - still pending
+                                }
+                                _ => {
+                                    // Unknown status - assume dropped after timeout
+                                    if let Some(info) = self.bundles.get(&bundle_id) {
+                                        expired_to_release.push((bundle_id.clone(), info.value_usd));
+                                        log::warn!(
+                                            "⏰ Releasing expired bundle {} (${:.2}) after {}s - unknown status: {}",
+                                            bundle_id,
+                                            info.value_usd,
+                                            expiry_timeout_secs,
+                                            status_str
+                                        );
+                                    }
+                                }
+                            }
+                        } else if status.slot.is_some() {
+                            // Has slot - likely confirmed
+                            if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                                if !info.confirmed {
+                                    info.confirmed = true;
+                                    newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                    log::debug!(
+                                        "✅ Bundle {} confirmed during expiry check (has slot)",
+                                        bundle_id
+                                    );
+                                }
+                            }
+                            continue; // Don't release - it's confirmed
+                        } else {
+                            // No status but has response - assume dropped after timeout
+                            if let Some(info) = self.bundles.get(&bundle_id) {
+                                expired_to_release.push((bundle_id.clone(), info.value_usd));
+                                log::warn!(
+                                    "⏰ Releasing expired bundle {} (${:.2}) after {}s - no status in response",
+                                    bundle_id,
+                                    info.value_usd,
+                                    expiry_timeout_secs
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No status available - assume dropped after timeout
+                        if let Some(info) = self.bundles.get(&bundle_id) {
+                            expired_to_release.push((bundle_id.clone(), info.value_usd));
+                            log::warn!(
+                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - no status available",
+                                bundle_id,
+                                info.value_usd,
+                                expiry_timeout_secs
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // API error - assume dropped after timeout (conservative)
+                        if let Some(info) = self.bundles.get(&bundle_id) {
+                            expired_to_release.push((bundle_id.clone(), info.value_usd));
+                            log::warn!(
+                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - status check failed: {}",
+                                bundle_id,
+                                info.value_usd,
+                                expiry_timeout_secs,
+                                e
+                            );
+                        }
+                    }
+                }
             }
+            
+            // Remove released bundles from tracking
+            for (bundle_id, _) in &expired_to_release {
+                self.bundles.remove(bundle_id);
+            }
+            
+            // Return both confirmed and expired bundles
+            // Both should release committed amounts (confirmed = executed, expired = dropped)
+            // Expired bundles are added to newly_confirmed so caller can release committed amounts
+            newly_confirmed.extend(expired_to_release);
             
             newly_confirmed
         }
@@ -565,22 +693,15 @@ async fn process_cycle(
                 .sum()
         }
         
-        /// Release expired bundles (return their committed value)
+        /// Release expired bundles (DEPRECATED - now handled in update_statuses)
+        /// This function is kept for backward compatibility but is no longer used.
+        /// Expired bundle handling is now integrated into update_statuses() for better
+        /// status verification before releasing.
+        #[allow(dead_code)]
         fn release_expired(&mut self) -> Vec<(String, f64)> {
-            let now = Instant::now();
-            
-            let expired: Vec<(String, f64)> = self.bundles.iter()
-                .filter(|(_, info)| {
-                    !info.confirmed && now.duration_since(info.sent_at) >= Duration::from_secs(5)
-                })
-                .map(|(id, info)| (id.clone(), info.value_usd))
-                .collect();
-            
-            for (bundle_id, _) in &expired {
-                self.bundles.remove(bundle_id);
-            }
-            
-            expired
+            // This function is deprecated - expired bundles are now handled in update_statuses()
+            // with proper status verification
+            Vec::new()
         }
     }
     
@@ -1072,7 +1193,10 @@ fn switchboard_program_id_v3() -> Result<Pubkey> {
 /// 
 /// CRITICAL: Set to 1e-6 to support micro-cap tokens while maintaining safety
 /// Previous 1e-3 was too aggressive and rejected valid micro-cap tokens ($0.0005)
-const MIN_VALID_PRICE_USD: f64 = 1e-6; // $0.000001 minimum (1 micro-dollar) - supports micro-cap tokens
+// CRITICAL FIX: Minimum valid price threshold
+// Increased from 1e-6 to 0.01 to prevent division by zero and floating point precision issues
+// Micro-cap tokens (< $0.01) are too risky for liquidations anyway
+const MIN_VALID_PRICE_USD: f64 = 0.01; // $0.01 minimum (was 1e-6)
 
 /// Get oracle configuration from .env (no hardcoded values)
 fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
@@ -1082,7 +1206,7 @@ fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
     let max_oracle_age_secs = env::var("MAX_ORACLE_AGE_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120); // Default 120 seconds if not set
+        .unwrap_or(300); // Default 300 seconds (5 minutes) if not set - more flexible for production
     
     // Convert to slots (assuming ~400ms per slot)
     let max_slot_difference = (max_oracle_age_secs * 1000 / 400).max(25); // Minimum 25 slots
@@ -1103,7 +1227,7 @@ fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
     let max_confidence_pct = env::var("MAX_CONFIDENCE_PCT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(5.0); // Default 5%
+        .unwrap_or(15.0); // Default 15% (more flexible for volatile markets)
 
     // MAX_CONFIDENCE_PCT_PYTH_ONLY: Stricter confidence for Pyth-only mode
     let max_confidence_pct_pyth_only = env::var("MAX_CONFIDENCE_PCT_PYTH_ONLY")
@@ -1647,15 +1771,19 @@ async fn validate_switchboard_oracle_if_available(
     // Prevents parsing malicious accounts that claim to be oracles
     if oracle_account.owner != switchboard_program_id_v2 
         && oracle_account.owner != switchboard_program_id_v3 {
-        log::debug!(
+        log::error!(
             "❌ Switchboard oracle account {} rejected: invalid owner\n\
              - Expected: {} (v2) or {} (v3)\n\
              - Found: {}\n\
+             - Account size: {} bytes\n\
+             - First 32 bytes: {:02x?}\n\
              - This may indicate: wrong oracle type, malicious account, or data corruption",
             switchboard_oracle_pubkey,
             switchboard_program_id_v2,
             switchboard_program_id_v3,
-            oracle_account.owner
+            oracle_account.owner,
+            oracle_account.data.len(),
+            &oracle_account.data[..32.min(oracle_account.data.len())]
         );
         return Ok(None);
     }
@@ -1667,13 +1795,19 @@ async fn validate_switchboard_oracle_if_available(
     let account_size = oracle_account.data.len();
     
     if account_size < EXPECTED_FEED_SIZE_MIN || account_size > EXPECTED_FEED_SIZE_MAX {
-        log::warn!(
-            "⚠️  Switchboard feed {} has unusual size: {} bytes (expected: {}-{} bytes)\n\
-             This may indicate wrong account type or data corruption",
+        log::error!(
+            "❌ Switchboard feed {} has unusual size:\n\
+             - Account size: {} bytes\n\
+             - Expected range: {}-{} bytes\n\
+             - Owner: {}\n\
+             - First 32 bytes: {:02x?}\n\
+             - This may indicate: wrong account type, data corruption, or RPC issue",
             switchboard_oracle_pubkey,
             account_size,
             EXPECTED_FEED_SIZE_MIN,
-            EXPECTED_FEED_SIZE_MAX
+            EXPECTED_FEED_SIZE_MAX,
+            oracle_account.owner,
+            &oracle_account.data[..32.min(oracle_account.data.len())]
         );
         return Ok(None);
     }
@@ -1691,107 +1825,321 @@ async fn validate_switchboard_oracle_if_available(
         account_size
     );
 
-    // 3. Parse using Switchboard On-Demand SDK (Solana 2.0 compatible)
-    // 
-    // PullFeedAccountData implements Pod (Plain Old Data), so we can use bytemuck
-    // to directly deserialize from the account data. This is the recommended approach
-    // for off-chain clients, as the SDK's parse() method is designed for Anchor's
-    // account.data.borrow() pattern which requires Ref<'_, &mut [u8]>.
-    // 
-    // CRITICAL FIX: Solana account data is not guaranteed to be aligned.
-    // try_from_bytes requires alignment, which can cause runtime panic.
-    // We handle AlignmentMismatch error with a safe fallback that ensures proper alignment.
+    // 3. Parse using appropriate SDK based on version
+    // CRITICAL FIX: v2 and v3 use DIFFERENT account layouts!
+    // - v2: AggregatorAccountData (buffer-layout)
+    // - v3: PullFeedAccountData (Anchor format)
+    // We MUST use the correct parser for each version
     
-    // Ensure we have enough data
-    let feed_size = std::mem::size_of::<PullFeedAccountData>();
-    if oracle_account.data.len() < feed_size {
-        log::warn!(
-            "Switchboard feed account data too short: {} bytes (need at least {})",
-            oracle_account.data.len(),
-            feed_size
-        );
-        return Ok(None);
-    }
-    
-    // CRITICAL: Solana RPC account data is NOT guaranteed to be aligned.
-    // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
-    // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
-    // We use a safe alignment strategy: try direct parse first, then fallback to explicit alignment.
-    // Note: PullFeedAccountData implements Pod, so we can use bytemuck safely IF aligned.
-    let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
-            Ok(feed) => *feed,
-            Err(bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned) => {
-                // Fallback: Copy to aligned buffer
-                // This is slower but safe for unaligned data
-                let aligned_data = oracle_account.data.to_vec();
-                match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_data) {
-                    Ok(feed) => *feed,
+    if oracle_account.owner == switchboard_program_id_v3 {
+        // ========== SWITCHBOARD v3 (On-Demand) ==========
+        // Use PullFeedAccountData (Anchor format with discriminator)
+        
+        // CRITICAL: Check discriminator for v3 (Anchor format)
+        const DISCRIMINATOR_SIZE: usize = 8;
+        if oracle_account.data.len() < DISCRIMINATOR_SIZE {
+            log::error!(
+                "❌ Switchboard v3 account {} too small for discriminator check: {} bytes",
+                switchboard_oracle_pubkey,
+                oracle_account.data.len()
+            );
+            return Ok(None);
+        }
+        
+        // Ensure we have enough data for PullFeedAccountData
+        let feed_size = std::mem::size_of::<PullFeedAccountData>();
+        if oracle_account.data.len() < feed_size {
+            log::error!(
+                "❌ Switchboard v3 feed account data too short for {}:\n\
+                 - Account size: {} bytes\n\
+                 - Required size: {} bytes (PullFeedAccountData)\n\
+                 - Owner: {}\n\
+                 - First 32 bytes: {:02x?}\n\
+                 - This may indicate: wrong account type, incomplete data, or RPC issue",
+                switchboard_oracle_pubkey,
+                oracle_account.data.len(),
+                feed_size,
+                oracle_account.owner,
+                &oracle_account.data[..32.min(oracle_account.data.len())]
+            );
+            return Ok(None);
+        }
+        
+        // CRITICAL FIX: Proper alignment handling for v3
+        // Solana RPC account data is NOT guaranteed to be aligned.
+        // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
+        let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
+        Ok(feed) => *feed,
+        Err(bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned) => {
+            // CRITICAL FIX: Properly align the data
+            // Vec allocates aligned memory, but we need to ensure the slice we pass
+            // to bytemuck starts at an aligned address
+            let alignment = std::mem::align_of::<PullFeedAccountData>();
+            let size = oracle_account.data.len();
+            
+            // Allocate buffer with extra space for alignment padding
+            let mut aligned_buffer = get_aligned_buffer(size + alignment);
+            
+            // Find the aligned offset within the buffer
+            let ptr = aligned_buffer.as_ptr();
+            let offset = unsafe {
+                // SAFETY: align_offset is safe to call, it just calculates an offset
+                ptr.align_offset(alignment)
+            };
+            
+            // Ensure we have enough space after alignment
+            let required_size = offset + size;
+            if required_size > aligned_buffer.len() {
+                aligned_buffer = get_aligned_buffer(required_size);
+                let ptr = aligned_buffer.as_ptr();
+                let offset = unsafe {
+                    // SAFETY: align_offset is safe to call
+                    ptr.align_offset(alignment)
+                };
+                aligned_buffer[offset..offset + size].copy_from_slice(&oracle_account.data[..size]);
+                
+                log::debug!(
+                    "Switchboard feed {} requires alignment fix (offset: {}, size: {})",
+                    switchboard_oracle_pubkey,
+                    offset,
+                    size
+                );
+                
+                match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_buffer[offset..offset + size]) {
+                    Ok(feed) => {
+                        let feed_copy = *feed; // Clone the feed data
+                        return_aligned_buffer(aligned_buffer);
+                        feed_copy
+                    },
                     Err(e) => {
-                        let (_, _, _, _, _, _, _, _) = get_oracle_config();
-                        log::debug!(
-                            "Switchboard feed parsing failed (even with alignment) for {}: {}. Falling back to Pyth-only.",
+                        return_aligned_buffer(aligned_buffer);
+                        log::error!(
+                            "❌ Switchboard feed parsing failed (aligned) for {}:\n\
+                             - Error: {:?}\n\
+                             - Account size: {} bytes\n\
+                             - Required size: {} bytes\n\
+                             - Owner: {}\n\
+                             - Falling back to Pyth-only mode",
                             switchboard_oracle_pubkey,
-                            e
+                            e,
+                            oracle_account.data.len(),
+                            feed_size,
+                            oracle_account.owner
                         );
                         return Ok(None);
                     }
                 }
-            },
-            Err(e) => {
-                let (_, _, _, _, _, _, _, _) = get_oracle_config();
+            } else {
+                aligned_buffer[offset..offset + size].copy_from_slice(&oracle_account.data[..size]);
+                
                 log::debug!(
-                    "Switchboard feed parsing failed for {}: {}. Falling back to Pyth-only mode.",
+                    "Switchboard feed {} requires alignment fix (offset: {}, size: {})",
                     switchboard_oracle_pubkey,
-                    e
+                    offset,
+                    size
                 );
-                return Ok(None);
+                
+                match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_buffer[offset..offset + size]) {
+                    Ok(feed) => {
+                        let feed_copy = *feed; // Clone the feed data
+                        return_aligned_buffer(aligned_buffer);
+                        feed_copy
+                    },
+                    Err(e) => {
+                        return_aligned_buffer(aligned_buffer);
+                        log::error!(
+                            "❌ Switchboard feed parsing failed (aligned) for {}:\n\
+                             - Error: {:?}\n\
+                             - Account size: {} bytes\n\
+                             - Required size: {} bytes\n\
+                             - Owner: {}\n\
+                             - Falling back to Pyth-only mode",
+                            switchboard_oracle_pubkey,
+                            e,
+                            oracle_account.data.len(),
+                            feed_size,
+                            oracle_account.owner
+                        );
+                        return Ok(None);
+                    }
+                }
             }
-        };
-    
-    // 4. Get price using SDK's value() method with staleness check
-    // The value() method requires current slot for staleness validation
-    // It returns Result<Decimal, OnDemandError> - Ok if valid, Err if stale/insufficient
-    let price_decimal = match feed.value(current_slot) {
-        Ok(v) => v,
+        },
         Err(e) => {
-            log::debug!(
-                "Switchboard feed {} value() failed (stale or insufficient quorum): {}",
+            log::error!(
+                "❌ Switchboard feed parsing failed for {}:\n\
+                 - Error: {:?}\n\
+                 - Account size: {} bytes\n\
+                 - Required size: {} bytes (PullFeedAccountData)\n\
+                 - Owner: {}\n\
+                 - First 32 bytes: {:02x?}\n\
+                 - This may indicate: SDK version mismatch, data corruption, or wrong account type\n\
+                 - Falling back to Pyth-only mode",
                 switchboard_oracle_pubkey,
-                e
+                e,
+                oracle_account.data.len(),
+                feed_size,
+                oracle_account.owner,
+                &oracle_account.data[..32.min(oracle_account.data.len())]
             );
             return Ok(None);
         }
     };
     
-    // 5. Convert Decimal to f64
-    // rust_decimal::Decimal provides better precision, but we use f64 for consistency with Pyth
-    let price = price_decimal.to_string().parse::<f64>()
-        .unwrap_or_else(|_| {
-            // Fallback: manual conversion using mantissa and scale
-            let mantissa = price_decimal.mantissa();
-            let scale = price_decimal.scale();
-            mantissa as f64 / 10_f64.powi(scale as i32)
-        });
-    
-    // 6. Validate price is positive and reasonable
-    if price <= 0.0 || !price.is_finite() {
+        // 4. Get price using SDK's value() method with staleness check
+        let price_decimal = match feed.value(current_slot) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Switchboard v3 feed {} value() failed (stale or insufficient quorum): {}\n\
+                     - Current slot: {}\n\
+                     - This may indicate: feed is stale, insufficient publisher quorum, or network delay",
+                    switchboard_oracle_pubkey,
+                    e,
+                    current_slot
+                );
+                return Ok(None);
+            }
+        };
+        
+        // 5. Convert Decimal to f64
+        let price = price_decimal.to_string().parse::<f64>()
+            .unwrap_or_else(|_| {
+                let mantissa = price_decimal.mantissa();
+                let scale = price_decimal.scale();
+                mantissa as f64 / 10_f64.powi(scale as i32)
+            });
+        
+        // 6. Validate price
+        if price <= 0.0 || !price.is_finite() {
+            log::warn!(
+                "⚠️  Switchboard v3 oracle price is invalid for {}: {}",
+                switchboard_oracle_pubkey,
+                price
+            );
+            return Ok(None);
+        }
+        
         log::debug!(
-            "Switchboard oracle price is invalid: {} (from feed {}, decimal: {})",
-            price,
+            "✅ Switchboard v3 oracle validation passed for {} (price: {})",
             switchboard_oracle_pubkey,
-            price_decimal
+            price
         );
-        return Ok(None);
+        
+        Ok(Some(price))
+        
+    } else if oracle_account.owner == switchboard_program_id_v2 {
+        // ========== SWITCHBOARD v2 (Legacy) ==========
+        // CRITICAL: v2 uses AggregatorAccountData with buffer-layout format
+        // switchboard-v2 SDK is NOT Solana 2.0 compatible, so we parse manually
+        // 
+        // Switchboard v2 AggregatorAccountData layout (approximate):
+        // - Offset 0-32: name (32 bytes)
+        // - Offset 32-64: metadata (32 bytes)  
+        // - Offset 64-72: timestamp (i64)
+        // - Offset 72-80: round_id (u64)
+        // - Offset 80-88: latest_round (AggregatorRound)
+        //   - latest_round.num_success (u32)
+        //   - latest_round.num_error (u32)
+        //   - latest_round.round_open_slot (u64)
+        //   - latest_round.round_open_timestamp (i64)
+        //   - latest_round.result (SwitchboardDecimal) - THIS IS THE PRICE
+        //     - result.mantissa (i128)
+        //     - result.scale (u32)
+        
+        // Minimum size check
+        const MIN_V2_SIZE: usize = 200; // Approximate minimum size
+        if oracle_account.data.len() < MIN_V2_SIZE {
+            log::error!(
+                "❌ Switchboard v2 account {} too small: {} bytes (min: {})",
+                switchboard_oracle_pubkey,
+                oracle_account.data.len(),
+                MIN_V2_SIZE
+            );
+            return Ok(None);
+        }
+        
+        // Parse latest_round.result (SwitchboardDecimal)
+        // Result is at offset ~152 (80 + 72 for latest_round fields)
+        // SwitchboardDecimal: mantissa (i128, 16 bytes) + scale (u32, 4 bytes) = 20 bytes
+        const RESULT_OFFSET: usize = 152;
+        if oracle_account.data.len() < RESULT_OFFSET + 20 {
+            log::error!(
+                "❌ Switchboard v2 account {} too small for result field: {} bytes",
+                switchboard_oracle_pubkey,
+                oracle_account.data.len()
+            );
+            return Ok(None);
+        }
+        
+        // Parse mantissa (i128, little-endian, 16 bytes)
+        let mantissa_bytes: [u8; 16] = oracle_account.data[RESULT_OFFSET..RESULT_OFFSET + 16]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse mantissa"))?;
+        let mantissa = i128::from_le_bytes(mantissa_bytes);
+        
+        // Parse scale (u32, little-endian, 4 bytes)
+        let scale_bytes: [u8; 4] = oracle_account.data[RESULT_OFFSET + 16..RESULT_OFFSET + 20]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse scale"))?;
+        let scale = u32::from_le_bytes(scale_bytes);
+        
+        // Validate scale (reasonable range: 0-18 for token decimals)
+        if scale > 18 {
+            log::warn!(
+                "⚠️  Switchboard v2 scale out of range for {}: {} (expected 0-18)",
+                switchboard_oracle_pubkey,
+                scale
+            );
+            return Ok(None);
+        }
+        
+        // Convert to f64: mantissa / 10^scale
+        let price_multiplier = 10_f64.powi(scale as i32);
+        if !price_multiplier.is_finite() {
+            log::warn!(
+                "⚠️  Switchboard v2 price multiplier overflow for {}: scale={}",
+                switchboard_oracle_pubkey,
+                scale
+            );
+            return Ok(None);
+        }
+        
+        let price = mantissa as f64 / price_multiplier;
+        
+        // Validate price
+        if price <= 0.0 || !price.is_finite() {
+            log::warn!(
+                "⚠️  Switchboard v2 oracle price is invalid for {}: {} (mantissa: {}, scale: {})",
+                switchboard_oracle_pubkey,
+                price,
+                mantissa,
+                scale
+            );
+            return Ok(None);
+        }
+        
+        log::debug!(
+            "✅ Switchboard v2 oracle validation passed for {} (price: {}, mantissa: {}, scale: {})",
+            switchboard_oracle_pubkey,
+            price,
+            mantissa,
+            scale
+        );
+        
+        Ok(Some(price))
+        
+    } else {
+        // This should never happen - we already checked owner above
+        log::error!(
+            "❌ Switchboard oracle {} has unknown owner: {} (expected v2: {} or v3: {})",
+            switchboard_oracle_pubkey,
+            oracle_account.owner,
+            switchboard_program_id_v2,
+            switchboard_program_id_v3
+        );
+        Ok(None)
     }
-    
-    log::debug!(
-        "✅ Switchboard oracle validation passed for {} (price: {}, decimal: {})",
-        switchboard_oracle_pubkey,
-        price,
-        price_decimal
-    );
-    
-    Ok(Some(price))
 }
 
 /// Validate Pyth oracle per Structure.md section 5.2
@@ -1879,11 +2227,27 @@ async fn validate_pyth_oracle(
     }
 
     // Check price status (price_type byte)
-    // ✅ FIXED: Accept both Trading (2) and Price (1) statuses for liquidations
-    // Trading is preferred, but Price status is also acceptable (feed may be updating)
+    // CRITICAL FIX: Price status validation with configurable acceptance
+    // Trading (2) is always acceptable
+    // Price (1) is risky - feed might be updating, but can be enabled via env var
     // Reject: Unknown (0), Halted (3), Auction (4)
     let price_type = oracle_account.data[5];
-    if price_type != PYTH_PRICE_STATUS_TRADING && price_type != PYTH_PRICE_STATUS_PRICE {
+    
+    // Check if PRICE status acceptance is enabled via env var
+    let accept_price_status = env::var("PYTH_ACCEPT_PRICE_STATUS")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false); // Default: false (only Trading accepted)
+    
+    let is_price_status_acceptable = if price_type == PYTH_PRICE_STATUS_TRADING {
+        true // Always OK
+    } else if price_type == PYTH_PRICE_STATUS_PRICE && accept_price_status {
+        true // OK if enabled
+    } else {
+        false
+    };
+    
+    if !is_price_status_acceptable {
         let status_name = match price_type {
             0 => "Unknown",
             1 => "Price",
@@ -1893,18 +2257,28 @@ async fn validate_pyth_oracle(
             _ => "Invalid",
         };
         
-        log::warn!(
-            "Pyth price status is {} ({}) - REJECTING oracle. Only Trading or Price status is acceptable for liquidations.",
-            price_type,
-            status_name
-        );
+        if price_type == PYTH_PRICE_STATUS_PRICE {
+            log::warn!(
+                "Pyth price status is {} ({}) - REJECTING oracle. Price status is risky (feed may be updating). \
+                 Set PYTH_ACCEPT_PRICE_STATUS=true to accept (not recommended for production).",
+                price_type,
+                status_name
+            );
+        } else {
+            log::warn!(
+                "Pyth price status is {} ({}) - REJECTING oracle. Only Trading status is acceptable (or Price if enabled).",
+                price_type,
+                status_name
+            );
+        }
         return Ok((false, None));
     }
     
     // Log which status we're accepting (for debugging)
     if price_type == PYTH_PRICE_STATUS_PRICE {
-        log::debug!(
-            "⚠️  Pyth oracle {} has Price status (not Trading). This may indicate feed is updating, but accepting for liquidation.",
+        log::warn!(
+            "⚠️  Pyth oracle {} has Price status (not Trading). This may indicate feed is updating. \
+             Accepting because PYTH_ACCEPT_PRICE_STATUS=true (risky).",
             oracle_pubkey
         );
     }
@@ -1923,11 +2297,22 @@ async fn validate_pyth_oracle(
     const AGGREGATE_STATUS_TRADING: u64 = 1;
     
     // CRITICAL: Accept Trading status (1) normally.
-    // RELAXED: Also accept Unknown (0) IF the price is very fresh (within 10 slots ~4 seconds).
+    // RELAXED: Also accept Unknown (0) IF enabled via ALLOW_ORACLE_STATUS_UNKNOWN and price is fresh.
     // This handles cases where Pyth status might flicker or RPC is slightly behind but data is fresh.
+    let allow_status_unknown = env::var("ALLOW_ORACLE_STATUS_UNKNOWN")
+        .ok()
+        .and_then(|s| s.parse::<bool>().ok())
+        .unwrap_or(false); // Default false for safety
+    
+    // STATUS_UNKNOWN_FRESHNESS_SLOTS: Maximum slot difference for Unknown status (default: 25 slots ~10 seconds)
+    let status_unknown_freshness_slots = env::var("STATUS_UNKNOWN_FRESHNESS_SLOTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(25); // Default 25 slots (~10 seconds) - more flexible than 10 slots
+    
     let is_status_ok = if aggregate_status == AGGREGATE_STATUS_TRADING {
         true
-    } else if aggregate_status == 0 {
+    } else if aggregate_status == 0 && allow_status_unknown {
         // Parse last_slot early for this check
         let last_slot_bytes: [u8; 8] = oracle_account.data[56..64]
             .try_into()
@@ -1935,18 +2320,20 @@ async fn validate_pyth_oracle(
         let last_slot = u64::from_le_bytes(last_slot_bytes);
         let slot_diff = current_slot.saturating_sub(last_slot);
         
-        if slot_diff <= 10 { // ✅ 10 slots (4s) tolerance
+        if slot_diff <= status_unknown_freshness_slots {
             log::debug!(
-                "Pyth aggregate status is 0 (Unknown) but price is FRESH (diff={} slots, {:.1}s) - ACCEPTING oracle for {}",
+                "Pyth aggregate status is 0 (Unknown) but price is FRESH (diff={} slots, {:.1}s, max={}) - ACCEPTING oracle for {}",
                 slot_diff,
                 slot_diff as f64 * 0.4,
+                status_unknown_freshness_slots,
                 oracle_pubkey
             );
             true
         } else {
             log::warn!(
-                "Pyth aggregate status is 0 (Unknown) and stale (diff={} slots) - REJECTING oracle for {}",
+                "Pyth aggregate status is 0 (Unknown) and stale (diff={} slots, max={}) - REJECTING oracle for {}",
                 slot_diff,
+                status_unknown_freshness_slots,
                 oracle_pubkey
             );
             false
@@ -2002,6 +2389,23 @@ async fn validate_pyth_oracle(
         .map_err(|_| anyhow::anyhow!("Failed to parse exponent"))?;
     let exponent = i32::from_le_bytes(exponent_bytes);
 
+    // CRITICAL FIX: Exponent overflow check
+    // Pyth exponents are typically in range -18 to 18 (for token decimals)
+    // Extremely large exponents can cause overflow: 10^127 = infinity
+    const MAX_EXPONENT: i32 = 18;   // SOL max decimals
+    const MIN_EXPONENT: i32 = -18;
+    
+    if exponent > MAX_EXPONENT || exponent < MIN_EXPONENT {
+        log::warn!(
+            "❌ Pyth exponent out of range for {}: {} (expected range: {} to {})",
+            oracle_pubkey,
+            exponent,
+            MIN_EXPONENT,
+            MAX_EXPONENT
+        );
+        return Ok((false, None));
+    }
+
     // Parse price (i64)
     let price_bytes: [u8; 8] = oracle_account.data[8..16]
         .try_into()
@@ -2020,7 +2424,20 @@ async fn validate_pyth_oracle(
     // Mathematical equivalence: price_raw * 10^(-8) = price_raw / 10^8
     // Example: price_raw=150000000, exponent=-8 → 150000000 * 10^(-8) = 1.5 USD
     // This is CORRECT: powi() handles negative exponents properly (10^(-8) = 1/10^8)
-    let price = Some(price_raw as f64 * 10_f64.powi(exponent));
+    let price_multiplier = 10_f64.powi(exponent);
+    
+    // CRITICAL FIX: Check if price multiplier overflowed
+    if !price_multiplier.is_finite() {
+        log::warn!(
+            "❌ Pyth price multiplier overflow for {}: exponent={}, multiplier={}",
+            oracle_pubkey,
+            exponent,
+            price_multiplier
+        );
+        return Ok((false, None));
+    }
+    
+    let price = Some(price_raw as f64 * price_multiplier);
 
     // 3. Check if price is stale (last_slot and valid_slot check)
     // CRITICAL FIX: last_slot is the PRIMARY staleness check (when price was last updated)
@@ -2126,14 +2543,27 @@ async fn validate_pyth_oracle(
     }
 
     // COMBINED CHECK: Old feed + high confidence = suspicious
-    // If slot difference is > 15 slots (~6 seconds) AND confidence > 1.0%, reject
-    // This prevents accepting manipulated prices that are slightly stale but have high confidence
-    if slot_diff_last > 15 && confidence_pct > 1.0 {
+    // RELAXED: Only reject if slot difference is > 30 slots (~12 seconds) AND confidence > 3.0%
+    // This prevents accepting manipulated prices while allowing more legitimate stale prices
+    // Configurable via environment variables
+    let suspicious_slot_threshold = env::var("SUSPICIOUS_ORACLE_SLOT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30); // Default 30 slots (~12 seconds) - more flexible than 15
+    
+    let suspicious_confidence_threshold = env::var("SUSPICIOUS_ORACLE_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(3.0); // Default 3.0% - more flexible than 1.0%
+    
+    if slot_diff_last > suspicious_slot_threshold && confidence_pct > suspicious_confidence_threshold {
         log::warn!(
-            "Suspicious oracle: old_feed ({} slots, ~{:.1}s) + high_confidence ({:.2}%) - rejecting",
+            "Suspicious oracle: old_feed ({} slots, ~{:.1}s, threshold: {}) + high_confidence ({:.2}%, threshold: {:.2}%) - rejecting",
             slot_diff_last,
             slot_diff_last as f64 * 0.4, // Convert slots to seconds (400ms per slot)
-            confidence_pct
+            suspicious_slot_threshold,
+            confidence_pct,
+            suspicious_confidence_threshold
         );
         return Ok((false, None));
     }
@@ -2170,12 +2600,33 @@ async fn validate_pyth_confidence_strict(
         .map_err(|_| anyhow::anyhow!("Failed to parse exponent"))?;
     let exponent = i32::from_le_bytes(exponent_bytes);
 
+    // CRITICAL FIX: Exponent overflow check (same as in validate_pyth_oracle)
+    const MAX_EXPONENT: i32 = 18;
+    const MIN_EXPONENT: i32 = -18;
+    
+    if exponent > MAX_EXPONENT || exponent < MIN_EXPONENT {
+        log::warn!(
+            "Pyth exponent out of range for strict check: {} (expected range: {} to {})",
+            exponent,
+            MIN_EXPONENT,
+            MAX_EXPONENT
+        );
+        return Ok(false);
+    }
+
     // Parse confidence (u64 at offset 48-56)
     let conf_bytes: [u8; 8] = oracle_account.data[48..56]
         .try_into()
         .map_err(|_| anyhow::anyhow!("Failed to parse confidence"))?;
     let confidence_raw = u64::from_le_bytes(conf_bytes);
-    let confidence = confidence_raw as f64 * 10_f64.powi(exponent);
+    
+    let confidence_multiplier = 10_f64.powi(exponent);
+    if !confidence_multiplier.is_finite() {
+        log::warn!("Pyth confidence multiplier overflow: exponent={}", exponent);
+        return Ok(false);
+    }
+    
+    let confidence = confidence_raw as f64 * confidence_multiplier;
 
     // CRITICAL: Check minimum price threshold to prevent division by zero and floating point issues
     // Edge case: price_value = 1e-100 → price_value.abs() > 0.0 check passes, but
@@ -2255,63 +2706,92 @@ async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Op
     }
     
     // Method 2: Fetch from Pyth SOL/USD price feed (primary)
-    // Pyth SOL/USD mainnet price feed: H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG
-    let sol_usd_pyth_feed_primary = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
-        Ok(pk) => pk,
-        Err(_) => {
-            log::warn!("Failed to parse primary Pyth SOL/USD feed address");
-            return None;
+    // Read from .env or use default fallback
+    let sol_usd_pyth_feed_primary = {
+        let feed_str = env::var("SOL_USD_PYTH_FEED")
+            .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
+        
+        match Pubkey::from_str(&feed_str) {
+            Ok(pk) => pk,
+            Err(_) => {
+                log::error!("Failed to parse primary Pyth SOL/USD feed address from SOL_USD_PYTH_FEED: {}", feed_str);
+                // Try to continue with hardcoded fallback
+                match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        log::error!("Failed to parse hardcoded fallback Pyth feed address");
+                        return None;
+                    }
+                }
+            }
         }
     };
     
-    let current_slot = match rpc.get_slot() {
-        Ok(slot) => slot,
-        Err(e) => {
-            log::warn!("Failed to get current slot for SOL price: {}", e);
-            return None;
-        }
-    };
+    // Get current slot once and reuse it
+    let current_slot = rpc.get_slot().ok();
     
-    // Try primary Pyth feed
-    match validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, current_slot).await {
-        Ok((true, Some(price))) => {
-            log::info!("✅ SOL price from primary Pyth feed: ${:.2}", price);
-            return Some(price);
-        }
-        Ok((true, None)) => {
-            // This shouldn't happen (if valid=true, price should be Some), but handle it
-            log::warn!(
-                "⚠️  Primary Pyth SOL/USD feed validation passed but price is None (unexpected). \
-                 Feed: {}",
-                sol_usd_pyth_feed_primary
-            );
-        }
-        Ok((false, _)) => {
-            log::warn!(
-                "⚠️  Primary Pyth SOL/USD feed validation failed (stale/invalid). \
-                 Feed: {}. This may indicate: stale price, invalid status, or high confidence interval.",
-                sol_usd_pyth_feed_primary
-            );
-        }
-        Err(e) => {
-            log::error!(
-                "❌ Error validating primary Pyth SOL/USD feed {}: {}. \
-                 This is CRITICAL - SOL price is required for profit calculations!",
-                sol_usd_pyth_feed_primary,
-                e
-            );
+    // Try primary Pyth feed (if we have a valid slot)
+    if let Some(slot) = current_slot {
+        match validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {
+            Ok((true, Some(price))) => {
+                log::info!("✅ SOL price from primary Pyth feed: ${:.2}", price);
+                return Some(price);
+            }
+            Ok((true, None)) => {
+                // This shouldn't happen (if valid=true, price should be Some), but handle it
+                log::warn!(
+                    "⚠️  Primary Pyth SOL/USD feed validation passed but price is None (unexpected). \
+                     Feed: {}",
+                    sol_usd_pyth_feed_primary
+                );
+            }
+            Ok((false, _)) => {
+                log::warn!(
+                    "⚠️  Primary Pyth SOL/USD feed validation failed (stale/invalid). \
+                     Feed: {}. This may indicate: stale price, invalid status, or high confidence interval.",
+                    sol_usd_pyth_feed_primary
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "❌ Error validating primary Pyth SOL/USD feed {}: {}. \
+                     This is CRITICAL - SOL price is required for profit calculations!",
+                    sol_usd_pyth_feed_primary,
+                    e
+                );
+            }
         }
     }
     
-    // Method 3: Try alternative Pyth feed if available
-    // Alternative: SOL/USD price feed (if different feed exists)
-    // Note: For now, we only have one feed, but this structure allows easy addition of alternatives
+    // Method 3: Try backup Pyth feed if available
+    if let Ok(backup_feed_str) = env::var("SOL_USD_BACKUP_FEED") {
+        if let Ok(backup_feed) = Pubkey::from_str(&backup_feed_str) {
+            if let Some(slot) = current_slot {
+                log::info!("Trying backup Pyth feed: {}", backup_feed);
+                match validate_pyth_oracle(rpc, backup_feed, slot).await {
+                    Ok((true, Some(price))) => {
+                        log::info!("✅ SOL price from backup Pyth feed: ${:.2}", price);
+                        return Some(price);
+                    }
+                    Ok((false, _)) => {
+                        log::warn!("⚠️ Backup Pyth SOL/USD feed validation failed (stale/invalid). Feed: {}", backup_feed);
+                    }
+                    Err(e) => {
+                        log::warn!("❌ Error validating backup Pyth SOL/USD feed {}: {}", backup_feed, e);
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            log::warn!("Failed to parse backup Pyth feed address from SOL_USD_BACKUP_FEED: {}", backup_feed_str);
+        }
+    }
     
-    // Method 4: Fetch from Jupiter Price API (External fallback - "kesin çalışmalı")
+    // Method 4: Fetch from Jupiter Price API (IMMEDIATE fallback when Pyth fails)
     // This is a robust fallback when on-chain oracles are failing due to RPC issues
     const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
     
-    log::warn!("Trying Jupiter Price API fallback for SOL price...");
+    log::warn!("⚠️ All Pyth feeds failed, trying Jupiter Price API fallback for SOL price...");
     
     // Create a short-lived client with strict timeout (2s)
     let client = reqwest::Client::builder()
@@ -2333,16 +2813,20 @@ async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Op
                     
                     if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
                         if let Some(data) = json.data.get("SOL") {
-                            log::info!("✅ SOL price from Jupiter API fallback: ${:.2}", data.price);
+                            log::warn!("✅ SOL price from Jupiter API fallback (Pyth failed): ${:.2}", data.price);
                             return Some(data.price);
                         }
                     }
+                } else {
+                    log::warn!("Jupiter Price API returned non-success status: {}", resp.status());
                 }
             }
             Err(e) => {
                 log::warn!("Jupiter Price API fallback failed: {}", e);
             }
         }
+    } else {
+        log::warn!("Failed to create HTTP client for Jupiter Price API");
     }
 
     log::error!(
@@ -2738,12 +3222,20 @@ async fn get_liquidation_quote(
     
     // Step 8: Get final Jupiter quote with calculated dynamic slippage
     // CRITICAL: Jupiter quote uses UNDERLYING token (SOL), not cToken (cSOL)
+    // CRITICAL: Limit retries to preserve blockhash freshness
+    // Blockhash expires in ~60s, Jupiter timeout: 6s + 10s = 16s worst case
+    // Reducing retries from 3 to 2 to minimize time spent on Jupiter
+    let max_retries = env::var("JUPITER_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(2); // Default: 2 retries (total 3 attempts: 1 initial + 2 retries)
+    
     let quote = get_jupiter_quote_with_retry(
         &collateral_underlying_mint, // ✅ Underlying token (SOL), NOT cToken (cSOL)
         &debt_mint,                  // ✅ Debt token (USDC)
         sol_amount_after_redemption, // ✅ CORRECT: Actual SOL amount after redemption
         initial_slippage,            // ✅ CORRECT: Buffered initial slippage
-        3, // max_retries
+        max_retries,
     )
     .await
     .context("Failed to get Jupiter quote with retries")?;
@@ -3489,6 +3981,55 @@ async fn build_liquidation_tx1(
         AccountMeta::new_readonly(sysvar::clock::id(), false),        // 10: clockSysvar
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),          // 11: tokenProgram
     ];
+
+    // CRITICAL FIX: Validate account ordering per Problems.md section 3.B
+    // Account order must match Solend IDL exactly, or transaction will fail
+    const EXPECTED_ACCOUNT_COUNT: usize = 12;
+    if accounts.len() != EXPECTED_ACCOUNT_COUNT {
+        return Err(anyhow::anyhow!(
+            "Invalid account count for LiquidateObligation: expected {}, got {}",
+            EXPECTED_ACCOUNT_COUNT,
+            accounts.len()
+        ));
+    }
+    
+    // Validate specific account requirements
+    // Account 9 (transferAuthority) must be a signer
+    if !accounts[9].is_signer {
+        return Err(anyhow::anyhow!(
+            "Account ordering validation failed: transferAuthority (index 9) must be a signer"
+        ));
+    }
+    
+    // Validate account 0 (sourceLiquidity) is writable
+    if !accounts[0].is_writable {
+        return Err(anyhow::anyhow!(
+            "Account ordering validation failed: sourceLiquidity (index 0) must be writable"
+        ));
+    }
+    
+    // Validate account 1 (destinationCollateral) is writable
+    if !accounts[1].is_writable {
+        return Err(anyhow::anyhow!(
+            "Account ordering validation failed: destinationCollateral (index 1) must be writable"
+        ));
+    }
+    
+    // Validate readonly accounts (indices 4, 7, 8, 10, 11)
+    let readonly_indices = [4, 7, 8, 10, 11];
+    for &idx in &readonly_indices {
+        if accounts[idx].is_writable {
+            return Err(anyhow::anyhow!(
+                "Account ordering validation failed: account at index {} must be readonly",
+                idx
+            ));
+        }
+    }
+    
+    log::debug!(
+        "✅ Account ordering validation passed for LiquidateObligation: {} accounts, transferAuthority is signer",
+        accounts.len()
+    );
 
     let liquidation_ix = Instruction {
         program_id,

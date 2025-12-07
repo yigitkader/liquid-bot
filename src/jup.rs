@@ -10,10 +10,11 @@ const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
 // CRITICAL FIX: Adaptive timeout for blockhash freshness
 // Bundle expires in ~60 seconds, blockhash can go stale if Jupiter takes too long
-// Primary timeout: 8 seconds (normal conditions - fast fail to preserve blockhash)
-// Fallback timeout: 15 seconds (busy periods - only for retries)
-const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 8;  // First attempt - preserve blockhash freshness
-const REQUEST_TIMEOUT_RETRY_SECS: u64 = 15;   // Retries - allow more time during busy periods
+// Primary timeout: 6 seconds (normal conditions - fast fail to preserve blockhash)
+// Fallback timeout: 10 seconds (busy periods - only for retries)
+// Total worst case: 6s (first) + 10s (retry) = 16s, leaving 44s for TX build + send
+const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 6;   // First attempt - preserve blockhash freshness
+const REQUEST_TIMEOUT_RETRY_SECS: u64 = 10;   // Retries - allow more time during busy periods
 
 // Legacy constant for backward compatibility (use REQUEST_TIMEOUT_RETRY_SECS)
 const REQUEST_TIMEOUT_SECS: u64 = REQUEST_TIMEOUT_RETRY_SECS;
@@ -125,11 +126,12 @@ pub async fn get_jupiter_quote(
 /// Get Jupiter quote with retry mechanism and adaptive timeout
 /// 
 /// CRITICAL: Uses adaptive timeout strategy to preserve blockhash freshness:
-/// - First attempt: 8 seconds (fast fail to preserve blockhash)
-/// - Retries: 15 seconds (allow more time during busy periods)
+/// - First attempt: 6 seconds (fast fail to preserve blockhash)
+/// - Retries: 10 seconds (allow more time during busy periods)
+/// - Max retries: 2 (configurable via JUPITER_MAX_RETRIES, default: 2)
 /// 
 /// Blockhash is valid for ~60 seconds. Bundle expires in ~60 seconds.
-/// If Jupiter takes 10+ seconds on first attempt, blockhash may go stale.
+/// Worst case: 6s (first) + 10s (retry) = 16s for Jupiter, leaving 44s for TX build + send.
 /// This adaptive strategy maximizes blockhash freshness while still allowing
 /// retries during busy periods.
 pub async fn get_jupiter_quote_with_retry(
@@ -151,12 +153,12 @@ pub async fn get_jupiter_quote_with_retry(
             env::var("JUPITER_TIMEOUT_NORMAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(15) // ✅ FIX: 15s default (was 8s)
+                .unwrap_or(REQUEST_TIMEOUT_NORMAL_SECS) // Default: 6s (fast fail to preserve blockhash)
         } else {
             env::var("JUPITER_TIMEOUT_RETRY_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(30) // ✅ FIX: 30s retry default (was 15s)
+                .unwrap_or(REQUEST_TIMEOUT_RETRY_SECS) // Default: 10s (reasonable retry)
         };
         
         log::debug!(
