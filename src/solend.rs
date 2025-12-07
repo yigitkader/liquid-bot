@@ -105,22 +105,30 @@ impl Obligation {
         const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from generated layout
         const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
         
-        // ✅ FIXED: Consistent discriminator handling
-        // STEP 1: Check if account has Anchor discriminator (8 bytes)
-        // Obligation accounts from native Solend program don't use discriminators
-        // But Save Protocol (2024 rebrand) may use Anchor-style discriminators
-        let has_discriminator = if data.len() >= DISCRIMINATOR_SIZE {
-            // Anchor discriminator is NOT all zeros
-            // Solend native program uses zero discriminator or no discriminator
-            let first_8 = &data[0..DISCRIMINATOR_SIZE];
-            !first_8.iter().all(|&b| b == 0)
-        } else {
+        // ✅ FIXED: Size-based discriminator detection
+        // STEP 1: Check account size to determine if discriminator exists
+        // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
+        // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
+        let has_discriminator = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
+            // Account is 1308 bytes - likely has Anchor discriminator
+            true
+        } else if data.len() == EXPECTED_STRUCT_SIZE {
+            // Account is exactly 1300 bytes - Legacy account, no discriminator
             false
+        } else {
+            // Size doesn't match expected - fallback to old logic for edge cases
+            // But this should rarely happen for valid Solend accounts
+            if data.len() > EXPECTED_STRUCT_SIZE {
+                // Account is larger than expected - might have discriminator
+                !data[0..DISCRIMINATOR_SIZE].iter().all(|&b| b == 0)
+            } else {
+                false
+            }
         };
         
         // STEP 2: Skip discriminator if present
         let data_without_discriminator = if has_discriminator {
-            log::trace!("Skipping 8-byte Anchor discriminator");
+            log::trace!("Skipping 8-byte Anchor discriminator (account size: {} bytes)", data.len());
             if data.len() < DISCRIMINATOR_SIZE + EXPECTED_STRUCT_SIZE {
                 return Err(anyhow::anyhow!(
                     "Account too short: {} bytes (need {} bytes after discriminator)",
@@ -130,6 +138,7 @@ impl Obligation {
             }
             &data[DISCRIMINATOR_SIZE..]
         } else {
+            log::trace!("No discriminator detected (account size: {} bytes, Legacy format)", data.len());
             data
         };
         
@@ -481,34 +490,52 @@ pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
 /// 
 /// This is faster and more reliable than attempting to parse every account.
 pub fn identify_solend_account_type(data: &[u8]) -> SolendAccountType {
-    if data.len() < 8 {
+    if data.len() < 1 {
         return SolendAccountType::Unknown;
     }
     
-    // STEP 1: Check discriminator
-    // Anchor discriminators are NOT all zeros
-    // Solend native program uses zero discriminator or no discriminator
-    let has_discriminator = !data[0..8].iter().all(|&b| b == 0);
+    // ✅ FIXED: Size-based discriminator detection
+    // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
+    // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
+    const EXPECTED_STRUCT_SIZE: usize = 1300;
+    const DISCRIMINATOR_SIZE: usize = 8;
     
-    // STEP 2: Get actual data (skip discriminator if present)
-    let actual_data = if has_discriminator {
-        if data.len() < 8 {
+    // STEP 1: Determine if discriminator exists based on size
+    let (has_discriminator, actual_data) = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
+        // Account is 1308 bytes - likely has Anchor discriminator
+        if data.len() < DISCRIMINATOR_SIZE {
             return SolendAccountType::Unknown;
         }
-        &data[8..]
+        (true, &data[DISCRIMINATOR_SIZE..])
+    } else if data.len() == EXPECTED_STRUCT_SIZE {
+        // Account is exactly 1300 bytes - Legacy account, no discriminator
+        (false, data)
     } else {
-        data
+        // Size doesn't match expected - try to detect discriminator using old logic
+        if data.len() >= DISCRIMINATOR_SIZE && !data[0..DISCRIMINATOR_SIZE].iter().all(|&b| b == 0) {
+            if data.len() < DISCRIMINATOR_SIZE {
+                return SolendAccountType::Unknown;
+            }
+            (true, &data[DISCRIMINATOR_SIZE..])
+        } else {
+            (false, data)
+        }
     };
     
-    // STEP 3: Size-based heuristic (after discriminator)
+    // STEP 2: Size-based heuristic (after discriminator)
     let size = actual_data.len();
     
-    // STEP 4: Check version byte
+    // STEP 3: Check version byte
     if size > 0 {
         let version = actual_data[0];
         
-        // Obligation: 1200-1400 bytes, version 0 or 1
+        // Obligation: 1300 bytes (exact match for Legacy), version 0 or 1
         // Note: Obligation can be version 0 (legacy) or 1 (current)
+        if size == EXPECTED_STRUCT_SIZE && (version == 0 || version == 1) {
+            return SolendAccountType::Obligation;
+        }
+        
+        // Obligation: 1200-1400 bytes (with some tolerance), version 0 or 1
         if (1200..=1400).contains(&size) && (version == 0 || version == 1) {
             return SolendAccountType::Obligation;
         }
@@ -743,22 +770,30 @@ impl Reserve {
         const EXPECTED_RESERVE_STRUCT_SIZE: usize = 1300; // Full Reserve struct size including padding
         const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
         
-        // ✅ FIXED: Consistent discriminator handling (same as Obligation)
-        // STEP 1: Check if account has Anchor discriminator (8 bytes)
-        // Reserve accounts from native Solend program don't use discriminators
-        // But Save Protocol (2024 rebrand) may use Anchor-style discriminators
-        let has_discriminator = if data.len() >= DISCRIMINATOR_SIZE {
-            // Anchor discriminator is NOT all zeros
-            // Solend native program uses zero discriminator or no discriminator
-            let first_8 = &data[0..DISCRIMINATOR_SIZE];
-            !first_8.iter().all(|&b| b == 0)
-        } else {
+        // ✅ FIXED: Size-based discriminator detection (same as Obligation)
+        // STEP 1: Check account size to determine if discriminator exists
+        // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
+        // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
+        let has_discriminator = if data.len() == EXPECTED_RESERVE_STRUCT_SIZE + DISCRIMINATOR_SIZE {
+            // Account is 1308 bytes - likely has Anchor discriminator
+            true
+        } else if data.len() == EXPECTED_RESERVE_STRUCT_SIZE {
+            // Account is exactly 1300 bytes - Legacy account, no discriminator
             false
+        } else {
+            // Size doesn't match expected - fallback to old logic for edge cases
+            // But this should rarely happen for valid Solend accounts
+            if data.len() > EXPECTED_RESERVE_STRUCT_SIZE {
+                // Account is larger than expected - might have discriminator
+                !data[0..DISCRIMINATOR_SIZE].iter().all(|&b| b == 0)
+            } else {
+                false
+            }
         };
         
         // STEP 2: Skip discriminator if present
         let data_without_discriminator = if has_discriminator {
-            log::trace!("Skipping 8-byte Anchor discriminator");
+            log::trace!("Skipping 8-byte Anchor discriminator (account size: {} bytes)", data.len());
             if data.len() < DISCRIMINATOR_SIZE + EXPECTED_RESERVE_STRUCT_SIZE {
                 return Err(anyhow::anyhow!(
                     "Account too short: {} bytes (need {} bytes after discriminator)",
@@ -768,6 +803,7 @@ impl Reserve {
             }
             &data[DISCRIMINATOR_SIZE..]
         } else {
+            log::trace!("No discriminator detected (account size: {} bytes, Legacy format)", data.len());
             data
         };
         
