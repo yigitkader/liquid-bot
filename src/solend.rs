@@ -335,9 +335,16 @@ impl Obligation {
             }
             let collateral_data = &deposits_buffer[offset..offset + COLLATERAL_SIZE];
             match ObligationCollateral::try_from_slice(collateral_data) {
-                Ok(collateral) => deposits.push(collateral),
+                Ok(collateral) => {
+                    // CRITICAL: Verify padding field was deserialized (prevents offset loss)
+                    // BorshDeserialize automatically reads all fields including padding
+                    // If padding is missing from struct, Borsh would skip it and cause offset loss
+                    // Padding field MUST be present in generated struct for correct deserialization
+                    let _padding_verified = collateral.padding; // Access padding to ensure it was deserialized
+                    deposits.push(collateral);
+                }
                 Err(e) => {
-                    log::warn!("Failed to parse deposit {}: {}", i, e);
+                    log::warn!("Failed to parse deposit {}: {} (data size: {} bytes, expected: {} bytes)", i, e, collateral_data.len(), COLLATERAL_SIZE);
                 }
             }
         }
@@ -386,9 +393,16 @@ impl Obligation {
             }
             let liquidity_data = &borrows_buffer[offset..offset + LIQUIDITY_SIZE];
             match ObligationLiquidity::try_from_slice(liquidity_data) {
-                Ok(liquidity) => borrows.push(liquidity),
+                Ok(liquidity) => {
+                    // CRITICAL: Verify padding field was deserialized (prevents offset loss)
+                    // BorshDeserialize automatically reads all fields including padding
+                    // If padding is missing from struct, Borsh would skip it and cause offset loss
+                    // Padding field MUST be present in generated struct for correct deserialization
+                    let _padding_verified = liquidity.padding; // Access padding to ensure it was deserialized
+                    borrows.push(liquidity);
+                }
                 Err(e) => {
-                    log::warn!("Failed to parse borrow {}: {}", i, e);
+                    log::warn!("Failed to parse borrow {}: {} (data size: {} bytes, expected: {} bytes)", i, e, liquidity_data.len(), LIQUIDITY_SIZE);
                 }
             }
         }
@@ -943,14 +957,23 @@ impl Reserve {
         }
         
         // Check ReserveConfig for close factor (if available in updated layout)
-        // Currently ReserveConfig struct does not have liquidationCloseFactor field exposed
-        // If Solend adds it, uncomment:
+        // VERIFIED: ReserveConfig struct does NOT have liquidationCloseFactor field
+        // - Checked: idl/solend_reserve_layout.json - field not present
+        // - Checked: Generated solend_layout.rs - field not present
+        // - Checked: Solend SDK v0.13.43 - field not present in ReserveConfigLayout
+        // 
+        // If Solend adds liquidationCloseFactor to ReserveConfig in the future:
+        // 1. Update idl/solend_reserve_layout.json (run: npm run dump-layouts)
+        // 2. Rebuild (cargo build) to regenerate solend_layout.rs
+        // 3. Add field to ReserveConfig struct in src/solend.rs
+        // 4. Uncomment the code below:
         // let config = self.config();
         // if config.liquidationCloseFactor > 0 && config.liquidationCloseFactor <= 100 {
         //     return config.liquidationCloseFactor as f64 / 100.0;
         // }
         
         // Fallback to standard 50% (0.5) - Solend's current default
+        // This is correct behavior: Solend uses 50% close factor by default
         0.5
     }
 

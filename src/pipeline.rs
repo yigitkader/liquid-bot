@@ -1360,13 +1360,18 @@ async fn get_reserve_price(
                         } else {
                             false
                         };
+                        log::debug!("✅ Pyth oracle validation succeeded for reserve {}: price=${:.2}", pyth_pubkey, price);
                         return Ok((Some(price), true, has_switchboard));
+                    } else {
+                        log::warn!("⚠️ Pyth oracle {} validation returned valid=true but price=None", pyth_pubkey);
                     }
+                } else {
+                    log::warn!("⚠️ Pyth oracle {} validation failed: valid=false", pyth_pubkey);
                 }
                 // Pyth validation failed or no price - try Switchboard
             }
             Err(e) => {
-                log::debug!("Pyth oracle validation error: {}, trying Switchboard", e);
+                log::warn!("❌ Pyth oracle {} validation error: {}, trying Switchboard", pyth_pubkey, e);
                 // Pyth error - try Switchboard
             }
         }
@@ -1444,13 +1449,13 @@ async fn validate_oracles(
         match get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
                 if price.is_none() {
-                    log::debug!("Borrow reserve: No valid oracle price found");
+                    log::warn!("❌ Borrow reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
                     return Ok((false, None, None));
                 }
                 (price, has_pyth, has_switchboard)
             }
             Err(e) => {
-                log::debug!("Borrow reserve oracle error: {}", e);
+                log::warn!("❌ Borrow reserve oracle error: {}", e);
                 return Ok((false, None, None));
             }
         }
@@ -1463,13 +1468,13 @@ async fn validate_oracles(
         match get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
                 if price.is_none() {
-                    log::debug!("Deposit reserve: No valid oracle price found");
+                    log::warn!("❌ Deposit reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
                     return Ok((false, None, None));
                 }
                 (price, has_pyth, has_switchboard)
             }
             Err(e) => {
-                log::debug!("Deposit reserve oracle error: {}", e);
+                log::warn!("❌ Deposit reserve oracle error: {}", e);
                 return Ok((false, None, None));
             }
         }
@@ -1836,6 +1841,7 @@ async fn validate_switchboard_oracle_if_available(
         // Use PullFeedAccountData (Anchor format with discriminator)
         
         // CRITICAL: Check discriminator for v3 (Anchor format)
+        // Anchor accounts have an 8-byte discriminator at the start
         const DISCRIMINATOR_SIZE: usize = 8;
         if oracle_account.data.len() < DISCRIMINATOR_SIZE {
             log::error!(
@@ -1846,18 +1852,49 @@ async fn validate_switchboard_oracle_if_available(
             return Ok(None);
         }
         
-        // Ensure we have enough data for PullFeedAccountData
+        // Validate discriminator matches PullFeedAccountData
+        // Switchboard On-Demand v3 uses Anchor format with discriminator
+        use switchboard_on_demand::utils::get_account_discriminator;
+        let expected_discriminator = get_account_discriminator("PullFeedAccountData");
+        let actual_discriminator: [u8; 8] = oracle_account.data[0..8]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to extract discriminator"))?;
+        
+        if actual_discriminator != expected_discriminator {
+            log::error!(
+                "❌ Switchboard v3 account {} has invalid discriminator:\n\
+                 - Expected: {:02x?} (PullFeedAccountData)\n\
+                 - Actual: {:02x?}\n\
+                 - This may indicate: wrong account type, corrupted data, or wrong program version",
+                switchboard_oracle_pubkey,
+                expected_discriminator,
+                actual_discriminator
+            );
+            return Ok(None);
+        }
+        
+        log::debug!(
+            "✅ Switchboard v3 discriminator validated for {}: {:02x?}",
+            switchboard_oracle_pubkey,
+            actual_discriminator
+        );
+        
+        // Ensure we have enough data for PullFeedAccountData (after discriminator)
+        // Anchor format: [discriminator: 8 bytes][struct data: N bytes]
         let feed_size = std::mem::size_of::<PullFeedAccountData>();
-        if oracle_account.data.len() < feed_size {
+        let required_total_size = DISCRIMINATOR_SIZE + feed_size;
+        if oracle_account.data.len() < required_total_size {
             log::error!(
                 "❌ Switchboard v3 feed account data too short for {}:\n\
                  - Account size: {} bytes\n\
-                 - Required size: {} bytes (PullFeedAccountData)\n\
+                 - Required size: {} bytes ({} discriminator + {} PullFeedAccountData)\n\
                  - Owner: {}\n\
                  - First 32 bytes: {:02x?}\n\
                  - This may indicate: wrong account type, incomplete data, or RPC issue",
                 switchboard_oracle_pubkey,
                 oracle_account.data.len(),
+                required_total_size,
+                DISCRIMINATOR_SIZE,
                 feed_size,
                 oracle_account.owner,
                 &oracle_account.data[..32.min(oracle_account.data.len())]
@@ -1865,17 +1902,21 @@ async fn validate_switchboard_oracle_if_available(
             return Ok(None);
         }
         
+        // CRITICAL: Skip discriminator when parsing - Anchor format has discriminator at start
+        // PullFeedAccountData struct does NOT include discriminator, so we parse from offset 8
+        let struct_data = &oracle_account.data[DISCRIMINATOR_SIZE..DISCRIMINATOR_SIZE + feed_size];
+        
         // CRITICAL FIX: Proper alignment handling for v3
         // Solana RPC account data is NOT guaranteed to be aligned.
         // bytemuck::try_from_bytes requires strict alignment, which can cause runtime panic.
-        let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(&oracle_account.data) {
+        let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(struct_data) {
         Ok(feed) => *feed,
         Err(bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned) => {
             // CRITICAL FIX: Properly align the data
             // Vec allocates aligned memory, but we need to ensure the slice we pass
             // to bytemuck starts at an aligned address
             let alignment = std::mem::align_of::<PullFeedAccountData>();
-            let size = oracle_account.data.len();
+            let size = feed_size; // Only struct size, discriminator already skipped
             
             // Allocate buffer with extra space for alignment padding
             let mut aligned_buffer = get_aligned_buffer(size + alignment);
@@ -1896,10 +1937,11 @@ async fn validate_switchboard_oracle_if_available(
                     // SAFETY: align_offset is safe to call
                     ptr.align_offset(alignment)
                 };
-                aligned_buffer[offset..offset + size].copy_from_slice(&oracle_account.data[..size]);
+                // Copy struct data (after discriminator) to aligned buffer
+                aligned_buffer[offset..offset + size].copy_from_slice(struct_data);
                 
                 log::debug!(
-                    "Switchboard feed {} requires alignment fix (offset: {}, size: {})",
+                    "Switchboard feed {} requires alignment fix (offset: {}, size: {}, discriminator skipped)",
                     switchboard_oracle_pubkey,
                     offset,
                     size
@@ -1930,10 +1972,11 @@ async fn validate_switchboard_oracle_if_available(
                     }
                 }
             } else {
-                aligned_buffer[offset..offset + size].copy_from_slice(&oracle_account.data[..size]);
+                // Copy struct data (after discriminator) to aligned buffer
+                aligned_buffer[offset..offset + size].copy_from_slice(struct_data);
                 
                 log::debug!(
-                    "Switchboard feed {} requires alignment fix (offset: {}, size: {})",
+                    "Switchboard feed {} requires alignment fix (offset: {}, size: {}, discriminator skipped)",
                     switchboard_oracle_pubkey,
                     offset,
                     size
@@ -1970,14 +2013,16 @@ async fn validate_switchboard_oracle_if_available(
                 "❌ Switchboard feed parsing failed for {}:\n\
                  - Error: {:?}\n\
                  - Account size: {} bytes\n\
-                 - Required size: {} bytes (PullFeedAccountData)\n\
+                 - Discriminator: {:02x?}\n\
+                 - Required struct size: {} bytes (PullFeedAccountData, after discriminator)\n\
                  - Owner: {}\n\
                  - First 32 bytes: {:02x?}\n\
-                 - This may indicate: SDK version mismatch, data corruption, or wrong account type\n\
+                 - This may indicate: SDK version mismatch, data corruption, wrong account type, or alignment issue\n\
                  - Falling back to Pyth-only mode",
                 switchboard_oracle_pubkey,
                 e,
                 oracle_account.data.len(),
+                actual_discriminator,
                 feed_size,
                 oracle_account.owner,
                 &oracle_account.data[..32.min(oracle_account.data.len())]
@@ -2142,8 +2187,125 @@ async fn validate_switchboard_oracle_if_available(
     }
 }
 
+/// Validate Pythnet v3 oracle (current mainnet standard)
+///
+/// Pythnet v3 uses a different account layout than legacy Pyth v2.
+/// Account size: ~3312 bytes (much larger than v2's 84 bytes)
+///
+/// Use pyth-sdk-solana crate for proper parsing
+async fn validate_pyth_oracle_v3(
+    rpc: &Arc<RpcClient>,
+    oracle_pubkey: Pubkey,
+    current_slot: u64,
+) -> Result<(bool, Option<f64>)> {
+    use pyth_sdk_solana::load_price_feed_from_account;
+
+    // Get account data
+    let mut oracle_account = rpc
+        .get_account(&oracle_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get oracle account: {}", e))?;
+    
+    // Parse using pyth-sdk-solana
+    // Use load_price_feed_from_account which accepts Account directly (simpler than AccountInfo)
+    // Note: This function is deprecated but still works and is simpler to use
+    let price_feed = load_price_feed_from_account(&oracle_pubkey, &mut oracle_account)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
+    
+    // Get current time for staleness check (max age: 60 seconds)
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    
+    // Get current price with staleness check (max age: 60 seconds)
+    // get_price_no_older_than already validates that price is fresh and valid
+    let price_data = match price_feed.get_price_no_older_than(current_time, 60) {
+        Some(price) => price,
+        None => {
+            log::warn!(
+                "⚠️ Pythnet v3 oracle {}: No current price available or price is stale (current_time: {}, max_age: 60s)",
+                oracle_pubkey,
+                current_time
+            );
+            return Ok((false, None));
+        }
+    };
+    
+    // Calculate price in USD using all price data fields
+    // Price struct has: price (i64), conf (u64), expo (i32), publish_time (i64)
+    let price = (price_data.price as f64) * 10_f64.powi(price_data.expo);
+    
+    // Validate price - use all validation checks
+    if price <= 0.0 || !price.is_finite() {
+        log::warn!("⚠️ Pythnet v3 oracle price is invalid: {} for oracle {}", price, oracle_pubkey);
+        return Ok((false, None));
+    }
+    
+    // Validate confidence interval - use confidence data properly
+    let confidence = (price_data.conf as f64) * 10_f64.powi(price_data.expo);
+    let confidence_pct = (confidence / price.abs()) * 100.0;
+    
+    // Check minimum price threshold
+    if price.abs() < MIN_VALID_PRICE_USD {
+        log::debug!(
+            "Pythnet v3 oracle price below minimum threshold: {} < {} for oracle {}",
+            price.abs(),
+            MIN_VALID_PRICE_USD,
+            oracle_pubkey
+        );
+        return Ok((false, None));
+    }
+    
+    let (_, _, _, _, _, _, max_confidence_pct, _) = get_oracle_config();
+    if confidence_pct > max_confidence_pct {
+        log::debug!(
+            "Pythnet v3 confidence too high: {:.2}% > {:.2}% for oracle {} (price: {}, confidence: {})",
+            confidence_pct,
+            max_confidence_pct,
+            oracle_pubkey,
+            price,
+            confidence
+        );
+        return Ok((false, None));
+    }
+    
+    // Validate freshness using publish_time
+    // Pythnet v3 uses publish_time (Unix timestamp) instead of slot numbers
+    // We already checked staleness in get_price_no_older_than above, but log for debugging
+    let (max_slot_difference, _, _, _, _, _, _, _) = get_oracle_config();
+    let max_age_seconds = max_slot_difference * 400 / 1000; // Convert slots to seconds (~400ms per slot)
+    let age_seconds = current_time - price_data.publish_time;
+    
+    if age_seconds > max_age_seconds as i64 {
+        log::debug!(
+            "Pythnet v3 price too old: age={}s > {}s for oracle {} (publish_time: {}, current_time: {})",
+            age_seconds,
+            max_age_seconds,
+            oracle_pubkey,
+            price_data.publish_time,
+            current_time
+        );
+        return Ok((false, None));
+    }
+    
+    log::debug!(
+        "✅ Pythnet v3 oracle validation passed for {}: price={}, confidence={:.2}%, publish_time={}, age={}s",
+        oracle_pubkey,
+        price,
+        confidence_pct,
+        price_data.publish_time,
+        age_seconds
+    );
+    
+    Ok((true, Some(price)))
+}
+
 /// Validate Pyth oracle per Structure.md section 5.2
 /// Returns (is_valid, price) where price is in USD with decimals
+/// 
+/// Auto-detects Pyth version based on account size:
+/// - Pyth v2: ~84 bytes (legacy)
+/// - Pythnet v3: 3312+ bytes (current mainnet standard)
 async fn validate_pyth_oracle(
     rpc: &Arc<RpcClient>,
     oracle_pubkey: Pubkey,
@@ -2173,6 +2335,31 @@ async fn validate_pyth_oracle(
         oracle_account.data.len(),
         &oracle_account.data[..16.min(oracle_account.data.len())]
     );
+
+    // 2. Auto-detect Pyth version from account size
+    // Pyth v2: ~84 bytes (legacy)
+    // Pythnet v3: 3312+ bytes (current mainnet standard)
+    let account_size = oracle_account.data.len();
+    
+    // CRITICAL: Pythnet v3 format (3312 bytes) is now standard on mainnet
+    // Old v2 format (84 bytes) is deprecated
+    let is_pythnet_v3 = account_size >= 3000;
+    
+    if is_pythnet_v3 {
+        // Use Pythnet v3 parser (pyth-sdk-solana crate)
+        log::debug!("✅ Detected Pythnet v3 format ({} bytes) for oracle {} - using v3 parser", account_size, oracle_pubkey);
+        return validate_pyth_oracle_v3(rpc, oracle_pubkey, current_slot).await;
+    }
+    
+    // Legacy v2 format (deprecated, but keep for compatibility)
+    if account_size < 84 {
+        log::warn!(
+            "❌ Oracle account {} data too short: {} bytes (need at least 84 for Pyth v2)",
+            oracle_pubkey,
+            account_size
+        );
+        return Ok((false, None));
+    }
 
     // 2. Parse Pyth v2 price account structure
     // Pyth v2 price account layout (COMPLETE):

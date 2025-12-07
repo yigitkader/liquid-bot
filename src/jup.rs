@@ -10,11 +10,20 @@ const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
 // CRITICAL FIX: Adaptive timeout for blockhash freshness
 // Bundle expires in ~60 seconds, blockhash can go stale if Jupiter takes too long
-// Primary timeout: 6 seconds (normal conditions - fast fail to preserve blockhash)
-// Fallback timeout: 10 seconds (busy periods - only for retries)
-// Total worst case: 6s (first) + 10s (retry) = 16s, leaving 44s for TX build + send
-const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 6;   // First attempt - preserve blockhash freshness
-const REQUEST_TIMEOUT_RETRY_SECS: u64 = 10;   // Retries - allow more time during busy periods
+// 
+// UPDATED: Increased timeouts to handle Jupiter API high-load scenarios (can take 30s+)
+// Primary timeout: 10 seconds (normal conditions - balance between speed and reliability)
+// Fallback timeout: 20 seconds (busy periods - allow more time for slow API responses)
+// Total worst case: 10s (first) + 20s (retry) = 30s, leaving 30s for TX build + send
+// 
+// NOTE: These values can be overridden via environment variables:
+// - JUPITER_TIMEOUT_NORMAL_SECS (default: 10)
+// - JUPITER_TIMEOUT_RETRY_SECS (default: 20)
+// 
+// Trade-off: Longer timeouts may cause some opportunities to be missed due to blockhash staleness,
+// but shorter timeouts cause more missed opportunities due to Jupiter API slowness.
+const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 10;   // First attempt - balance speed and reliability
+const REQUEST_TIMEOUT_RETRY_SECS: u64 = 20;    // Retries - allow more time for high-load scenarios
 
 // Legacy constant for backward compatibility (use REQUEST_TIMEOUT_RETRY_SECS)
 const REQUEST_TIMEOUT_SECS: u64 = REQUEST_TIMEOUT_RETRY_SECS;
@@ -125,15 +134,23 @@ pub async fn get_jupiter_quote(
 
 /// Get Jupiter quote with retry mechanism and adaptive timeout
 /// 
-/// CRITICAL: Uses adaptive timeout strategy to preserve blockhash freshness:
-/// - First attempt: 6 seconds (fast fail to preserve blockhash)
-/// - Retries: 10 seconds (allow more time during busy periods)
+/// CRITICAL: Uses adaptive timeout strategy to balance blockhash freshness and API reliability:
+/// - First attempt: 10 seconds (default, configurable via JUPITER_TIMEOUT_NORMAL_SECS)
+/// - Retries: 20 seconds (default, configurable via JUPITER_TIMEOUT_RETRY_SECS)
 /// - Max retries: 2 (configurable via JUPITER_MAX_RETRIES, default: 2)
 /// 
 /// Blockhash is valid for ~60 seconds. Bundle expires in ~60 seconds.
-/// Worst case: 6s (first) + 10s (retry) = 16s for Jupiter, leaving 44s for TX build + send.
-/// This adaptive strategy maximizes blockhash freshness while still allowing
-/// retries during busy periods.
+/// Worst case: 10s (first) + 20s (retry) = 30s for Jupiter, leaving 30s for TX build + send.
+/// 
+/// NOTE: Jupiter API can sometimes take 30+ seconds during high load periods.
+/// These timeout values balance between:
+/// - Preserving blockhash freshness (shorter = better)
+/// - Handling Jupiter API slowness (longer = better)
+/// 
+/// If Jupiter is consistently slow, consider:
+/// - Increasing JUPITER_TIMEOUT_NORMAL_SECS and JUPITER_TIMEOUT_RETRY_SECS
+/// - Accepting that some opportunities may be missed due to blockhash staleness
+/// - Or reducing max retries to fail faster
 pub async fn get_jupiter_quote_with_retry(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -145,7 +162,7 @@ pub async fn get_jupiter_quote_with_retry(
     
     for attempt in 1..=max_retries {
         // CRITICAL: Use configurable timeout strategy
-        // Default: 15s first attempt, 30s for retries
+        // Default: 10s first attempt, 20s for retries (updated to handle Jupiter API high-load)
         // Read from environment variables to allow runtime configuration
         use std::env;
         
@@ -153,12 +170,12 @@ pub async fn get_jupiter_quote_with_retry(
             env::var("JUPITER_TIMEOUT_NORMAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(REQUEST_TIMEOUT_NORMAL_SECS) // Default: 6s (fast fail to preserve blockhash)
+                .unwrap_or(REQUEST_TIMEOUT_NORMAL_SECS) // Default: 10s (balance speed and reliability)
         } else {
             env::var("JUPITER_TIMEOUT_RETRY_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(REQUEST_TIMEOUT_RETRY_SECS) // Default: 10s (reasonable retry)
+                .unwrap_or(REQUEST_TIMEOUT_RETRY_SECS) // Default: 20s (handle high-load scenarios)
         };
         
         log::debug!(
@@ -295,8 +312,16 @@ pub async fn build_jupiter_swap_instruction(
         "dynamicComputeUnitLimit": true,
     });
     
+    // Use configurable timeout for swap-instructions endpoint
+    // Default: 20 seconds (same as retry timeout, since this is a critical operation)
+    use std::env;
+    let swap_timeout_secs = env::var("JUPITER_TIMEOUT_RETRY_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(REQUEST_TIMEOUT_RETRY_SECS); // Default: 20s
+    
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(swap_timeout_secs))
         .build()
         .context("Failed to create HTTP client")?;
     
@@ -305,7 +330,10 @@ pub async fn build_jupiter_swap_instruction(
         .json(&payload)
         .send()
         .await
-        .context("Jupiter swap instruction request failed")?;
+        .context(format!(
+            "Jupiter swap instruction request failed or timed out after {} seconds",
+            swap_timeout_secs
+        ))?;
     
     if !response.status().is_success() {
         let status = response.status();

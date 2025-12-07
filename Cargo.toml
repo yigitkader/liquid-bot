@@ -39,3 +39,7 @@ bytemuck = "1.24.0"
 parking_lot = "0.12"
 lazy_static = "1.4"
 rand = "0.8"
+# Pyth Network SDK for Pythnet v3 (current mainnet standard)
+# Note: Legacy Pyth v2 parsing is kept in code for backward compatibility,
+# but Pythnet v3 is now the standard format on mainnet
+pyth-sdk-solana = "0.10"
