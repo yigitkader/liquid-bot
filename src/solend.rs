@@ -394,62 +394,84 @@ impl Obligation {
 //    Only programs with USDC reserve can be used for liquidation operations.
 //
 // ✅ ACTIVE PROGRAMS WITH USDC:
-// 1. Save Protocol Main Market (RECOMMENDED): SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
-//    - Active on mainnet (Save Protocol is Solend's 2024 rebrand)
+// 1. Legacy Solend Main Pool (DEFAULT - RECOMMENDED): So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
+//    - Active on mainnet (original Solend protocol)
 //    - Has USDC reserve (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v)
 //    - Verified working for liquidation bot
+//    - Verification: https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
 //
 // ❌ PROGRAMS WITHOUT USDC (DO NOT USE):
-//    "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo" - Save Main Market (NO USDC reserve)
+//    "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh" - Save Protocol Main Market (NO USDC reserve)
+//       Note: Save Protocol (2024 rebrand) focuses on SUSD, not USDC
 //    "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw" - Altcoins Market (NO USDC)
 //    "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP" - Turbo SOL Market (NO USDC)
 //
-// NOTE: Save markets (2024 rebrand) may not have USDC reserves.
-//       Always verify USDC reserve exists before using a program ID.
+// NOTE: Save Protocol (2024 rebrand) markets may not have USDC reserves.
+//       They focus on SUSD (Save USD) instead. Use Legacy Solend for USDC.
 //
 // Verification: Check Solana Explorer for USDC reserves:
-// https://solscan.io/account/SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
-pub const SOLEND_PROGRAM_ID: &str = "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh"; // Save Protocol Main Market (USDC reserve available)
-pub const SOLEND_PROGRAM_ID_ALTCOINS: &str = "ALcohoCRRXGDKhc5pS5UqzVVjZE5x9dkgjZjD8MJCTw"; // Altcoins Market (NO USDC)
-pub const SOLEND_PROGRAM_ID_TURBO: &str = "turboJPMBqVwWU26JsKivCm9wPU3fuaYx8EM9rRHfuuP"; // Turbo SOL Market (NO USDC)
-
-/// Known Solend program IDs (for validation)
-/// NOTE: Only programs with USDC reserve should be used for liquidation bot
-pub const SOLEND_PROGRAM_IDS: &[&str] = &[
-    "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh", // Save Protocol Main Market (USDC reserve available - RECOMMENDED)
-];
+// - Legacy Solend: https://solscan.io/account/So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo
+// - Save Protocol: https://solscan.io/account/SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh
+// NOTE: All program IDs are now read from .env file
+// No hardcoded program IDs - all must be configured in .env
 
 /// Get Solend program ID (mainnet production)
 /// 
-/// CRITICAL: This returns the Solend program ID that has USDC reserve
-/// Defaults to Save Protocol Main Market (SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh)
-/// Can be overridden via SOLEND_PROGRAM_ID environment variable
+/// CRITICAL: Reads from SOLEND_PROGRAM_ID environment variable
+/// No hardcoded defaults - must be set in .env file
 /// 
 /// NOTE: Bot requires USDC reserve - only programs with USDC can be used
+///       Save Protocol (2024 rebrand) markets use SUSD, not USDC
 pub fn solend_program_id() -> Result<Pubkey> {
     use std::env;
     
-    // First, try to read from environment variable (allows override)
-    if let Ok(env_program_id) = env::var("SOLEND_PROGRAM_ID") {
-        log::info!("📝 Using Save/Solend program ID from .env: {}", env_program_id);
-        return Pubkey::from_str(&env_program_id)
-            .map_err(|e| anyhow::anyhow!("Invalid SOLEND_PROGRAM_ID from .env: {} - Error: {}", env_program_id, e));
-    }
+    let env_program_id = env::var("SOLEND_PROGRAM_ID")
+        .map_err(|_| anyhow::anyhow!(
+            "SOLEND_PROGRAM_ID not found in .env file. \
+             Please set SOLEND_PROGRAM_ID in .env file. \
+             Example: SOLEND_PROGRAM_ID=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo"
+        ))?;
     
-    // Fallback to default (Save Main Market - active as of 2024)
-    log::info!("📝 Using default Save program ID: {}", SOLEND_PROGRAM_ID);
-    Pubkey::from_str(SOLEND_PROGRAM_ID)
-        .map_err(|e| anyhow::anyhow!("Invalid Save program ID: {}", e))
+    log::info!("📝 Using Solend program ID from .env: {}", env_program_id);
+    Pubkey::from_str(&env_program_id)
+        .map_err(|e| anyhow::anyhow!("Invalid SOLEND_PROGRAM_ID from .env: {} - Error: {}", env_program_id, e))
 }
 
 /// Verify if a program ID is a known Solend program
 /// 
-/// This can be used to validate that we're connecting to a legitimate Solend program
+/// This checks if the program ID matches known Solend program IDs from .env
 /// NOTE: Only programs with USDC reserve should be used for liquidation operations
 pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
-    SOLEND_PROGRAM_IDS
-        .iter()
-        .any(|&id| Pubkey::from_str(id).ok() == Some(*pubkey))
+    use std::env;
+    
+    // Check against SOLEND_PROGRAM_ID from env
+    if let Ok(env_program_id) = env::var("SOLEND_PROGRAM_ID") {
+        if let Ok(env_pubkey) = Pubkey::from_str(&env_program_id) {
+            if *pubkey == env_pubkey {
+                return true;
+            }
+        }
+    }
+    
+    // Check against optional SOLEND_PROGRAM_ID_LEGACY
+    if let Ok(legacy_id) = env::var("SOLEND_PROGRAM_ID_LEGACY") {
+        if let Ok(legacy_pubkey) = Pubkey::from_str(&legacy_id) {
+            if *pubkey == legacy_pubkey {
+                return true;
+            }
+        }
+    }
+    
+    // Check against optional SOLEND_PROGRAM_ID_SAVE
+    if let Ok(save_id) = env::var("SOLEND_PROGRAM_ID_SAVE") {
+        if let Ok(save_pubkey) = Pubkey::from_str(&save_id) {
+            if *pubkey == save_pubkey {
+                return true;
+            }
+        }
+    }
+    
+    false
 }
 
 /// Identify Solend account type without parsing
@@ -944,6 +966,7 @@ impl Reserve {
 
 /// Find USDC mint address from Solend reserves (chain-based discovery)
 /// This automatically discovers USDC by checking all reserves
+/// Also checks for SUSD if USDC is not found (Save Protocol uses SUSD)
 /// 
 /// CRITICAL: No fallback to hardcoded values - MUST read from chain
 /// DYNAMIC CHAIN READING: All data is read from chain via RPC - no static values.
@@ -952,13 +975,46 @@ pub fn find_usdc_mint_from_reserves(
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
     
-    // Known USDC mint address (mainnet) - used only for comparison, not as fallback
-    const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    let known_usdc_mint = Pubkey::from_str(USDC_MINT_MAINNET)
-        .map_err(|e| anyhow::anyhow!("Invalid known USDC mint: {}", e))?;
+    // Read USDC mint address from environment variable
+    use std::env;
+    let usdc_mint_str = env::var("USDC_MINT")
+        .map_err(|_| anyhow::anyhow!(
+            "USDC_MINT not found in .env file. \
+             Please set USDC_MINT in .env file. \
+             Example: USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        ))?;
+    let known_usdc_mint = Pubkey::from_str(&usdc_mint_str)
+        .map_err(|e| anyhow::anyhow!("Invalid USDC_MINT from .env: {} - Error: {}", usdc_mint_str, e))?;
     
-    log::info!("🔍 Starting USDC reserve discovery...");
+    // Read SUSD mint addresses from environment variable (comma-separated)
+    let susd_mint_candidates: Vec<Pubkey> = env::var("SUSD_MINT_CANDIDATES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| Pubkey::from_str(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Invalid SUSD_MINT_CANDIDATES in .env (comma-separated list): {}", e))?;
+    
+    // Validate program ID and determine protocol type (read from env for comparison)
+    let program_id_str = program_id.to_string();
+    let save_program_id = env::var("SOLEND_PROGRAM_ID_SAVE")
+        .unwrap_or_else(|_| "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh".to_string());
+    let legacy_program_id = env::var("SOLEND_PROGRAM_ID_LEGACY")
+        .unwrap_or_else(|_| "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo".to_string());
+    
+    let is_save_protocol = program_id_str == save_program_id;
+    let is_legacy_solend = program_id_str == legacy_program_id;
+    
+    log::info!("🔍 Starting debt token reserve discovery...");
     log::info!("   Program ID: {}", program_id);
+    if is_save_protocol {
+        log::info!("   ⚠️  Protocol: Save Protocol (2024 rebrand) - typically uses SUSD, not USDC");
+    } else if is_legacy_solend {
+        log::info!("   ✅ Protocol: Legacy Solend - should have USDC reserve");
+    } else {
+        log::warn!("   ⚠️  Protocol: Unknown/Other - verifying reserves...");
+    }
     log::info!("   Expected USDC mint: {}", known_usdc_mint);
     
     // Log RPC URL (partially masked for security)
@@ -1028,8 +1084,9 @@ pub fn find_usdc_mint_from_reserves(
             
             // Check if we can access other known accounts to verify network
             log::warn!("⚠️  Program account not found. Verifying network connectivity...");
-            const TEST_MAINNET_ACCOUNT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC mint
-            if let Ok(test_account) = Pubkey::from_str(TEST_MAINNET_ACCOUNT) {
+            // Use USDC_MINT from env for network verification
+            if let Ok(usdc_mint_str) = env::var("USDC_MINT") {
+                if let Ok(test_account) = Pubkey::from_str(&usdc_mint_str) {
                 match rpc.get_account(&test_account) {
                     Ok(usdc_account) => {
                         diagnostic.push_str("✅ Network verification: USDC mint found - RPC is on mainnet\n");
@@ -1185,15 +1242,19 @@ pub fn find_usdc_mint_from_reserves(
         ));
     }
     
-    log::info!("🔍 Searching for USDC reserve among {} accounts...", accounts_count);
+    log::info!("🔍 Searching for debt token reserves (USDC/SUSD) among {} accounts...", accounts_count);
     log::info!("   Account size distribution will be analyzed during parsing...");
     
-    // Search for USDC reserve by checking all reserves from chain
+    // Search for USDC or SUSD reserve by checking all reserves from chain
     let mut parsed_reserves = 0;
     let mut skipped_accounts = 0;
     let mut parse_errors = 0;
     let mut found_mints = std::collections::HashSet::new();
     let mut account_size_distribution = std::collections::HashMap::new();
+    let mut usdc_found = false;
+    let mut susd_found = false;
+    let mut usdc_mint: Option<Pubkey> = None;
+    let mut susd_mint: Option<Pubkey> = None;
     let start_time = std::time::Instant::now();
     
     for (pubkey, account) in &accounts {
@@ -1235,6 +1296,8 @@ pub fn find_usdc_mint_from_reserves(
                 // Check if this reserve is USDC (check both liquidity and collateral mints)
                 // USDC is typically a liquidity mint (debt token), but check both to be safe
                 if liquidity_mint == known_usdc_mint {
+                    usdc_found = true;
+                    usdc_mint = Some(liquidity_mint);
                     let elapsed = start_time.elapsed();
                     log::info!("✅ Found USDC reserve from chain (as liquidity mint)!");
                     log::info!("   Reserve pubkey: {}", pubkey);
@@ -1243,8 +1306,10 @@ pub fn find_usdc_mint_from_reserves(
                     log::info!("   Parsed {} reserves total in {:?}", parsed_reserves, elapsed);
                     log::info!("   Skipped {} accounts (too small)", skipped_accounts);
                     log::info!("   Found {} unique token mints", found_mints.len());
-                    return Ok(liquidity_mint);
+                    // Continue scanning to also check for SUSD, but USDC takes priority
                 } else if collateral_mint == known_usdc_mint {
+                    usdc_found = true;
+                    usdc_mint = Some(liquidity_mint); // Still use liquidity mint
                     let elapsed = start_time.elapsed();
                     log::warn!("⚠️  Found USDC as collateral mint (unusual, but using liquidity mint)");
                     log::info!("   Reserve pubkey: {}", pubkey);
@@ -1252,9 +1317,22 @@ pub fn find_usdc_mint_from_reserves(
                     log::info!("   USDC collateral mint: {}", collateral_mint);
                     log::info!("   Note: Using liquidity mint for USDC operations");
                     log::info!("   Parsed {} reserves total in {:?}", parsed_reserves, elapsed);
-                    // Still return liquidity mint as USDC is typically used as debt token
-                    // But log this unusual case
-                    return Ok(liquidity_mint);
+                    // Continue scanning to also check for SUSD
+                }
+                
+                // Check for SUSD (Save Protocol stablecoin)
+                // Only check if USDC not found yet (USDC takes priority)
+                if !usdc_found && !susd_mint_candidates.is_empty() {
+                    for susd_candidate in &susd_mint_candidates {
+                        if liquidity_mint == *susd_candidate || collateral_mint == *susd_candidate {
+                            susd_found = true;
+                            susd_mint = Some(liquidity_mint);
+                            log::info!("✅ Found SUSD reserve from chain!");
+                            log::info!("   Reserve pubkey: {}", pubkey);
+                            log::info!("   SUSD mint: {}", susd_candidate);
+                            break;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -1269,7 +1347,31 @@ pub fn find_usdc_mint_from_reserves(
     }
     
     let elapsed = start_time.elapsed();
-    log::warn!("⚠️  USDC reserve not found after parsing {} reserves", parsed_reserves);
+    
+    // Report findings
+    if usdc_found {
+        log::info!("✅ USDC reserve found!");
+        if let Some(mint) = usdc_mint {
+            return Ok(mint);
+        }
+    }
+    
+    if susd_found {
+        log::warn!("⚠️  USDC not found, but SUSD reserve found!");
+        log::warn!("   This program uses SUSD (Save Protocol stablecoin), not USDC");
+        log::warn!("   Bot requires USDC for liquidation operations");
+        if let Some(mint) = susd_mint {
+            return Err(anyhow::anyhow!(
+                "SUSD reserve found but USDC required. \
+                 This program ({}) uses SUSD, not USDC. \
+                 Bot requires USDC reserve for liquidation operations. \
+                 Please use Legacy Solend program: So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+                program_id
+            ));
+        }
+    }
+    
+    log::warn!("⚠️  Neither USDC nor SUSD reserve found after parsing {} reserves", parsed_reserves);
     log::warn!("   Total accounts checked: {}", accounts_count);
     log::warn!("   Successfully parsed: {} reserves", parsed_reserves);
     log::warn!("   Parse errors: {}", parse_errors);
@@ -1311,44 +1413,80 @@ pub fn find_usdc_mint_from_reserves(
         log::info!("   You can search for USDC in this file to verify if it exists with a different address");
     }
     
-    // Check if USDC might be in the list with a different address
-    log::warn!("🔍 Checking if USDC exists with a different mint address...");
-    log::warn!("   This Solend instance may use a different USDC variant (e.g., USDC.e)");
-    log::warn!("   Or USDC may not be available in this Solend program");
-    
-    // CRITICAL: No fallback - if USDC reserve not found, it's an error
-    // This ensures we're always using real chain data, not hardcoded values
-    // CRITICAL: Only mainnet is supported - no devnet/testnet
-    Err(anyhow::anyhow!(
+    // Program ID validation and recommendations
+    let mut error_msg = format!(
         "USDC reserve not found in chain data. \
          Checked {} accounts, successfully parsed {} reserves, but none match USDC mint {}. \
          \n\
          Analysis:\n\
          - Found {} unique token mints (both liquidity and collateral)\n\
-         - USDC mint {} was not found in any reserve\n\
-         - All mints have been saved to: {}\n\
-         \n\
-         Possible causes:\n\
-         1. This Solend program instance does not have a USDC reserve\n\
-         2. USDC may be using a different mint address (check {})\n\
-         3. RPC_URL may not be pointing to the correct Solend program\n\
-         4. Solend program layout may have changed\n\
-         \n\
-         Troubleshooting:\n\
-         - Check {} file to see all available mints\n\
-         - Verify Solend program ID is correct: {}\n\
-         - Verify RPC_URL points to mainnet\n\
-         - Check Solana Explorer for this program's reserves\n\
-         - Consider if USDC is actually needed (maybe use a different stablecoin?)",
+         - USDC mint {} was not found in any reserve\n",
         accounts_count,
         parsed_reserves,
         known_usdc_mint,
         found_mints.len(),
-        known_usdc_mint,
+        known_usdc_mint
+    );
+    
+    // Add protocol-specific recommendations
+    if is_save_protocol {
+        error_msg.push_str(
+            "\n\
+         ⚠️  PROGRAM ID ANALYSIS:\n\
+         - You are using Save Protocol (SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh)\n\
+         - Save Protocol (2024 rebrand) uses SUSD, not USDC\n\
+         - SUSD status: {}\n\
+         \n\
+         ✅ RECOMMENDED SOLUTION:\n\
+         - Use Legacy Solend program ID: So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo\n\
+         - Legacy Solend has USDC reserve\n\
+         - Set in .env: SOLEND_PROGRAM_ID=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo\n",
+            if susd_found { "FOUND" } else { "NOT FOUND" }
+        );
+    } else if is_legacy_solend {
+        error_msg.push_str(
+            "\n\
+         ⚠️  PROGRAM ID ANALYSIS:\n\
+         - You are using Legacy Solend (So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo)\n\
+         - This program should have USDC reserve\n\
+         - USDC not found - this is unexpected\n\
+         \n\
+         Possible causes:\n\
+         1. RPC_URL may not be pointing to mainnet\n\
+         2. Program layout may have changed\n\
+         3. USDC reserve may have been removed\n",
+        );
+    } else {
+        error_msg.push_str(
+            "\n\
+         ⚠️  PROGRAM ID ANALYSIS:\n\
+         - Unknown program ID: {}\n\
+         - Verify this is a valid Solend/Save program\n",
+            program_id
+        );
+    }
+    
+    error_msg.push_str(&format!(
+        "\n\
+         Troubleshooting:\n\
+         - All mints have been saved to: {}\n\
+         - Check {} file to see all available mints\n\
+         - Verify Solend program ID is correct: {}\n\
+         - Verify RPC_URL points to mainnet\n\
+         - Check Solana Explorer for this program's reserves:\n\
+           https://solscan.io/account/{}\n\
+         \n\
+         For USDC support, use Legacy Solend:\n\
+         SOLEND_PROGRAM_ID=So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
         mints_file,
         mints_file,
-        mints_file,
+        program_id,
         program_id
-    ))
+    ));
+    
+    // CRITICAL: No fallback - if USDC reserve not found, it's an error
+    // This ensures we're always using real chain data, not hardcoded values
+    // CRITICAL: Only mainnet is supported - no devnet/testnet
+    Err(anyhow::anyhow!("{}", error_msg))
 }
 

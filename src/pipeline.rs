@@ -83,10 +83,16 @@ pub async fn run_liquidation_loop(
     let program_id = solend_program_id()?;
     let wallet = config.wallet.pubkey();
 
-    // Initialize Jito client with tip account from config or default
-    // Auto-discovered from environment variables, no hardcoded values
+    // Initialize Jito client with tip account from config or env
+    // No hardcoded defaults - must be set in .env file
+    use std::env;
     let jito_tip_account_str = config.jito_tip_account.as_deref()
-        .unwrap_or("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"); // Default mainnet tip account
+        .or_else(|| env::var("JITO_TIP_ACCOUNT").ok().as_deref())
+        .ok_or_else(|| anyhow::anyhow!(
+            "JITO_TIP_ACCOUNT not found in .env file or config. \
+             Please set JITO_TIP_ACCOUNT in .env file. \
+             Example: JITO_TIP_ACCOUNT=96gYZGLnJYVFmbjzopPSU6QiEV5fGqZ6N6VBY6FuDgU3"
+        ))?;
     
     // CRITICAL: Validate Jito tip account address format
     // 
@@ -992,15 +998,45 @@ async fn build_liquidation_context(
     })
 }
 
-/// Pyth Network program ID (mainnet)
-const PYTH_PROGRAM_ID: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH";
+/// Get Pyth Network program ID from environment
+fn pyth_program_id() -> Result<Pubkey> {
+    use std::env;
+    let pyth_id_str = env::var("PYTH_PROGRAM_ID")
+        .map_err(|_| anyhow::anyhow!(
+            "PYTH_PROGRAM_ID not found in .env file. \
+             Please set PYTH_PROGRAM_ID in .env file. \
+             Example: PYTH_PROGRAM_ID=FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH"
+        ))?;
+    Pubkey::from_str(&pyth_id_str)
+        .map_err(|e| anyhow::anyhow!("Invalid PYTH_PROGRAM_ID from .env: {} - Error: {}", pyth_id_str, e))
+}
 
-/// Switchboard v2 program ID (mainnet)
-const SWITCHBOARD_PROGRAM_ID_V2: &str = "SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f";
+/// Get Switchboard v2 program ID from environment
+fn switchboard_program_id_v2() -> Result<Pubkey> {
+    use std::env;
+    let switchboard_id_str = env::var("SWITCHBOARD_PROGRAM_ID")
+        .map_err(|_| anyhow::anyhow!(
+            "SWITCHBOARD_PROGRAM_ID not found in .env file. \
+             Please set SWITCHBOARD_PROGRAM_ID in .env file. \
+             Example: SWITCHBOARD_PROGRAM_ID=SW1TCH7qEPTdLsDHRgPuMQjbQxKdH2aBStViMFnt64f"
+        ))?;
+    Pubkey::from_str(&switchboard_id_str)
+        .map_err(|e| anyhow::anyhow!("Invalid SWITCHBOARD_PROGRAM_ID from .env: {} - Error: {}", switchboard_id_str, e))
+}
 
-/// Switchboard On-Demand v3 program ID (mainnet)
+/// Get Switchboard On-Demand v3 program ID from environment
 /// Solend uses Switchboard On-Demand v3, so this is the primary program ID we check
-const SWITCHBOARD_PROGRAM_ID_V3: &str = "SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv";
+fn switchboard_program_id_v3() -> Result<Pubkey> {
+    use std::env;
+    let switchboard_id_str = env::var("SWITCHBOARD_PROGRAM_ID_V3")
+        .map_err(|_| anyhow::anyhow!(
+            "SWITCHBOARD_PROGRAM_ID_V3 not found in .env file. \
+             Please set SWITCHBOARD_PROGRAM_ID_V3 in .env file. \
+             Example: SWITCHBOARD_PROGRAM_ID_V3=SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv"
+        ))?;
+    Pubkey::from_str(&switchboard_id_str)
+        .map_err(|e| anyhow::anyhow!("Invalid SWITCHBOARD_PROGRAM_ID_V3 from .env: {} - Error: {}", switchboard_id_str, e))
+}
 
 /// Maximum allowed confidence interval (as percentage of price)
 /// When Switchboard is available, this is used as secondary validation.
@@ -1538,11 +1574,8 @@ async fn validate_switchboard_oracle_if_available(
 
     // ✅ FIXED: Check for both Switchboard v2 and v3 program IDs
     // Solend uses Switchboard On-Demand v3, but we also support v2 for compatibility
-    let switchboard_program_id_v2 = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID_V2)
-        .map_err(|e| anyhow::anyhow!("Invalid Switchboard v2 program ID: {}", e))?;
-    
-    let switchboard_program_id_v3 = Pubkey::from_str(SWITCHBOARD_PROGRAM_ID_V3)
-        .map_err(|e| anyhow::anyhow!("Invalid Switchboard v3 program ID: {}", e))?;
+    let switchboard_program_id_v2 = switchboard_program_id_v2()?;
+    let switchboard_program_id_v3 = switchboard_program_id_v3()?;
 
     // CRITICAL SECURITY: Verify account owner BEFORE parsing
     // Prevents parsing malicious accounts that claim to be oracles
@@ -1778,8 +1811,7 @@ async fn validate_pyth_oracle(
         .get_account(&oracle_pubkey)
         .map_err(|e| anyhow::anyhow!("Failed to get oracle account: {}", e))?;
 
-    let pyth_program_id = Pubkey::from_str(PYTH_PROGRAM_ID)
-        .map_err(|e| anyhow::anyhow!("Invalid Pyth program ID: {}", e))?;
+    let pyth_program_id = pyth_program_id()?;
 
     if oracle_account.owner != pyth_program_id {
         log::warn!(

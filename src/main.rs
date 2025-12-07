@@ -142,12 +142,17 @@ async fn validate_mainnet_connection(rpc: &Arc<RpcClient>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to RPC: {}", e))?;
     log::info!("✅ RPC connected (current slot: {})", slot);
     
-    // Verify we're on mainnet by checking a known mainnet account
-    // USDC mint on mainnet: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    // Verify we're on mainnet by checking USDC mint account from .env
     // This account exists on mainnet but has different address on devnet
-    const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    let usdc_mint = Pubkey::from_str(MAINNET_USDC_MINT)
-        .map_err(|e| anyhow::anyhow!("Invalid USDC mint address: {}", e))?;
+    use std::env;
+    let usdc_mint_str = env::var("USDC_MINT")
+        .map_err(|_| anyhow::anyhow!(
+            "USDC_MINT not found in .env file. \
+             Please set USDC_MINT in .env file. \
+             Example: USDC_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        ))?;
+    let usdc_mint = Pubkey::from_str(&usdc_mint_str)
+        .map_err(|e| anyhow::anyhow!("Invalid USDC_MINT from .env: {} - Error: {}", usdc_mint_str, e))?;
     
     match rpc.get_account(&usdc_mint) {
         Ok(account) => {
