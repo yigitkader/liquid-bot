@@ -636,7 +636,7 @@ async fn process_cycle(
                             if let Some(info) = self.bundles.get_mut(&bundle_id) {
                                 if !info.confirmed {
                                     info.confirmed = true;
-                                    newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                    processed_bundles.push((bundle_id.clone(), info.value_usd, true));
                                     log::debug!(
                                         "✅ Bundle {} confirmed during expiry check (has slot)",
                                         bundle_id
@@ -692,10 +692,12 @@ async fn process_cycle(
             
             // Return both confirmed and expired bundles
             // Both should release committed amounts (confirmed = executed, expired = dropped)
-            // Expired bundles are added to newly_confirmed so caller can release committed amounts
-            newly_confirmed.extend(expired_to_release);
+            // Expired bundles are added to processed_bundles as "dropped" (false) so caller can release committed amounts
+            for (bundle_id, value) in expired_to_release {
+                processed_bundles.push((bundle_id, value, false));
+            }
             
-            newly_confirmed
+            processed_bundles
         }
         
         /// Get total pending committed value (unconfirmed bundles)
@@ -807,7 +809,9 @@ async fn process_cycle(
                     r.liquidity().liquiditySwitchboardOracle)
             }).unwrap_or_else(|| "deposit_reserve=None".to_string());
             
-            log::warn!(
+            // Reduce log spam: Use debug instead of warn for frequent oracle failures
+            // We have a summary at the end of the cycle to track these stats
+            log::debug!(
                 "Skipping {}: Oracle validation failed - {} | {} | borrow_price={:?}, deposit_price={:?}",
                 obl_pubkey,
                 borrow_info,
@@ -1105,33 +1109,32 @@ async fn process_cycle(
     );
 
     // Structured log for external monitoring (Problems.md requirement)
-    if total_processed > 0 {
-        log::info!(target: "scan_stats", "{}", serde_json::json!({
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-            "candidates": total_processed,
-            "successful": metrics.successful,
-            "skipped": total_skipped,
-            "skipped_breakdown": {
-                "oracle": metrics.skipped_oracle_fail,
-                "jupiter": metrics.skipped_jupiter_fail,
-                "profit": metrics.skipped_insufficient_profit,
-                "risk": metrics.skipped_risk_limit,
-                "rpc": metrics.skipped_rpc_error,
-                "reserve": metrics.skipped_reserve_load_fail,
-                "ata": metrics.skipped_ata_missing
-            },
-            "failed_tx": total_failed,
-            "bundles": {
-                "confirmed": metrics.confirmed_bundles,
-                "dropped": metrics.dropped_bundles
-            },
-            "risk": {
-                "cumulative_used": cumulative_risk_usd,
-                "limit": final_max_position_usd,
-                "wallet_balance": final_wallet_value_usd
-            }
-        }));
-    }
+    // Always log scan stats even if no candidates found (for liveness check)
+    log::info!(target: "scan_stats", "{}", serde_json::json!({
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "candidates": total_processed,
+        "successful": metrics.successful,
+        "skipped": total_skipped,
+        "skipped_breakdown": {
+            "oracle": metrics.skipped_oracle_fail,
+            "jupiter": metrics.skipped_jupiter_fail,
+            "profit": metrics.skipped_insufficient_profit,
+            "risk": metrics.skipped_risk_limit,
+            "rpc": metrics.skipped_rpc_error,
+            "reserve": metrics.skipped_reserve_load_fail,
+            "ata": metrics.skipped_ata_missing
+        },
+        "failed_tx": total_failed,
+        "bundles": {
+            "confirmed": metrics.confirmed_bundles,
+            "dropped": metrics.dropped_bundles
+        },
+        "risk": {
+            "cumulative_used": cumulative_risk_usd,
+            "limit": final_max_position_usd,
+            "wallet_balance": final_wallet_value_usd
+        }
+    }));
 
     Ok(())
 }
@@ -1904,28 +1907,21 @@ async fn validate_switchboard_oracle_if_available(
         return Ok(None);
     }
     
-    // Additional validation: Check account size is reasonable
-    // Switchboard PullFeedAccountData should be ~512 bytes
+    // Switchboard PullFeedAccountData should be ~512 bytes, but logs show ~3851 bytes
+    // We increase the max size to accommodate larger accounts (historical data, etc.)
     const EXPECTED_FEED_SIZE_MIN: usize = 400;
-    const EXPECTED_FEED_SIZE_MAX: usize = 2000;
+    const EXPECTED_FEED_SIZE_MAX: usize = 10000; // Increased from 2000 to cover 3851 bytes
     let account_size = oracle_account.data.len();
     
     if account_size < EXPECTED_FEED_SIZE_MIN || account_size > EXPECTED_FEED_SIZE_MAX {
-        log::error!(
-            "❌ Switchboard feed {} has unusual size:\n\
-             - Account size: {} bytes\n\
-             - Expected range: {}-{} bytes\n\
-             - Owner: {}\n\
-             - First 32 bytes: {:02x?}\n\
-             - This may indicate: wrong account type, data corruption, or RPC issue",
+        // Just warn but try to continue - allow parsing logic to decide validity
+        log::warn!(
+            "⚠️ Switchboard feed {} has unusual size: {} bytes (expected {}-{}). Continuing with validation...",
             switchboard_oracle_pubkey,
             account_size,
             EXPECTED_FEED_SIZE_MIN,
-            EXPECTED_FEED_SIZE_MAX,
-            oracle_account.owner,
-            &oracle_account.data[..32.min(oracle_account.data.len())]
+            EXPECTED_FEED_SIZE_MAX
         );
-        return Ok(None);
     }
     
     // Log which version we're using for debugging
@@ -2896,10 +2892,13 @@ async fn validate_pyth_oracle(
         if is_pythnet_v3 { "v3" } else if is_pyth_v2 { "v2" } else { "env" }
     );
 
-    // 2. Route to correct parser based on program ID (not account size!)
-    if is_pythnet_v3 {
+    // 2. Route to correct parser based on program ID OR account size
+    // CRITICAL FIX: If account is large (>2000 bytes), it is almost certainly Pyth v3,
+    // regardless of the exact program ID match (which might be using a proxy or different ID).
+    // Pyth v2 accounts are small (~84 bytes).
+    if is_pythnet_v3 || oracle_account.data.len() > 2000 {
         // Use Pythnet v3 parser (pyth-sdk-solana crate)
-        log::debug!("✅ Detected Pythnet v3 oracle (program ID match) for {} - using v3 parser", oracle_pubkey);
+        log::debug!("✅ Detected Pythnet v3 oracle (via program ID or size > 2000) for {} - using v3 parser", oracle_pubkey);
         return validate_pyth_oracle_v3(rpc, oracle_pubkey, current_slot).await;
     }
     
@@ -3902,11 +3901,15 @@ async fn get_liquidation_quote(
     // PROBLEM: cTokens cannot be traded directly on Jupiter!
     // SOLUTION: We need to redeem cToken to underlying token first (cSOL -> SOL)
     //
-    // However, the current build_liquidation_tx() only includes LiquidateObligation.
-    // RedeemReserveCollateral instruction is MISSING!
+    // ✅ CORRECT FLOW IMPLEMENTED in build_flashloan_liquidation_tx():
+    // 1. FlashLoan (borrow USDC)
+    // 2. LiquidateObligation (USDC -> cSOL)
+    // 3. RedeemReserveCollateral (cSOL -> SOL)
+    // 4. Jupiter Swap (SOL -> USDC)
+    // 5. FlashRepay (repay USDC + fee)
     //
-    // For now, we'll use the underlying token mint for Jupiter quote,
-    // assuming we'll add RedeemReserveCollateral instruction later.
+    // For quote calculation, we use the underlying token mint (e.g. SOL) for Jupiter,
+    // knowing that the transaction will handle the cToken -> Token conversion.
     
     // Step 1: Get collateral cToken mint (what Solend gives us)
     let collateral_ctoken_mint = ctx
