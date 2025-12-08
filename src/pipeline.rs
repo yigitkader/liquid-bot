@@ -277,6 +277,10 @@ struct CycleMetrics {
     skipped_rpc_error: usize,      // RPC call failures
     skipped_reserve_load_fail: usize, // Failed to load reserve accounts
     skipped_ata_missing: usize,   // Missing ATA (shouldn't happen if startup check works)
+    
+    // Bundle outcome tracking
+    confirmed_bundles: usize,     // Bundles confirmed on-chain
+    dropped_bundles: usize,       // Bundles dropped/failed after sending
 }
 
 async fn process_cycle(
@@ -385,6 +389,8 @@ async fn process_cycle(
         skipped_rpc_error: 0,
         skipped_reserve_load_fail: 0,
         skipped_ata_missing: 0,
+        confirmed_bundles: 0,
+        dropped_bundles: 0,
     };
 
     // Per Structure.md section 6.4: Track block-wide cumulative risk
@@ -468,12 +474,12 @@ async fn process_cycle(
         }
         
         /// Update bundle status by checking Jito API
-        /// Returns list of newly confirmed bundle IDs with their values
+        /// Returns list of processed bundles: (id, value_usd, is_success)
         async fn update_statuses(
             &mut self,
             jito_client: &JitoClient,
-        ) -> Vec<(String, f64)> {
-            let mut newly_confirmed = Vec::new();
+        ) -> Vec<(String, f64, bool)> {
+            let mut processed_bundles = Vec::new();
             
             // Check bundles that haven't been checked in last 200ms
             let now = Instant::now();
@@ -495,7 +501,7 @@ async fn process_cycle(
                                 if let Some(info) = self.bundles.get_mut(&bundle_id) {
                                     if !info.confirmed {
                                         info.confirmed = true;
-                                        newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                        processed_bundles.push((bundle_id.clone(), info.value_usd, true));
                                         
                                         log::debug!(
                                             "✅ Bundle {} confirmed in {:.1}s",
@@ -507,8 +513,11 @@ async fn process_cycle(
                             } else if status_str == "failed" || status_str == "dropped" {
                                 // Bundle failed - mark as confirmed (will be cleaned up)
                                 if let Some(info) = self.bundles.get_mut(&bundle_id) {
-                                    info.confirmed = true; // Mark as processed
-                                    log::debug!("Bundle {} failed/dropped", bundle_id);
+                                    if !info.confirmed {
+                                        info.confirmed = true; // Mark as processed
+                                        processed_bundles.push((bundle_id.clone(), info.value_usd, false));
+                                        log::debug!("Bundle {} failed/dropped", bundle_id);
+                                    }
                                 }
                             }
                         }
@@ -518,7 +527,7 @@ async fn process_cycle(
                             if let Some(info) = self.bundles.get_mut(&bundle_id) {
                                 if !info.confirmed {
                                     info.confirmed = true;
-                                    newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                    processed_bundles.push((bundle_id.clone(), info.value_usd, true));
                                     log::debug!("Bundle {} confirmed (has slot)", bundle_id);
                                 }
                             }
@@ -577,7 +586,7 @@ async fn process_cycle(
                                     if let Some(info) = self.bundles.get_mut(&bundle_id) {
                                         if !info.confirmed {
                                             info.confirmed = true;
-                                            newly_confirmed.push((bundle_id.clone(), info.value_usd));
+                                            processed_bundles.push((bundle_id.clone(), info.value_usd, true));
                                             log::debug!(
                                                 "✅ Bundle {} confirmed during expiry check (was about to expire)",
                                                 bundle_id
@@ -589,7 +598,7 @@ async fn process_cycle(
                                 "failed" | "dropped" => {
                                     // Bundle definitely failed - safe to release
                                     if let Some(info) = self.bundles.get(&bundle_id) {
-                                        expired_to_release.push((bundle_id.clone(), info.value_usd));
+                                        processed_bundles.push((bundle_id.clone(), info.value_usd, false));
                                         log::warn!(
                                             "⏰ Releasing expired bundle {} (${:.2}) after {}s - status: {}",
                                             bundle_id,
@@ -842,16 +851,19 @@ async fn process_cycle(
         // CRITICAL FIX: Real-time bundle status checking (instead of timeout-based)
         // Check bundle status proactively every 200ms to detect confirmed bundles immediately
         // This prevents overcommit by releasing committed amounts as soon as bundles execute (~400ms)
-        let newly_confirmed = bundle_tracker.update_statuses(jito_client).await;
+        let processed_bundles = bundle_tracker.update_statuses(jito_client).await;
         
-        // Release committed amounts for newly confirmed bundles
-        for (bundle_id, value_usd) in newly_confirmed {
+        // Release committed amounts and update metrics
+        for (bundle_id, value_usd, is_success) in processed_bundles {
             wallet_balance_tracker.pending_committed_usd -= value_usd;
-            log::debug!(
-                "Released ${:.2} committed amount for confirmed bundle {}",
-                value_usd,
-                bundle_id
-            );
+            
+            if is_success {
+                metrics.confirmed_bundles += 1;
+                log::debug!("Released ${:.2} committed for CONFIRMED bundle {}", value_usd, bundle_id);
+            } else {
+                metrics.dropped_bundles += 1;
+                log::debug!("Released ${:.2} committed for DROPPED bundle {}", value_usd, bundle_id);
+            }
         }
         
         // Calculate available liquidity with real-time pending
@@ -1071,7 +1083,7 @@ async fn process_cycle(
     let total_failed = metrics.failed_build_tx + metrics.failed_send_bundle;
     
     log::info!(
-        "📊 Cycle Summary: {} candidates | {} successful | {} skipped (oracle:{}, jupiter:{}, profit:{}, risk:{}, rpc:{}, reserve:{}, ata:{}) | {} failed (build:{}, send:{}) | cumulative_risk=${:.2}/{:.2} (final_wallet_value=${:.2})",
+        "📊 Cycle Summary: {} candidates | {} successful | {} skipped (oracle:{}, jup:{}, profit:{}, risk:{}, rpc:{}, load:{}, ata:{}) | {} tx_failed (build:{}, send:{}) | Bundles: {} confirmed, {} dropped | cumulative_risk=${:.2}/{:.2} (wallet=${:.2})",
         total_processed,
         metrics.successful,
         total_skipped,
@@ -1085,10 +1097,41 @@ async fn process_cycle(
         total_failed,
         metrics.failed_build_tx,
         metrics.failed_send_bundle,
+        metrics.confirmed_bundles,
+        metrics.dropped_bundles,
         cumulative_risk_usd,
         final_max_position_usd,
         final_wallet_value_usd
     );
+
+    // Structured log for external monitoring (Problems.md requirement)
+    if total_processed > 0 {
+        log::info!(target: "scan_stats", "{}", serde_json::json!({
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "candidates": total_processed,
+            "successful": metrics.successful,
+            "skipped": total_skipped,
+            "skipped_breakdown": {
+                "oracle": metrics.skipped_oracle_fail,
+                "jupiter": metrics.skipped_jupiter_fail,
+                "profit": metrics.skipped_insufficient_profit,
+                "risk": metrics.skipped_risk_limit,
+                "rpc": metrics.skipped_rpc_error,
+                "reserve": metrics.skipped_reserve_load_fail,
+                "ata": metrics.skipped_ata_missing
+            },
+            "failed_tx": total_failed,
+            "bundles": {
+                "confirmed": metrics.confirmed_bundles,
+                "dropped": metrics.dropped_bundles
+            },
+            "risk": {
+                "cumulative_used": cumulative_risk_usd,
+                "limit": final_max_position_usd,
+                "wallet_balance": final_wallet_value_usd
+            }
+        }));
+    }
 
     Ok(())
 }
