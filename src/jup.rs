@@ -8,25 +8,25 @@ use std::time::Duration;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 
-// CRITICAL FIX: Adaptive timeout for blockhash freshness
-// Bundle expires in ~60 seconds, blockhash can go stale if Jupiter takes too long
+// ✅ FIXED: Balanced timeout strategy (Problems.md issue #4)
+// Jupiter API can take 20-30s during high load, but we also need blockhash freshness
 // 
-// UPDATED: Increased timeouts to handle Jupiter API high-load scenarios (can take 30s+)
-// Primary timeout: 10 seconds (normal conditions - balance between speed and reliability)
-// Fallback timeout: 20 seconds (busy periods - allow more time for slow API responses)
-// Total worst case: 10s (first) + 20s (retry) = 30s, leaving 30s for TX build + send
+// Strategy: 
+// - Primary timeout: 10 seconds (normal conditions - balance between speed and reliability)
+// - Retry timeout: 20 seconds (high load scenarios - allow more time for slow API responses)
+// - Total worst case: 10s (first) + 20s (retry) = 30s, leaving 30s for TX build + send
+// 
+// Blockhash expires in ~60s, so we have: Jupiter (10+20=30s) + TX build (20-30s) = 50-60s total
+// This leaves 0-10s buffer for blockhash freshness (acceptable trade-off)
 // 
 // NOTE: These values can be overridden via environment variables:
-// - JUPITER_TIMEOUT_NORMAL_SECS (default: 6)
-// - JUPITER_TIMEOUT_RETRY_SECS (default: 12)
+// - JUPITER_TIMEOUT_NORMAL_SECS (default: 10)
+// - JUPITER_TIMEOUT_RETRY_SECS (default: 20)
 // 
-// CRITICAL FIX: Reduced timeouts to prevent blockhash expiry
-// Blockhash expires in ~60s, so we need: Jupiter (6+12=18s) + TX build (20-30s) = 38-48s total
-// This leaves 12-22s buffer for blockhash freshness
-// Trade-off: Shorter timeouts may cause some opportunities to be missed due to Jupiter API slowness,
-// but longer timeouts cause more missed opportunities due to blockhash staleness.
-const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 6;    // First attempt - reduced from 10s to preserve blockhash
-const REQUEST_TIMEOUT_RETRY_SECS: u64 = 12;   // Retries - reduced from 20s to preserve blockhash
+// Trade-off: Longer timeouts handle Jupiter API slowness better, but reduce blockhash freshness buffer.
+// However, missing opportunities due to Jupiter timeout is worse than slightly stale blockhash.
+const REQUEST_TIMEOUT_NORMAL_SECS: u64 = 10;   // ✅ Increased from 6s to 10s (Problems.md fix)
+const REQUEST_TIMEOUT_RETRY_SECS: u64 = 20;    // ✅ Increased from 12s to 20s (Problems.md fix)
 
 // Legacy constant for backward compatibility (use REQUEST_TIMEOUT_RETRY_SECS)
 const REQUEST_TIMEOUT_SECS: u64 = REQUEST_TIMEOUT_RETRY_SECS;

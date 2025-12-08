@@ -2156,16 +2156,31 @@ async fn validate_switchboard_oracle_if_available(
         //     - result.mantissa (i128)
         //     - result.scale (u32)
         
-        // Minimum size check
-        const MIN_V2_SIZE: usize = 200; // Approximate minimum size
-        if oracle_account.data.len() < MIN_V2_SIZE {
+        // ✅ FIXED: Size check with realistic range (Problems.md issue #2)
+        // Switchboard v2 accounts can be 200-5000 bytes (real accounts are typically 3000-4000 bytes)
+        const MIN_V2_SIZE: usize = 200;
+        const MAX_V2_SIZE: usize = 5000; // ✅ Increased from implicit limit to handle real account sizes
+        
+        let account_size = oracle_account.data.len();
+        
+        if account_size < MIN_V2_SIZE {
             log::error!(
                 "❌ Switchboard v2 account {} too small: {} bytes (min: {})",
                 switchboard_oracle_pubkey,
-                oracle_account.data.len(),
+                account_size,
                 MIN_V2_SIZE
             );
             return Ok(None);
+        }
+        
+        if account_size > MAX_V2_SIZE {
+            log::warn!(
+                "⚠️ Switchboard v2 account {} unusually large: {} bytes (expected max {}). Attempting to parse anyway...",
+                switchboard_oracle_pubkey,
+                account_size,
+                MAX_V2_SIZE
+            );
+            // ⚠️ Don't reject immediately - try to parse (may be valid large account)
         }
         
         // CRITICAL: Parse and use additional Switchboard v2 fields for enhanced validation
@@ -2404,6 +2419,178 @@ async fn validate_switchboard_oracle_if_available(
             switchboard_program_id_v2,
             switchboard_program_id_v3
         );
+        Ok(None)
+    }
+}
+
+/// ✅ Helper function: Validate Switchboard oracle directly by pubkey (for standalone price fetching)
+/// This is used when we don't have a Reserve object (e.g., for SOL/USD price fetching)
+async fn validate_switchboard_oracle_by_pubkey(
+    rpc: &Arc<RpcClient>,
+    switchboard_oracle_pubkey: Pubkey,
+    current_slot: u64,
+) -> Result<Option<f64>> {
+    // Get Switchboard feed account data from chain
+    let oracle_account = rpc
+        .get_account(&switchboard_oracle_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get Switchboard oracle account: {}", e))?;
+
+    // Check for both Switchboard v2 and v3 program IDs
+    let switchboard_program_id_v2 = switchboard_program_id_v2()?;
+    let switchboard_program_id_v3 = switchboard_program_id_v3()?;
+
+    // CRITICAL SECURITY: Verify account owner BEFORE parsing
+    if oracle_account.owner != switchboard_program_id_v2 
+        && oracle_account.owner != switchboard_program_id_v3 {
+        log::debug!(
+            "Switchboard oracle account {} rejected: invalid owner (expected v2: {} or v3: {}, found: {})",
+            switchboard_oracle_pubkey,
+            switchboard_program_id_v2,
+            switchboard_program_id_v3,
+            oracle_account.owner
+        );
+        return Ok(None);
+    }
+    
+    // Size check with realistic range (same as validate_switchboard_oracle_if_available)
+    const EXPECTED_FEED_SIZE_MIN: usize = 200;
+    const EXPECTED_FEED_SIZE_MAX: usize = 5000;
+    let account_size = oracle_account.data.len();
+    
+    if account_size < EXPECTED_FEED_SIZE_MIN {
+        log::debug!("Switchboard oracle {} too small: {} bytes", switchboard_oracle_pubkey, account_size);
+        return Ok(None);
+    }
+    
+    if account_size > EXPECTED_FEED_SIZE_MAX {
+        log::warn!(
+            "⚠️ Switchboard oracle {} unusually large: {} bytes (expected max {}). Attempting to parse anyway...",
+            switchboard_oracle_pubkey,
+            account_size,
+            EXPECTED_FEED_SIZE_MAX
+        );
+    }
+
+    // Route to v2 or v3 parser based on owner
+    if oracle_account.owner == switchboard_program_id_v3 {
+        // Use v3 parser (same logic as validate_switchboard_oracle_if_available)
+        use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
+        use switchboard_on_demand::utils::get_account_discriminator;
+        
+        const DISCRIMINATOR_SIZE: usize = 8;
+        if oracle_account.data.len() < DISCRIMINATOR_SIZE {
+            return Ok(None);
+        }
+        
+        // Validate discriminator
+        let expected_discriminator = get_account_discriminator("PullFeedAccountData");
+        let actual_discriminator: [u8; 8] = oracle_account.data[0..8]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to extract discriminator"))?;
+        
+        if actual_discriminator != expected_discriminator {
+            log::debug!("Switchboard v3 account {} has invalid discriminator", switchboard_oracle_pubkey);
+            return Ok(None);
+        }
+        
+        // Parse struct data (skip discriminator)
+        let feed_size = std::mem::size_of::<PullFeedAccountData>();
+        let required_total_size = DISCRIMINATOR_SIZE + feed_size;
+        if oracle_account.data.len() < required_total_size {
+            return Ok(None);
+        }
+        
+        let struct_data = &oracle_account.data[DISCRIMINATOR_SIZE..DISCRIMINATOR_SIZE + feed_size];
+        
+        // Parse using bytemuck (same as existing code)
+        let feed = match bytemuck::try_from_bytes::<PullFeedAccountData>(struct_data) {
+            Ok(feed) => *feed,
+            Err(bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned) => {
+                // Alignment issue - use helper functions for aligned buffer
+                let alignment = std::mem::align_of::<PullFeedAccountData>();
+                let mut aligned_buffer = get_aligned_buffer(feed_size + alignment);
+                let ptr = aligned_buffer.as_ptr();
+                let offset = ptr.align_offset(alignment);
+                aligned_buffer[offset..offset + feed_size].copy_from_slice(struct_data);
+                
+                match bytemuck::try_from_bytes::<PullFeedAccountData>(&aligned_buffer[offset..offset + feed_size]) {
+                    Ok(feed) => {
+                        let feed_copy = *feed;
+                        return_aligned_buffer(aligned_buffer);
+                        feed_copy
+                    }
+                    Err(_) => {
+                        return_aligned_buffer(aligned_buffer);
+                        log::debug!("Failed to parse Switchboard v3 feed {}: alignment/parsing error", switchboard_oracle_pubkey);
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(_) => {
+                log::debug!("Failed to parse Switchboard v3 feed {}: parsing error", switchboard_oracle_pubkey);
+                return Ok(None);
+            }
+        };
+        
+        // Get price using SDK's value() method
+        match feed.value(current_slot) {
+            Ok(price_decimal) => {
+                // Convert Decimal to f64
+                let price = price_decimal.to_string().parse::<f64>()
+                    .unwrap_or_else(|_| {
+                        let mantissa = price_decimal.mantissa();
+                        let scale = price_decimal.scale();
+                        mantissa as f64 / 10_f64.powi(scale as i32)
+                    });
+                
+                if price > 0.0 && price.is_finite() {
+                    Ok(Some(price))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => {
+                log::debug!("Switchboard v3 feed {} value() failed (stale or insufficient quorum)", switchboard_oracle_pubkey);
+                Ok(None)
+            }
+        }
+    } else if oracle_account.owner == switchboard_program_id_v2 {
+        // Use v2 parser (same logic as validate_switchboard_oracle_if_available)
+        // Parse latest_round.result (SwitchboardDecimal)
+        const LATEST_ROUND_OFFSET: usize = 80;
+        const RESULT_OFFSET: usize = LATEST_ROUND_OFFSET + 24; // 104
+        
+        if oracle_account.data.len() < RESULT_OFFSET + 20 {
+            return Ok(None);
+        }
+        
+        // Parse mantissa (i128, 16 bytes) and scale (u32, 4 bytes)
+        let mantissa_bytes: [u8; 16] = oracle_account.data[RESULT_OFFSET..RESULT_OFFSET + 16]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse mantissa"))?;
+        let mantissa = i128::from_le_bytes(mantissa_bytes);
+        
+        let scale_bytes: [u8; 4] = oracle_account.data[RESULT_OFFSET + 16..RESULT_OFFSET + 20]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed to parse scale"))?;
+        let scale = u32::from_le_bytes(scale_bytes);
+        
+        if scale > 18 {
+            return Ok(None);
+        }
+        
+        let price_multiplier = 10_f64.powi(scale as i32);
+        if !price_multiplier.is_finite() {
+            return Ok(None);
+        }
+        
+        let price = mantissa as f64 / price_multiplier;
+        if price > 0.0 && price.is_finite() {
+            Ok(Some(price))
+        } else {
+            Ok(None)
+        }
+    } else {
         Ok(None)
     }
 }
@@ -3481,7 +3668,32 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         }
     }
     
-    // Method 3: Try multiple reliable price APIs (sequential with fast timeout)
+    // ✅ FIXED: Method 3 - Try Switchboard feed (Problems.md issue #3)
+    // Add Switchboard as fallback before API calls (faster and more reliable)
+    if let Ok(switchboard_feed_str) = env::var("SOL_USD_SWITCHBOARD_FEED") {
+        if let Ok(switchboard_feed) = Pubkey::from_str(&switchboard_feed_str) {
+            if let Some(slot) = current_slot {
+                log::debug!("Trying Switchboard feed: {}", switchboard_feed);
+                // Use direct Switchboard validation by pubkey (no Reserve needed)
+                match validate_switchboard_oracle_by_pubkey(rpc, switchboard_feed, slot).await {
+                    Ok(Some(price)) => {
+                        log::info!("✅ SOL price from Switchboard feed: ${:.2}", price);
+                        return Some(price);
+                    }
+                    Ok(None) => {
+                        log::debug!("⚠️ Switchboard SOL/USD feed validation failed (stale/invalid). Feed: {}", switchboard_feed);
+                    }
+                    Err(e) => {
+                        log::debug!("❌ Error validating Switchboard SOL/USD feed {}: {}", switchboard_feed, e);
+                    }
+                }
+            }
+        } else {
+            log::warn!("Failed to parse Switchboard feed address from SOL_USD_SWITCHBOARD_FEED: {}", switchboard_feed_str);
+        }
+    }
+    
+    // Method 4: Try multiple reliable price APIs (sequential with fast timeout)
     // These are reliable off-chain APIs that should always work
     log::info!("⚠️ All Pyth feeds failed, trying multiple reliable price APIs for SOL price...");
     
@@ -3917,13 +4129,24 @@ async fn get_liquidation_quote(
         .ok_or_else(|| anyhow::anyhow!("Decimals multiplier overflow"))?;
     
     // Convert normalized amount to raw amount
+    // ✅ FIXED: Overflow protection with u64::MAX check (Problems.md issue #6)
     // CRITICAL FIX: Use u128 arithmetic instead of f64 to prevent overflow and precision loss
     // f64 has only 53 bits of precision and can overflow for large numbers
-    let actual_borrowed_raw = actual_borrowed_normalized
+    let actual_borrowed_u128 = actual_borrowed_normalized
         .checked_mul(decimals_multiplier)
         // .and_then(|v| v.checked_div(WAD)) // ❌ REMOVED: No division needed, already normalized!
-        .ok_or_else(|| anyhow::anyhow!("Overflow in actual borrowed calculation: actual_borrowed_normalized * decimals_multiplier"))?
-        as u64;
+        .ok_or_else(|| anyhow::anyhow!("Overflow in actual borrowed calculation: actual_borrowed_normalized ({}) * decimals_multiplier ({})", actual_borrowed_normalized, decimals_multiplier))?;
+    
+    // ✅ Check u64::MAX before casting (prevents silent truncation)
+    if actual_borrowed_u128 > u64::MAX as u128 {
+        return Err(anyhow::anyhow!(
+            "Borrowed amount exceeds u64::MAX: {} (max: {}). This indicates extremely large borrow position.",
+            actual_borrowed_u128,
+            u64::MAX
+        ));
+    }
+    
+    let actual_borrowed_raw = actual_borrowed_u128 as u64;
     
     // Step 3: Total underlying supply
     let total_underlying_supply = available_amount.saturating_add(actual_borrowed_raw);
@@ -5482,45 +5705,66 @@ async fn execute_liquidation_with_swap(
     // ✅ FIXED: Exponential backoff for bundle status polling
     // Max 10 attempts with increasing delay: 200, 400, 600, 800... ms
     // Reduces RPC load while still checking frequently enough
+    // ✅ FIXED: Exponential backoff polling (Problems.md issue #5)
+    // Bundle can confirm in 400ms, but first check was at 200ms - timing issue fixed
+    // Strategy: Start at 100ms, then exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms, max 2000ms)
     let mut confirmed = false;
-    for i in 0..10 {
-        let delay_ms = 200 * (i + 1);
+    let mut delay_ms = 100; // ✅ Start at 100ms (faster initial check)
+    const MAX_ATTEMPTS: u32 = 10;
+    const MAX_DELAY_MS: u64 = 2000; // Max 2s between checks
+    
+    for attempt in 0..MAX_ATTEMPTS {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         
         if let Ok(Some(status)) = jito_client.get_bundle_status(&bundle_id).await {
             if let Some(status_str) = &status.status {
-                if status_str == "landed" || status_str == "confirmed" {
-                    confirmed = true;
-                    log::debug!(
-                        "✅ Bundle {} confirmed in {:.1}s (poll #{})",
-                        bundle_id,
-                        (i + 1) as f64 * 0.2,
-                        i + 1
-                    );
-                    break;
-                } else if status_str == "failed" || status_str == "dropped" {
-                    log::warn!(
-                        "Bundle {} failed/dropped after {:.1}s (poll #{})",
-                        bundle_id,
-                        (i + 1) as f64 * 0.2,
-                        i + 1
-                    );
-                    break;
+                match status_str.as_str() {
+                    "landed" | "confirmed" => {
+                        confirmed = true;
+                        let total_time_ms = delay_ms * (attempt + 1) as u64;
+                        log::debug!(
+                            "✅ Bundle {} confirmed in {:.1}s (poll #{})",
+                            bundle_id,
+                            total_time_ms as f64 / 1000.0,
+                            attempt + 1
+                        );
+                        break;
+                    }
+                    "failed" | "dropped" => {
+                        let total_time_ms = delay_ms * (attempt + 1) as u64;
+                        log::warn!(
+                            "Bundle {} failed/dropped after {:.1}s (poll #{})",
+                            bundle_id,
+                            total_time_ms as f64 / 1000.0,
+                            attempt + 1
+                        );
+                        break;
+                    }
+                    "pending" => {
+                        // Continue polling
+                    }
+                    _ => {
+                        log::debug!("Bundle {} unknown status: {}", bundle_id, status_str);
+                    }
                 }
             }
             
             // If slot is present, bundle likely executed
             if status.slot.is_some() {
                 confirmed = true;
+                let total_time_ms = delay_ms * (attempt + 1) as u64;
                 log::debug!(
                     "✅ Bundle {} confirmed (has slot) in {:.1}s (poll #{})",
                     bundle_id,
-                    (i + 1) as f64 * 0.2,
-                    i + 1
+                    total_time_ms as f64 / 1000.0,
+                    attempt + 1
                 );
                 break;
             }
         }
+        
+        // ✅ Exponential backoff: double delay each time, max 2000ms
+        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
     }
     
     if !confirmed {
