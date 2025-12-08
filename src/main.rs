@@ -2,6 +2,7 @@ mod solend;
 mod pipeline;
 mod jup;
 mod utils;
+mod oracle;
 
 use anyhow::{Context, Result};
 use dotenv::dotenv;

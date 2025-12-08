@@ -19,6 +19,7 @@ use crate::jup::{get_jupiter_quote_with_retry, JupiterQuote};
 use crate::solend::{Obligation, Reserve, solend_program_id};
 use crate::solend::{ObligationLiquidity, ObligationCollateral};
 use crate::utils::{send_jito_bundle, JitoClient};
+use crate::oracle;
 
 // Static aligned buffer pool for Switchboard Oracle alignment fix
 // Reduces GC pressure by reusing buffers instead of allocating on every oracle read
@@ -1307,43 +1308,9 @@ fn switchboard_program_id_v3() -> Result<Pubkey> {
 const MIN_VALID_PRICE_USD: f64 = 0.01; // $0.01 minimum (was 1e-6)
 
 /// Get oracle configuration from .env (no hardcoded values)
+/// NOTE: This function is now in oracle::get_oracle_config, but kept here for backward compatibility
 fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
-    use std::env;
-    
-    // MAX_ORACLE_AGE_SECONDS: Maximum age of oracle price in seconds
-    let max_oracle_age_secs = env::var("MAX_ORACLE_AGE_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300); // Default 300 seconds (5 minutes) if not set - more flexible for production
-    
-    // Convert to slots (assuming ~400ms per slot)
-    let max_slot_difference = (max_oracle_age_secs * 1000 / 400).max(25); // Minimum 25 slots
-    
-    // MAX_ORACLE_DEVIATION_PCT: Maximum price deviation between Pyth and Switchboard
-    let max_oracle_deviation_pct = env::var("MAX_ORACLE_DEVIATION_PCT")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(2.0); // Default 2% if not set
-    
-    // TWAP configuration
-    let twap_max_age_secs = max_oracle_age_secs.min(30); // Use oracle age or 30s, whichever is smaller
-    let twap_min_samples = 5; // Minimum samples for TWAP (fixed for reliability)
-    let twap_max_samples = 50; // Maximum samples for TWAP (fixed for memory efficiency)
-    let twap_anomaly_threshold_pct = 3.0; // 3% deviation from TWAP triggers anomaly (fixed)
-
-    // MAX_CONFIDENCE_PCT: Maximum confidence interval (percentage)
-    let max_confidence_pct = env::var("MAX_CONFIDENCE_PCT")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(15.0); // Default 15% (more flexible for volatile markets)
-
-    // MAX_CONFIDENCE_PCT_PYTH_ONLY: Stricter confidence for Pyth-only mode
-    let max_confidence_pct_pyth_only = env::var("MAX_CONFIDENCE_PCT_PYTH_ONLY")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(2.0); // Default 2%
-    
-    (max_slot_difference, max_oracle_deviation_pct, twap_max_age_secs, twap_min_samples, twap_max_samples, twap_anomaly_threshold_pct, max_confidence_pct, max_confidence_pct_pyth_only)
+    oracle::get_oracle_config()
 }
 
 /// Oracle price cache for TWAP calculation
@@ -1440,73 +1407,7 @@ const PYTH_PRICE_STATUS_PRICE: u8 = 1; // Price status - acceptable for liquidat
 const PYTH_PRICE_STATUS_TRADING: u8 = 2; // Trading status - preferred for liquidations
 const PYTH_PRICE_STATUS_HALTED: u8 = 3;
 
-/// Validate Pyth and Switchboard oracles per Structure.md section 5.2
-/// Helper function to get price from either Pyth or Switchboard oracle
-/// Returns (price, has_pyth, has_switchboard) where:
-/// - price: Some(f64) if valid price found, None otherwise
-/// - has_pyth: true if price came from Pyth
-/// - has_switchboard: true if price came from Switchboard (and we also checked for cross-validation)
-async fn get_reserve_price(
-    rpc: &Arc<RpcClient>,
-    reserve: &Reserve,
-    current_slot: u64,
-) -> Result<(Option<f64>, bool, bool)> {
-    let pyth_pubkey = reserve.oracle_pubkey();
-    // ✅ FIXED: Use liquiditySwitchboardOracle (primary Switchboard oracle for liquidity pricing)
-    // instead of config().switchboardOraclePubkey (which uses extraOracle and may be different)
-    let switchboard_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
-    
-    // Try Pyth first if available
-    if pyth_pubkey != Pubkey::default() {
-        match validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
-            Ok((valid, price)) => {
-                if valid {
-                    if let Some(price) = price {
-                        // Pyth succeeded - check if Switchboard is also available for cross-validation
-                        let has_switchboard = if switchboard_pubkey != Pubkey::default() {
-                            validate_switchboard_oracle_if_available(rpc, reserve, current_slot)
-                                .await?
-                                .is_some()
-                        } else {
-                            false
-                        };
-                        log::debug!("✅ Pyth oracle validation succeeded for reserve {}: price=${:.2}", pyth_pubkey, price);
-                        return Ok((Some(price), true, has_switchboard));
-                    } else {
-                        log::debug!("Pyth oracle {} validation returned valid=true but price=None, trying Switchboard", pyth_pubkey);
-                    }
-                } else {
-                    // Pyth validation failed - this might be a Switchboard oracle misconfigured as Pyth
-                    log::debug!("Pyth oracle {} validation failed (may be Switchboard oracle), trying Switchboard", pyth_pubkey);
-                }
-                // Pyth validation failed or no price - try Switchboard
-            }
-            Err(e) => {
-                log::debug!("Pyth oracle {} validation error: {}, trying Switchboard", pyth_pubkey, e);
-                // Pyth error - try Switchboard
-            }
-        }
-    }
-    
-    // Pyth not available or failed - try Switchboard
-    if switchboard_pubkey != Pubkey::default() {
-        match validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
-            Ok(Some(switchboard_price)) => {
-                log::debug!("Using Switchboard price (Pyth not available or failed)");
-                return Ok((Some(switchboard_price), false, true));
-            }
-            Ok(None) => {
-                log::debug!("Switchboard oracle not available or invalid");
-            }
-            Err(e) => {
-                log::debug!("Switchboard oracle validation error: {}", e);
-            }
-        }
-    }
-    
-    // Neither oracle worked
-    Ok((None, false, false))
-}
+// get_reserve_price is now in oracle module - use oracle::get_reserve_price
 
 /// Returns (is_valid, borrow_price_usd, deposit_price_usd)
 async fn validate_oracles(
@@ -1558,7 +1459,7 @@ async fn validate_oracles(
 
     // ✅ FIXED: Validate borrow reserve oracle - try Pyth first, fallback to Switchboard
     let (borrow_price, borrow_has_pyth, borrow_has_switchboard_for_crossval) = if let Some(reserve) = borrow_reserve {
-        match get_reserve_price(rpc, reserve, current_slot).await {
+        match oracle::get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
                 if price.is_none() {
                     log::warn!("❌ Borrow reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
@@ -1577,7 +1478,7 @@ async fn validate_oracles(
 
     // ✅ FIXED: Validate deposit reserve oracle - try Pyth first, fallback to Switchboard
     let (deposit_price, deposit_has_pyth, deposit_has_switchboard_for_crossval) = if let Some(reserve) = deposit_reserve {
-        match get_reserve_price(rpc, reserve, current_slot).await {
+        match oracle::get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
                 if price.is_none() {
                     log::warn!("❌ Deposit reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
@@ -1605,7 +1506,7 @@ async fn validate_oracles(
     let (_, max_oracle_deviation_pct, _, _, _, _, max_confidence_pct, max_confidence_pct_pyth_only) = get_oracle_config();
     if borrow_has_pyth && borrow_has_switchboard_for_crossval {
         if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
-            if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
+            if let Some(switchboard_price) = oracle::switchboard::validate_switchboard_oracle_if_available(
                 rpc,
                 borrow_reserve,
                 current_slot,
@@ -1636,7 +1537,7 @@ async fn validate_oracles(
 
     if deposit_has_pyth && deposit_has_switchboard_for_crossval {
         if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
-            if let Some(switchboard_price) = validate_switchboard_oracle_if_available(
+            if let Some(switchboard_price) = oracle::switchboard::validate_switchboard_oracle_if_available(
                 rpc,
                 deposit_reserve,
                 current_slot,
@@ -1685,7 +1586,7 @@ async fn validate_oracles(
         if borrow_needs_stricter_validation {
             if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
                 // Re-check Pyth confidence with stricter threshold
-                let confidence_check = validate_pyth_confidence_strict(
+                let confidence_check = oracle::pyth::validate_pyth_confidence_strict(
                     rpc,
                     borrow_reserve.oracle_pubkey(),
                     borrow_price,
@@ -1703,7 +1604,7 @@ async fn validate_oracles(
         if deposit_needs_stricter_validation {
             if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
                 // Re-check Pyth confidence with stricter threshold
-                let confidence_check = validate_pyth_confidence_strict(
+                let confidence_check = oracle::pyth::validate_pyth_confidence_strict(
                     rpc,
                     deposit_reserve.oracle_pubkey(),
                     deposit_price,
@@ -1760,13 +1661,13 @@ async fn validate_oracles_with_twap(
     let mut deposit_has_switchboard = false;
     
     if let Some(reserve) = borrow_reserve {
-        if let Ok(Some(_)) = validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
+        if let Ok(Some(_)) = oracle::switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
             borrow_has_switchboard = true;
         }
     }
     
     if let Some(reserve) = deposit_reserve {
-        if let Ok(Some(_)) = validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
+        if let Ok(Some(_)) = oracle::switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
             deposit_has_switchboard = true;
         }
     }
@@ -2658,8 +2559,24 @@ async fn validate_pyth_oracle_v3(
     // Type annotation: use explicit type parameters for GenericPriceAccount
     // For Pythnet v3, use GenericPriceAccount<128, PriceAccountExt>
     use pyth_sdk_solana::state::{GenericPriceAccount, PriceAccountExt};
-    let price_account: &GenericPriceAccount<128, PriceAccountExt> = load_price_account(&account_data)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Pythnet v3 price feed: {}", e))?;
+    let price_account: &GenericPriceAccount<128, PriceAccountExt> = match load_price_account(&account_data) {
+        Ok(account) => account,
+        Err(e) => {
+            // Log detailed error information for troubleshooting
+            log::warn!(
+                "❌ Failed to parse Pythnet v3 price feed {}: {}\n\
+                 Account size: {} bytes\n\
+                 First 16 bytes: {:02x?}\n\
+                 Owner: {}",
+                oracle_pubkey,
+                e,
+                account_data.len(),
+                &account_data[..16.min(account_data.len())],
+                "N/A (check caller)"
+            );
+            return Ok((false, None));
+        }
+    };
     
     // Get current time for staleness check
     // Note: Pythnet v3 uses Unix timestamps, but we also have current_slot for logging/debugging
@@ -3735,92 +3652,127 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         }
     }
     
-    // Method 4: Try multiple reliable price APIs (sequential with fast timeout)
-    // These are reliable off-chain APIs that should always work
-    log::info!("⚠️ All Pyth feeds failed, trying multiple reliable price APIs for SOL price...");
+    // Method 4: Try Pyth Hermes Price Service API (Primary off-chain source)
+    // This is faster and more reliable than other public APIs
+    const PYTH_HERMES_API: &str = "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
     
     // Create HTTP client with short timeout (2s per API)
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build();
-    
-    if let Ok(client) = client {
-        // API 1: CoinGecko (most reliable, free, no API key needed, used by millions)
-        const COINGECKO_API: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
-        match client.get(COINGECKO_API).send().await {
+        
+    if let Ok(client) = &client {
+        match client.get(PYTH_HERMES_API).send().await {
             Ok(resp) if resp.status().is_success() => {
-                #[derive(serde::Deserialize)]
-                struct CoinGeckoResponse {
-                    solana: Option<CoinGeckoPrice>,
-                }
-                #[derive(serde::Deserialize)]
-                struct CoinGeckoPrice {
-                    usd: Option<f64>,
-                }
-                if let Ok(json) = resp.json::<CoinGeckoResponse>().await {
-                    if let Some(price) = json.solana.and_then(|p| p.usd) {
-                        log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
-                        return Some(price);
+                // Parse Pyth Hermes response
+                // Format: [{"id": "...", "price": {"price": "...", "conf": "...", "expo": ...}, ...}]
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(feed) = json.as_array().and_then(|arr| arr.get(0)) {
+                        if let Some(price_obj) = feed.get("price") {
+                            let price_str = price_obj.get("price").and_then(|p| p.as_str());
+                            let expo = price_obj.get("expo").and_then(|e| e.as_i64());
+                            
+                            if let (Some(p_str), Some(e)) = (price_str, expo) {
+                                if let Ok(p_val) = p_str.parse::<i64>() {
+                                    let price = (p_val as f64) * 10_f64.powi(e as i32);
+                                    log::info!("✅ SOL price from Pyth Hermes API: ${:.2}", price);
+                                    return Some(price);
+                                }
+                            }
+                        }
                     }
                 }
             }
             Err(e) => {
-                log::debug!("CoinGecko API failed: {}", e);
+                log::debug!("Pyth Hermes API failed: {}", e);
             }
             _ => {}
         }
-        
-        // API 2: Binance (very fast and reliable, largest exchange)
-        const BINANCE_API: &str = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
-        match client.get(BINANCE_API).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                #[derive(serde::Deserialize)]
-                struct BinanceResponse {
-                    price: String,
-                }
-                if let Ok(json) = resp.json::<BinanceResponse>().await {
-                    if let Ok(price) = json.price.parse::<f64>() {
-                        log::info!("✅ SOL price from Binance API: ${:.2}", price);
-                        return Some(price);
-                    }
-                }
-            }
-            Err(e) => {
-                log::debug!("Binance API failed: {}", e);
-            }
-            _ => {}
-        }
-        
-        // API 3: Jupiter Price API (Solana-native, should be fast)
-        const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
-        match client.get(JUPITER_PRICE_API).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                #[derive(serde::Deserialize)]
-                struct PriceData {
-                    price: f64,
-                }
-                #[derive(serde::Deserialize)]
-                struct JupiterPriceResponse {
-                    data: std::collections::HashMap<String, PriceData>,
-                }
-                if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
-                    if let Some(data) = json.data.get("SOL") {
-                        log::info!("✅ SOL price from Jupiter API: ${:.2}", data.price);
-                        return Some(data.price);
-                    }
-                }
-            }
-            Err(e) => {
-                log::debug!("Jupiter Price API failed: {}", e);
-            }
-            _ => {}
-        }
-        
-        // Note: CoinGecko, Binance, and Jupiter are all FREE and don't require API keys
-        // These three should be more than enough to get SOL price reliably
-    } else {
-        log::warn!("Failed to create HTTP client for price APIs");
     }
+
+    // Method 5: Try multiple reliable price APIs (sequential with fast timeout)
+    // These are reliable off-chain APIs that should always work
+    log::info!("⚠️ All Pyth feeds failed, trying multiple reliable price APIs for SOL price...");
+    
+    // Reuse existing client if possible, or create new one
+    let client = client.unwrap_or_else(|_| reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default());
+    
+    // API 1: CoinGecko (most reliable, free, no API key needed, used by millions)
+    const COINGECKO_API: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+    match client.get(COINGECKO_API).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct CoinGeckoResponse {
+                solana: Option<CoinGeckoPrice>,
+            }
+            #[derive(serde::Deserialize)]
+            struct CoinGeckoPrice {
+                usd: Option<f64>,
+            }
+            if let Ok(json) = resp.json::<CoinGeckoResponse>().await {
+                if let Some(price) = json.solana.and_then(|p| p.usd) {
+                    log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
+                    return Some(price);
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("CoinGecko API failed: {}", e);
+        }
+        _ => {}
+    }
+    
+    // API 2: Binance (very fast and reliable, largest exchange)
+    const BINANCE_API: &str = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
+    match client.get(BINANCE_API).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct BinanceResponse {
+                price: String,
+            }
+            if let Ok(json) = resp.json::<BinanceResponse>().await {
+                if let Ok(price) = json.price.parse::<f64>() {
+                    log::info!("✅ SOL price from Binance API: ${:.2}", price);
+                    return Some(price);
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("Binance API failed: {}", e);
+        }
+        _ => {}
+    }
+    
+    // API 3: Jupiter Price API (Solana-native, should be fast)
+    const JUPITER_PRICE_API: &str = "https://price.jup.ag/v4/price?ids=SOL";
+    match client.get(JUPITER_PRICE_API).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct PriceData {
+                price: f64,
+            }
+            #[derive(serde::Deserialize)]
+            struct JupiterPriceResponse {
+                data: std::collections::HashMap<String, PriceData>,
+            }
+            if let Ok(json) = resp.json::<JupiterPriceResponse>().await {
+                if let Some(data) = json.data.get("SOL") {
+                    log::info!("✅ SOL price from Jupiter API: ${:.2}", data.price);
+                    return Some(data.price);
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("Jupiter Price API failed: {}", e);
+        }
+        _ => {}
+    }
+    
+    // Note: CoinGecko, Binance, and Jupiter are all FREE and don't require API keys
+    // These three should be more than enough to get SOL price reliably
 
     log::error!(
         "❌ CRITICAL: All SOL price oracle methods failed! \
@@ -5748,40 +5700,35 @@ async fn execute_liquidation_with_swap(
         bundle_id
     );
     
-    // ✅ FIXED: Exponential backoff for bundle status polling
-    // Max 10 attempts with increasing delay: 200, 400, 600, 800... ms
-    // Reduces RPC load while still checking frequently enough
-    // ✅ FIXED: Exponential backoff polling (Problems.md issue #5)
-    // Bundle can confirm in 400ms, but first check was at 200ms - timing issue fixed
-    // Strategy: Start at 100ms, then exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms, max 2000ms)
+    // ✅ FIXED: Smart polling strategy (Problems.md recommendation)
+    // Bundle typically confirms in 300-400ms. Starting at 100ms is too aggressive.
+    // Strategy: Wait 300ms initially, then exponential backoff (300, 600, 1200, 2000...)
     let mut confirmed = false;
-    let mut delay_ms = 100; // ✅ Start at 100ms (faster initial check)
+    
+    // Initial wait - typical bundle confirmation time
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    
+    let mut delay_ms = 300; 
     const MAX_ATTEMPTS: u32 = 10;
     const MAX_DELAY_MS: u64 = 2000; // Max 2s between checks
     
     for attempt in 0..MAX_ATTEMPTS {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        
         if let Ok(Some(status)) = jito_client.get_bundle_status(&bundle_id).await {
             if let Some(status_str) = &status.status {
                 match status_str.as_str() {
                     "landed" | "confirmed" => {
                         confirmed = true;
-                        let total_time_ms = delay_ms * (attempt + 1) as u64;
                         log::debug!(
-                            "✅ Bundle {} confirmed in {:.1}s (poll #{})",
+                            "✅ Bundle {} confirmed (poll #{})",
                             bundle_id,
-                            total_time_ms as f64 / 1000.0,
                             attempt + 1
                         );
                         break;
                     }
                     "failed" | "dropped" => {
-                        let total_time_ms = delay_ms * (attempt + 1) as u64;
                         log::warn!(
-                            "Bundle {} failed/dropped after {:.1}s (poll #{})",
+                            "Bundle {} failed/dropped (poll #{})",
                             bundle_id,
-                            total_time_ms as f64 / 1000.0,
                             attempt + 1
                         );
                         break;
@@ -5798,19 +5745,18 @@ async fn execute_liquidation_with_swap(
             // If slot is present, bundle likely executed
             if status.slot.is_some() {
                 confirmed = true;
-                let total_time_ms = delay_ms * (attempt + 1) as u64;
                 log::debug!(
-                    "✅ Bundle {} confirmed (has slot) in {:.1}s (poll #{})",
+                    "✅ Bundle {} confirmed (has slot) (poll #{})",
                     bundle_id,
-                    total_time_ms as f64 / 1000.0,
                     attempt + 1
                 );
                 break;
             }
         }
         
-        // ✅ Exponential backoff: double delay each time, max 2000ms
+        // Exponential backoff: double delay each time, max 2000ms
         delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
     
     if !confirmed {
