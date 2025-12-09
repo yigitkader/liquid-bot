@@ -12,6 +12,8 @@ use crate::jup::get_jupiter_quote_with_retry;
 use crate::oracle;
 use crate::pipeline::{Config, LiquidationContext, LiquidationQuote};
 
+const WAD: u128 = 1_000_000_000_000_000_000;
+
 /// Get SOL price in USD from oracle (standalone version - no context required)
 /// Returns SOL price if available, otherwise None
 pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
@@ -277,9 +279,6 @@ pub async fn get_liquidation_quote(
         ));
     }
     
-    // Calculate debt to repay (close factor from reserve config)
-    const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
-    
     let close_factor_f64 = borrow_reserve.close_factor();
     let close_factor_wad = (close_factor_f64 * WAD as f64) as u128;
     
@@ -465,9 +464,6 @@ pub async fn get_liquidation_quote(
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid Jupiter out_amount: {}", e))?;
     
-    // CRITICAL: Calculate flashloan fee BEFORE profit calculation
-    // Flashloan fee is required for repayment, so we need to ensure Jupiter output covers it
-    const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
     let flashloan_fee_amount_raw = if let Some(borrow_reserve) = &ctx.borrow_reserve {
         let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
         (debt_to_repay_raw as u128)

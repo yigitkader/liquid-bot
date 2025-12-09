@@ -250,6 +250,94 @@ impl Obligation {
     pub fn total_borrowed_value_usd(&self) -> f64 {
         self.borrowedValue as f64 / 1e18
     }
+
+    pub fn deposits(&self) -> Result<Vec<ObligationCollateral>> {
+        use borsh::BorshDeserialize;
+        
+        let deposits_len = self.depositsLen as usize;
+        if deposits_len == 0 {
+            return Ok(Vec::new());
+        }
+        
+        const COLLATERAL_SIZE: usize = 32 + 8 + 16 + 32;
+        let deposits_size = deposits_len * COLLATERAL_SIZE;
+        
+        if deposits_size > self.dataFlat.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid deposits size: {} bytes (max: {})",
+                deposits_size,
+                self.dataFlat.len()
+            ));
+        }
+        
+        let deposits_buffer = &self.dataFlat[0..deposits_size];
+        let mut deposits = Vec::new();
+        
+        for i in 0..deposits_len {
+            let offset = i * COLLATERAL_SIZE;
+            if offset + COLLATERAL_SIZE > deposits_buffer.len() {
+                break;
+            }
+            let collateral_data = &deposits_buffer[offset..offset + COLLATERAL_SIZE];
+            match ObligationCollateral::try_from_slice(collateral_data) {
+                Ok(collateral) => {
+                    let _padding_verified = collateral.padding;
+                    deposits.push(collateral);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse deposit {}: {} (data size: {} bytes, expected: {} bytes)", i, e, collateral_data.len(), COLLATERAL_SIZE);
+                }
+            }
+        }
+        
+        Ok(deposits)
+    }
+
+    pub fn borrows(&self) -> Result<Vec<ObligationLiquidity>> {
+        use borsh::BorshDeserialize;
+        
+        let borrows_len = self.borrowsLen as usize;
+        if borrows_len == 0 {
+            return Ok(Vec::new());
+        }
+        
+        const COLLATERAL_SIZE: usize = 32 + 8 + 16 + 32;
+        let deposits_size = self.depositsLen as usize * COLLATERAL_SIZE;
+        const LIQUIDITY_SIZE: usize = 32 + 16 + 16 + 16 + 32;
+        let borrows_size = borrows_len * LIQUIDITY_SIZE;
+        let borrows_offset = deposits_size;
+        
+        if borrows_offset + borrows_size > self.dataFlat.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid borrows size: {} bytes (offset: {}, max: {})",
+                borrows_size,
+                borrows_offset,
+                self.dataFlat.len()
+            ));
+        }
+        
+        let borrows_buffer = &self.dataFlat[borrows_offset..borrows_offset + borrows_size];
+        let mut borrows = Vec::new();
+        
+        for i in 0..borrows_len {
+            let offset = i * LIQUIDITY_SIZE;
+            if offset + LIQUIDITY_SIZE > borrows_buffer.len() {
+                break;
+            }
+            let liquidity_data = &borrows_buffer[offset..offset + LIQUIDITY_SIZE];
+            match ObligationLiquidity::try_from_slice(liquidity_data) {
+                Ok(liquidity) => {
+                    let _padding_verified = liquidity.padding;
+                    borrows.push(liquidity);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse borrow {}: {} (data size: {} bytes, expected: {} bytes)", i, e, liquidity_data.len(), LIQUIDITY_SIZE);
+                }
+            }
+        }
+        
+        Ok(borrows)
+    }
 }
 
 #[cfg(test)]
@@ -343,114 +431,6 @@ mod tests {
             dataFlat: vec![],
         };
         assert!(!obligation5.is_liquidatable());
-    }
-
-    /// Parse deposits array from dataFlat
-    /// SDK stores deposits in dataFlat, we need to parse them
-    pub fn deposits(&self) -> Result<Vec<ObligationCollateral>> {
-        use borsh::BorshDeserialize;
-        
-        let deposits_len = self.depositsLen as usize;
-        if deposits_len == 0 {
-            return Ok(Vec::new());
-        }
-        
-        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) + 32 (padding) = 88 bytes
-        // CRITICAL FIX: Generated layout includes _padding_56: [u8; 32] which we were missing!
-        const COLLATERAL_SIZE: usize = 32 + 8 + 16 + 32; // 88 bytes (from generated layout)
-        let deposits_size = deposits_len * COLLATERAL_SIZE;
-        
-        if deposits_size > self.dataFlat.len() {
-            return Err(anyhow::anyhow!(
-                "Invalid deposits size: {} bytes (max: {})",
-                deposits_size,
-                self.dataFlat.len()
-            ));
-        }
-        
-        let deposits_buffer = &self.dataFlat[0..deposits_size];
-        let mut deposits = Vec::new();
-        
-        for i in 0..deposits_len {
-            let offset = i * COLLATERAL_SIZE;
-            if offset + COLLATERAL_SIZE > deposits_buffer.len() {
-                break;
-            }
-            let collateral_data = &deposits_buffer[offset..offset + COLLATERAL_SIZE];
-            match ObligationCollateral::try_from_slice(collateral_data) {
-                Ok(collateral) => {
-                    // CRITICAL: Verify padding field was deserialized (prevents offset loss)
-                    // BorshDeserialize automatically reads all fields including padding
-                    // If padding is missing from struct, Borsh would skip it and cause offset loss
-                    // Padding field MUST be present in generated struct for correct deserialization
-                    let _padding_verified = collateral.padding; // Access padding to ensure it was deserialized
-                    deposits.push(collateral);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse deposit {}: {} (data size: {} bytes, expected: {} bytes)", i, e, collateral_data.len(), COLLATERAL_SIZE);
-                }
-            }
-        }
-        
-        Ok(deposits)
-    }
-
-    /// Parse borrows array from dataFlat
-    /// SDK stores borrows in dataFlat, we need to parse them
-    pub fn borrows(&self) -> Result<Vec<ObligationLiquidity>> {
-        use borsh::BorshDeserialize;
-        
-        let borrows_len = self.borrowsLen as usize;
-        if borrows_len == 0 {
-            return Ok(Vec::new());
-        }
-        
-        // Each ObligationLiquidity is 32 (Pubkey) + 16 (u128) + 16 (u128) + 16 (u128) + 32 (padding) = 112 bytes
-        // CRITICAL FIX: Generated layout includes _padding_80: [u8; 32] which we were missing!
-        const LIQUIDITY_SIZE: usize = 32 + 16 + 16 + 16 + 32; // 112 bytes (from generated layout)
-        let borrows_size = borrows_len * LIQUIDITY_SIZE;
-        
-        // Deposits come first, then borrows
-        let deposits_len = self.depositsLen as usize;
-        // Each ObligationCollateral is 32 (Pubkey) + 8 (u64) + 16 (u128) + 32 (padding) = 88 bytes
-        const COLLATERAL_SIZE_FOR_BORROWS: usize = 32 + 8 + 16 + 32; // 88 bytes (must match deposits() function)
-        let deposits_size = deposits_len * COLLATERAL_SIZE_FOR_BORROWS;
-        let borrows_offset = deposits_size;
-        
-        if borrows_offset + borrows_size > self.dataFlat.len() {
-            return Err(anyhow::anyhow!(
-                "Invalid borrows size: {} bytes (offset: {}, max: {})",
-                borrows_size,
-                borrows_offset,
-                self.dataFlat.len()
-            ));
-        }
-        
-        let borrows_buffer = &self.dataFlat[borrows_offset..borrows_offset + borrows_size];
-        let mut borrows = Vec::new();
-        
-        for i in 0..borrows_len {
-            let offset = i * LIQUIDITY_SIZE;
-            if offset + LIQUIDITY_SIZE > borrows_buffer.len() {
-                break;
-            }
-            let liquidity_data = &borrows_buffer[offset..offset + LIQUIDITY_SIZE];
-            match ObligationLiquidity::try_from_slice(liquidity_data) {
-                Ok(liquidity) => {
-                    // CRITICAL: Verify padding field was deserialized (prevents offset loss)
-                    // BorshDeserialize automatically reads all fields including padding
-                    // If padding is missing from struct, Borsh would skip it and cause offset loss
-                    // Padding field MUST be present in generated struct for correct deserialization
-                    let _padding_verified = liquidity.padding; // Access padding to ensure it was deserialized
-                    borrows.push(liquidity);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse borrow {}: {} (data size: {} bytes, expected: {} bytes)", i, e, liquidity_data.len(), LIQUIDITY_SIZE);
-                }
-            }
-        }
-        
-        Ok(borrows)
     }
 }
 
@@ -1225,7 +1205,6 @@ pub fn find_usdc_mint_from_reserves(
                 5 // Default 5 retries if not set
             });
         let mut retries = max_retries;
-        let mut last_error = None;
         
         loop {
             match rpc.get_program_accounts(program_id) {
@@ -1235,15 +1214,13 @@ pub fn find_usdc_mint_from_reserves(
                 },
                 Err(e) => {
                     let error_msg = e.to_string();
-                    last_error = Some(e);
                     retries -= 1;
                     
                     if retries > 0 {
-                        // Exponential backoff with initial delay from .env
                         let initial_delay_ms = env::var("INITIAL_RETRY_DELAY_MS")
                             .ok()
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(1000); // Default 1 second
+                            .unwrap_or(1000);
                         let delay_secs = (initial_delay_ms / 1000) * 2_u64.pow(max_retries - retries);
                         log::warn!(
                             "⚠️  RPC error getting program accounts (retries left: {}): {}",
@@ -1254,11 +1231,8 @@ pub fn find_usdc_mint_from_reserves(
                         std::thread::sleep(std::time::Duration::from_secs(delay_secs));
                         continue;
                     } else {
-                        // All retries exhausted
                         log::error!("❌ All {} retry attempts failed", max_retries);
-                        // CRITICAL: Use expect() instead of unwrap() for safety
-                        // We know last_error is Some because we are in the Err branch
-                        break Err(last_error.expect("RPC error guaranteed to exist"));
+                        break Err(e);
                     }
                 }
             }

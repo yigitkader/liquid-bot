@@ -1045,10 +1045,7 @@ async fn build_liquidation_context(
                     Ok(account) => {
                         match Reserve::from_account_data(&account) {
                             Ok(reserve) => {
-                                // Use ReserveConfig fields for logging/debugging
-                                let config = reserve.config();
                                 let liquidity = reserve.liquidity();
-                                // Use liquidityMarketPrice for logging (WAD format, convert to f64)
                                 const WAD: f64 = 1_000_000_000_000_000_000.0;
                                 let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
                                 log::debug!(
@@ -1088,10 +1085,7 @@ async fn build_liquidation_context(
                     Ok(account) => {
                         match Reserve::from_account_data(&account) {
                             Ok(reserve) => {
-                                // Use ReserveConfig fields for logging/debugging
-                                let config = reserve.config();
                                 let liquidity = reserve.liquidity();
-                                // Use liquidityMarketPrice for logging (WAD format, convert to f64)
                                 const WAD: f64 = 1_000_000_000_000_000_000.0;
                                 let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
                                 log::debug!(

@@ -8,6 +8,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
+#[allow(deprecated)]
 use solana_sdk::system_instruction;
 use std::str::FromStr;
 use std::sync::Arc;
