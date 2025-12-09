@@ -60,11 +60,14 @@ async fn get_solana_price_coingecko(client: &reqwest::Client) -> Result<f64> {
 pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     log::debug!("🔍 Starting SOL price discovery from multiple oracle sources...");
     
-    // Check if we should prefer HTTP price (CoinGecko) over on-chain oracles
-    // This is useful for testing or when on-chain oracles are providing stale/incorrect data
+    // 🔴 CRITICAL FIX: Default to HTTP price sources (CoinGecko, Binance, Jupiter)
+    // The on-chain Pyth feed H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG was returning
+    // stale/incorrect prices ($42.95 instead of ~$138 as of Dec 2025).
+    // HTTP sources are more reliable and provide real-time prices.
+    // Set PREFER_HTTP_PRICE=false to use on-chain oracles instead.
     let prefer_http_price = env::var("PREFER_HTTP_PRICE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
+        .map(|v| v.to_lowercase() != "false") // Default true unless explicitly "false"
+        .unwrap_or(true); // ✅ DEFAULT: true (use HTTP sources)
         
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -72,12 +75,12 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         .unwrap_or_default();
         
     if prefer_http_price {
-        log::info!("🌐 PREFER_HTTP_PRICE=true: Attempting to fetch SOL price from CoinGecko first...");
+        log::info!("🌐 Fetching SOL price from CoinGecko API...");
         if let Ok(price) = get_solana_price_coingecko(&client).await {
-            log::info!("✅ SOL price from CoinGecko API (preferred): ${:.2}", price);
+            log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
             return Some(price);
         }
-        log::warn!("⚠️  Preferred HTTP price fetch failed, falling back to on-chain oracles");
+        log::warn!("⚠️  CoinGecko failed, trying other sources...");
     }
     
     // Method 1: Fetch from Pyth SOL/USD price feed (primary)
@@ -109,7 +112,7 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     let current_slot = rpc.get_slot().ok();
     log::debug!("Current slot: {:?}", current_slot);
     
-    // Try primary Pyth feed
+    // Try primary Pyth feed (fallback if HTTP sources fail)
     if let Some(slot) = current_slot {
         log::debug!("🔍 Attempting to get SOL price from primary Pyth feed: {} (slot: {})", sol_usd_pyth_feed_primary, slot);
         match oracle::pyth::validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {

@@ -231,7 +231,9 @@ async fn process_cycle(
     jito_client: &JitoClient,
 ) -> Result<()> {
     // 1. Solend obligation account'larını çek
-    log::debug!("Fetching obligation accounts...");
+    // NOTE: This RPC call fetches 300K+ accounts and can take 30-90 seconds
+    log::info!("📡 Fetching Solend accounts from RPC (this may take 30-90 seconds for 300K+ accounts)...");
+    let fetch_start = std::time::Instant::now();
     let rpc_clone = Arc::clone(rpc);
     let program_id_clone = *program_id;
     let accounts = tokio::task::spawn_blocking(move || {
@@ -241,17 +243,40 @@ async fn process_cycle(
     .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
     .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
 
-    log::debug!("Found {} accounts", accounts.len());
+    let fetch_duration = fetch_start.elapsed();
+    log::info!("✅ Fetched {} accounts in {:.1}s", accounts.len(), fetch_duration.as_secs_f64());
 
     // 🔴 CRITICAL FIX: Get current slot for stale obligation check
-    let current_slot = rpc.get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+    // Use retry mechanism to handle transient RPC errors after large get_program_accounts calls
+    let current_slot = {
+        let mut retries = 3;
+        let mut last_error = None;
+        loop {
+            match rpc.get_slot() {
+                Ok(slot) => break slot,
+                Err(e) => {
+                    retries -= 1;
+                    last_error = Some(e);
+                    if retries == 0 {
+                        return Err(anyhow::anyhow!(
+                            "Failed to get current slot after 3 retries: {}",
+                            last_error.unwrap()
+                        ));
+                    }
+                    log::warn!("⚠️ get_slot failed (retries left: {}): {}", retries, last_error.as_ref().unwrap());
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    };
     
-    // Configurable max slot diff for stale obligations (default: 150 slots = ~60 seconds)
+    // Configurable max slot diff for stale obligations
+    // Default: 450 slots = ~3 minutes (previously 150 slots = ~60 seconds was too aggressive)
+    // Many obligations may not be updated frequently, causing false "stale" skips
     let max_obligation_slot_diff = std::env::var("MAX_OBLIGATION_SLOT_DIFF")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(150); // Default: 150 slots (~60 seconds at 400ms per slot)
+        .unwrap_or(450); // Default: 450 slots (~3 minutes at 400ms per slot)
 
     // 2. HF < 1.0 olanları bul
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data

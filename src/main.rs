@@ -88,7 +88,19 @@ async fn main() -> Result<()> {
     log::info!("🔗 RPC URL: {} (masked)", rpc_url_display);
     log::info!("   Full RPC URL length: {} characters", app_config.rpc_url.len());
     
-    let rpc = Arc::new(RpcClient::new(app_config.rpc_url.clone()));
+    // CRITICAL: Configure RPC client with appropriate timeout for large requests
+    // get_program_accounts() for 300K+ accounts can take 60+ seconds
+    // Default timeout (30s) is too short and causes "error sending request" failures
+    let rpc_timeout = std::env::var("RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120); // Default: 120 seconds for large account fetches
+    
+    let rpc = Arc::new(RpcClient::new_with_timeout(
+        app_config.rpc_url.clone(),
+        std::time::Duration::from_secs(rpc_timeout),
+    ));
+    log::info!("✅ RPC client initialized with {}s timeout", rpc_timeout);
     
     // CRITICAL: Verify we're connected to mainnet, not devnet/testnet
     validate_mainnet_connection(&rpc)
