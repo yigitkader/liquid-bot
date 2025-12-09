@@ -6,11 +6,15 @@
  * 2. Proper BufferLayout field traversal
  * 3. Accurate padding calculation with validation
  * 4. Type registry for all custom types
- * 5. ✅ NEW: On-chain account validation to fix padding calculation
+ * 5. ✅ On-chain account size validation
  *
- * CRITICAL FIX: SDK layout shows 619 bytes, but on-chain accounts are 1300 bytes.
- * This script now validates against a real on-chain Reserve account to ensure
- * padding is correctly calculated.
+ * VERIFIED ON-CHAIN ACCOUNT SIZES (from solana account command):
+ * - Reserve: 619 bytes
+ * - Obligation: 1300 bytes
+ * - LendingMarket: 290 bytes
+ *
+ * This script generates IDL JSON files that build.rs uses to create Rust structs.
+ * The "size" field in JSON MUST match on-chain account size for Borsh to work correctly.
  */
 
 import { writeFileSync, mkdirSync, readFileSync } from "fs";
@@ -407,7 +411,9 @@ async function dumpLayouts() {
   let reserveFields = extractFieldsFromLayout("Reserve", reserveLayout);
 
   // ✅ CRITICAL FIX: Validate and fix padding based on on-chain account size
-  const RESERVE_ONCHAIN_SIZE = 1300;
+  // VERIFIED: On-chain Reserve accounts are 619 bytes (from solana account command)
+  // NOT 1300 bytes - that was an incorrect assumption based on SDK struct vs on-chain layout
+  const RESERVE_ONCHAIN_SIZE = 619;
   const calculatedReserveSize = reserveLayout.span || 0;
 
   // Calculate actual struct size from fields (excluding on-chain padding)
@@ -503,12 +509,15 @@ async function dumpLayouts() {
     }
   }
 
-  // ✅ CRITICAL: Use actual struct size (619 bytes) for Borsh deserialization
-  // On-chain accounts are 1300 bytes, but Borsh deserializer expects exactly
-  // the struct size based on layout (without on-chain padding).
-  // Using 1300 bytes would cause "Not all bytes read" error.
-  // Rust code handles this by using only the first actualStructSize bytes from on-chain accounts.
-  const RESERVE_BORSH_SIZE = actualStructSize; // 619 bytes for Borsh deserialization
+  // ✅ CRITICAL: Use on-chain account size (619 bytes) for Borsh deserialization
+  // On-chain Reserve accounts are EXACTLY 619 bytes (verified from solana account command)
+  // Borsh deserializer will read the full account data including padding
+  // struct size = data fields (570 bytes) + padding (49 bytes) = 619 bytes
+  // 
+  // The JSON "size" field MUST match on-chain account size because:
+  // 1. build.rs generates Rust struct with padding field
+  // 2. Borsh deserializes the FULL account data (619 bytes)
+  // 3. If size is wrong, Borsh throws "Not all bytes read" error
   
   // Write Reserve file
   const reserveFile: LayoutFile = {
@@ -522,7 +531,7 @@ async function dumpLayouts() {
       {
         name: "Reserve",
         fields: reserveFields,
-        size: RESERVE_BORSH_SIZE, // Use SDK struct size (619) for Borsh, not on-chain size (1300)
+        size: RESERVE_ONCHAIN_SIZE, // MUST be on-chain size (619) for correct Borsh deserialization
       },
     ],
   };

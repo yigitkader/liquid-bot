@@ -550,74 +550,72 @@ pub fn is_valid_solend_program(pubkey: &Pubkey) -> bool {
 /// identify account types without expensive Borsh deserialization.
 /// 
 /// This is faster and more reliable than attempting to parse every account.
+/// 
+/// Account sizes (verified from on-chain data):
+/// - Obligation: 1300 bytes
+/// - Reserve: 619 bytes
+/// - LendingMarket: 290 bytes
 pub fn identify_solend_account_type(data: &[u8]) -> SolendAccountType {
-    if data.len() < 1 {
+    if data.is_empty() {
         return SolendAccountType::Unknown;
     }
     
-    // ✅ FIXED: Size-based discriminator detection
-    // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
-    // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
-    const EXPECTED_STRUCT_SIZE: usize = 1300;
+    // ✅ VERIFIED SIZE CONSTANTS (from on-chain data)
+    // Obligation: 1300 bytes (version 0 or 1)
+    // Reserve: 619 bytes (version 1 only)
+    // LendingMarket: 290 bytes
+    const OBLIGATION_SIZE: usize = 1300;
+    const RESERVE_SIZE: usize = 619;
     const DISCRIMINATOR_SIZE: usize = 8;
     
-    // STEP 1: Determine if discriminator exists based on size
-    let (_has_discriminator, actual_data) = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
-        // Account is 1308 bytes - likely has Anchor discriminator
-        if data.len() < DISCRIMINATOR_SIZE {
-            return SolendAccountType::Unknown;
-        }
-        (true, &data[DISCRIMINATOR_SIZE..])
-    } else if data.len() == EXPECTED_STRUCT_SIZE {
-        // Account is exactly 1300 bytes - Legacy account, no discriminator
-        (false, data)
-    } else {
-        // Size doesn't match expected - try to detect discriminator using old logic
-        if data.len() >= DISCRIMINATOR_SIZE && !data[0..DISCRIMINATOR_SIZE].iter().all(|&b| b == 0) {
-            if data.len() < DISCRIMINATOR_SIZE {
-                return SolendAccountType::Unknown;
-            }
-            (true, &data[DISCRIMINATOR_SIZE..])
-        } else {
-            (false, data)
-        }
-    };
+    let size = data.len();
+    let version = data[0];
     
-    // STEP 2: Size-based heuristic (after discriminator)
-    let size = actual_data.len();
+    // STEP 1: Exact size matching (most reliable)
     
-    // STEP 3: Check version byte
-    if size > 0 {
-        let version = actual_data[0];
-        
-        // Obligation: 1300 bytes (exact match for Legacy), version 0 or 1
-        // Note: Obligation can be version 0 (legacy) or 1 (current)
-        if size == EXPECTED_STRUCT_SIZE && (version == 0 || version == 1) {
-            return SolendAccountType::Obligation;
-        }
-        
-        // Obligation: 1200-1400 bytes (with some tolerance), version 0 or 1
-        if (1200..=1400).contains(&size) && (version == 0 || version == 1) {
-            return SolendAccountType::Obligation;
-        }
-        
-        // Reserve: 1200-1400 bytes, version 1 only
-        // Note: Reserve is always version 1 (version 0 is invalid for Reserve)
-        // CRITICAL: Both Obligation and Reserve can be 1300 bytes with version 1
-        // We check Obligation first (version 0 or 1), so if we reach here with version 1,
-        // it could be either. We return Reserve as a heuristic, but caller should
-        // try parsing to confirm (Obligation parsing will fail if it's actually a Reserve)
-        if (1200..=1400).contains(&size) && version == 1 {
-            // This could be either Obligation or Reserve
-            // Return Reserve as default, but caller should verify by parsing
+    // Reserve: exactly 619 bytes, version 1 only
+    if size == RESERVE_SIZE && version == 1 {
+        return SolendAccountType::Reserve;
+    }
+    
+    // Reserve with Anchor discriminator: 619 + 8 = 627 bytes
+    if size == RESERVE_SIZE + DISCRIMINATOR_SIZE {
+        // Skip discriminator and check version
+        if data.len() > DISCRIMINATOR_SIZE && data[DISCRIMINATOR_SIZE] == 1 {
             return SolendAccountType::Reserve;
         }
-        
-        // LendingMarket: 200-400 bytes
-        // LendingMarket doesn't have a version byte in the same way
-        if (200..=400).contains(&size) {
-            return SolendAccountType::LendingMarket;
+    }
+    
+    // Obligation: exactly 1300 bytes, version 0 or 1
+    if size == OBLIGATION_SIZE && (version == 0 || version == 1) {
+        return SolendAccountType::Obligation;
+    }
+    
+    // Obligation with Anchor discriminator: 1300 + 8 = 1308 bytes
+    if size == OBLIGATION_SIZE + DISCRIMINATOR_SIZE {
+        // Skip discriminator and check version
+        if data.len() > DISCRIMINATOR_SIZE {
+            let version_after_disc = data[DISCRIMINATOR_SIZE];
+            if version_after_disc == 0 || version_after_disc == 1 {
+                return SolendAccountType::Obligation;
+            }
         }
+    }
+    
+    // LendingMarket: 200-400 bytes range
+    if (200..=400).contains(&size) {
+        return SolendAccountType::LendingMarket;
+    }
+    
+    // STEP 2: Fallback with tolerance (for edge cases)
+    // Reserve: 600-700 bytes range, version 1
+    if (600..=700).contains(&size) && version == 1 {
+        return SolendAccountType::Reserve;
+    }
+    
+    // Obligation: 1200-1400 bytes range, version 0 or 1
+    if (1200..=1400).contains(&size) && (version == 0 || version == 1) {
+        return SolendAccountType::Obligation;
     }
     
     SolendAccountType::Unknown
@@ -751,18 +749,22 @@ impl Reserve {
             log::trace!("First 32 bytes (hex): {}", preview);
         }
         
-        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 1300; // Full Reserve struct size including padding
+        // CRITICAL: Reserve struct size must match on-chain account size
+        // On-chain Reserve accounts are 619 bytes (verified from chain data)
+        // NOT 1300 bytes - that was an incorrect assumption
+        // Layout: 570 bytes data + 49 bytes padding = 619 bytes total
+        const EXPECTED_RESERVE_STRUCT_SIZE: usize = 619;
         const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
         
-        // ✅ FIXED: Size-based discriminator detection (same as Obligation)
+        // ✅ FIXED: Size-based discriminator detection
         // STEP 1: Check account size to determine if discriminator exists
-        // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
-        // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
+        // Reserve accounts are exactly 619 bytes (no discriminator)
+        // Anchor-based accounts would be 627 bytes (619 + 8 byte discriminator)
         let has_discriminator = if data.len() == EXPECTED_RESERVE_STRUCT_SIZE + DISCRIMINATOR_SIZE {
-            // Account is 1308 bytes - likely has Anchor discriminator
+            // Account is 627 bytes - likely has Anchor discriminator
             true
         } else if data.len() == EXPECTED_RESERVE_STRUCT_SIZE {
-            // Account is exactly 1300 bytes - Legacy account, no discriminator
+            // Account is exactly 619 bytes - Legacy account, no discriminator
             false
         } else {
             // Size doesn't match expected - fallback to old logic for edge cases
@@ -792,7 +794,7 @@ impl Reserve {
         };
         
         // STEP 3: Validate data size against expected struct size
-        // CRITICAL FIX: We now use the full on-chain layout (1300 bytes) including padding.
+        // CRITICAL FIX: We now use the full on-chain layout (619 bytes) including padding.
         // build.rs has been updated to include the padding fields in the struct, so Borsh
         // will consume the full data. We don't need to slice or pad manually anymore.
         
@@ -1234,9 +1236,10 @@ pub fn find_usdc_mint_from_reserves(
         }
     }
     
-    // ✅ PERFORMANCE FIX: Only fetch Reserve accounts (1300 bytes) instead of all 300k+ accounts
+    // ✅ PERFORMANCE FIX: Only fetch Reserve accounts (619 bytes) instead of all 300k+ accounts
     // This dramatically reduces response size (~500MB+ -> ~few MB) and avoids RPC rate limiting
-    log::info!("🔍 Fetching Solend Reserve accounts from RPC (filtered by size: 1300 bytes)...");
+    // VERIFIED: On-chain Reserve accounts are 619 bytes (from solana account command)
+    log::info!("🔍 Fetching Solend Reserve accounts from RPC (filtered by size: 619 bytes)...");
     let accounts = {
         // Read MAX_RETRIES from .env (no hardcoded values)
         let max_retries = env::var("MAX_RETRIES")
@@ -1248,9 +1251,9 @@ pub fn find_usdc_mint_from_reserves(
             });
         let mut retries = max_retries;
         
-        // ✅ Use size filter to only fetch Reserve accounts (1300 bytes)
-        // This avoids fetching 300k+ accounts and reduces response size from ~500MB+ to ~few MB
-        const RESERVE_ACCOUNT_SIZE: u64 = 1300;
+        // ✅ Use size filter to only fetch Reserve accounts (619 bytes)
+        // VERIFIED: On-chain Reserve accounts are 619 bytes (from solana account command)
+        const RESERVE_ACCOUNT_SIZE: u64 = 619;
         let filters = vec![
             RpcFilterType::DataSize(RESERVE_ACCOUNT_SIZE),
         ];
@@ -1390,7 +1393,7 @@ pub fn find_usdc_mint_from_reserves(
         // Track account size distribution
         *account_size_distribution.entry(account_size).or_insert(0) += 1;
         
-        // Pre-filter: Reserves should be ~1300 bytes (same as obligations, but we'll try to parse)
+        // Pre-filter: Reserves should be ~619 bytes (smaller than 1300-byte Obligations)
         // Skip accounts that are clearly too small (LendingMarkets are ~200-300 bytes)
         if account_size < 400 {
             skipped_accounts += 1;
