@@ -194,6 +194,15 @@ pub async fn run_liquidation_loop(
     log::info!("🚀 Starting liquidation loop");
     log::info!("   Program ID: {}", program_id);
     log::info!("   Wallet: {}", wallet);
+    log::info!("   RPC URL: {} (masked)", {
+        let url = &config.rpc_url;
+        if url.len() > 50 {
+            format!("{}...{}", &url[..25], &url[url.len()-25..])
+        } else {
+            url.clone()
+        }
+    });
+    log::info!("   Keypair path: {}", config.keypair_path.display());
     log::info!("   Min Profit USDC: ${}", config.min_profit_usdc);
     log::info!("   Max Position %: {:.2}%", config.max_position_pct * 100.0);
     log::info!("   Mode: {:?}", config.liquidation_mode);
@@ -297,12 +306,26 @@ async fn process_cycle(
                         // f64 precision loss can cause missed liquidations for HF very close to 1.0
                         // (e.g., 0.9999999999 vs 1.0000000001)
                         const WAD: u128 = 1_000_000_000_000_000_000;
-                        let hf_wad = obligation.health_factor_u128();
                         
-                        // Convert threshold to WAD with care
-                        let threshold_wad = (hf_threshold * WAD as f64) as u128;
+                        // Use is_liquidatable() method when threshold is 1.0 (default)
+                        // For custom thresholds, use health_factor_u128() with threshold comparison
+                        let is_liquidatable = if hf_threshold == 1.0 {
+                            obligation.is_liquidatable()
+                        } else {
+                            let hf_wad = obligation.health_factor_u128();
+                            let threshold_wad = (hf_threshold * WAD as f64) as u128;
+                            hf_wad < threshold_wad
+                        };
                         
-                        if hf_wad < threshold_wad {
+                        if is_liquidatable {
+                            // Log obligation details for debugging
+                            log::debug!(
+                                "Found liquidatable obligation {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}",
+                                pk,
+                                obligation.health_factor(),
+                                obligation.total_deposited_value_usd(),
+                                obligation.total_borrowed_value_usd()
+                            );
                             candidates.push((pk, obligation));
                         }
                     }
@@ -414,6 +437,58 @@ async fn process_cycle(
     // CRITICAL FIX: Use real-time bundle status checking to handle race conditions
     // Bundles can execute in ~400ms, so we check status proactively instead of waiting for timeout
     
+    // Bundle status enum for tracking bundle execution state (defined before BundleTracker to allow use in methods)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BundleStatus {
+        Pending,
+        Confirmed,
+        Failed,
+        Unknown,
+    }
+    
+    /// Verify bundle status before removing from tracking
+    /// This prevents race conditions where we release committed amount for bundles that actually executed
+    /// This function is now used by BundleTracker::update_statuses() for consistent bundle status checking
+    async fn verify_bundle_status(
+        _rpc: &Arc<RpcClient>,
+        bundle_id: &str,
+        jito_client: &JitoClient,
+    ) -> BundleStatus {
+        // Option 1: Check Jito bundle status API
+        if let Ok(Some(status_response)) = jito_client.get_bundle_status(bundle_id).await {
+            if let Some(status_str) = &status_response.status {
+                match status_str.as_str() {
+                    "landed" | "confirmed" => {
+                        log::debug!("Bundle {} confirmed via Jito API", bundle_id);
+                        return BundleStatus::Confirmed;
+                    }
+                    "failed" | "dropped" => {
+                        log::debug!("Bundle {} failed/dropped via Jito API", bundle_id);
+                        return BundleStatus::Failed;
+                    }
+                    "pending" => {
+                        return BundleStatus::Pending;
+                    }
+                    _ => {
+                        log::debug!("Bundle {} has unknown status: {}", bundle_id, status_str);
+                    }
+                }
+            }
+            
+            // If slot is present, bundle likely executed
+            if status_response.slot.is_some() {
+                log::debug!("Bundle {} has slot, assuming confirmed", bundle_id);
+                return BundleStatus::Confirmed;
+            }
+        }
+        
+        // Option 2: Fallback - conservative approach
+        // If we can't determine status, assume executed to avoid overcommit
+        // This is safer than assuming failed (which would release committed amount incorrectly)
+        log::debug!("Bundle {} status unknown, assuming confirmed (conservative)", bundle_id);
+        BundleStatus::Unknown
+    }
+    
     /// Enhanced bundle tracking with real-time status
     struct BundleInfo {
         value_usd: f64,
@@ -446,6 +521,7 @@ async fn process_cycle(
         /// Returns list of processed bundles: (id, value_usd, is_success)
         async fn update_statuses(
             &mut self,
+            rpc: &Arc<RpcClient>,
             jito_client: &JitoClient,
         ) -> Vec<(String, f64, bool)> {
             let mut processed_bundles = Vec::new();
@@ -461,17 +537,43 @@ async fn process_cycle(
                 .collect();
             
             for bundle_id in bundle_ids_to_check {
-                // Check bundle status via Jito API
+                // Use verify_bundle_status helper function to check bundle status
+                // Note: verify_bundle_status is defined later in process_cycle, but since we're in an async context
+                // and both are in the same scope, we can call it. However, to avoid forward reference issues,
+                // we'll use the inline implementation here but keep verify_bundle_status for other uses.
+                // Check bundle status via Jito API (same logic as verify_bundle_status)
                 match jito_client.get_bundle_status(&bundle_id).await {
-                    Ok(Some(status)) => {
-                        if let Some(status_str) = &status.status {
-                            if status_str == "landed" || status_str == "confirmed" {
-                                // Bundle confirmed!
-                                if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                    Ok(Some(status_response)) => {
+                        let mut bundle_status = BundleStatus::Unknown;
+                        if let Some(status_str) = &status_response.status {
+                            match status_str.as_str() {
+                                "landed" | "confirmed" => {
+                                    bundle_status = BundleStatus::Confirmed;
+                                }
+                                "failed" | "dropped" => {
+                                    bundle_status = BundleStatus::Failed;
+                                }
+                                "pending" => {
+                                    bundle_status = BundleStatus::Pending;
+                                }
+                                _ => {
+                                    bundle_status = BundleStatus::Unknown;
+                                }
+                            }
+                        }
+                        
+                        // If slot is present, bundle likely executed
+                        if status_response.slot.is_some() {
+                            bundle_status = BundleStatus::Confirmed;
+                        }
+                        
+                        // Process based on status
+                        if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                            match bundle_status {
+                                BundleStatus::Confirmed => {
                                     if !info.confirmed {
                                         info.confirmed = true;
                                         processed_bundles.push((bundle_id.clone(), info.value_usd, true));
-                                        
                                         log::debug!(
                                             "✅ Bundle {} confirmed in {:.1}s",
                                             bundle_id,
@@ -479,32 +581,18 @@ async fn process_cycle(
                                         );
                                     }
                                 }
-                            } else if status_str == "failed" || status_str == "dropped" {
-                                // Bundle failed - mark as confirmed (will be cleaned up)
-                                if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                                BundleStatus::Failed => {
                                     if !info.confirmed {
                                         info.confirmed = true; // Mark as processed
                                         processed_bundles.push((bundle_id.clone(), info.value_usd, false));
                                         log::debug!("Bundle {} failed/dropped", bundle_id);
                                     }
                                 }
-                            }
-                        }
-                        
-                        // If slot is present, bundle likely executed
-                        if status.slot.is_some() {
-                            if let Some(info) = self.bundles.get_mut(&bundle_id) {
-                                if !info.confirmed {
-                                    info.confirmed = true;
-                                    processed_bundles.push((bundle_id.clone(), info.value_usd, true));
-                                    log::debug!("Bundle {} confirmed (has slot)", bundle_id);
+                                BundleStatus::Pending | BundleStatus::Unknown => {
+                                    // Keep tracking, update check time
+                                    info.last_status_check = now;
                                 }
                             }
-                        }
-                        
-                        // Update last check timestamp
-                        if let Some(info) = self.bundles.get_mut(&bundle_id) {
-                            info.last_status_check = now;
                         }
                     }
                     Ok(None) => {
@@ -543,111 +631,56 @@ async fn process_cycle(
                 .collect();
             
             // Verify bundle status before releasing (to avoid false positives)
+            // Use verify_bundle_status helper function for consistency
             let mut expired_to_release: Vec<(String, f64)> = Vec::new();
             for bundle_id in expired_bundle_ids {
-                // Check bundle status one more time before releasing
-                match jito_client.get_bundle_status(&bundle_id).await {
-                    Ok(Some(status)) => {
-                        if let Some(status_str) = &status.status {
-                            match status_str.as_str() {
-                                "landed" | "confirmed" => {
-                                    // Bundle actually confirmed - mark as confirmed instead of releasing
-                                    if let Some(info) = self.bundles.get_mut(&bundle_id) {
-                                        if !info.confirmed {
-                                            info.confirmed = true;
-                                            processed_bundles.push((bundle_id.clone(), info.value_usd, true));
-                                            log::debug!(
-                                                "✅ Bundle {} confirmed during expiry check (was about to expire)",
-                                                bundle_id
-                                            );
-                                        }
-                                    }
-                                    continue; // Don't release - it's confirmed
-                                }
-                                "failed" | "dropped" => {
-                                    // Bundle definitely failed - safe to release
-                                    if let Some(info) = self.bundles.get(&bundle_id) {
-                                        processed_bundles.push((bundle_id.clone(), info.value_usd, false));
-                                        log::warn!(
-                                            "⏰ Releasing expired bundle {} (${:.2}) after {}s - status: {}",
-                                            bundle_id,
-                                            info.value_usd,
-                                            expiry_timeout_secs,
-                                            status_str
-                                        );
-                                    }
-                                }
-                                "pending" => {
-                                    // Still pending - give it more time (don't release yet)
-                                    log::debug!(
-                                        "Bundle {} still pending after {}s - keeping for now",
-                                        bundle_id,
-                                        expiry_timeout_secs
-                                    );
-                                    continue; // Don't release - still pending
-                                }
-                                _ => {
-                                    // Unknown status - assume dropped after timeout
-                                    if let Some(info) = self.bundles.get(&bundle_id) {
-                                        expired_to_release.push((bundle_id.clone(), info.value_usd));
-                                        log::warn!(
-                                            "⏰ Releasing expired bundle {} (${:.2}) after {}s - unknown status: {}",
-                                            bundle_id,
-                                            info.value_usd,
-                                            expiry_timeout_secs,
-                                            status_str
-                                        );
-                                    }
-                                }
-                            }
-                        } else if status.slot.is_some() {
-                            // Has slot - likely confirmed
-                            if let Some(info) = self.bundles.get_mut(&bundle_id) {
-                                if !info.confirmed {
-                                    info.confirmed = true;
-                                    processed_bundles.push((bundle_id.clone(), info.value_usd, true));
-                                    log::debug!(
-                                        "✅ Bundle {} confirmed during expiry check (has slot)",
-                                        bundle_id
-                                    );
-                                }
-                            }
-                            continue; // Don't release - it's confirmed
-                        } else {
-                            // No status but has response - assume dropped after timeout
-                            if let Some(info) = self.bundles.get(&bundle_id) {
-                                expired_to_release.push((bundle_id.clone(), info.value_usd));
-                                log::warn!(
-                                    "⏰ Releasing expired bundle {} (${:.2}) after {}s - no status in response",
-                                    bundle_id,
-                                    info.value_usd,
-                                    expiry_timeout_secs
+                // Use verify_bundle_status to check bundle status one more time before releasing
+                let status = verify_bundle_status(rpc, &bundle_id, jito_client).await;
+                match status {
+                    BundleStatus::Confirmed => {
+                        // Bundle actually confirmed - mark as confirmed instead of releasing
+                        if let Some(info) = self.bundles.get_mut(&bundle_id) {
+                            if !info.confirmed {
+                                info.confirmed = true;
+                                processed_bundles.push((bundle_id.clone(), info.value_usd, true));
+                                log::debug!(
+                                    "✅ Bundle {} confirmed during expiry check (was about to expire)",
+                                    bundle_id
                                 );
                             }
                         }
+                        // Don't release - it's confirmed
                     }
-                    Ok(None) => {
-                        // No status available - assume dropped after timeout
+                    BundleStatus::Failed => {
+                        // Bundle definitely failed - safe to release
                         if let Some(info) = self.bundles.get(&bundle_id) {
                             expired_to_release.push((bundle_id.clone(), info.value_usd));
                             log::warn!(
-                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - no status available",
+                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - status: failed/dropped",
                                 bundle_id,
                                 info.value_usd,
                                 expiry_timeout_secs
                             );
                         }
                     }
-                    Err(e) => {
-                        // API error - assume dropped after timeout (conservative)
+                    BundleStatus::Pending => {
+                        // Still pending - give it more time (don't release yet)
+                        log::debug!(
+                            "Bundle {} still pending after {}s - keeping for now",
+                            bundle_id,
+                            expiry_timeout_secs
+                        );
+                        // Don't release - still pending
+                    }
+                    BundleStatus::Unknown => {
+                        // Unknown status - assume dropped after timeout (conservative)
                         if let Some(info) = self.bundles.get(&bundle_id) {
                             expired_to_release.push((bundle_id.clone(), info.value_usd));
                             log::warn!(
-                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - status check failed: {}",
+                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - unknown status",
                                 bundle_id,
                                 info.value_usd,
-                                expiry_timeout_secs,
-                                e
+                                expiry_timeout_secs
                             );
                         }
                     }
@@ -690,57 +723,6 @@ async fn process_cycle(
     }
     
     let mut bundle_tracker = BundleTracker::new();
-    
-    // Bundle status enum for tracking bundle execution state
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum BundleStatus {
-        Pending,
-        Confirmed,
-        Failed,
-        Unknown,
-    }
-    
-    /// Verify bundle status before removing from tracking
-    /// This prevents race conditions where we release committed amount for bundles that actually executed
-    async fn verify_bundle_status(
-        _rpc: &Arc<RpcClient>,
-        bundle_id: &str,
-        jito_client: &JitoClient,
-    ) -> BundleStatus {
-        // Option 1: Check Jito bundle status API
-        if let Ok(Some(status_response)) = jito_client.get_bundle_status(bundle_id).await {
-            if let Some(status_str) = &status_response.status {
-                match status_str.as_str() {
-                    "landed" | "confirmed" => {
-                        log::debug!("Bundle {} confirmed via Jito API", bundle_id);
-                        return BundleStatus::Confirmed;
-                    }
-                    "failed" | "dropped" => {
-                        log::debug!("Bundle {} failed/dropped via Jito API", bundle_id);
-                        return BundleStatus::Failed;
-                    }
-                    "pending" => {
-                        return BundleStatus::Pending;
-                    }
-                    _ => {
-                        log::debug!("Bundle {} has unknown status: {}", bundle_id, status_str);
-                    }
-                }
-            }
-            
-            // If slot is present, bundle likely executed
-            if status_response.slot.is_some() {
-                log::debug!("Bundle {} has slot, assuming confirmed", bundle_id);
-                return BundleStatus::Confirmed;
-            }
-        }
-        
-        // Option 2: Fallback - conservative approach
-        // If we can't determine status, assume executed to avoid overcommit
-        // This is safer than assuming failed (which would release committed amount incorrectly)
-        log::debug!("Bundle {} status unknown, assuming confirmed (conservative)", bundle_id);
-        BundleStatus::Unknown
-    }
 
     log::debug!(
         "Cycle started: initial_wallet_value=${:.2}, cumulative_risk tracking initialized (using estimated balance with refresh every 5 liquidations)",
@@ -824,7 +806,7 @@ async fn process_cycle(
         // CRITICAL FIX: Real-time bundle status checking (instead of timeout-based)
         // Check bundle status proactively every 200ms to detect confirmed bundles immediately
         // This prevents overcommit by releasing committed amounts as soon as bundles execute (~400ms)
-        let processed_bundles = bundle_tracker.update_statuses(jito_client).await;
+        let processed_bundles = bundle_tracker.update_statuses(rpc, jito_client).await;
         
         // Release committed amounts and update metrics
         for (bundle_id, value_usd, is_success) in processed_bundles {
@@ -1149,8 +1131,21 @@ async fn build_liquidation_context(
                     Ok(account) => {
                         match Reserve::from_account_data(&account) {
                             Ok(reserve) => {
+                                // Use ReserveConfig fields for logging/debugging
+                                let config = reserve.config();
+                                let liquidity = reserve.liquidity();
+                                // Use liquidityMarketPrice for logging (WAD format, convert to f64)
+                                const WAD: f64 = 1_000_000_000_000_000_000.0;
+                                let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
+                                log::debug!(
+                                    "✅ Loaded borrow reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
+                                    borrow_reserve_pubkey,
+                                    reserve.liquidation_threshold() * 100.0,
+                                    reserve.liquidation_bonus() * 100.0,
+                                    reserve.close_factor() * 100.0,
+                                    market_price
+                                );
                                 borrow_reserve = Some(reserve);
-                                log::debug!("✅ Loaded borrow reserve: {}", borrow_reserve_pubkey);
                             }
                             Err(e) => {
                                 log::warn!("❌ Failed to parse borrow reserve {}: {}", borrow_reserve_pubkey, e);
@@ -1179,8 +1174,21 @@ async fn build_liquidation_context(
                     Ok(account) => {
                         match Reserve::from_account_data(&account) {
                             Ok(reserve) => {
+                                // Use ReserveConfig fields for logging/debugging
+                                let config = reserve.config();
+                                let liquidity = reserve.liquidity();
+                                // Use liquidityMarketPrice for logging (WAD format, convert to f64)
+                                const WAD: f64 = 1_000_000_000_000_000_000.0;
+                                let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
+                                log::debug!(
+                                    "✅ Loaded deposit reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
+                                    deposit_reserve_pubkey,
+                                    reserve.liquidation_threshold() * 100.0,
+                                    reserve.liquidation_bonus() * 100.0,
+                                    reserve.close_factor() * 100.0,
+                                    market_price
+                                );
                                 deposit_reserve = Some(reserve);
-                                log::debug!("✅ Loaded deposit reserve: {}", deposit_reserve_pubkey);
                             }
                             Err(e) => {
                                 log::warn!("❌ Failed to parse deposit reserve {}: {}", deposit_reserve_pubkey, e);

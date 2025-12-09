@@ -118,10 +118,13 @@ pub async fn validate_pyth_oracle(
 }
 
 /// Validate Pythnet v3 oracle (current mainnet standard)
+/// 
+/// Note: `current_slot` parameter is kept for API consistency with other validation functions,
+/// but Pythnet v3 uses Clock sysvar for staleness checking instead of slot-based checks.
 pub async fn validate_pyth_oracle_v3(
     rpc: &Arc<RpcClient>,
     oracle_pubkey: Pubkey,
-    current_slot: u64,
+    _current_slot: u64, // Unused: Pythnet v3 uses Clock sysvar for staleness, not slot-based
 ) -> Result<(bool, Option<f64>)> {
     use pyth_sdk_solana::state::load_price_account;
     
