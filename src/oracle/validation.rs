@@ -139,9 +139,14 @@ pub async fn validate_oracles(
         .unwrap_or(false);
 
     // ✅ CRITICAL FIX: Fallback oracle validation when reserve parsing fails
-    // If reserves are None (parsing failed), try to validate oracles from env variables
-    if !borrow_ok || !deposit_ok {
+    // If reserves are None (parsing failed) OR missing oracle pubkeys, try to validate oracles from env variables
+    // This handles the case where Reserve::from_account_data() fails but oracle still works
+    if borrow_reserve.is_none() || deposit_reserve.is_none() || !borrow_ok || !deposit_ok {
         log::warn!("⚠️  Reserve parsing failed or missing oracle pubkeys, attempting fallback oracle validation from env");
+        log::warn!("   Borrow reserve: {:?}, Deposit reserve: {:?}", 
+                  if borrow_reserve.is_some() { "parsed" } else { "None (parsing failed)" },
+                  if deposit_reserve.is_some() { "parsed" } else { "None (parsing failed)" });
+        log::warn!("   Borrow reserve has oracle: {}, Deposit reserve has oracle: {}", borrow_ok, deposit_ok);
         
         // Try to get oracle pubkeys from environment variables
         use std::env;
@@ -159,8 +164,13 @@ pub async fn validate_oracles(
                 match validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
                     Ok((true, Some(price))) => {
                         log::info!("✅ Fallback oracle validation successful: Pyth price=${:.2}", price);
+                        log::info!("   Using fallback price for both borrow and deposit reserves");
                         // Return same price for both borrow and deposit (fallback mode)
                         return Ok((true, Some(price), Some(price)));
+                    }
+                    Ok((true, None)) => {
+                        // Oracle is valid but price is None (shouldn't happen, but handle it)
+                        log::warn!("⚠️  Fallback oracle validation: Oracle is valid but price is None");
                     }
                     Ok((false, _)) => {
                         log::warn!("❌ Fallback oracle validation failed: Pyth oracle invalid");
@@ -169,14 +179,18 @@ pub async fn validate_oracles(
                         log::warn!("❌ Fallback oracle validation error: {}", e);
                     }
                 }
+            } else {
+                log::warn!("❌ Invalid SOL_USD_PYTH_FEED pubkey format: {}", pyth_feed_str);
             }
+        } else {
+            log::warn!("❌ SOL_USD_PYTH_FEED not found in environment variables");
         }
         
         // If fallback also failed, return error
-        log::warn!("❌ Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
-        log::warn!("   Borrow reserve has oracle: {}", borrow_ok);
-        log::warn!("   Deposit reserve has oracle: {}", deposit_ok);
-        log::warn!("   Fallback validation from env also failed");
+        log::error!("❌ Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
+        log::error!("   Borrow reserve has oracle: {}", borrow_ok);
+        log::error!("   Deposit reserve has oracle: {}", deposit_ok);
+        log::error!("   Fallback validation from env also failed");
         return Ok((false, None, None));
     }
     

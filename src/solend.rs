@@ -305,7 +305,7 @@ impl Obligation {
             let collateral_data = &deposits_buffer[offset..offset + COLLATERAL_SIZE];
             match ObligationCollateral::try_from_slice(collateral_data) {
                 Ok(collateral) => {
-                    let _padding_verified = collateral.padding;
+                    // Padding field removed from struct (handled in parsing code)
                     deposits.push(collateral);
                 }
                 Err(e) => {
@@ -351,7 +351,7 @@ impl Obligation {
             let liquidity_data = &borrows_buffer[offset..offset + LIQUIDITY_SIZE];
             match ObligationLiquidity::try_from_slice(liquidity_data) {
                 Ok(liquidity) => {
-                    let _padding_verified = liquidity.padding;
+                    // Padding field removed from struct (handled in parsing code)
                     borrows.push(liquidity);
                 }
                 Err(e) => {
@@ -825,7 +825,7 @@ impl Reserve {
             data_without_discriminator.to_vec()
         };
         
-        // STEP 4: Parse the data (now guaranteed to be EXPECTED_RESERVE_STRUCT_SIZE bytes)
+        // STEP 4: Parse the data (now guaranteed to be SDK_STRUCT_SIZE bytes, not EXPECTED_RESERVE_STRUCT_SIZE)
         
         // STEP 5: Pre-check version byte (early validation)
         // Reserve version must be 1 (unlike Obligation which can be 0 or 1)

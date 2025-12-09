@@ -215,24 +215,57 @@ fn generate_struct_from_layout(
         if let Some(field_name) = field.get("name").and_then(|n| n.as_str()) {
             let rust_type = layout_field_to_rust(field, all_types, all_accounts);
             
-            // ✅ CRITICAL FIX: Padding fields should be skipped by Borsh
-            // Padding is in the JSON layout but Borsh should skip it during deserialization
-            // to avoid "Not all bytes read" errors
-            // Note: Padding field is still in struct for layout documentation, but Borsh skips it
+            // ✅ CRITICAL FIX: Padding fields should be skipped by Borsh but kept in struct for documentation
+            // Padding is in the JSON layout and struct for documentation, but Borsh skips it during deserialization
+            // because:
+            // 1. Borsh deserializer expects exact struct size (619 bytes), not on-chain size (1300 bytes)
+            // 2. Padding is handled in parsing code by using only first N bytes (actual struct size)
+            // 3. Large padding arrays need manual Default implementation (added after struct definition)
             let is_padding = field_name.contains("padding") || field_name.starts_with("_padding");
             
             if is_padding {
                 // Add #[borsh(skip)] attribute for padding fields
-                // This tells Borsh to skip this field during deserialization
+                // This tells Borsh to skip this field during deserialization/serialization
                 // The field is still in the struct for documentation/layout purposes
                 code.push_str("    #[borsh(skip)]\n");
+                code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
+            } else {
+                code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
             }
-            
-            code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
         }
     }
     
     code.push_str("}\n");
+    
+    // ✅ Add manual Default implementation for padding fields with large arrays
+    // Rust doesn't implement Default for arrays larger than 32 elements
+    // This is needed for BorshSerialize even though padding is skipped
+    let has_large_padding = fields.iter().any(|f| {
+        if let Some(name) = f.get("name").and_then(|n| n.as_str()) {
+            if name.contains("padding") || name.starts_with("_padding") {
+                if let Some(len) = f.get("len").and_then(|l| l.as_u64()) {
+                    return len > 32;
+                }
+            }
+        }
+        false
+    });
+    
+    if has_large_padding {
+        // Add Default implementation for structs with large padding arrays
+        // This is needed for BorshSerialize even though padding fields are skipped
+        // We use a safe approach: manually construct the struct with zeroed padding
+        code.push_str("\nimpl Default for ");
+        code.push_str(name);
+        code.push_str(" {\n");
+        code.push_str("    fn default() -> Self {\n");
+        code.push_str("        // Safe default: padding fields are skipped by Borsh, so zero values are fine\n");
+        code.push_str("        // This is only used for BorshSerialize, not for actual deserialization\n");
+        code.push_str("        unsafe { std::mem::zeroed() }\n");
+        code.push_str("    }\n");
+        code.push_str("}\n");
+    }
+    
     code
 }
 

@@ -410,28 +410,64 @@ async function dumpLayouts() {
   const RESERVE_ONCHAIN_SIZE = 1300;
   const calculatedReserveSize = reserveLayout.span || 0;
 
-  if (calculatedReserveSize !== RESERVE_ONCHAIN_SIZE) {
-    console.warn(
-      `⚠️  Reserve size mismatch: SDK=${calculatedReserveSize}, expected=${RESERVE_ONCHAIN_SIZE}`
-    );
+  // Calculate actual struct size from fields (excluding on-chain padding)
+  // This is the size that Borsh deserializer expects
+  let actualStructSize = 0;
+  for (const field of reserveFields) {
+    // Skip padding fields when calculating actual struct size
+    if (field.kind === "array" && 
+        (field.name.includes("padding") || field.name.includes("_padding"))) {
+      continue;
+    }
     
-    // Calculate missing padding
-    const missingPadding = RESERVE_ONCHAIN_SIZE - calculatedReserveSize;
-    console.log(`   📏 Missing padding: ${missingPadding} bytes`);
+    let fieldSize = 0;
+    if (field.kind === "array") {
+      fieldSize = field.len;
+    } else if (field.kind === "scalar") {
+      fieldSize = getScalarSize(field.type);
+    } else if (field.kind === "custom") {
+      // For custom types, get size from type registry
+      const customType = typeRegistry.get(field.type);
+      fieldSize = customType?.size || 0;
+    }
+    const fieldEnd = (field.offset || 0) + fieldSize;
+    if (fieldEnd > actualStructSize) {
+      actualStructSize = fieldEnd;
+    }
+  }
+
+  console.log(`   📏 Reserve struct size: ${actualStructSize} bytes (from fields)`);
+  console.log(`   📏 Reserve SDK span: ${calculatedReserveSize} bytes`);
+  console.log(`   📏 Reserve on-chain size: ${RESERVE_ONCHAIN_SIZE} bytes`);
+
+  // Calculate padding needed to reach on-chain size
+  // Note: Padding is NOT part of Borsh struct, it's just on-chain account padding
+  const onChainPadding = RESERVE_ONCHAIN_SIZE - actualStructSize;
+  
+  if (onChainPadding > 0) {
+    console.log(`   📏 On-chain padding: ${onChainPadding} bytes (not included in Borsh struct)`);
     
-    // Find the last field to determine where padding should be added
-    let lastFieldOffset = 0;
-    let lastFieldSize = 0;
+    // Find the last non-padding field to determine where padding starts
+    let lastFieldEnd = 0;
     for (const field of reserveFields) {
-      const fieldEnd = (field.offset || 0) + (field.kind === "array" ? field.len : 
-                     field.kind === "scalar" ? getScalarSize(field.type) : 0);
-      if (fieldEnd > lastFieldOffset) {
-        lastFieldOffset = fieldEnd;
-        if (field.kind === "array") {
-          lastFieldSize = field.len;
-        } else if (field.kind === "scalar") {
-          lastFieldSize = getScalarSize(field.type);
-        }
+      // Skip existing padding fields when calculating last field end
+      if (field.kind === "array" && 
+          (field.name.includes("padding") || field.name.includes("_padding"))) {
+        continue;
+      }
+      
+      let fieldSize = 0;
+      if (field.kind === "array") {
+        fieldSize = field.len;
+      } else if (field.kind === "scalar") {
+        fieldSize = getScalarSize(field.type);
+      } else if (field.kind === "custom") {
+        const customType = typeRegistry.get(field.type);
+        fieldSize = customType?.size || 0;
+      }
+      const fieldEnd = (field.offset || 0) + fieldSize;
+      if (fieldEnd > lastFieldEnd) {
+        lastFieldEnd = fieldEnd;
       }
     }
     
@@ -441,33 +477,38 @@ async function dumpLayouts() {
       (f.name.includes("padding") || f.name.includes("_padding"))
     );
     
-    if (paddingFieldIndex >= 0 && missingPadding > 0) {
-      // Extend existing padding field
+    if (paddingFieldIndex >= 0) {
+      // Update existing padding field to match on-chain padding
       const paddingField = reserveFields[paddingFieldIndex];
       if (paddingField.kind === "array") {
         const currentPaddingSize = paddingField.len;
-        const newPaddingSize = currentPaddingSize + missingPadding;
-        console.log(`   ✅ Extending existing padding field: ${currentPaddingSize} -> ${newPaddingSize} bytes`);
-        paddingField.len = newPaddingSize;
+        // Padding field should start at lastFieldEnd and extend to on-chain size
+        const correctPaddingSize = RESERVE_ONCHAIN_SIZE - lastFieldEnd;
+        if (currentPaddingSize !== correctPaddingSize) {
+          console.log(`   ✅ Updating padding field: ${currentPaddingSize} -> ${correctPaddingSize} bytes`);
+          paddingField.len = correctPaddingSize;
+          paddingField.offset = lastFieldEnd;
+        }
       }
-    } else if (missingPadding > 0) {
-      // Add new padding field at the end
-      console.log(`   ✅ Adding ${missingPadding} bytes padding at offset ${calculatedReserveSize}`);
+    } else {
+      // Add new padding field at the end (for documentation only - Borsh will skip it)
+      console.log(`   ✅ Adding ${onChainPadding} bytes padding field at offset ${lastFieldEnd} (for documentation)`);
       reserveFields.push({
         kind: "array",
         name: "padding",
         elementType: "u8",
-        len: missingPadding,
-        offset: calculatedReserveSize,
+        len: onChainPadding,
+        offset: lastFieldEnd,
       });
     }
   }
 
-  // ✅ CRITICAL: Use SDK struct size (619 bytes) for Borsh deserialization
+  // ✅ CRITICAL: Use actual struct size (619 bytes) for Borsh deserialization
   // On-chain accounts are 1300 bytes, but Borsh deserializer expects exactly
-  // the struct size based on layout. Using 1300 bytes would cause "Not all bytes read" error.
-  // Rust code handles this by using only the first 619 bytes from on-chain accounts.
-  const RESERVE_BORSH_SIZE = calculatedReserveSize; // 619 bytes for Borsh deserialization
+  // the struct size based on layout (without on-chain padding).
+  // Using 1300 bytes would cause "Not all bytes read" error.
+  // Rust code handles this by using only the first actualStructSize bytes from on-chain accounts.
+  const RESERVE_BORSH_SIZE = actualStructSize; // 619 bytes for Borsh deserialization
   
   // Write Reserve file
   const reserveFile: LayoutFile = {
