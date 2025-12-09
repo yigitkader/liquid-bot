@@ -60,6 +60,26 @@ async fn get_solana_price_coingecko(client: &reqwest::Client) -> Result<f64> {
 pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     log::debug!("🔍 Starting SOL price discovery from multiple oracle sources...");
     
+    // Check if we should prefer HTTP price (CoinGecko) over on-chain oracles
+    // This is useful for testing or when on-chain oracles are providing stale/incorrect data
+    let prefer_http_price = env::var("PREFER_HTTP_PRICE")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+        
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+        
+    if prefer_http_price {
+        log::info!("🌐 PREFER_HTTP_PRICE=true: Attempting to fetch SOL price from CoinGecko first...");
+        if let Ok(price) = get_solana_price_coingecko(&client).await {
+            log::info!("✅ SOL price from CoinGecko API (preferred): ${:.2}", price);
+            return Some(price);
+        }
+        log::warn!("⚠️  Preferred HTTP price fetch failed, falling back to on-chain oracles");
+    }
+    
     // Method 1: Fetch from Pyth SOL/USD price feed (primary)
     let sol_usd_pyth_feed_primary = {
         let feed_str = env::var("SOL_USD_PYTH_FEED")
@@ -144,25 +164,25 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     // Method 4: Try Pyth Hermes Price Service API
     const PYTH_HERMES_API: &str = "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
     
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build();
-        
-    if let Ok(client) = &client {
-        if let Ok(resp) = client.get(PYTH_HERMES_API).send().await {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(feed) = json.as_array().and_then(|arr| arr.get(0)) {
-                        if let Some(price_obj) = feed.get("price") {
-                            let price_str = price_obj.get("price").and_then(|p| p.as_str());
-                            let expo = price_obj.get("expo").and_then(|e| e.as_i64());
-                            
-                            if let (Some(p_str), Some(e)) = (price_str, expo) {
-                                if let Ok(p_val) = p_str.parse::<i64>() {
-                                    let price = (p_val as f64) * 10_f64.powi(e as i32);
-                                    log::info!("✅ SOL price from Pyth Hermes API: ${:.2}", price);
-                                    return Some(price);
-                                }
+    // Check if client is already initialized (from PREFER_HTTP_PRICE block)
+    // If not, use the local client logic, but we need to reconcile the variable names
+    // To avoid complex variable shadowing, we'll just create a new client for Hermes if needed
+    // or use the one we have if we can reference it properly.
+    // Given the previous block structure, 'client' variable exists from the PREFER_HTTP_PRICE block.
+    
+    if let Ok(resp) = client.get(PYTH_HERMES_API).send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(feed) = json.as_array().and_then(|arr| arr.get(0)) {
+                    if let Some(price_obj) = feed.get("price") {
+                        let price_str = price_obj.get("price").and_then(|p| p.as_str());
+                        let expo = price_obj.get("expo").and_then(|e| e.as_i64());
+                        
+                        if let (Some(p_str), Some(e)) = (price_str, expo) {
+                            if let Ok(p_val) = p_str.parse::<i64>() {
+                                let price = (p_val as f64) * 10_f64.powi(e as i32);
+                                log::info!("✅ SOL price from Pyth Hermes API: ${:.2}", price);
+                                return Some(price);
                             }
                         }
                     }
@@ -172,10 +192,7 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     }
 
     // Method 5: Try reliable price APIs
-    let client = client.unwrap_or_else(|_| reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .unwrap_or_default());
+    // client is already available
     
     // Method 5: CoinGecko API (fallback)
     if let Ok(price) = get_solana_price_coingecko(&client).await {
