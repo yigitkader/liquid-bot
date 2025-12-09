@@ -11,9 +11,8 @@ use std::sync::Arc;
 
 use crate::solend::Reserve;
 
-// Re-export for convenience
-pub use pyth::{validate_pyth_oracle, validate_pyth_confidence_strict};
-pub use switchboard::{validate_switchboard_oracle_if_available, validate_switchboard_oracle_by_pubkey};
+// Re-export for convenience (only export what's needed)
+// Note: Individual functions can be accessed via oracle::pyth::* or oracle::switchboard::*
 
 /// Oracle price result with source information
 #[derive(Debug, Clone)]
