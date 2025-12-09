@@ -145,23 +145,22 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         .build()
         .unwrap_or_default());
     
-    // CoinGecko
+    // Method 5: CoinGecko API (fallback)
     const COINGECKO_API: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
     if let Ok(resp) = client.get(COINGECKO_API).send().await {
         if resp.status().is_success() {
             #[derive(serde::Deserialize)]
-            struct CoinGeckoResponse {
-                solana: Option<CoinGeckoPrice>,
+            struct PriceResponse {
+                solana: SolanaPrice,
             }
             #[derive(serde::Deserialize)]
-            struct CoinGeckoPrice {
-                usd: Option<f64>,
+            struct SolanaPrice {
+                usd: f64,
             }
-            if let Ok(json) = resp.json::<CoinGeckoResponse>().await {
-                if let Some(price) = json.solana.and_then(|p| p.usd) {
-                    log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
-                    return Some(price);
-                }
+            if let Ok(json) = resp.json::<PriceResponse>().await {
+                let price = json.solana.usd;
+                log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
+                return Some(price);
             }
         }
     }

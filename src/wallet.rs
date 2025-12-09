@@ -30,15 +30,27 @@ pub async fn get_wallet_balance(
         .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
     let sol_balance = sol_balance_lamports as f64 / 1_000_000_000.0;
     
-    // Get SOL price from oracle
+    // ✅ CRITICAL FIX: Get SOL price from oracle - NO hardcoded fallback
+    // Hardcoded fallback ($150) causes incorrect risk calculations:
+    // - Wallet value wrong: 0.34 SOL * $150 = $51 (real: $14.62)
+    // - Risk limits wrong: $51 * 5% = $2.55 (real: $0.73)
+    // - Overcommit risk: Bot thinks it has $51 wallet when it has $14.62
     let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
         Some(price) => {
             log::debug!("✅ SOL price from oracle: ${:.2}", price);
             price
         },
         None => {
-            log::warn!("⚠️  Failed to get SOL price, using fallback $150");
-            150.0
+            // ✅ CRITICAL: Oracle unavailable - cannot safely calculate wallet value
+            // Returning error prevents incorrect risk calculations
+            log::error!("❌ CRITICAL: Cannot get SOL price from any oracle!");
+            log::error!("   All oracle sources failed. Bot cannot operate safely without accurate SOL price.");
+            log::error!("   Risk calculations would be completely wrong with fallback price.");
+            return Err(anyhow::anyhow!(
+                "Cannot calculate wallet value without SOL price. \
+                 All oracle sources failed. Bot cannot operate safely. \
+                 Please check oracle configuration and network connectivity."
+            ));
         }
     };
     

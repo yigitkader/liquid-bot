@@ -214,8 +214,20 @@ fn generate_struct_from_layout(
     for field in fields {
         if let Some(field_name) = field.get("name").and_then(|n| n.as_str()) {
             let rust_type = layout_field_to_rust(field, all_types, all_accounts);
-            // Padding fields should NOT be skipped - Borsh needs to read them
-            // to match the exact byte layout from the SDK
+            
+            // ✅ CRITICAL FIX: Padding fields should be skipped by Borsh
+            // Padding is in the JSON layout but Borsh should skip it during deserialization
+            // to avoid "Not all bytes read" errors
+            // Note: Padding field is still in struct for layout documentation, but Borsh skips it
+            let is_padding = field_name.contains("padding") || field_name.starts_with("_padding");
+            
+            if is_padding {
+                // Add #[borsh(skip)] attribute for padding fields
+                // This tells Borsh to skip this field during deserialization
+                // The field is still in the struct for documentation/layout purposes
+                code.push_str("    #[borsh(skip)]\n");
+            }
+            
             code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
         }
     }

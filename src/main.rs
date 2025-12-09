@@ -419,10 +419,14 @@ async fn validate_wallet_balances(
 
     let sol_balance_sol = sol_balance as f64 / 1_000_000_000.0;
     
-    // Get current SOL price estimate (rough estimate for logging)
-    // This is just for display, not used in calculations
-    let estimated_sol_price_usd = 150.0; // Rough estimate
-    let sol_balance_usd = sol_balance_sol * estimated_sol_price_usd;
+    // ✅ FIX: Try to get real SOL price from oracle for accurate logging
+    // If oracle fails, use conservative estimate but clearly mark it as "estimated"
+    use crate::quotes::get_sol_price_usd_standalone;
+    let sol_price_usd = get_sol_price_usd_standalone(rpc).await.unwrap_or_else(|| {
+        log::warn!("⚠️  Could not get SOL price from oracle for startup log, using conservative estimate $100");
+        100.0 // Conservative estimate (lower than $150 to avoid overconfidence)
+    });
+    let sol_balance_usd = sol_balance_sol * sol_price_usd;
 
     // Minimum SOL for fees + Jito tip
     // Dynamically calculated: base fee (0.001 SOL) + Jito tip (0.01 SOL) + buffer (0.005 SOL)
@@ -433,8 +437,12 @@ async fn validate_wallet_balances(
     
     log::info!("   SOL balance: {} lamports", sol_balance);
     log::info!("   SOL balance: {:.9} SOL", sol_balance_sol);
-    log::info!("   SOL balance: ~${:.2} USD (estimated)", sol_balance_usd);
-    log::info!("   Minimum required: {:.9} SOL (~${:.2} USD)", min_sol, min_sol * estimated_sol_price_usd);
+    if sol_price_usd == 100.0 {
+        log::info!("   SOL balance: ~${:.2} USD (estimated, oracle unavailable)", sol_balance_usd);
+    } else {
+        log::info!("   SOL balance: ~${:.2} USD (from oracle @ ${:.2}/SOL)", sol_balance_usd, sol_price_usd);
+    }
+    log::info!("   Minimum required: {:.9} SOL (~${:.2} USD)", min_sol, min_sol * sol_price_usd);
     
     if sol_balance < MIN_SOL_LAMPORTS {
         panic!("Insufficient SOL balance. Required: {} lamports (~{} SOL), Available: {} lamports (~{} SOL)", 

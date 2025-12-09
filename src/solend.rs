@@ -7,6 +7,8 @@ include!(concat!(env!("OUT_DIR"), "/solend_layout.rs"));
 
 use anyhow::Result;
 use std::str::FromStr;
+use solana_client::rpc_filter::RpcFilterType;
+use solana_client::rpc_config::RpcProgramAccountsConfig;
 
 /// Solend account type identification
 /// Used to quickly identify account types without parsing
@@ -790,30 +792,37 @@ impl Reserve {
         };
         
         // STEP 3: Handle SDK struct size (619 bytes) vs on-chain size (1300 bytes)
-        // CRITICAL FIX: Some RPC methods return only struct data (619 bytes) without padding
-        // On-chain accounts are 1300 bytes with padding, but SDK struct is 619 bytes
+        // CRITICAL FIX: Borsh deserializer expects exactly the struct size based on layout
+        // Padding causes "Not all bytes read" error because Borsh can't parse padded zeros
+        // Solution: Use SDK struct size (619 bytes) as-is, don't pad to 1300 bytes
         const SDK_STRUCT_SIZE: usize = 619; // SDK struct size without padding
         let data_to_parse: Vec<u8> = if data_without_discriminator.len() == SDK_STRUCT_SIZE {
-            // This is SDK struct size - pad to expected size
+            // ✅ FIX: Use SDK struct size as-is, don't pad
+            // Borsh deserializer expects exactly 619 bytes based on struct layout
             log::debug!(
-                "Reserve account is {} bytes (SDK struct size), padding to {} bytes (on-chain size)",
-                SDK_STRUCT_SIZE,
-                EXPECTED_RESERVE_STRUCT_SIZE
+                "Reserve account is {} bytes (SDK struct size), using as-is for Borsh deserialization",
+                SDK_STRUCT_SIZE
             );
-            let mut padded = data_without_discriminator.to_vec();
-            padded.resize(EXPECTED_RESERVE_STRUCT_SIZE, 0);
-            padded
-        } else if data_without_discriminator.len() < EXPECTED_RESERVE_STRUCT_SIZE {
+            data_without_discriminator.to_vec()
+        } else if data_without_discriminator.len() >= EXPECTED_RESERVE_STRUCT_SIZE {
+            // On-chain full size (1300 bytes) - use only first 619 bytes (SDK struct size)
+            // The remaining bytes are padding that Borsh doesn't expect
+            log::debug!(
+                "Reserve account is {} bytes (on-chain size), using first {} bytes (SDK struct size) for Borsh deserialization",
+                data_without_discriminator.len(),
+                SDK_STRUCT_SIZE
+            );
+            data_without_discriminator[..SDK_STRUCT_SIZE].to_vec()
+        } else if data_without_discriminator.len() < SDK_STRUCT_SIZE {
             return Err(anyhow::anyhow!(
-                "Reserve data too short: {} bytes (need {} bytes or {} bytes for SDK struct). \
+                "Reserve data too short: {} bytes (need at least {} bytes for SDK struct). \
                  Account may be corrupted or layout may have changed.",
                 data_without_discriminator.len(),
-                EXPECTED_RESERVE_STRUCT_SIZE,
                 SDK_STRUCT_SIZE
             ));
         } else {
-            // Account is >= EXPECTED_RESERVE_STRUCT_SIZE bytes - take exactly what we need
-            data_without_discriminator[..EXPECTED_RESERVE_STRUCT_SIZE].to_vec()
+            // Fallback: use what we have (shouldn't reach here)
+            data_without_discriminator.to_vec()
         };
         
         // STEP 4: Parse the data (now guaranteed to be EXPECTED_RESERVE_STRUCT_SIZE bytes)
@@ -1233,7 +1242,9 @@ pub fn find_usdc_mint_from_reserves(
         }
     }
     
-    log::info!("🔍 Fetching Solend program accounts from RPC (this may take a moment for ~300k accounts)...");
+    // ✅ PERFORMANCE FIX: Only fetch Reserve accounts (1300 bytes) instead of all 300k+ accounts
+    // This dramatically reduces response size (~500MB+ -> ~few MB) and avoids RPC rate limiting
+    log::info!("🔍 Fetching Solend Reserve accounts from RPC (filtered by size: 1300 bytes)...");
     let accounts = {
         // Read MAX_RETRIES from .env (no hardcoded values)
         let max_retries = env::var("MAX_RETRIES")
@@ -1245,10 +1256,22 @@ pub fn find_usdc_mint_from_reserves(
             });
         let mut retries = max_retries;
         
+        // ✅ Use size filter to only fetch Reserve accounts (1300 bytes)
+        // This avoids fetching 300k+ accounts and reduces response size from ~500MB+ to ~few MB
+        const RESERVE_ACCOUNT_SIZE: u64 = 1300;
+        let filters = vec![
+            RpcFilterType::DataSize(RESERVE_ACCOUNT_SIZE),
+        ];
+        
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            ..Default::default()
+        };
+        
         loop {
-            match rpc.get_program_accounts(program_id) {
+            match rpc.get_program_accounts_with_config(program_id, config.clone()) {
                 Ok(accs) => {
-                    log::info!("✅ Successfully fetched {} accounts from RPC", accs.len());
+                    log::info!("✅ Successfully fetched {} Reserve accounts from RPC (filtered by size)", accs.len());
                     break Ok(accs);
                 },
                 Err(e) => {
@@ -1262,7 +1285,7 @@ pub fn find_usdc_mint_from_reserves(
                             .unwrap_or(1000);
                         let delay_secs = (initial_delay_ms / 1000) * 2_u64.pow(max_retries - retries);
                         log::warn!(
-                            "⚠️  RPC error getting program accounts (retries left: {}): {}",
+                            "⚠️  RPC error getting Reserve accounts (retries left: {}): {}",
                             retries,
                             error_msg
                         );

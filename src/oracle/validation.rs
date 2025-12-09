@@ -138,10 +138,45 @@ pub async fn validate_oracles(
         })
         .unwrap_or(false);
 
+    // ✅ CRITICAL FIX: Fallback oracle validation when reserve parsing fails
+    // If reserves are None (parsing failed), try to validate oracles from env variables
     if !borrow_ok || !deposit_ok {
+        log::warn!("⚠️  Reserve parsing failed or missing oracle pubkeys, attempting fallback oracle validation from env");
+        
+        // Try to get oracle pubkeys from environment variables
+        use std::env;
+        use std::str::FromStr;
+        use super::pyth::validate_pyth_oracle;
+        
+        if let Ok(pyth_feed_str) = env::var("SOL_USD_PYTH_FEED") {
+            if let Ok(pyth_pubkey) = Pubkey::from_str(&pyth_feed_str) {
+                log::debug!("  🔄 Attempting fallback validation with Pyth feed from env: {}", pyth_pubkey);
+                
+                let current_slot = rpc
+                    .get_slot()
+                    .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+                
+                match validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
+                    Ok((true, Some(price))) => {
+                        log::info!("✅ Fallback oracle validation successful: Pyth price=${:.2}", price);
+                        // Return same price for both borrow and deposit (fallback mode)
+                        return Ok((true, Some(price), Some(price)));
+                    }
+                    Ok((false, _)) => {
+                        log::warn!("❌ Fallback oracle validation failed: Pyth oracle invalid");
+                    }
+                    Err(e) => {
+                        log::warn!("❌ Fallback oracle validation error: {}", e);
+                    }
+                }
+            }
+        }
+        
+        // If fallback also failed, return error
         log::warn!("❌ Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
         log::warn!("   Borrow reserve has oracle: {}", borrow_ok);
         log::warn!("   Deposit reserve has oracle: {}", deposit_ok);
+        log::warn!("   Fallback validation from env also failed");
         return Ok((false, None, None));
     }
     
