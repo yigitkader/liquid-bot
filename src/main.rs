@@ -5,6 +5,7 @@ mod utils;
 mod oracle;
 mod liquidation_tx;
 mod quotes;
+mod wallet;
 
 use anyhow::{Context, Result};
 use dotenv::dotenv;

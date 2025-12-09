@@ -8,7 +8,7 @@ use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::jup::{get_jupiter_quote_with_retry, JupiterQuote};
+use crate::jup::get_jupiter_quote_with_retry;
 use crate::oracle;
 use crate::pipeline::{Config, LiquidationContext, LiquidationQuote};
 

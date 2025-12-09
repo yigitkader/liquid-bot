@@ -16,10 +16,8 @@ use spl_token::ID as TOKEN_PROGRAM_ID;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::jup::JupiterQuote;
 use crate::pipeline::{Config, LiquidationContext, LiquidationQuote};
 use crate::solend::solend_program_id;
-use crate::utils::send_jito_bundle;
 
 /// Build single atomic transaction with flashloan
 /// Flow:

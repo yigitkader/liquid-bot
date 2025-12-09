@@ -29,7 +29,7 @@ pub enum OracleSource {
 }
 
 // Re-export validation functions for convenience
-pub use validation::{validate_oracles, validate_oracles_with_twap};
+pub use validation::validate_oracles_with_twap;
 
 /// Get price from reserve, trying Pyth first, then Switchboard
 /// Returns (price, has_pyth, has_switchboard)
