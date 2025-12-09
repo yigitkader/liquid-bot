@@ -14,6 +14,38 @@ use crate::pipeline::{Config, LiquidationContext, LiquidationQuote};
 
 const WAD: u128 = 1_000_000_000_000_000_000;
 
+#[derive(serde::Deserialize)]
+struct CoinGeckoPriceResponse {
+    solana: CoinGeckoSolanaPrice,
+}
+
+#[derive(serde::Deserialize)]
+struct CoinGeckoSolanaPrice {
+    usd: f64,
+}
+
+/// Get SOL price from CoinGecko API
+/// Used as a fallback when on-chain oracles are unavailable
+async fn get_solana_price_coingecko(client: &reqwest::Client) -> Result<f64> {
+    let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+    
+    // User suggestion implementation integrated with existing client
+    let response = client.get(url)
+        .send()
+        .await
+        .context("Failed to send CoinGecko request")?;
+        
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("CoinGecko API returned error status: {}", response.status()));
+    }
+
+    let json: CoinGeckoPriceResponse = response.json()
+        .await
+        .context("Failed to parse CoinGecko response")?;
+        
+    Ok(json.solana.usd)
+}
+
 /// Get SOL price in USD from oracle (standalone version - no context required)
 /// Returns SOL price if available, otherwise None
 /// 
@@ -146,23 +178,9 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         .unwrap_or_default());
     
     // Method 5: CoinGecko API (fallback)
-    const COINGECKO_API: &str = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
-    if let Ok(resp) = client.get(COINGECKO_API).send().await {
-        if resp.status().is_success() {
-            #[derive(serde::Deserialize)]
-            struct PriceResponse {
-                solana: SolanaPrice,
-            }
-            #[derive(serde::Deserialize)]
-            struct SolanaPrice {
-                usd: f64,
-            }
-            if let Ok(json) = resp.json::<PriceResponse>().await {
-                let price = json.solana.usd;
-                log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
-                return Some(price);
-            }
-        }
+    if let Ok(price) = get_solana_price_coingecko(&client).await {
+        log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
+        return Some(price);
     }
     
     // Binance

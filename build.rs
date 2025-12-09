@@ -215,23 +215,14 @@ fn generate_struct_from_layout(
         if let Some(field_name) = field.get("name").and_then(|n| n.as_str()) {
             let rust_type = layout_field_to_rust(field, all_types, all_accounts);
             
-            // ✅ CRITICAL FIX: Padding fields should be skipped by Borsh but kept in struct for documentation
-            // Padding is in the JSON layout and struct for documentation, but Borsh skips it during deserialization
-            // because:
-            // 1. Borsh deserializer expects exact struct size (619 bytes), not on-chain size (1300 bytes)
-            // 2. Padding is handled in parsing code by using only first N bytes (actual struct size)
-            // 3. Large padding arrays need manual Default implementation (added after struct definition)
-            let is_padding = field_name.contains("padding") || field_name.starts_with("_padding");
+            // ✅ CRITICAL FIX: Padding fields must NOT be skipped if they are part of the on-chain data
+            // We want Borsh to read these bytes (even if they are zero) so that we consume the full account data.
+            // If we skip them, Borsh expects the data to end before the padding, causing "Not all bytes read" error.
+            let is_padding_field = field_name.contains("padding") || field_name.starts_with("_padding");
             
-            if is_padding {
-                // Add #[borsh(skip)] attribute for padding fields
-                // This tells Borsh to skip this field during deserialization/serialization
-                // The field is still in the struct for documentation/layout purposes
-                code.push_str("    #[borsh(skip)]\n");
-                code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
-            } else {
-                code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
-            }
+            // Note: We still identify padding fields for the Default impl check below, 
+            // but we don't add #[borsh(skip)] anymore.
+            code.push_str(&format!("    pub {}: {},\n", field_name, rust_type));
         }
     }
     

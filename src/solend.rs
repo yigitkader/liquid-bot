@@ -791,39 +791,31 @@ impl Reserve {
             data
         };
         
-        // STEP 3: Handle SDK struct size (619 bytes) vs on-chain size (1300 bytes)
-        // CRITICAL FIX: Borsh deserializer expects exactly the struct size based on layout
-        // Padding causes "Not all bytes read" error because Borsh can't parse padded zeros
-        // Solution: Use SDK struct size (619 bytes) as-is, don't pad to 1300 bytes
-        const SDK_STRUCT_SIZE: usize = 619; // SDK struct size without padding
-        let data_to_parse: Vec<u8> = if data_without_discriminator.len() == SDK_STRUCT_SIZE {
-            // ✅ FIX: Use SDK struct size as-is, don't pad
-            // Borsh deserializer expects exactly 619 bytes based on struct layout
-            log::debug!(
-                "Reserve account is {} bytes (SDK struct size), using as-is for Borsh deserialization",
-                SDK_STRUCT_SIZE
-            );
-            data_without_discriminator.to_vec()
-        } else if data_without_discriminator.len() >= EXPECTED_RESERVE_STRUCT_SIZE {
-            // On-chain full size (1300 bytes) - use only first 619 bytes (SDK struct size)
-            // The remaining bytes are padding that Borsh doesn't expect
-            log::debug!(
-                "Reserve account is {} bytes (on-chain size), using first {} bytes (SDK struct size) for Borsh deserialization",
-                data_without_discriminator.len(),
-                SDK_STRUCT_SIZE
-            );
-            data_without_discriminator[..SDK_STRUCT_SIZE].to_vec()
-        } else if data_without_discriminator.len() < SDK_STRUCT_SIZE {
-            return Err(anyhow::anyhow!(
-                "Reserve data too short: {} bytes (need at least {} bytes for SDK struct). \
-                 Account may be corrupted or layout may have changed.",
-                data_without_discriminator.len(),
-                SDK_STRUCT_SIZE
-            ));
-        } else {
-            // Fallback: use what we have (shouldn't reach here)
-            data_without_discriminator.to_vec()
-        };
+        // STEP 3: Validate data size against expected struct size
+        // CRITICAL FIX: We now use the full on-chain layout (1300 bytes) including padding.
+        // build.rs has been updated to include the padding fields in the struct, so Borsh
+        // will consume the full data. We don't need to slice or pad manually anymore.
+        
+        if data_without_discriminator.len() != EXPECTED_RESERVE_STRUCT_SIZE {
+             // Allow for some tolerance if the account is larger (future proofing), but we must slice it
+             if data_without_discriminator.len() > EXPECTED_RESERVE_STRUCT_SIZE {
+                 log::debug!(
+                     "Reserve account is larger than expected ({} > {}), slicing to expected size",
+                     data_without_discriminator.len(),
+                     EXPECTED_RESERVE_STRUCT_SIZE
+                 );
+             } else {
+                 return Err(anyhow::anyhow!(
+                     "Reserve data size mismatch: {} bytes (expected {} bytes). \
+                      Account may be corrupted or layout may have changed.",
+                     data_without_discriminator.len(),
+                     EXPECTED_RESERVE_STRUCT_SIZE
+                 ));
+             }
+        }
+        
+        // Use the data up to expected size (handling potential extra data by slicing)
+        let data_to_parse = &data_without_discriminator[..EXPECTED_RESERVE_STRUCT_SIZE];
         
         // STEP 4: Parse the data (now guaranteed to be SDK_STRUCT_SIZE bytes, not EXPECTED_RESERVE_STRUCT_SIZE)
         
@@ -852,7 +844,7 @@ impl Reserve {
             version_byte
         );
         
-        let reserve: Reserve = BorshDeserialize::try_from_slice(&data_to_parse)
+        let reserve: Reserve = BorshDeserialize::try_from_slice(data_to_parse)
             .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
                 log::error!("Data length: {} bytes (expected: {} bytes for Reserve struct)", data.len(), EXPECTED_RESERVE_STRUCT_SIZE);
