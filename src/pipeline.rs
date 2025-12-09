@@ -261,13 +261,13 @@ async fn process_cycle(
     let scan_start = std::time::Instant::now();
     
     let mut candidates = Vec::new();
-    let mut parse_errors = 0;
-    let mut skipped_wrong_type = 0;
-    let mut obligation_count = 0;
-    let mut skipped_zero_borrow = 0;
-    let mut skipped_zero_deposit = 0;
-    let mut skipped_stale = 0;
-    let mut skipped_hf_too_high = 0;
+    let mut parse_errors: usize = 0;
+    let mut skipped_wrong_type: usize = 0;
+    let mut obligation_count: usize = 0;
+    let mut skipped_zero_borrow: usize = 0;
+    let mut skipped_zero_deposit: usize = 0;
+    let mut skipped_stale: usize = 0;
+    let mut skipped_hf_too_high: usize = 0;
     let total_accounts = accounts.len();
     
     for (pk, acc) in accounts {
