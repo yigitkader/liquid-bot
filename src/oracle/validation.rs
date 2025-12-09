@@ -319,12 +319,15 @@ pub async fn validate_oracles_with_twap(
     }
 
     // Check if TWAP protection is enabled via environment variable
+    // CRITICAL: Default is ENABLED (true) to protect against oracle manipulation in Pyth-only mode
+    // TWAP protection is essential when Switchboard is not available for cross-validation
+    // Only disable if explicitly set to false via ENABLE_TWAP_PROTECTION=false
     let enable_twap = std::env::var("ENABLE_TWAP_PROTECTION")
         .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false); // Default: disabled
+        .unwrap_or(true); // ✅ DEFAULT: ENABLED (protects against oracle manipulation)
 
     if !enable_twap {
-        log::debug!("TWAP protection disabled (ENABLE_TWAP_PROTECTION=false)");
+        log::warn!("⚠️  TWAP protection DISABLED (ENABLE_TWAP_PROTECTION=false) - Oracle manipulation risk increased!");
         return Ok((true, borrow_price, deposit_price));
     }
     

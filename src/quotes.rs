@@ -465,6 +465,46 @@ pub async fn get_liquidation_quote(
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid Jupiter out_amount: {}", e))?;
     
+    // CRITICAL: Calculate flashloan fee BEFORE profit calculation
+    // Flashloan fee is required for repayment, so we need to ensure Jupiter output covers it
+    const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+    let flashloan_fee_amount_raw = if let Some(borrow_reserve) = &ctx.borrow_reserve {
+        let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
+        (debt_to_repay_raw as u128)
+            .checked_mul(flashloan_fee_wad)
+            .and_then(|v| v.checked_div(WAD))
+            .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow"))?
+            as u64
+    } else {
+        0
+    };
+    
+    // CRITICAL CHECK: Ensure Jupiter output is sufficient for flashloan repayment
+    // Repay amount = flashloan_amount + flashloan_fee
+    // Jupiter output must be >= repay_amount, otherwise transaction will fail
+    let repay_amount_required = debt_to_repay_raw
+        .checked_add(flashloan_fee_amount_raw)
+        .ok_or_else(|| anyhow::anyhow!("Repay amount calculation overflow"))?;
+    
+    if jupiter_out_amount < repay_amount_required {
+        return Err(anyhow::anyhow!(
+            "Jupiter output insufficient for flashloan repayment: output={} < required={} (debt={} + fee={}). \
+             Transaction would fail - insufficient funds to repay flashloan.",
+            jupiter_out_amount,
+            repay_amount_required,
+            debt_to_repay_raw,
+            flashloan_fee_amount_raw
+        ));
+    }
+    
+    log::debug!(
+        "✅ Flashloan repayment check passed: jupiter_out={} >= repay_required={} (debt={} + fee={})",
+        jupiter_out_amount,
+        repay_amount_required,
+        debt_to_repay_raw,
+        flashloan_fee_amount_raw
+    );
+    
     let profit_raw = (jupiter_out_amount as i128) - (debt_to_repay_raw as i128);
     let profit_tokens = (profit_raw as f64) / 10_f64.powi(debt_decimals as i32);
     let profit_before_fees_usd = profit_tokens * debt_price_usd;
@@ -513,18 +553,8 @@ pub async fn get_liquidation_quote(
     let tx_priority_fee_lamports = (tx_compute_units * tx_priority_fee_per_cu) / 1_000_000;
     let tx_total_fee_lamports = tx_base_fee_lamports + tx_priority_fee_lamports;
     
-    // Flashloan fee calculation
-    let flashloan_fee_amount_raw = if let Some(borrow_reserve) = &ctx.borrow_reserve {
-        let flashloan_fee_wad = borrow_reserve.config().flashLoanFeeWad as u128;
-        (debt_to_repay_raw as u128)
-            .checked_mul(flashloan_fee_wad)
-            .and_then(|v| v.checked_div(WAD))
-            .ok_or_else(|| anyhow::anyhow!("Flashloan fee calculation overflow"))?
-            as u64
-    } else {
-        0
-    };
-    
+    // Flashloan fee was already calculated above (for repayment check)
+    // Reuse the same value here for USD conversion
     let flashloan_fee_usd = if flashloan_fee_amount_raw > 0 {
         let flashloan_fee_tokens = (flashloan_fee_amount_raw as f64) / 10_f64.powi(debt_decimals as i32);
         flashloan_fee_tokens * debt_price_usd

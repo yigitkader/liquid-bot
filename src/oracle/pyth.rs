@@ -157,11 +157,14 @@ pub async fn validate_pyth_oracle_v3(
         .unwrap()
         .as_secs() as i64;
     
-    // Configurable max age for Pythnet v3 (default: 300 seconds = 5 minutes)
+    // Configurable max age for Pythnet v3 (default: 60 seconds = 1 minute)
+    // ✅ IMPROVED: Reduced from 300s to 60s for Pyth v3 - requires fresher data
+    // Pyth v3 provides more frequent updates, so shorter max age is safer
+    // Environment variable: PYTHNET_V3_MAX_AGE_SECONDS (default: 60)
     let max_age_seconds = std::env::var("PYTHNET_V3_MAX_AGE_SECONDS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(300);
+        .unwrap_or(60); // ✅ Reduced from 300s to 60s for better freshness
     
     // Get Clock from RPC for get_price_no_older_than()
     use solana_sdk::clock::Clock;

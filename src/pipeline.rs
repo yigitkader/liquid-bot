@@ -10,7 +10,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-// parking_lot and lazy_static moved to oracle/switchboard.rs (for aligned buffer pool)
 
 use crate::jup::JupiterQuote;
 use crate::solend::{Obligation, Reserve, solend_program_id};
@@ -21,9 +20,7 @@ use crate::liquidation_tx::build_flashloan_liquidation_tx;
 use crate::quotes::get_liquidation_quote;
 use crate::wallet::{log_wallet_balances, get_wallet_value_usd};
 
-// Aligned buffer pool moved to oracle/switchboard.rs
-
-/// Liquidation mode - per Structure.md
+/// Liquidation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiquidationMode {
     DryRun,
@@ -39,10 +36,10 @@ pub struct Config {
     pub keypair_path: PathBuf,
     pub liquidation_mode: LiquidationMode,
     pub min_profit_usdc: f64,
-    pub max_position_pct: f64, // Örn: 0.05 => cüzdanın %5'i max risk
+    pub max_position_pct: f64,
     pub wallet: Arc<Keypair>,
-    pub jito_tip_account: Option<String>, // Auto-discovered from env or default
-    pub jito_tip_amount_lamports: Option<u64>, // Auto-discovered from env or default
+    pub jito_tip_account: Option<String>,
+    pub jito_tip_amount_lamports: Option<u64>,
 }
 
 /// Main liquidation loop - minimal async pipeline per Structure.md section 9
@@ -53,8 +50,6 @@ pub async fn run_liquidation_loop(
     let program_id = solend_program_id()?;
     let wallet = config.wallet.pubkey();
 
-    // Initialize Jito client with tip account from config or env
-    // No hardcoded defaults - must be set in .env file
     use std::env;
     let jito_tip_account_str = if let Some(tip_account) = config.jito_tip_account.as_deref() {
         tip_account.to_string()
@@ -68,22 +63,6 @@ pub async fn run_liquidation_loop(
         ));
     };
     
-    // CRITICAL: Validate Jito tip account address format
-    // 
-    // IMPORTANT: Jito tip account is CRITICAL for bot operation:
-    // - All liquidation transactions are sent via Jito bundles (MEV protection)
-    // - Each bundle includes a tip transaction to the tip account
-    // - Tip account is just a transfer address (SOL is sent to it)
-    // - Account doesn't need to exist in RPC (AccountNotFound is OK)
-    // - But address MUST be valid Pubkey format (otherwise tip transaction will fail)
-    //
-    // If tip account is wrong:
-    // - Tip will be lost (sent to wrong address)
-    // - But bundle can still be sent (Jito will accept it)
-    // - However, without proper tip, bundle may not get priority processing
-    //
-    // Bot will work even if tip account not found in RPC, but tip account address
-    // must be valid for tip transaction to be created successfully.
     let jito_tip_account = Pubkey::from_str(&jito_tip_account_str)
         .context(format!(
             "CRITICAL: Invalid Jito tip account address format: {}. \
@@ -92,15 +71,10 @@ pub async fn run_liquidation_loop(
             jito_tip_account_str
         ))?;
     
-    // Optional: Try to fetch account info for validation (but don't fail if not found)
-    // Jito tip accounts are just transfer addresses - they may not exist in RPC
-    // This is just for informational purposes - bot will work regardless
     match rpc.get_account(&jito_tip_account) {
         Ok(account_data) => {
-            // If account exists, validate it's a system account (native SOL account)
             use solana_system_interface::program;
             let system_program_address = program::id();
-            // Convert Address to Pubkey for comparison
             let system_program_id = Pubkey::try_from(system_program_address.as_ref())
                 .unwrap_or_else(|_| Pubkey::default()); // Fallback if conversion fails
             if account_data.owner == system_program_id {
@@ -120,9 +94,6 @@ pub async fn run_liquidation_loop(
             }
         }
         Err(_) => {
-            // AccountNotFound is OK - Jito tip accounts are just transfer addresses
-            // They don't need to exist in RPC, they're just used for SOL transfers
-            // Bot will work fine - tip transaction will be created and sent
             log::warn!(
                 "ℹ️  Jito tip account {} not found in RPC (this is OK - tip accounts are transfer addresses, not regular accounts). \
                  Bot will work normally - tip transaction will be created when sending bundles.",
@@ -132,31 +103,24 @@ pub async fn run_liquidation_loop(
     }
     
     let jito_tip_amount = config.jito_tip_amount_lamports
-        .unwrap_or(10_000_000u64); // Default: 0.01 SOL
+        .unwrap_or(10_000_000u64);
     log::info!("✅ Jito tip amount: {} lamports (~{} SOL)", 
         jito_tip_amount, 
         jito_tip_amount as f64 / 1_000_000_000.0);
     
-    // CRITICAL: Try to get tip accounts dynamically from Jito Block Engine API
-    // Tip accounts can change over time, so we should fetch them dynamically
-    // If JITO_TIP_ACCOUNT is set in env, use it (user override)
-    // Otherwise, try to fetch from Jito API, fallback to default if API fails
     let final_tip_account = if config.jito_tip_account.is_some() {
-        // User explicitly set JITO_TIP_ACCOUNT - use it (no dynamic fetch)
         log::info!("Using JITO_TIP_ACCOUNT from environment: {}", jito_tip_account);
         jito_tip_account
     } else {
-        // Try to fetch tip accounts dynamically from Jito API
         let temp_jito_client = JitoClient::new(
             config.jito_url.clone(),
-            jito_tip_account, // Temporary, will be updated
+            jito_tip_account,
             jito_tip_amount,
         );
         
         match temp_jito_client.get_tip_accounts().await {
             Ok(tip_accounts) => {
                 if !tip_accounts.is_empty() {
-                    // Use first tip account from Jito API
                     let dynamic_tip_account = tip_accounts[0];
                     log::info!(
                         "✅ Using tip account from Jito API (dynamic): {} (found {} total tip accounts)",
@@ -187,7 +151,6 @@ pub async fn run_liquidation_loop(
         jito_tip_amount,
     );
 
-    // Validate Jito endpoint per Structure.md section 13
     validate_jito_endpoint(&jito_client).await
         .context("Jito endpoint validation failed - check network connectivity")?;
 
@@ -336,13 +299,11 @@ async fn process_cycle(
                 }
             }
             _ => {
-                // Skip non-Obligation accounts (Reserve, LendingMarket, Unknown)
                 skipped_wrong_type += 1;
             }
         }
     }
     
-    // Log filtering statistics
     if skipped_wrong_type > 0 {
         log::debug!(
             "Skipped {} accounts with wrong type (likely Reserves/LendingMarkets, not Obligations)",
@@ -350,7 +311,6 @@ async fn process_cycle(
         );
     }
     
-    // Log error rate if high (indicates potential layout change or widespread corruption)
     if parse_errors > 10 {
         log::error!(
             "⚠️  High parse error rate: {}/{} obligations failed to parse. Layout may have changed or data may be corrupted!",
@@ -385,18 +345,7 @@ async fn process_cycle(
         dropped_bundles: 0,
     };
 
-    // Per Structure.md section 6.4: Track block-wide cumulative risk
-    // "Tek blok içinde kullanılan toplam risk de aynı limit ile sınırlıdır"
-    // 
-    // CRITICAL FIX: Wallet balance tracking strategy
-    //
-    // Problem: Her liquidation sonrası wallet balance değişir, ama RPC call çok yavaş
-    // Çözüm: Hybrid approach
-    // 1. Cycle başında initial balance al
-    // 2. Her liquidation sonrası ESTIMATED balance hesapla (RPC call yapmadan)
-    // 3. Her 5 liquidation'da bir GERÇEK balance refresh et (doğrulama için)
-    
-    // Helper struct for wallet balance tracking
+    // Wallet balance tracking: estimated balance with refresh every 3 liquidations
     struct WalletBalanceTracker {
         initial_balance_usd: f64,
         current_estimated_balance_usd: f64,
@@ -431,13 +380,9 @@ async fn process_cycle(
         }
     }
     
-    let mut cumulative_risk_usd = 0.0; // Track total risk used in this cycle
+    let mut cumulative_risk_usd = 0.0;
     
-    // Track pending liquidations (sent but not yet executed on-chain)
-    // CRITICAL FIX: Use real-time bundle status checking to handle race conditions
-    // Bundles can execute in ~400ms, so we check status proactively instead of waiting for timeout
-    
-    // Bundle status enum for tracking bundle execution state (defined before BundleTracker to allow use in methods)
+    // Bundle status enum (defined before BundleTracker to allow use in methods)
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BundleStatus {
         Pending,
@@ -447,8 +392,6 @@ async fn process_cycle(
     }
     
     /// Verify bundle status before removing from tracking
-    /// This prevents race conditions where we release committed amount for bundles that actually executed
-    /// This function is now used by BundleTracker::update_statuses() for consistent bundle status checking
     async fn verify_bundle_status(
         _rpc: &Arc<RpcClient>,
         bundle_id: &str,
@@ -612,14 +555,18 @@ async fn process_cycle(
                 !info.confirmed || now.duration_since(info.sent_at) < Duration::from_secs(10)
             });
             
-            // CRITICAL: Release expired unconfirmed bundles (more aggressive timeout)
-            // Timeout configurable via BUNDLE_EXPIRY_TIMEOUT_SECS (default: 2s)
-            // This prevents overcommit by releasing dropped bundles quickly
+            // CRITICAL: Release expired unconfirmed bundles
+            // Timeout configurable via BUNDLE_EXPIRY_TIMEOUT_SECS (default: 10s)
+            // This prevents overcommit by releasing dropped bundles, but must be long enough to avoid false positives
+            // 
+            // Jito bundles typically confirm in 400ms-2s, but during high load can take 5-10s
+            // Using 5s timeout risks early release (false positive) of bundles that are still processing
+            // 10s timeout provides safer buffer for high-load scenarios while still preventing overcommit
             use std::env;
             let expiry_timeout_secs = env::var("BUNDLE_EXPIRY_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5); // Default: 5 seconds - Jito bundles can take 400ms-2s to confirm, need buffer
+                .unwrap_or(10); // ✅ Default: 10 seconds - Safe buffer for high-load scenarios (5-10s possible)
             
             // Find expired bundles (unconfirmed and older than timeout)
             let expired_bundle_ids: Vec<String> = self.bundles.iter()
@@ -638,7 +585,6 @@ async fn process_cycle(
                 let status = verify_bundle_status(rpc, &bundle_id, jito_client).await;
                 match status {
                     BundleStatus::Confirmed => {
-                        // Bundle actually confirmed - mark as confirmed instead of releasing
                         if let Some(info) = self.bundles.get_mut(&bundle_id) {
                             if !info.confirmed {
                                 info.confirmed = true;
@@ -649,10 +595,8 @@ async fn process_cycle(
                                 );
                             }
                         }
-                        // Don't release - it's confirmed
                     }
                     BundleStatus::Failed => {
-                        // Bundle definitely failed - safe to release
                         if let Some(info) = self.bundles.get(&bundle_id) {
                             expired_to_release.push((bundle_id.clone(), info.value_usd));
                             log::warn!(
@@ -664,16 +608,13 @@ async fn process_cycle(
                         }
                     }
                     BundleStatus::Pending => {
-                        // Still pending - give it more time (don't release yet)
                         log::debug!(
                             "Bundle {} still pending after {}s - keeping for now",
                             bundle_id,
                             expiry_timeout_secs
                         );
-                        // Don't release - still pending
                     }
                     BundleStatus::Unknown => {
-                        // Unknown status - assume dropped after timeout (conservative)
                         if let Some(info) = self.bundles.get(&bundle_id) {
                             expired_to_release.push((bundle_id.clone(), info.value_usd));
                             log::warn!(
@@ -692,9 +633,6 @@ async fn process_cycle(
                 self.bundles.remove(bundle_id);
             }
             
-            // Return both confirmed and expired bundles
-            // Both should release committed amounts (confirmed = executed, expired = dropped)
-            // Expired bundles are added to processed_bundles as "dropped" (false) so caller can release committed amounts
             for (bundle_id, value) in expired_to_release {
                 processed_bundles.push((bundle_id, value, false));
             }
@@ -702,22 +640,15 @@ async fn process_cycle(
             processed_bundles
         }
         
-        /// Get total pending committed value (unconfirmed bundles)
         fn get_pending_committed(&self) -> f64 {
             self.bundles.iter()
-                .filter(|(_, info)| !info.confirmed) // ✅ CRITICAL FIX: Only count unconfirmed bundles
+                .filter(|(_, info)| !info.confirmed)
                 .map(|(_, info)| info.value_usd)
                 .sum()
         }
         
-        /// Release expired bundles (DEPRECATED - now handled in update_statuses)
-        /// This function is kept for backward compatibility but is no longer used.
-        /// Expired bundle handling is now integrated into update_statuses() for better
-        /// status verification before releasing.
         #[allow(dead_code)]
         fn release_expired(&mut self) -> Vec<(String, f64)> {
-            // This function is deprecated - expired bundles are now handled in update_statuses()
-            // with proper status verification
             Vec::new()
         }
     }
@@ -725,7 +656,7 @@ async fn process_cycle(
     let mut bundle_tracker = BundleTracker::new();
 
     log::debug!(
-        "Cycle started: initial_wallet_value=${:.2}, cumulative_risk tracking initialized (using estimated balance with refresh every 5 liquidations)",
+        "Cycle started: initial_wallet_value=${:.2}, cumulative_risk tracking initialized (using estimated balance with refresh every 3 liquidations)",
         wallet_balance_tracker.initial_balance_usd
     );
 
@@ -774,7 +705,6 @@ async fn process_cycle(
             continue;
         }
 
-        // b) Jupiter'den kârlılık kontrolü
         let quote_result = get_liquidation_quote(&ctx, config, rpc).await;
         let quote = match quote_result {
             Ok(q) => q,
@@ -797,18 +727,7 @@ async fn process_cycle(
         }
 
         // c) Wallet risk limiti - per-liquidation check
-        // CRITICAL OPTIMIZATION: Use cached wallet balance with pending liquidation tracking
-        // instead of refreshing before each liquidation. This reduces RPC calls significantly.
-        // 
-        // With 10 liquidations, this reduces RPC calls from 20 (2 per liquidation) to 2 (once at start).
-        // Trade-off: Slightly less accurate but much faster and avoids RPC rate limits.
-        // 
-        // CRITICAL FIX: Real-time bundle status checking (instead of timeout-based)
-        // Check bundle status proactively every 200ms to detect confirmed bundles immediately
-        // This prevents overcommit by releasing committed amounts as soon as bundles execute (~400ms)
         let processed_bundles = bundle_tracker.update_statuses(rpc, jito_client).await;
-        
-        // Release committed amounts and update metrics
         for (bundle_id, value_usd, is_success) in processed_bundles {
             wallet_balance_tracker.pending_committed_usd -= value_usd;
             
@@ -821,7 +740,6 @@ async fn process_cycle(
             }
         }
         
-        // Calculate available liquidity with real-time pending
         let pending_committed = bundle_tracker.get_pending_committed();
         let available_liquidity = wallet_balance_tracker.current_estimated_balance_usd - pending_committed;
         let current_max_position_usd = available_liquidity * config.max_position_pct;
@@ -917,8 +835,7 @@ async fn process_cycle(
                             // Calculate current pending value for logging
                             let current_pending_value = bundle_tracker.get_pending_committed();
                             
-                            // REFRESH balance every 5 liquidations (doğrulama için)
-                            const REFRESH_INTERVAL: u32 = 5;
+                            const REFRESH_INTERVAL: u32 = 3;
                             let refresh_countdown = REFRESH_INTERVAL.saturating_sub(wallet_balance_tracker.liquidations_since_refresh);
                             
                             log::info!(
@@ -933,7 +850,6 @@ async fn process_cycle(
                                 current_max_position_usd
                             );
                             
-                            // Refresh actual balance every 5 liquidations to verify estimation accuracy
                             if wallet_balance_tracker.liquidations_since_refresh >= REFRESH_INTERVAL {
                                 match get_wallet_value_usd(rpc, &config.wallet.pubkey()).await {
                                     Ok(actual_balance) => {
@@ -953,12 +869,10 @@ async fn process_cycle(
                                             error_pct
                                         );
                                         
-                                        // Update with actual balance
                                         wallet_balance_tracker.current_estimated_balance_usd = actual_balance;
                                         wallet_balance_tracker.last_refresh_balance_usd = actual_balance;
                                         wallet_balance_tracker.liquidations_since_refresh = 0;
                                         
-                                        // CRITICAL: High error rate indicates problem
                                         if error_pct > 10.0 {
                                             log::error!(
                                                 "⚠️  HIGH BALANCE ESTIMATION ERROR: {:.2}%! \
@@ -1022,7 +936,7 @@ async fn process_cycle(
         }
         Err(e) => {
             log::warn!("Failed to get final wallet value for summary: {}, using estimated balance", e);
-            wallet_balance_tracker.current_estimated_balance_usd // Use estimated as fallback
+            wallet_balance_tracker.current_estimated_balance_usd
         }
     };
     let final_max_position_usd = final_wallet_value_usd * config.max_position_pct;
@@ -1214,12 +1128,10 @@ async fn build_liquidation_context(
     let deposits = obligation.deposits()
         .map_err(|e| anyhow::anyhow!("Failed to parse deposits: {}", e))?;
 
-    // Validate Oracle per Structure.md section 5.2
-    // Use TWAP protection when Switchboard is not available (Pyth-only mode)
     let (oracle_ok, borrow_price, deposit_price) = validate_oracles_with_twap(rpc, &borrow_reserve, &deposit_reserve).await?;
 
     Ok(LiquidationContext {
-        obligation_pubkey: obligation.owner, // Note: actual obligation pubkey should be passed separately
+        obligation_pubkey: obligation.owner,
         obligation: obligation.clone(),
         borrows,
         deposits,
@@ -1231,41 +1143,17 @@ async fn build_liquidation_context(
     })
 }
 
-// Oracle validation functions moved to oracle::validation module:
-// - validate_oracles -> oracle::validation::validate_oracles
-// - validate_oracles_with_twap -> oracle::validation::validate_oracles_with_twap
-// - OraclePriceCache -> oracle::validation::OraclePriceCache (private)
-
-
-/// Liquidation quote with profit calculation per Structure.md section 7
+/// Liquidation quote with profit calculation
 pub struct LiquidationQuote {
     pub quote: JupiterQuote,
     pub profit_usdc: f64,
-    pub collateral_value_usd: f64, // Position size in USD for risk limit calculation
-    pub debt_to_repay_raw: u64, // Debt amount to repay (in debt token raw units) for Solend instruction
-    pub collateral_to_seize_raw: u64, // Collateral cToken amount to seize (for redemption check)
-    pub flashloan_fee_raw: u64, // Flashloan fee amount (in raw token units) - CRITICAL: Store to avoid recalculation inconsistency
+    pub collateral_value_usd: f64,
+    pub debt_to_repay_raw: u64,
+    pub collateral_to_seize_raw: u64,
+    pub flashloan_fee_raw: u64,
 }
 
-// Quote and profit calculation functions moved to quotes module:
-// - get_liquidation_quote -> quotes::get_liquidation_quote
-// - get_sol_price_usd -> quotes::get_sol_price_usd
-// - get_sol_price_usd_standalone -> quotes::get_sol_price_usd_standalone
-
-// Removed old implementations - see quotes.rs for current code
-
-// Quote and profit calculation functions moved to quotes module - see quotes.rs
-// Wallet balance functions moved to wallet module - see wallet.rs
-
-// NOTE: The old get_liquidation_quote implementation (lines 1253-1845) was removed
-// as it's now in quotes::get_liquidation_quote
-
-// NOTE: is_within_risk_limits() function was removed.
-// Risk limit checking is now done inline in process_cycle() before each liquidation
-// to ensure wallet balance is refreshed and cumulative risk tracking works correctly.
-// This prevents race conditions where wallet balance changes during the cycle.
-
-/// Build liquidation transaction per Structure.md section 8
+/// Build liquidation transaction (DEPRECATED)
 /// 
 /// ⚠️ DEPRECATED: Two-Transaction Approach (Race Condition Risk!)
 /// 
@@ -1303,17 +1191,10 @@ async fn build_liquidation_tx1(
     };
     use spl_token::ID as TOKEN_PROGRAM_ID;
 
-    // ============================================================================
-    // CRITICAL: Re-validate oracle freshness before building transaction
-    // ============================================================================
-    // Oracle validation happens at cycle start, but by the time we build the TX,
-    // 2-3 seconds may have passed (Jupiter quote + TX build time).
-    // The oracle might have become stale during this time, so we re-check here.
     let current_slot_now = rpc
         .get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot for oracle re-validation: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
     
-    // Re-validate borrow reserve oracle
     if let Some(reserve) = &ctx.borrow_reserve {
         let (valid, _) = oracle::pyth::validate_pyth_oracle(
             rpc,
@@ -1321,18 +1202,16 @@ async fn build_liquidation_tx1(
             current_slot_now,
         )
         .await
-        .context("Failed to re-validate borrow reserve oracle")?;
+        .context("Failed to validate borrow reserve oracle")?;
         
         if !valid {
             return Err(anyhow::anyhow!(
-                "Borrow reserve oracle became stale during TX preparation. \
-                 Time elapsed since initial validation: ~2-3s. Aborting liquidation for obligation {}.",
+                "Borrow reserve oracle became stale during TX preparation for obligation {}",
                 ctx.obligation_pubkey
             ));
         }
     }
     
-    // Re-validate deposit reserve oracle
     if let Some(reserve) = &ctx.deposit_reserve {
         let (valid, _) = oracle::pyth::validate_pyth_oracle(
             rpc,
@@ -1340,7 +1219,7 @@ async fn build_liquidation_tx1(
             current_slot_now,
         )
         .await
-        .context("Failed to re-validate deposit reserve oracle")?;
+        .context("Failed to validate deposit reserve oracle")?;
         
         if !valid {
             return Err(anyhow::anyhow!(

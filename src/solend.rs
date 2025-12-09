@@ -86,13 +86,9 @@ impl Number {
 // Helper implementation for Obligation
 impl Obligation {
     /// Parse obligation from account data using Borsh
-    /// 
-    /// CRITICAL SECURITY: Validates version field to detect layout changes.
-    /// If Solend updates their layout (e.g., v1 -> v2), this will catch it early.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         log::trace!("Parsing Obligation from {} bytes of data", data.len());
         
-        // Log first few bytes for debugging
         if data.len() >= 32 {
             let preview: String = data.iter()
                 .take(32)
@@ -102,31 +98,21 @@ impl Obligation {
             log::trace!("First 32 bytes (hex): {}", preview);
         }
         
-        const EXPECTED_STRUCT_SIZE: usize = 1300; // Actual struct size from generated layout
-        const DISCRIMINATOR_SIZE: usize = 8; // Anchor discriminator size
+        const EXPECTED_STRUCT_SIZE: usize = 1300;
+        const DISCRIMINATOR_SIZE: usize = 8;
         
-        // ✅ FIXED: Size-based discriminator detection
-        // STEP 1: Check account size to determine if discriminator exists
-        // Solend Legacy accounts are exactly 1300 bytes (no discriminator)
-        // Anchor-based accounts would be 1308 bytes (1300 + 8 byte discriminator)
         let has_discriminator = if data.len() == EXPECTED_STRUCT_SIZE + DISCRIMINATOR_SIZE {
-            // Account is 1308 bytes - likely has Anchor discriminator
             true
         } else if data.len() == EXPECTED_STRUCT_SIZE {
-            // Account is exactly 1300 bytes - Legacy account, no discriminator
             false
         } else {
-            // Size doesn't match expected - fallback to old logic for edge cases
-            // But this should rarely happen for valid Solend accounts
             if data.len() > EXPECTED_STRUCT_SIZE {
-                // Account is larger than expected - might have discriminator
                 !data[0..DISCRIMINATOR_SIZE].iter().all(|&b| b == 0)
             } else {
                 false
             }
         };
         
-        // STEP 2: Skip discriminator if present
         let data_without_discriminator = if has_discriminator {
             log::trace!("Skipping 8-byte Anchor discriminator (account size: {} bytes)", data.len());
             if data.len() < DISCRIMINATOR_SIZE + EXPECTED_STRUCT_SIZE {
@@ -142,7 +128,6 @@ impl Obligation {
             data
         };
         
-        // STEP 3: Validate size
         if data_without_discriminator.len() < EXPECTED_STRUCT_SIZE {
             return Err(anyhow::anyhow!(
                 "Obligation data too short: {} bytes (need {} bytes). \
@@ -152,10 +137,7 @@ impl Obligation {
             ));
         }
         
-        // STEP 4: Take exactly EXPECTED_STRUCT_SIZE bytes
         let data_to_parse = &data_without_discriminator[..EXPECTED_STRUCT_SIZE];
-        
-        // STEP 5: Pre-check version byte (early validation)
         let version_byte = data_to_parse[0];
         if version_byte != 0 && version_byte != 1 {
             return Err(anyhow::anyhow!(
@@ -172,14 +154,12 @@ impl Obligation {
             version_byte
         );
         
-        // STEP 6: Parse with Borsh
         let obligation: Obligation = BorshDeserialize::try_from_slice(data_to_parse)
             .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
                 log::error!("Data length: {} bytes (expected: {} bytes for Obligation struct)", data.len(), EXPECTED_STRUCT_SIZE);
                 log::error!("Parsed length: {} bytes", data_to_parse.len());
                 
-                // Log detailed byte analysis for debugging
                 if data.len() >= 200 {
                     let hex_preview: String = data.iter()
                         .take(200)
@@ -200,18 +180,15 @@ impl Obligation {
         
         log::trace!("Successfully deserialized Obligation, version={}", obligation.version);
         
-        // STEP 7: Validate version again (double-check after parsing)
         const EXPECTED_VERSION: u8 = 1;
         const LEGACY_VERSION: u8 = 0;
         
         if obligation.version == LEGACY_VERSION {
-            // Version 0 is legacy but still valid - log debug (not warning to reduce spam)
             log::debug!(
                 "Obligation version {} (legacy) - still valid",
                 obligation.version
             );
         } else if obligation.version != EXPECTED_VERSION {
-            // Unknown version - reject
             log::error!(
                 "Version mismatch: found version {} but expected {} or {} (legacy)",
                 obligation.version,
@@ -231,75 +208,141 @@ impl Obligation {
     }
 
     /// Calculate health factor: allowedBorrowValue / borrowedValue
-    /// Per Structure.md section 4.2
-    /// 
-    /// NOTE: This uses f64 which has precision loss for very large values.
-    /// For high-precision calculations, use health_factor_u128() instead.
     pub fn health_factor(&self) -> f64 {
-        let borrowed = self.borrowedValue as f64 / 1e18; // Convert WAD to f64
+        let borrowed = self.borrowedValue as f64 / 1e18;
         if borrowed == 0.0 {
             return f64::INFINITY;
         }
-        let weighted_collateral = self.allowedBorrowValue as f64 / 1e18; // Convert WAD to f64
+        let weighted_collateral = self.allowedBorrowValue as f64 / 1e18;
         weighted_collateral / borrowed
     }
 
-    /// Alias for health_factor (backward compatibility)
     pub fn calculate_health_factor(&self) -> f64 {
         self.health_factor()
     }
 
-    /// Calculate health factor using u128 arithmetic to avoid precision loss
-    /// Returns health factor in WAD format (multiplied by 10^18)
-    /// 
-    /// CRITICAL: This preserves full precision for large values.
-    /// f64 only has ~15 significant digits, but u128 WAD format has 36 digits.
-    /// 
-    /// Returns u128::MAX if borrowed is 0 (represents infinity).
-    /// Returns u128::MAX on overflow (should not happen in practice).
-    /// 
-    /// Example:
-    ///   HF = 1.0 => returns 1_000_000_000_000_000_000 (WAD)
-    ///   HF = 0.5 => returns 500_000_000_000_000_000 (WAD / 2)
+    /// Calculate health factor using u128 arithmetic (returns WAD format)
     pub fn health_factor_u128(&self) -> u128 {
-        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
+        const WAD: u128 = 1_000_000_000_000_000_000;
         
         let borrowed = self.borrowedValue;
         if borrowed == 0 {
-            return u128::MAX; // Infinity representation
+            return u128::MAX;
         }
         
         let weighted_collateral = self.allowedBorrowValue;
-        
-        // HF = weighted_collateral / borrowed (in WAD format)
-        // Result in WAD format: (weighted_collateral * WAD) / borrowed
         weighted_collateral
             .checked_mul(WAD)
             .and_then(|v| v.checked_div(borrowed))
-            .unwrap_or(u128::MAX) // Overflow protection
+            .unwrap_or(u128::MAX)
     }
 
-    /// Check if obligation is liquidatable using high-precision u128 arithmetic
-    /// 
-    /// Returns true if health factor < 1.0 (in WAD format: HF < WAD)
-    /// 
-    /// CRITICAL: This uses u128 arithmetic to avoid precision loss that could
-    /// cause false positives/negatives near the liquidation threshold (HF = 1.0).
+    /// Check if obligation is liquidatable (HF < 1.0)
     pub fn is_liquidatable(&self) -> bool {
-        const WAD: u128 = 1_000_000_000_000_000_000; // 10^18
-        
-        // HF < 1.0 => health_factor_u128 < WAD
+        const WAD: u128 = 1_000_000_000_000_000_000;
         self.health_factor_u128() < WAD
     }
 
-    /// Get total deposited value in USD
     pub fn total_deposited_value_usd(&self) -> f64 {
-        self.depositedValue as f64 / 1e18 // Convert WAD to f64
+        self.depositedValue as f64 / 1e18
     }
 
-    /// Get total borrowed value in USD
     pub fn total_borrowed_value_usd(&self) -> f64 {
-        self.borrowedValue as f64 / 1e18 // Convert WAD to f64
+        self.borrowedValue as f64 / 1e18
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_health_factor_precision() {
+        let obligation1 = Obligation {
+            version: 1,
+            lastUpdate: crate::solend::LastUpdate {
+                slot: 0,
+                stale: false,
+            },
+            lendingMarket: Pubkey::default(),
+            owner: Pubkey::default(),
+            depositsLen: 0,
+            borrowsLen: 0,
+            depositedValue: 0,
+            borrowedValue: 999_999_999_999_999_999,
+            allowedBorrowValue: 1_000_000_000_000_000_000,
+            dataFlat: vec![],
+        };
+        
+        assert!(!obligation1.is_liquidatable());
+        
+        let obligation2 = Obligation {
+            version: 1,
+            lastUpdate: crate::solend::LastUpdate {
+                slot: 0,
+                stale: false,
+            },
+            lendingMarket: Pubkey::default(),
+            owner: Pubkey::default(),
+            depositsLen: 0,
+            borrowsLen: 0,
+            depositedValue: 0,
+            borrowedValue: 1_000_000_000_000_000_001,
+            allowedBorrowValue: 1_000_000_000_000_000_000,
+            dataFlat: vec![],
+        };
+        assert!(obligation2.is_liquidatable());
+        
+        let obligation3 = Obligation {
+            version: 1,
+            lastUpdate: crate::solend::LastUpdate {
+                slot: 0,
+                stale: false,
+            },
+            lendingMarket: Pubkey::default(),
+            owner: Pubkey::default(),
+            depositsLen: 0,
+            borrowsLen: 0,
+            depositedValue: 0,
+            borrowedValue: 1_000_000_000_000_000_000,
+            allowedBorrowValue: 1_000_000_000_000_000_000,
+            dataFlat: vec![],
+        };
+        assert!(!obligation3.is_liquidatable());
+        
+        let obligation4 = Obligation {
+            version: 1,
+            lastUpdate: crate::solend::LastUpdate {
+                slot: 0,
+                stale: false,
+            },
+            lendingMarket: Pubkey::default(),
+            owner: Pubkey::default(),
+            depositsLen: 0,
+            borrowsLen: 0,
+            depositedValue: 0,
+            borrowedValue: 2_000_000_000_000_000_000,
+            allowedBorrowValue: 1_000_000_000_000_000_000,
+            dataFlat: vec![],
+        };
+        assert!(obligation4.is_liquidatable());
+        
+        let obligation5 = Obligation {
+            version: 1,
+            lastUpdate: crate::solend::LastUpdate {
+                slot: 0,
+                stale: false,
+            },
+            lendingMarket: Pubkey::default(),
+            owner: Pubkey::default(),
+            depositsLen: 0,
+            borrowsLen: 0,
+            depositedValue: 0,
+            borrowedValue: 1_000_000_000_000_000_000,
+            allowedBorrowValue: 2_000_000_000_000_000_000,
+            dataFlat: vec![],
+        };
+        assert!(!obligation5.is_liquidatable());
     }
 
     /// Parse deposits array from dataFlat
@@ -643,23 +686,15 @@ pub fn derive_reserve_liquidity_supply_pda(
     None
 }
 
-/// Derive reserve collateral supply PDA (for verification)
-/// 
-/// SECURITY: This function attempts to derive the expected PDA for reserve collateral supply.
-/// Multiple seed formats are tried as Solend's exact format may vary.
-/// Returns Some(derived_pubkey) if a match is found, None otherwise.
 pub fn derive_reserve_collateral_supply_pda(
     reserve_pubkey: &Pubkey,
     program_id: &Pubkey,
 ) -> Option<Pubkey> {
-    // Try common Solend PDA seed formats for reserve collateral supply
-    // Format 1: ["collateral", reserve_pubkey]
     let seeds1 = &[b"collateral".as_ref(), reserve_pubkey.as_ref()];
     if let Some((pda, _)) = Pubkey::try_find_program_address(seeds1, program_id) {
         return Some(pda);
     }
     
-    // Format 2: ["reserve", reserve_pubkey, "collateral"]
     let seeds2 = &[
         b"reserve".as_ref(),
         reserve_pubkey.as_ref(),
@@ -669,7 +704,6 @@ pub fn derive_reserve_collateral_supply_pda(
         return Some(pda);
     }
     
-    // Format 3: ["reserve_collateral", reserve_pubkey]
     let seeds3 = &[b"reserve_collateral".as_ref(), reserve_pubkey.as_ref()];
     if let Some((pda, _)) = Pubkey::try_find_program_address(seeds3, program_id) {
         return Some(pda);
@@ -678,88 +712,20 @@ pub fn derive_reserve_collateral_supply_pda(
     None
 }
 
-/// Get Solend instruction discriminator for liquidateObligation
-/// 
-/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
-/// Solend uses enum-based instruction encoding via LendingInstruction enum.
-/// 
-/// Reference: solend-sdk crate, instruction.rs
-/// LendingInstruction enum tag mapping:
-///   tag 0  => InitLendingMarket
-///   tag 1  => SetLendingMarketOwner
-///   tag 2  => InitReserve
-///   tag 3  => RefreshReserve
-///   tag 4  => DepositReserveLiquidity
-///   tag 5  => RedeemReserveCollateral
-///   tag 6  => InitObligation
-///   tag 7  => RefreshObligation
-///   tag 8  => DepositObligationCollateral
-///   tag 9  => WithdrawObligationCollateral
-///   tag 10 => BorrowObligationLiquidity
-///   tag 11 => RepayObligationLiquidity
-///   tag 12 => LiquidateObligation  <-- THIS ONE
-///   tag 13 => FlashLoan
-///   ... (see solend-sdk/src/instruction.rs for full enum)
-/// 
-/// Format: [12, 0, 0, 0, 0, 0, 0, 0]
-/// Note: Only the first byte (tag = 12) is used by Solend program.
-/// The remaining 7 bytes are padding to match [u8; 8] return type.
 pub fn get_liquidate_obligation_discriminator() -> u8 {
-    // LendingInstruction::LiquidateObligation tag = 12
-    // Native Solana programs use only 1 byte as enum tag discriminator
-    12u8 // LiquidateObligation enum variant tag
+    12u8
 }
 
-/// Get Solend instruction discriminator for RedeemReserveCollateral
-/// 
-/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
-/// Solend uses enum-based instruction encoding via LendingInstruction enum.
-/// 
-/// Reference: solend-sdk crate, instruction.rs
-/// LendingInstruction enum tag mapping:
-///   tag 5  => RedeemReserveCollateral  <-- THIS ONE
-/// 
-/// Format: [5, 0, 0, 0, 0, 0, 0, 0]
-/// Note: Only the first byte (tag = 5) is used by Solend program.
 pub fn get_redeem_reserve_collateral_discriminator() -> u8 {
-    // LendingInstruction::RedeemReserveCollateral tag = 5
-    // Native Solana programs use only 1 byte as enum tag discriminator
-    5u8 // RedeemReserveCollateral enum variant tag
+    5u8
 }
 
-/// Get Solend instruction discriminator for FlashLoan
-/// 
-/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
-/// Solend uses enum-based instruction encoding via LendingInstruction enum.
-/// 
-/// Reference: solend-sdk crate, instruction.rs
-/// LendingInstruction enum tag mapping:
-///   tag 13 => FlashBorrowReserveLiquidity  <-- THIS ONE
-/// 
-/// Format: [13] + amount.to_le_bytes()
-/// Note: Only the first byte (tag = 13) is used as discriminator, followed by amount (u64).
 pub fn get_flashloan_discriminator() -> u8 {
-    // LendingInstruction::FlashBorrowReserveLiquidity tag = 13
-    // Native Solana programs use only 1 byte as enum tag discriminator
-    13u8 // FlashBorrowReserveLiquidity enum variant tag
+    13u8
 }
 
-/// Get Solend instruction discriminator for FlashRepayReserveLiquidity
-/// 
-/// CRITICAL: Solend is NOT an Anchor program - it's a native Solana program.
-/// Solend uses enum-based instruction encoding via LendingInstruction enum.
-/// 
-/// Reference: solend-sdk crate, instruction.rs
-/// LendingInstruction enum tag mapping:
-///   tag 14 => FlashRepayReserveLiquidity  <-- THIS ONE
-/// 
-/// Format: [14] + repay_amount.to_le_bytes() + borrowed_amount.to_le_bytes()
-/// Note: First byte (tag = 14) is discriminator, followed by repay_amount (u64) and borrowed_amount (u64).
-/// CRITICAL: FlashLoan requires explicit repayment instruction - NOT automatic!
 pub fn get_flashrepay_discriminator() -> u8 {
-    // LendingInstruction::FlashRepayReserveLiquidity tag = 14
-    // Native Solana programs use only 1 byte as enum tag discriminator
-    14u8 // FlashRepayReserveLiquidity enum variant tag
+    14u8
 }
 
 // Helper implementation for Reserve
@@ -875,7 +841,6 @@ impl Reserve {
             version_byte
         );
         
-        // STEP 6: Parse with Borsh
         let reserve: Reserve = BorshDeserialize::try_from_slice(&data_to_parse)
             .map_err(|e| {
                 log::error!("Borsh deserialization failed: {}", e);
@@ -892,10 +857,8 @@ impl Reserve {
         
         log::trace!("Successfully deserialized Reserve, version={}", reserve.version);
         
-        // STEP 7: Validate version again (double-check after parsing)
         const EXPECTED_VERSION: u8 = 1;
         if reserve.version != EXPECTED_VERSION {
-            // If version is clearly invalid (0, 254, 255), this is likely not a Reserve account
             if reserve.version == 0 || reserve.version >= 250 {
                 return Err(anyhow::anyhow!(
                     "Invalid Reserve version: {} (likely not a Reserve account - may be Obligation/LendingMarket)",
@@ -913,6 +876,22 @@ impl Reserve {
                 reserve.version,
                 EXPECTED_VERSION
             ));
+        }
+        
+        if reserve.liquidityMintPubkey == Pubkey::default() {
+            return Err(anyhow::anyhow!("Invalid Reserve: liquidity mint pubkey is zero/default"));
+        }
+        if reserve.collateralMintPubkey == Pubkey::default() {
+            return Err(anyhow::anyhow!("Invalid Reserve: collateral mint pubkey is zero/default"));
+        }
+        if reserve.liquiditySupplyPubkey == Pubkey::default() {
+            return Err(anyhow::anyhow!("Invalid Reserve: liquidity supply pubkey is zero/default"));
+        }
+        if reserve.collateralSupplyPubkey == Pubkey::default() {
+            return Err(anyhow::anyhow!("Invalid Reserve: collateral supply pubkey is zero/default"));
+        }
+        if reserve.lendingMarket == Pubkey::default() {
+            return Err(anyhow::anyhow!("Invalid Reserve: lending market pubkey is zero/default"));
         }
         
         Ok(reserve)
@@ -938,53 +917,25 @@ impl Reserve {
         self.liquidationThreshold as f64 / 100.0
     }
 
-    /// Get liquidation bonus (as f64, 0-1 range)
     pub fn liquidation_bonus(&self) -> f64 {
-        // Allow override from .env if set
         use std::env;
         if let Ok(bonus_str) = env::var("LIQUIDATION_BONUS") {
             if let Ok(bonus) = bonus_str.parse::<f64>() {
-                return bonus; // Use .env value if valid
+                return bonus;
             }
         }
-        // Otherwise use chain value
         self.liquidationBonus as f64 / 100.0
     }
 
-    /// Get close factor (as f64, 0-1 range)
-    /// 
-    /// CRITICAL: Close factor determines what percentage of debt can be liquidated.
-    /// Currently, Solend's ReserveConfig doesn't include close_factor field in the public IDL,
-    /// but it can be changed by governance.
-    /// 
-    /// If `liquidationCloseFactor` is available in the IDL/struct, use it.
-    /// Otherwise, use fallback.
-    /// 
-    /// Returns: Close factor as f64 (e.g., 0.5 = 50%)
     pub fn close_factor(&self) -> f64 {
-        // Allow override from .env if set (highest priority)
         use std::env;
         if let Ok(cf_str) = env::var("CLOSE_FACTOR") {
             if let Ok(cf) = cf_str.parse::<f64>() {
                 if cf > 0.0 && cf <= 1.0 {
-                    return cf; // Use .env value if valid (0-1 range)
+                    return cf;
                 }
             }
         }
-        
-        // Check ReserveConfig for close factor (if available in updated layout)
-        // VERIFIED: ReserveConfig struct does NOT have liquidationCloseFactor field
-        // - Checked: idl/solend_reserve_layout.json - field not present
-        // - Checked: Generated solend_layout.rs - field not present
-        // - Checked: Solend SDK v0.13.43 - field not present in ReserveConfigLayout
-        // 
-        // If Solend adds liquidationCloseFactor to ReserveConfig in the future:
-        // 1. Update idl/solend_reserve_layout.json (run: npm run dump-layouts)
-        // 2. Rebuild (cargo build) to regenerate solend_layout.rs
-        // 3. Add field to ReserveConfig struct in src/solend.rs
-        // 4. Uncomment the code below:
-        // let config = self.config();
-        // if config.liquidationCloseFactor > 0 && config.liquidationCloseFactor <= 100 {
         //     return config.liquidationCloseFactor as f64 / 100.0;
         // }
         
@@ -1057,18 +1008,11 @@ impl Reserve {
     }
 }
 
-/// Find USDC mint address from Solend reserves (chain-based discovery)
-/// This automatically discovers USDC by checking all reserves
-/// Also checks for SUSD if USDC is not found (Save Protocol uses SUSD)
-/// 
-/// CRITICAL: No fallback to hardcoded values - MUST read from chain
-/// DYNAMIC CHAIN READING: All data is read from chain via RPC - no static values.
 pub fn find_usdc_mint_from_reserves(
     rpc: &solana_client::rpc_client::RpcClient,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
     
-    // Read USDC mint address from environment variable
     use std::env;
     let usdc_mint_str = env::var("USDC_MINT")
         .map_err(|_| anyhow::anyhow!(
