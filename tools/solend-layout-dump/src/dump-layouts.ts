@@ -1,106 +1,247 @@
 /**
- * Dump Solend SDK layouts to JSON format - 100% SDK Compatibility
- * 
- * Uses recursive parsing of the actual @solendprotocol/solend-sdk BufferLayout objects.
- * 
- * Key improvements:
- * - 100% SDK type compatibility (reads actual layout definitions)
- * - Recursive parsing for nested structs
- * - Proper handling of custom types (ReserveLiquidity, ReserveConfig, etc.)
- * - Automatic padding calculation to match on-chain account sizes
+ * Dump Solend SDK layouts to JSON - FIXED VERSION
+ *
+ * Key fixes:
+ * 1. Recursive nested struct parsing (no blob fallback)
+ * 2. Proper BufferLayout field traversal
+ * 3. Accurate padding calculation with validation
+ * 4. Type registry for all custom types
  */
 
 import { writeFileSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 
-// --- Type Definitions per Structure.md ---
+// Type definitions
 type Field =
-  | { kind: "scalar"; name: string; type: string }
-  | { kind: "array"; name: string; elementType: string; len: number }
-  | { kind: "custom"; name: string; type: string };
+  | { kind: "scalar"; name: string; type: string; offset?: number }
+  | { kind: "array"; name: string; elementType: string; len: number; offset?: number }
+  | { kind: "custom"; name: string; type: string; offset?: number };
+
+interface TypeDefinition {
+  name: string;
+  fields: Field[];
+  size: number; // Total size in bytes
+}
 
 interface LayoutFile {
   meta: {
     sdkVersion: string;
     generatedAt: string;
   };
-  types: { name: string; fields: Field[] }[];
-  accounts: { name: string; fields: Field[] }[];
+  types: { name: string; fields: Field[]; size: number }[];
+  accounts: { name: string; fields: Field[]; size: number }[];
 }
 
+// Global type registry
+const typeRegistry = new Map<string, TypeDefinition>();
+
 /**
- * Parses a single layout field from the SDK and returns the IDL Field definition.
- * Handles primitives, blobs (Pubkeys), and nested structs.
- * 
- * This is the core function that ensures 100% SDK compatibility by reading
- * the actual layout structure, not just guessing from byte sizes.
+ * 🔴 FIX 1: Recursive nested struct parser
+ * Properly handles all BufferLayout types:
+ * - Structure (nested structs)
+ * - Seq (arrays of structs)
+ * - Union (enum-like)
+ * - Blob (raw bytes)
  */
-function parseLayoutField(layout: any, propertyName: string): Field | null {
+function parseLayoutFieldRecursive(
+  layout: any,
+  propertyName: string,
+  currentOffset: number = 0
+): Field | null {
   const name = propertyName || layout.property || "";
   const span = layout.span;
 
-  // A. Handle Padding (Explicitly named 'padding' or unnamed blobs used for spacing)
+  // A. Skip padding (explicit or unnamed blobs)
   if (name.includes("padding") || (!name && span > 0)) {
     return {
       kind: "array",
-      name: name || `_padding_${Math.floor(Math.random() * 1000)}`,
+      name: name || `_padding_${currentOffset}`,
       elementType: "u8",
       len: span,
+      offset: currentOffset,
     };
   }
 
-  // B. Handle Nested Structures (The most critical part for 100% compatibility)
-  // Check if it's a Structure/Seq/Union (has 'fields' or 'registry')
-  if (layout.fields && Array.isArray(layout.fields)) {
-    // 1. Check for specific known types (LastUpdate, etc.) to keep IDL clean
-    if (span === 9 && layout.fields.length === 2) {
-      // Heuristic for LastUpdate (u64 slot + u8 stale)
-      return { kind: "custom", name, type: "LastUpdate" };
+  // B. Handle BufferLayout.Structure (nested struct)
+  if (layout.constructor?.name === "Structure" || (layout.fields && Array.isArray(layout.fields))) {
+    // Check if this is a known type
+    const typeName = detectKnownType(name, span, layout.fields);
+
+    if (typeName) {
+      // Known custom type
+      if (!typeRegistry.has(typeName)) {
+        // Register this type first (recursive registration)
+        registerType(typeName, layout);
+      }
+      return {
+        kind: "custom",
+        name,
+        type: typeName,
+        offset: currentOffset,
+      };
+    } else {
+      // Unknown struct - recursively parse fields
+      // This is the KEY FIX - don't fall back to blob!
+      const structTypeName = `${name.charAt(0).toUpperCase() + name.slice(1)}Struct`;
+      if (!typeRegistry.has(structTypeName)) {
+        registerType(structTypeName, layout);
+      }
+      return {
+        kind: "custom",
+        name,
+        type: structTypeName,
+        offset: currentOffset,
+      };
     }
+  }
 
-    // 2. Check for Reserve sub-components by name convention
-    if (name === "liquidity") return { kind: "custom", name, type: "ReserveLiquidity" };
-    if (name === "collateral") return { kind: "custom", name, type: "ReserveCollateral" };
-    if (name === "config") return { kind: "custom", name, type: "ReserveConfig" };
+  // C. Handle BufferLayout.Seq (array/Vec)
+  if (layout.constructor?.name === "Sequence" || layout.elementLayout) {
+    const elementLayout = layout.elementLayout;
+    const count = layout.count || 0;
 
-    // 3. Fallback: If it's an unknown struct, treat as blob to avoid undefined type errors
-    // We could theoretically flatten it or create a new type, but for safety we use blob
-    // This ensures the layout matches the actual byte structure without requiring type definitions
+    if (elementLayout) {
+      // Parse element type
+      if (elementLayout.span === 1) {
+        return {
+          kind: "array",
+          name,
+          elementType: "u8",
+          len: count,
+          offset: currentOffset,
+        };
+      } else if (elementLayout.span === 8) {
+        return {
+          kind: "array",
+          name,
+          elementType: "u64",
+          len: count,
+          offset: currentOffset,
+        };
+      } else {
+        // Array of structs - register element type
+        const elemTypeName = `${name.charAt(0).toUpperCase() + name.slice(1)}Element`;
+        if (!typeRegistry.has(elemTypeName)) {
+          registerType(elemTypeName, elementLayout);
+        }
+        // Note: In Borsh, dynamic arrays are Vec<T>, not [T; N]
+        return {
+          kind: "custom",
+          name,
+          type: `Vec<${elemTypeName}>`,
+          offset: currentOffset,
+        };
+      }
+    }
+  }
+
+  // D. Handle primitives
+  if (span === 32) {
+    return { kind: "scalar", name, type: "Pubkey", offset: currentOffset };
+  }
+  if (span === 16) {
+    return { kind: "scalar", name, type: "u128", offset: currentOffset };
+  }
+  if (span === 8) {
+    return { kind: "scalar", name, type: "u64", offset: currentOffset };
+  }
+  if (span === 4) {
+    return { kind: "scalar", name, type: "u32", offset: currentOffset };
+  }
+  if (span === 2) {
+    return { kind: "scalar", name, type: "u16", offset: currentOffset };
+  }
+  if (span === 1) {
+    return { kind: "scalar", name, type: "u8", offset: currentOffset };
+  }
+
+  // E. Blob (last resort - only for truly unknown data)
+  if (span > 0) {
+    console.warn(`⚠️  Unknown layout for field '${name}' (span: ${span}) - using blob`);
     return {
       kind: "array",
       name,
       elementType: "u8",
       len: span,
+      offset: currentOffset,
     };
-  }
-
-  // C. Handle Primitives (Based on span and constructor names mostly)
-
-  // Pubkey detection: 32 bytes and usually named 'pubkey', 'mint', 'supply', etc.
-  // Or if the layout class is specifically handling 32 bytes.
-  if (span === 32) {
-    return { kind: "scalar", name, type: "Pubkey" };
-  }
-
-  if (span === 16) return { kind: "scalar", name, type: "u128" }; // Often WADs
-  if (span === 8) return { kind: "scalar", name, type: "u64" };
-  if (span === 4) return { kind: "scalar", name, type: "u32" };
-  if (span === 2) return { kind: "scalar", name, type: "u16" };
-  if (span === 1) return { kind: "scalar", name, type: "u8" };
-
-  // D. Handle Blobs (Byte Arrays)
-  if (span > 0) {
-    return { kind: "array", name, elementType: "u8", len: span };
   }
 
   return null;
 }
 
 /**
- * Main function to extract fields from a root layout
+ * 🔴 FIX 2: Detect known Solend types by heuristics
+ */
+function detectKnownType(name: string, span: number, fields: any[]): string | null {
+  // LastUpdate: 9 bytes (u64 slot + u8 stale)
+  if (span === 9 && fields.length === 2) {
+    return "LastUpdate";
+  }
+
+  // Name-based detection
+  if (name === "lastUpdate") return "LastUpdate";
+  if (name === "liquidity") return "ReserveLiquidity";
+  if (name === "collateral") return "ReserveCollateral";
+  if (name === "config") return "ReserveConfig";
+
+  // Size-based detection (less reliable)
+  // Note: These are approximate - actual sizes may vary
+  if (span >= 200 && span <= 250 && name.includes("liquidity")) {
+    return "ReserveLiquidity";
+  }
+  if (span >= 50 && span <= 80 && name.includes("collateral")) {
+    return "ReserveCollateral";
+  }
+
+  return null;
+}
+
+/**
+ * 🔴 FIX 3: Register a custom type in the type registry
+ */
+function registerType(typeName: string, layout: any) {
+  if (typeRegistry.has(typeName)) {
+    return; // Already registered
+  }
+
+  const fields: Field[] = [];
+  let currentOffset = 0;
+
+  if (layout.fields && Array.isArray(layout.fields)) {
+    for (const fieldLayout of layout.fields) {
+      // 🔴 CRITICAL FIX: Properly access nested layout
+      // In buffer-layout: fieldLayout.layout contains the actual layout
+      // In some cases: fieldLayout itself is the layout
+      const actualLayout = fieldLayout.layout || fieldLayout;
+      const propertyName = fieldLayout.property || actualLayout.property || "";
+
+      const field = parseLayoutFieldRecursive(actualLayout, propertyName, currentOffset);
+      if (field) {
+        fields.push(field);
+      }
+      // Always advance offset by span, even if field is null (for padding/skipped fields)
+      const span = actualLayout.span || 0;
+      if (span > 0) {
+        currentOffset += span;
+      } else if (!field) {
+        console.warn(`⚠️  Field '${propertyName}' returned null with span=0 in registerType`);
+      }
+    }
+  }
+
+  const size = layout.span || currentOffset;
+  typeRegistry.set(typeName, { name: typeName, fields, size });
+
+  console.log(`✅ Registered type: ${typeName} (${size} bytes, ${fields.length} fields)`);
+}
+
+/**
+ * Extract fields from root layout with offset tracking
  */
 function extractFieldsFromLayout(layoutName: string, rootLayout: any): Field[] {
   const fields: Field[] = [];
+  let currentOffset = 0;
 
   if (!rootLayout || !rootLayout.fields) {
     console.warn(`⚠️  Layout ${layoutName} seems empty or invalid.`);
@@ -108,23 +249,52 @@ function extractFieldsFromLayout(layoutName: string, rootLayout: any): Field[] {
   }
 
   for (const fieldLayout of rootLayout.fields) {
-    // ✅ FIXED: Check nested struct through fieldLayout.layout, not fieldLayout itself
-    // In buffer-layout, nested structs are in fieldLayout.layout, not directly in fieldLayout
-    const nestedLayout = fieldLayout.layout || fieldLayout;
-    const field = parseLayoutField(nestedLayout, fieldLayout.property);
+    // 🔴 CRITICAL FIX: Proper nested layout access
+    const actualLayout = fieldLayout.layout || fieldLayout;
+    const propertyName = fieldLayout.property || actualLayout.property || "";
+
+    const field = parseLayoutFieldRecursive(actualLayout, propertyName, currentOffset);
     if (field) {
       fields.push(field);
+      currentOffset += actualLayout.span || 0;
     }
   }
+
+  // 🔴 FIX 4: Validate total size
+  const calculatedSize = currentOffset;
+  const declaredSize = rootLayout.span || 0;
+
+  if (calculatedSize !== declaredSize && declaredSize > 0) {
+    console.warn(
+      `⚠️  Size mismatch for ${layoutName}: calculated=${calculatedSize}, declared=${declaredSize}`
+    );
+
+    // Add padding if needed
+    if (calculatedSize < declaredSize) {
+      const padLen = declaredSize - calculatedSize;
+      fields.push({
+        kind: "array",
+        name: `_padding_end`,
+        elementType: "u8",
+        len: padLen,
+        offset: calculatedSize,
+      });
+      console.log(`   + Added ${padLen} bytes padding at end`);
+    }
+  }
+
   return fields;
 }
 
+/**
+ * Main function
+ */
 async function dumpLayouts() {
   const outDir = join(process.cwd(), "..", "..", "idl");
   mkdirSync(outDir, { recursive: true });
 
   // 1. Get SDK Version
-  let sdkVersion = "0.13.43"; // Default
+  let sdkVersion = "0.13.43";
   try {
     const sdkPackagePath = join(
       process.cwd(),
@@ -140,236 +310,203 @@ async function dumpLayouts() {
     console.warn("⚠️  Could not read SDK version, using default:", sdkVersion);
   }
 
-  // 2. Import SDK Dynamically
+  // 2. Import SDK
   const solendSdk = await import("@solendprotocol/solend-sdk");
-
   const generatedAt = new Date().toISOString();
+
   console.log(`🚀 Dumping layouts from SDK v${sdkVersion}...`);
+  console.log("   Using improved recursive parser with type registry");
 
-  // --- Layout Extraction ---
+  // --- Extract Layouts ---
 
-  // 1. LastUpdate (Universal dependency)
-  let lastUpdateFields: Field[] = [];
-  try {
-    const lastUpdateRaw = (solendSdk as any)["LastUpdateLayout"] || (solendSdk as any)["LastUpdate"];
-    if (!lastUpdateRaw) {
-      throw new Error("LastUpdateLayout not found");
-    }
-    lastUpdateFields = extractFieldsFromLayout("LastUpdate", lastUpdateRaw);
-    console.log(`✅ Extracted LastUpdateLayout from SDK: ${lastUpdateRaw.span || "unknown"} bytes`);
-  } catch (e) {
-    console.error("❌ CRITICAL: Failed to read LastUpdate layout from SDK:", e);
-    throw new Error(`Cannot proceed without real LastUpdate layout: ${e}`);
+  // 1. LastUpdate (base type)
+  const lastUpdateLayout = (solendSdk as any)["LastUpdateLayout"];
+  if (!lastUpdateLayout) {
+    throw new Error("LastUpdateLayout not found in SDK");
   }
+  registerType("LastUpdate", lastUpdateLayout);
 
-  // Try to read Number type from SDK
-  let numberFields: Field[] = [];
-  try {
-    const numberLayout = (solendSdk as any)["NumberLayout"] || (solendSdk as any)["Number"];
-    if (numberLayout) {
-      numberFields = extractFieldsFromLayout("Number", numberLayout);
-    } else {
-      throw new Error("Number layout not found");
-    }
-  } catch (e) {
-    console.warn("⚠️  Number layout not found in SDK, using standard u128 definition");
-    numberFields = [{ kind: "scalar", name: "value", type: "u128" }];
+  // 2. Number (WAD wrapper)
+  const numberLayout = (solendSdk as any)["NumberLayout"];
+  if (numberLayout) {
+    registerType("Number", numberLayout);
+  } else {
+    // Fallback definition
+    typeRegistry.set("Number", {
+      name: "Number",
+      fields: [{ kind: "scalar", name: "value", type: "u128", offset: 0 }],
+      size: 16,
+    });
   }
 
   // Write LastUpdate file
+  const lastUpdateFields = typeRegistry.get("LastUpdate")?.fields || [];
+  const numberFields = typeRegistry.get("Number")?.fields || [];
   writeFileSync(
     join(outDir, "solend_last_update_layout.json"),
     JSON.stringify(
       {
         meta: { sdkVersion, generatedAt },
-        types: [{ name: "Number", fields: numberFields }],
-        accounts: [{ name: "LastUpdate", fields: lastUpdateFields }],
+        types: [
+          { name: "Number", fields: numberFields, size: typeRegistry.get("Number")?.size || 16 },
+        ],
+        accounts: [
+          {
+            name: "LastUpdate",
+            fields: lastUpdateFields,
+            size: typeRegistry.get("LastUpdate")?.size || 9,
+          },
+        ],
       },
       null,
       2
     )
   );
 
-  // 2. Reserve Sub-Types (Extract manually to ensure "custom" types work)
-  let reserveLiquidityFields: Field[] = [];
-  try {
-    const resLiqLayout = (solendSdk as any)["ReserveLiquidityLayout"];
-    if (resLiqLayout) {
-      reserveLiquidityFields = extractFieldsFromLayout("ReserveLiquidity", resLiqLayout);
-    }
-  } catch (e) {
-    console.warn("⚠️  ReserveLiquidityLayout not found in SDK - types may be inline in ReserveLayout");
+  // 3. Reserve sub-types (register before Reserve)
+  const reserveLiqLayout = (solendSdk as any)["ReserveLiquidityLayout"];
+  if (reserveLiqLayout) {
+    registerType("ReserveLiquidity", reserveLiqLayout);
   }
 
-  let reserveCollateralFields: Field[] = [];
-  try {
-    const resColLayout = (solendSdk as any)["ReserveCollateralLayout"];
-    if (resColLayout) {
-      reserveCollateralFields = extractFieldsFromLayout("ReserveCollateral", resColLayout);
-    }
-  } catch (e) {
-    console.warn("⚠️  ReserveCollateralLayout not found in SDK - types may be inline in ReserveLayout");
+  const reserveColLayout = (solendSdk as any)["ReserveCollateralLayout"];
+  if (reserveColLayout) {
+    registerType("ReserveCollateral", reserveColLayout);
   }
 
-  let reserveConfigFields: Field[] = [];
-  try {
-    const resConfLayout = (solendSdk as any)["ReserveConfigLayout"];
-    if (resConfLayout) {
-      reserveConfigFields = extractFieldsFromLayout("ReserveConfig", resConfLayout);
-    }
-  } catch (e) {
-    console.warn("⚠️  ReserveConfigLayout not found in SDK - types may be inline in ReserveLayout");
+  const reserveConfLayout = (solendSdk as any)["ReserveConfigLayout"];
+  if (reserveConfLayout) {
+    registerType("ReserveConfig", reserveConfLayout);
   }
 
-  // 3. Reserve Account
-  let reserveLayout: any;
-  try {
-    reserveLayout = (solendSdk as any)["ReserveLayout"];
-    if (!reserveLayout) {
-      throw new Error("ReserveLayout not found");
-    }
-  } catch (e) {
-    console.error("❌ CRITICAL: Failed to read ReserveLayout from SDK:", e);
-    throw new Error(`Cannot proceed without real ReserveLayout: ${e}`);
+  // 4. Reserve
+  const reserveLayout = (solendSdk as any)["ReserveLayout"];
+  if (!reserveLayout) {
+    throw new Error("ReserveLayout not found in SDK");
   }
-
   const reserveFields = extractFieldsFromLayout("Reserve", reserveLayout);
 
-  // ✅ FIXED: Padding for Account Size
-  // Real on-chain Reserve is 1300 bytes. SDK definition might be smaller.
+  // Validate against expected on-chain size
   const RESERVE_ONCHAIN_SIZE = 1300;
-  const sdkReserveSize = reserveLayout.span || 0;
-  if (sdkReserveSize < RESERVE_ONCHAIN_SIZE) {
-    const padLen = RESERVE_ONCHAIN_SIZE - sdkReserveSize;
-    reserveFields.push({
-      kind: "array",
-      name: `_padding_${sdkReserveSize}`,
-      elementType: "u8",
-      len: padLen,
-    });
-    console.log(`   + Added ${padLen} bytes padding to Reserve to match on-chain size (${sdkReserveSize} -> ${RESERVE_ONCHAIN_SIZE}).`);
-  }
+  const calculatedReserveSize = reserveLayout.span || 0;
 
-  const reserveFile: LayoutFile = {
-    meta: { sdkVersion, generatedAt },
-    types: [
-      { name: "LastUpdate", fields: lastUpdateFields },
-      ...(reserveLiquidityFields.length > 0
-        ? [{ name: "ReserveLiquidity", fields: reserveLiquidityFields }]
-        : []),
-      ...(reserveCollateralFields.length > 0
-        ? [{ name: "ReserveCollateral", fields: reserveCollateralFields }]
-        : []),
-      ...(reserveConfigFields.length > 0
-        ? [{ name: "ReserveConfig", fields: reserveConfigFields }]
-        : []),
-    ],
-    accounts: [{ name: "Reserve", fields: reserveFields }],
-  };
-
-  writeFileSync(join(outDir, "solend_reserve_layout.json"), JSON.stringify(reserveFile, null, 2));
-
-  // 4. Obligation Account
-  let obligationLayout: any;
-  try {
-    obligationLayout = (solendSdk as any)["ObligationLayout"];
-    if (!obligationLayout) {
-      throw new Error("ObligationLayout not found");
-    }
-    console.log(`✅ Extracted ObligationLayout from SDK: ${obligationLayout.span || "unknown"} bytes`);
-  } catch (e) {
-    console.error("❌ CRITICAL: Failed to read ObligationLayout from SDK:", e);
-    throw new Error(`Cannot proceed without real ObligationLayout: ${e}`);
-  }
-
-  // Obligation also has nested Liquidity/Collateral structs, extract them if needed
-  let obLiqFields: Field[] = [];
-  try {
-    const obLiqLayout = (solendSdk as any)["ObligationLiquidityLayout"];
-    if (obLiqLayout) {
-      obLiqFields = extractFieldsFromLayout("ObligationLiquidity", obLiqLayout);
-      console.log(`✅ Extracted ObligationLiquidityLayout from SDK`);
-    }
-  } catch (e) {
-    console.warn("⚠️  ObligationLiquidityLayout not found in SDK - types may be inline in ObligationLayout");
-  }
-
-  let obColFields: Field[] = [];
-  try {
-    const obColLayout = (solendSdk as any)["ObligationCollateralLayout"];
-    if (obColLayout) {
-      obColFields = extractFieldsFromLayout("ObligationCollateral", obColLayout);
-      console.log(`✅ Extracted ObligationCollateralLayout from SDK`);
-    }
-  } catch (e) {
-    console.warn("⚠️  ObligationCollateralLayout not found in SDK - types may be inline in ObligationLayout");
-  }
-
-  const obligationFields = extractFieldsFromLayout("Obligation", obligationLayout);
-
-  const obligationFile: LayoutFile = {
-    meta: { sdkVersion, generatedAt },
-    types: [
-      { name: "LastUpdate", fields: lastUpdateFields },
-      { name: "Number", fields: numberFields },
-      ...(obLiqFields.length > 0
-        ? [{ name: "ObligationLiquidity", fields: obLiqFields }]
-        : []),
-      ...(obColFields.length > 0
-        ? [{ name: "ObligationCollateral", fields: obColFields }]
-        : []),
-    ],
-    accounts: [{ name: "Obligation", fields: obligationFields }],
-  };
-
-  writeFileSync(join(outDir, "solend_obligation_layout.json"), JSON.stringify(obligationFile, null, 2));
-
-  // 5. Lending Market
-  let marketLayout: any;
-  try {
-    marketLayout = (solendSdk as any)["LendingMarketLayout"];
-    if (!marketLayout) {
-      throw new Error("LendingMarketLayout not found");
-    }
-    console.log(`✅ Extracted LendingMarketLayout from SDK: ${marketLayout.span || "unknown"} bytes`);
-  } catch (e) {
-    console.error("❌ CRITICAL: Failed to read LendingMarketLayout from SDK:", e);
-    throw new Error(`Cannot proceed without real LendingMarketLayout: ${e}`);
-  }
-
-  const marketFields = extractFieldsFromLayout("LendingMarket", marketLayout);
-
-  // Lending Market often has padding to 290 bytes
-  const MARKET_ONCHAIN_SIZE = 290;
-  const sdkMarketSize = marketLayout.span || 0;
-  if (sdkMarketSize < MARKET_ONCHAIN_SIZE) {
-    marketFields.push({
-      kind: "array",
-      name: `_padding_${sdkMarketSize}`,
-      elementType: "u8",
-      len: MARKET_ONCHAIN_SIZE - sdkMarketSize,
-    });
-    console.log(
-      `   + Added ${MARKET_ONCHAIN_SIZE - sdkMarketSize} bytes padding to LendingMarket to match on-chain size (${sdkMarketSize} -> ${MARKET_ONCHAIN_SIZE}).`
+  if (calculatedReserveSize !== RESERVE_ONCHAIN_SIZE) {
+    console.warn(
+      `⚠️  Reserve size mismatch: SDK=${calculatedReserveSize}, expected=${RESERVE_ONCHAIN_SIZE}`
     );
   }
 
+  // Write Reserve file
+  const reserveFile: LayoutFile = {
+    meta: { sdkVersion, generatedAt },
+    types: Array.from(typeRegistry.values()).map((t) => ({
+      name: t.name,
+      fields: t.fields,
+      size: t.size,
+    })),
+    accounts: [
+      {
+        name: "Reserve",
+        fields: reserveFields,
+        size: RESERVE_ONCHAIN_SIZE,
+      },
+    ],
+  };
+  writeFileSync(
+    join(outDir, "solend_reserve_layout.json"),
+    JSON.stringify(reserveFile, null, 2)
+  );
+
+  // 5. Obligation sub-types
+  const obLiqLayout = (solendSdk as any)["ObligationLiquidityLayout"];
+  if (obLiqLayout) {
+    registerType("ObligationLiquidity", obLiqLayout);
+  }
+
+  const obColLayout = (solendSdk as any)["ObligationCollateralLayout"];
+  if (obColLayout) {
+    registerType("ObligationCollateral", obColLayout);
+  }
+
+  // 6. Obligation
+  const obligationLayout = (solendSdk as any)["ObligationLayout"];
+  if (!obligationLayout) {
+    throw new Error("ObligationLayout not found in SDK");
+  }
+  const obligationFields = extractFieldsFromLayout("Obligation", obligationLayout);
+
+  const OBLIGATION_ONCHAIN_SIZE = 1300;
+  const calculatedObligationSize = obligationLayout.span || 0;
+
+  if (calculatedObligationSize !== OBLIGATION_ONCHAIN_SIZE) {
+    console.warn(
+      `⚠️  Obligation size mismatch: SDK=${calculatedObligationSize}, expected=${OBLIGATION_ONCHAIN_SIZE}`
+    );
+  }
+
+  const obligationFile: LayoutFile = {
+    meta: { sdkVersion, generatedAt },
+    types: Array.from(typeRegistry.values()).map((t) => ({
+      name: t.name,
+      fields: t.fields,
+      size: t.size,
+    })),
+    accounts: [
+      {
+        name: "Obligation",
+        fields: obligationFields,
+        size: OBLIGATION_ONCHAIN_SIZE,
+      },
+    ],
+  };
+  writeFileSync(
+    join(outDir, "solend_obligation_layout.json"),
+    JSON.stringify(obligationFile, null, 2)
+  );
+
+  // 7. LendingMarket
+  const marketLayout = (solendSdk as any)["LendingMarketLayout"];
+  if (!marketLayout) {
+    throw new Error("LendingMarketLayout not found in SDK");
+  }
+  const marketFields = extractFieldsFromLayout("LendingMarket", marketLayout);
+
+  const MARKET_ONCHAIN_SIZE = 290;
+
   const marketFile: LayoutFile = {
     meta: { sdkVersion, generatedAt },
-    types: [{ name: "LastUpdate", fields: lastUpdateFields }],
-    accounts: [{ name: "LendingMarket", fields: marketFields }],
+    types: Array.from(typeRegistry.values()).map((t) => ({
+      name: t.name,
+      fields: t.fields,
+      size: t.size,
+    })),
+    accounts: [
+      {
+        name: "LendingMarket",
+        fields: marketFields,
+        size: MARKET_ONCHAIN_SIZE,
+      },
+    ],
   };
+  writeFileSync(
+    join(outDir, "solend_lending_market_layout.json"),
+    JSON.stringify(marketFile, null, 2)
+  );
 
-  writeFileSync(join(outDir, "solend_lending_market_layout.json"), JSON.stringify(marketFile, null, 2));
-
-  console.log("✅ Successfully dumped layouts with 100% SDK type compatibility.");
+  // Summary
+  console.log("\n✅ Successfully dumped layouts with recursive parsing:");
+  console.log(`   - ${typeRegistry.size} custom types registered`);
   console.log("   - solend_last_update_layout.json");
-  console.log("   - solend_lending_market_layout.json");
   console.log("   - solend_reserve_layout.json");
   console.log("   - solend_obligation_layout.json");
-  console.log(`\n✅ Generated from @solendprotocol/solend-sdk v${sdkVersion}`);
-  console.log("   All layouts extracted from actual SDK BufferLayout structures.");
-  console.log("   Improved recursive parsing and type detection enabled.");
+  console.log("   - solend_lending_market_layout.json");
+  console.log(`\n📦 Generated from @solendprotocol/solend-sdk v${sdkVersion}`);
+
+  // Validation summary
+  console.log("\n🔍 Validation:");
+  for (const [typeName, typeDef] of typeRegistry) {
+    console.log(`   - ${typeName}: ${typeDef.size} bytes, ${typeDef.fields.length} fields`);
+  }
 }
 
 dumpLayouts().catch((e) => {
