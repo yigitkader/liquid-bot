@@ -32,7 +32,10 @@ pub async fn get_wallet_balance(
     
     // Get SOL price from oracle
     let sol_price_usd = match get_sol_price_usd_standalone(rpc).await {
-        Some(price) => price,
+        Some(price) => {
+            log::debug!("✅ SOL price from oracle: ${:.2}", price);
+            price
+        },
         None => {
             log::warn!("⚠️  Failed to get SOL price, using fallback $150");
             150.0
@@ -40,6 +43,14 @@ pub async fn get_wallet_balance(
     };
     
     let sol_value_usd = sol_balance * sol_price_usd;
+    
+    // CRITICAL: Log calculation details for debugging
+    log::debug!(
+        "SOL balance calculation: {:.6} SOL * ${:.2} = ${:.2}",
+        sol_balance,
+        sol_price_usd,
+        sol_value_usd
+    );
     
     // Get USDC balance
     let program_id = solend_program_id()?;
@@ -74,10 +85,18 @@ pub async fn log_wallet_balances(
 ) -> Result<()> {
     let balance = get_wallet_balance(rpc, wallet_pubkey).await?;
     
+    // Calculate SOL price from balance and value for verification
+    let calculated_sol_price = if balance.sol_balance > 0.0 {
+        balance.sol_value_usd / balance.sol_balance
+    } else {
+        0.0
+    };
+    
     log::info!(
-        "💰 Wallet Balances: SOL: {:.6} SOL (${:.2}), USDC: {:.2} USDC, Total: ${:.2}",
+        "💰 Wallet Balances: SOL: {:.6} SOL (${:.2} @ ${:.2}/SOL), USDC: {:.2} USDC, Total: ${:.2}",
         balance.sol_balance,
         balance.sol_value_usd,
+        calculated_sol_price,
         balance.usdc_balance,
         balance.total_value_usd
     );

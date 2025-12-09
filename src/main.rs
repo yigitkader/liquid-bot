@@ -310,8 +310,63 @@ async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
             }
             solend::SolendAccountType::Reserve => {
                 reserve_count += 1;
-                log::debug!("  ⏭️  Skipping Reserve account (not needed for validation)");
-                // Skip Reserve accounts in validation - we only care about Obligations
+                log::debug!("  🔍 Attempting to parse as Reserve...");
+                
+                // Log first few bytes for debugging
+                let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
+                let hex_preview = preview_bytes
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                log::debug!("  First 32 bytes (hex): {}", hex_preview);
+                
+                // Try to parse as Reserve to validate
+                match solend::Reserve::from_account_data(&account.data) {
+                    Ok(reserve) => {
+                        log::debug!(
+                            "  ✅ Successfully parsed Reserve: version={}, liquidityMint={}, collateralMint={}, lendingMarket={}",
+                            reserve.version,
+                            reserve.liquidityMintPubkey,
+                            reserve.collateralMintPubkey,
+                            reserve.lendingMarket
+                        );
+                        log::debug!(
+                            "  Reserve details: liquidityDecimals={}, availableAmount={}, borrowedAmountWads={}",
+                            reserve.liquidityMintDecimals,
+                            reserve.liquidityAvailableAmount,
+                            reserve.liquidityBorrowedAmountWads
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "  ⚠️  Failed to parse Reserve account {}: {}",
+                            pubkey,
+                            e
+                        );
+                        log::warn!(
+                            "  Account details: size={} bytes, owner={}, lamports={}",
+                            size,
+                            account.owner,
+                            account.lamports
+                        );
+                        log::warn!(
+                            "  First 64 bytes (hex): {}",
+                            account.data.iter()
+                                .take(64)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                        
+                        // Try to read version byte if possible
+                        if account.data.len() > 0 {
+                            let version_byte = account.data[0];
+                            log::warn!("  First byte (version?): {} (0x{:02x})", version_byte, version_byte);
+                        }
+                        // Don't fail validation if Reserve parsing fails - just log warning
+                    }
+                }
             }
             solend::SolendAccountType::LendingMarket => {
                 lending_market_count += 1;
@@ -457,8 +512,8 @@ async fn validate_wallet_balances(
     
     // Calculate total wallet value
     let total_wallet_value_usd = sol_balance_usd + usdc_balance_decimal;
-    log::info!("💰 Total wallet value: ~${:.2} USD (SOL: ${:.2} + Stable: ${:.2})", 
-               total_wallet_value_usd, sol_balance_usd, usdc_balance_decimal);
+    log::info!("💰 Total wallet value: ~${:.2} USD (SOL: {:.6} SOL / ${:.2} + Stable: ${:.2})", 
+               total_wallet_value_usd, sol_balance_sol, sol_balance_usd, usdc_balance_decimal);
 
     Ok(())
 }

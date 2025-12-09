@@ -227,6 +227,15 @@ pub async fn validate_pyth_oracle_v2(
     // Calculate price
     let price = (price_raw as f64) * 10_f64.powi(exponent);
     
+    // CRITICAL: Log price calculation details for debugging
+    log::debug!(
+        "Pyth v2 price calculation: raw={}, exponent={}, multiplier={}, final_price=${:.6}",
+        price_raw,
+        exponent,
+        10_f64.powi(exponent),
+        price
+    );
+    
     if price <= 0.0 || !price.is_finite() {
         log::debug!(
             "Pyth v2 oracle {}: Invalid price {} (raw: {}, exp: {})",
@@ -378,6 +387,15 @@ pub async fn validate_pyth_oracle_v3(
     
     // Calculate price in USD
     let price = (price_info.price as f64) * 10_f64.powi(price_info.expo);
+    
+    // CRITICAL: Log price calculation details for debugging
+    log::debug!(
+        "Pyth v3 price calculation: raw={}, exponent={}, multiplier={}, final_price=${:.6}",
+        price_info.price,
+        price_info.expo,
+        10_f64.powi(price_info.expo),
+        price
+    );
     
     // Validate price
     if price <= 0.0 || !price.is_finite() {

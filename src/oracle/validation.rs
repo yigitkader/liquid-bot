@@ -103,41 +103,49 @@ pub async fn validate_oracles(
     borrow_reserve: &Option<Reserve>,
     deposit_reserve: &Option<Reserve>,
 ) -> Result<(bool, Option<f64>, Option<f64>)> {
+    log::debug!("🔍 Starting oracle validation...");
+    
     // Check if reserves exist and have EITHER Pyth OR Switchboard oracle
     let borrow_ok = borrow_reserve
         .as_ref()
         .map(|r| {
-            // Check if Pyth oracle exists
-            if r.oracle_pubkey() != Pubkey::default() {
-                return true;
-            }
-            // Check if Switchboard oracle exists
-            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
-                return true;
-            }
-            false
+            let pyth_oracle = r.oracle_pubkey();
+            let switchboard_oracle = r.liquidity().liquiditySwitchboardOracle;
+            let has_pyth = pyth_oracle != Pubkey::default();
+            let has_switchboard = switchboard_oracle != Pubkey::default();
+            
+            log::debug!("  Borrow reserve oracle check: Pyth={} ({:?}), Switchboard={} ({:?})", 
+                       has_pyth, if has_pyth { Some(pyth_oracle) } else { None },
+                       has_switchboard, if has_switchboard { Some(switchboard_oracle) } else { None });
+            
+            has_pyth || has_switchboard
         })
         .unwrap_or(false);
 
     let deposit_ok = deposit_reserve
         .as_ref()
         .map(|r| {
-            // Check if Pyth oracle exists
-            if r.oracle_pubkey() != Pubkey::default() {
-                return true;
-            }
-            // Check if Switchboard oracle exists
-            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
-                return true;
-            }
-            false
+            let pyth_oracle = r.oracle_pubkey();
+            let switchboard_oracle = r.liquidity().liquiditySwitchboardOracle;
+            let has_pyth = pyth_oracle != Pubkey::default();
+            let has_switchboard = switchboard_oracle != Pubkey::default();
+            
+            log::debug!("  Deposit reserve oracle check: Pyth={} ({:?}), Switchboard={} ({:?})", 
+                       has_pyth, if has_pyth { Some(pyth_oracle) } else { None },
+                       has_switchboard, if has_switchboard { Some(switchboard_oracle) } else { None });
+            
+            has_pyth || has_switchboard
         })
         .unwrap_or(false);
 
     if !borrow_ok || !deposit_ok {
-        log::debug!("Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
+        log::warn!("❌ Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
+        log::warn!("   Borrow reserve has oracle: {}", borrow_ok);
+        log::warn!("   Deposit reserve has oracle: {}", deposit_ok);
         return Ok((false, None, None));
     }
+    
+    log::debug!("✅ Both reserves have oracle pubkeys, proceeding with price validation...");
 
     // Get current slot for stale check
     let current_slot = rpc
@@ -145,13 +153,19 @@ pub async fn validate_oracles(
         .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
 
     // Validate borrow reserve oracle - try Pyth first, fallback to Switchboard
+    log::debug!("  📡 Validating borrow reserve oracle...");
     let (borrow_price, borrow_has_pyth, borrow_has_switchboard_for_crossval) = if let Some(reserve) = borrow_reserve {
+        let oracle_start = std::time::Instant::now();
         match get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
+                let oracle_duration = oracle_start.elapsed();
                 if price.is_none() {
-                    log::warn!("❌ Borrow reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
+                    log::warn!("❌ Borrow reserve: No valid oracle price found (Pyth: {}, Switchboard: {}) after {:?}", 
+                              has_pyth, has_switchboard, oracle_duration);
                     return Ok((false, None, None));
                 }
+                log::debug!("  ✅ Borrow reserve oracle validated in {:?}: price=${:.6}, Pyth={}, Switchboard={}", 
+                           oracle_duration, price.unwrap(), has_pyth, has_switchboard);
                 (price, has_pyth, has_switchboard)
             }
             Err(e) => {
@@ -160,17 +174,24 @@ pub async fn validate_oracles(
             }
         }
     } else {
+        log::debug!("  ⏭️  No borrow reserve to validate");
         (None, false, false)
     };
 
     // Validate deposit reserve oracle - try Pyth first, fallback to Switchboard
+    log::debug!("  📡 Validating deposit reserve oracle...");
     let (deposit_price, deposit_has_pyth, deposit_has_switchboard_for_crossval) = if let Some(reserve) = deposit_reserve {
+        let oracle_start = std::time::Instant::now();
         match get_reserve_price(rpc, reserve, current_slot).await {
             Ok((price, has_pyth, has_switchboard)) => {
+                let oracle_duration = oracle_start.elapsed();
                 if price.is_none() {
-                    log::warn!("❌ Deposit reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
+                    log::warn!("❌ Deposit reserve: No valid oracle price found (Pyth: {}, Switchboard: {}) after {:?}", 
+                              has_pyth, has_switchboard, oracle_duration);
                     return Ok((false, None, None));
                 }
+                log::debug!("  ✅ Deposit reserve oracle validated in {:?}: price=${:.6}, Pyth={}, Switchboard={}", 
+                           oracle_duration, price.unwrap(), has_pyth, has_switchboard);
                 (price, has_pyth, has_switchboard)
             }
             Err(e) => {
@@ -179,6 +200,7 @@ pub async fn validate_oracles(
             }
         }
     } else {
+        log::debug!("  ⏭️  No deposit reserve to validate");
         (None, false, false)
     };
 
@@ -310,13 +332,18 @@ pub async fn validate_oracles_with_twap(
     borrow_reserve: &Option<Reserve>,
     deposit_reserve: &Option<Reserve>,
 ) -> Result<(bool, Option<f64>, Option<f64>)> {
+    log::debug!("🔍 Starting enhanced oracle validation with TWAP protection...");
+    
     // First, get current prices from standard oracle validation
     let (pyth_ok, borrow_price, deposit_price) = 
         validate_oracles(rpc, borrow_reserve, deposit_reserve).await?;
     
     if !pyth_ok {
+        log::warn!("❌ Standard oracle validation failed, skipping TWAP check");
         return Ok((false, None, None));
     }
+    
+    log::debug!("✅ Standard oracle validation passed, proceeding with TWAP protection check...");
 
     // Check if TWAP protection is enabled via environment variable
     // CRITICAL: Default is ENABLED (true) to protect against oracle manipulation in Pyth-only mode
@@ -427,6 +454,9 @@ pub async fn validate_oracles_with_twap(
             }
         }
     }
+    
+    log::debug!("✅ Enhanced oracle validation with TWAP protection completed successfully");
+    log::debug!("   Final prices: Borrow=${:?}, Deposit=${:?}", borrow_price, deposit_price);
     
     Ok((true, borrow_price, deposit_price))
 }

@@ -39,8 +39,11 @@ pub struct ReserveCollateral {
     pub supplyPubkey: Pubkey,
 }
 
+// Helper struct for Reserve configuration fields
+// NOTE: This is NOT the same as the generated ReserveConfig (which is for RateLimiter)
+// This helper struct provides convenient access to Reserve's configuration fields
 #[derive(Debug, Clone)]
-pub struct ReserveConfig {
+pub struct ReserveConfigHelper {
     pub optimalUtilizationRate: u8,
     pub loanToValueRatio: u8,
     pub liquidationBonus: u8,
@@ -967,11 +970,12 @@ impl Reserve {
         }
     }
 
-    /// Get ReserveConfig struct (helper for accessing config fields)
-    /// NOTE: switchboardOraclePubkey field was removed from Reserve struct in newer Solend layouts
+    /// Get ReserveConfigHelper struct (helper for accessing config fields)
+    /// NOTE: This is a helper struct, NOT the generated ReserveConfig (which is for RateLimiter)
+    /// switchboardOraclePubkey field was removed from Reserve struct in newer Solend layouts
     /// Use extraOracle field instead, or liquiditySwitchboardOracle for liquidity oracle
-    pub fn config(&self) -> ReserveConfig {
-        ReserveConfig {
+    pub fn config(&self) -> ReserveConfigHelper {
+        ReserveConfigHelper {
             optimalUtilizationRate: self.optimalUtilizationRate,
             loanToValueRatio: self.loanToValueRatio,
             liquidationBonus: self.liquidationBonus,
@@ -1007,10 +1011,21 @@ impl Reserve {
     }
 }
 
+// Static cache for USDC mint to avoid repeated lookups
+use std::sync::OnceLock;
+static USDC_MINT_CACHE: OnceLock<Pubkey> = OnceLock::new();
+
 pub fn find_usdc_mint_from_reserves(
     rpc: &solana_client::rpc_client::RpcClient,
     program_id: &Pubkey,
 ) -> Result<Pubkey> {
+    // Check cache first
+    if let Some(cached_mint) = USDC_MINT_CACHE.get() {
+        log::debug!("✅ Using cached USDC mint: {}", cached_mint);
+        return Ok(*cached_mint);
+    }
+    
+    log::debug!("🔍 USDC mint not in cache, discovering from chain...");
     
     use std::env;
     let usdc_mint_str = env::var("USDC_MINT")
@@ -1111,6 +1126,11 @@ pub fn find_usdc_mint_from_reserves(
         } else {
             log::info!("✅ USDC mint validated: {} (6 decimals)", known_usdc_mint);
         }
+        
+        // Cache the USDC mint
+        USDC_MINT_CACHE.set(known_usdc_mint)
+            .ok(); // Ignore if already set (shouldn't happen, but safe)
+        log::debug!("💾 Cached USDC mint: {}", known_usdc_mint);
         
         return Ok(known_usdc_mint);
     }
@@ -1444,6 +1464,10 @@ pub fn find_usdc_mint_from_reserves(
     if usdc_found {
         log::info!("✅ USDC reserve found!");
         if let Some(mint) = usdc_mint {
+            // Cache the USDC mint
+            USDC_MINT_CACHE.set(mint)
+                .ok(); // Ignore if already set
+            log::debug!("💾 Cached USDC mint from chain scan: {}", mint);
             return Ok(mint);
         }
     }
@@ -1461,6 +1485,10 @@ pub fn find_usdc_mint_from_reserves(
             if let Some(mint) = susd_mint {
                 log::info!("✅ SUSD accepted as quote token (ALLOW_SUSD=true)");
                 log::info!("   Using SUSD mint: {}", mint);
+                // Cache the SUSD mint (as quote token)
+                USDC_MINT_CACHE.set(mint)
+                    .ok(); // Ignore if already set
+                log::debug!("💾 Cached SUSD mint as quote token: {}", mint);
                 return Ok(mint);
             }
         } else {

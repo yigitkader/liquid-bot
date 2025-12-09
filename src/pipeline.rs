@@ -257,15 +257,24 @@ async fn process_cycle(
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data
     // ✅ FIXED: Use account type identification utility
     // This is faster and more reliable than attempting to parse every account
+    log::info!("🔍 Scanning {} accounts for liquidatable obligations...", accounts.len());
+    let scan_start = std::time::Instant::now();
+    
     let mut candidates = Vec::new();
     let mut parse_errors = 0;
     let mut skipped_wrong_type = 0;
+    let mut obligation_count = 0;
+    let mut skipped_zero_borrow = 0;
+    let mut skipped_zero_deposit = 0;
+    let mut skipped_stale = 0;
+    let mut skipped_hf_too_high = 0;
     let total_accounts = accounts.len();
     
     for (pk, acc) in accounts {
         // Use account type identification to quickly filter accounts
         match crate::solend::identify_solend_account_type(&acc.data) {
             crate::solend::SolendAccountType::Obligation => {
+                obligation_count += 1;
                 // This looks like an Obligation - try to parse it
                 match Obligation::from_account_data(&acc.data) {
                     Ok(obligation) => {
@@ -277,40 +286,51 @@ async fn process_cycle(
                         
                         // Skip if no borrows (nothing to liquidate)
                         if borrowed_value <= 0.0 {
-                            log::debug!(
-                                "Skipping obligation {}: zero borrow (borrowed=${:.2})",
-                                pk,
-                                borrowed_value
-                            );
+                            skipped_zero_borrow += 1;
+                            if skipped_zero_borrow <= 3 {
+                                log::debug!(
+                                    "Skipping obligation {}: zero borrow (borrowed=${:.2})",
+                                    pk,
+                                    borrowed_value
+                                );
+                            }
                             continue;
                         }
                         
                         // Skip if no deposits (no collateral to liquidate)
                         if deposited_value <= 0.0 {
-                            log::debug!(
-                                "Skipping obligation {}: zero deposit (deposited=${:.2})",
-                                pk,
-                                deposited_value
-                            );
+                            skipped_zero_deposit += 1;
+                            if skipped_zero_deposit <= 3 {
+                                log::debug!(
+                                    "Skipping obligation {}: zero deposit (deposited=${:.2})",
+                                    pk,
+                                    deposited_value
+                                );
+                            }
                             continue;
                         }
                         
                         // 🔴 CRITICAL FIX: Skip stale obligations based on lastUpdate.slot
                         // Stale obligations may have outdated health factor calculations
                         if obligation.is_stale(current_slot, max_obligation_slot_diff) {
+                            skipped_stale += 1;
                             if let Some(last_slot) = obligation.last_update_slot() {
-                                log::debug!(
-                                    "Skipping stale obligation {}: last_update_slot={}, current_slot={}, diff={}",
-                                    pk,
-                                    last_slot,
-                                    current_slot,
-                                    current_slot.saturating_sub(last_slot)
-                                );
+                                if skipped_stale <= 3 {
+                                    log::debug!(
+                                        "Skipping stale obligation {}: last_update_slot={}, current_slot={}, diff={}",
+                                        pk,
+                                        last_slot,
+                                        current_slot,
+                                        current_slot.saturating_sub(last_slot)
+                                    );
+                                }
                             } else {
-                                log::debug!(
-                                    "Skipping obligation {}: cannot determine lastUpdate slot (assuming stale)",
-                                    pk
-                                );
+                                if skipped_stale <= 3 {
+                                    log::debug!(
+                                        "Skipping obligation {}: cannot determine lastUpdate slot (assuming stale)",
+                                        pk
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -339,13 +359,23 @@ async fn process_cycle(
                         if is_liquidatable {
                             // Log obligation details for debugging
                             log::debug!(
-                                "Found liquidatable obligation {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}",
+                                "✅ Found liquidatable obligation {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}",
                                 pk,
                                 obligation.health_factor(),
                                 deposited_value,
                                 borrowed_value
                             );
                             candidates.push((pk, obligation));
+                        } else {
+                            skipped_hf_too_high += 1;
+                            if skipped_hf_too_high <= 3 {
+                                log::debug!(
+                                    "Skipping obligation {}: HF={:.6} >= threshold {:.6} (not liquidatable)",
+                                    pk,
+                                    obligation.health_factor(),
+                                    hf_threshold
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -383,6 +413,37 @@ async fn process_cycle(
 
     let total_candidates = candidates.len();
     log::info!("Found {} liquidation opportunities (HF < 1.0)", total_candidates);
+    
+    let scan_duration = scan_start.elapsed();
+    
+    // Log detailed statistics
+    log::info!("📊 Obligation scanning statistics (completed in {:?}):", scan_duration);
+    log::info!("   Total accounts scanned: {}", total_accounts);
+    log::info!("   Obligations identified: {}", obligation_count);
+    log::info!("   Obligations parsed successfully: {}", obligation_count.saturating_sub(parse_errors));
+    log::info!("   Parse errors: {}", parse_errors);
+    log::info!("   Accounts skipped (wrong type): {}", skipped_wrong_type);
+    log::info!("   Obligations skipped (zero borrow): {}", skipped_zero_borrow);
+    log::info!("   Obligations skipped (zero deposit): {}", skipped_zero_deposit);
+    log::info!("   Obligations skipped (stale): {}", skipped_stale);
+    log::info!("   Obligations skipped (HF too high): {}", skipped_hf_too_high);
+    log::info!("   ✅ Liquidatable obligations (HF < 1.0): {}", total_candidates);
+    
+    if total_candidates > 0 {
+        // Log first few candidates for debugging
+        let preview_count = total_candidates.min(5);
+        log::info!("   📋 First {} candidates preview:", preview_count);
+        for (idx, (pubkey, obligation)) in candidates.iter().take(preview_count).enumerate() {
+            let hf = obligation.health_factor();
+            log::info!("     {}. {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}, allowedBorrow=${:.2}", 
+                       idx + 1, pubkey, hf, 
+                       obligation.total_deposited_value_usd(),
+                       obligation.total_borrowed_value_usd(),
+                       obligation.allowedBorrowValue as f64 / 1e18);
+        }
+    } else {
+        log::info!("   ⚠️  No liquidatable obligations found (all HF >= threshold)");
+    }
 
     // Initialize metrics
     let mut metrics = CycleMetrics {
@@ -1049,6 +1110,36 @@ async fn process_cycle(
         final_max_position_usd,
         final_wallet_value_usd
     );
+    
+    // Log detailed breakdown for debugging
+    if total_skipped > 0 {
+        log::debug!("📋 Skip breakdown details:");
+        log::debug!("   Oracle failures: {}", metrics.skipped_oracle_fail);
+        log::debug!("   Jupiter failures: {}", metrics.skipped_jupiter_fail);
+        log::debug!("   Insufficient profit: {}", metrics.skipped_insufficient_profit);
+        log::debug!("   Risk limit: {}", metrics.skipped_risk_limit);
+        log::debug!("   RPC errors: {}", metrics.skipped_rpc_error);
+        log::debug!("   Reserve load failures: {}", metrics.skipped_reserve_load_fail);
+        log::debug!("   Missing ATAs: {}", metrics.skipped_ata_missing);
+    }
+    
+    if total_failed > 0 {
+        log::warn!("⚠️  Transaction failures:");
+        log::warn!("   Build failures: {}", metrics.failed_build_tx);
+        log::warn!("   Send failures: {}", metrics.failed_send_bundle);
+    }
+    
+    if metrics.confirmed_bundles > 0 || metrics.dropped_bundles > 0 {
+        log::info!("📦 Bundle statistics:");
+        log::info!("   Confirmed: {} (success rate: {:.1}%)", 
+                  metrics.confirmed_bundles,
+                  if (metrics.confirmed_bundles + metrics.dropped_bundles) > 0 {
+                      (metrics.confirmed_bundles as f64 / (metrics.confirmed_bundles + metrics.dropped_bundles) as f64) * 100.0
+                  } else {
+                      0.0
+                  });
+        log::info!("   Dropped: {}", metrics.dropped_bundles);
+    }
 
     // Structured log for external monitoring (Problems.md requirement)
     // Always log scan stats even if no candidates found (for liveness check)
@@ -1115,47 +1206,88 @@ async fn build_liquidation_context(
     let mut deposit_reserve = None;
 
     // Parse borrows and deposits first to get reserve pubkeys
+    log::debug!("🔍 Building liquidation context for obligation: owner={}, depositsLen={}, borrowsLen={}", 
+                obligation.owner, obligation.depositsLen, obligation.borrowsLen);
+    
     let borrow_reserve_pubkey = obligation.borrows()
         .ok()
-        .and_then(|borrows| borrows.first().map(|b| b.borrowReserve));
+        .and_then(|borrows| {
+            log::debug!("  📊 Parsed {} borrows from obligation", borrows.len());
+            if let Some(first_borrow) = borrows.first() {
+                log::debug!("  🔍 First borrow reserve: {}", first_borrow.borrowReserve);
+                Some(first_borrow.borrowReserve)
+            } else {
+                log::debug!("  ⚠️  No borrows found in obligation");
+                None
+            }
+        });
     
     let deposit_reserve_pubkey = obligation.deposits()
         .ok()
-        .and_then(|deposits| deposits.first().map(|d| d.depositReserve));
+        .and_then(|deposits| {
+            log::debug!("  📊 Parsed {} deposits from obligation", deposits.len());
+            if let Some(first_deposit) = deposits.first() {
+                log::debug!("  🔍 First deposit reserve: {}", first_deposit.depositReserve);
+                Some(first_deposit.depositReserve)
+            } else {
+                log::debug!("  ⚠️  No deposits found in obligation");
+                None
+            }
+        });
+    
+    if borrow_reserve_pubkey.is_none() && deposit_reserve_pubkey.is_none() {
+        log::warn!("⚠️  Obligation has neither borrows nor deposits - cannot liquidate");
+        return Err(anyhow::anyhow!("Obligation has no borrows or deposits"));
+    }
 
     // Load reserves in parallel using tokio::join!
+    log::debug!("  🔄 Loading reserves in parallel (borrow: {:?}, deposit: {:?})", 
+                borrow_reserve_pubkey, deposit_reserve_pubkey);
+    let reserve_load_start = std::time::Instant::now();
+    
     let (borrow_result, deposit_result) = tokio::join!(
         async {
             if let Some(pubkey) = borrow_reserve_pubkey {
+                log::debug!("  📥 Loading borrow reserve: {}", pubkey);
                 let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || {
-                    rpc_clone.get_account_data(&pubkey)
-                        .and_then(|account| {
-                            Reserve::from_account_data(&account)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e)))
-                        })
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("RPC error: {}", e)))
+                tokio::task::spawn_blocking(move || -> Result<Option<Reserve>, solana_client::client_error::ClientError> {
+                    let account_data = rpc_clone.get_account_data(&pubkey)?;
+                    log::debug!("  📊 Borrow reserve account data retrieved: {} bytes", account_data.len());
+                    let reserve = Reserve::from_account_data(&account_data)
+                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
+                    log::debug!("  ✅ Borrow reserve parsed successfully: version={}, mint={}", 
+                                reserve.version, reserve.liquidityMintPubkey);
+                    Ok(Some(reserve))
                 }).await
+                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
             } else {
-                Ok(None)
+                log::debug!("  ⏭️  No borrow reserve to load");
+                Ok(Ok(None))
             }
         },
         async {
             if let Some(pubkey) = deposit_reserve_pubkey {
+                log::debug!("  📥 Loading deposit reserve: {}", pubkey);
                 let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || {
-                    rpc_clone.get_account_data(&pubkey)
-                        .and_then(|account| {
-                            Reserve::from_account_data(&account)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e)))
-                        })
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("RPC error: {}", e)))
+                tokio::task::spawn_blocking(move || -> Result<Option<Reserve>, solana_client::client_error::ClientError> {
+                    let account_data = rpc_clone.get_account_data(&pubkey)?;
+                    log::debug!("  📊 Deposit reserve account data retrieved: {} bytes", account_data.len());
+                    let reserve = Reserve::from_account_data(&account_data)
+                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
+                    log::debug!("  ✅ Deposit reserve parsed successfully: version={}, mint={}", 
+                                reserve.version, reserve.liquidityMintPubkey);
+                    Ok(Some(reserve))
                 }).await
+                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
             } else {
-                Ok(None)
+                log::debug!("  ⏭️  No deposit reserve to load");
+                Ok(Ok(None))
             }
         }
     );
+    
+    let reserve_load_duration = reserve_load_start.elapsed();
+    log::debug!("  ⏱️  Reserve loading completed in {:?}", reserve_load_duration);
 
     // Process borrow reserve result
     match borrow_result {

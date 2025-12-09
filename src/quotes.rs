@@ -16,35 +16,67 @@ const WAD: u128 = 1_000_000_000_000_000_000;
 
 /// Get SOL price in USD from oracle (standalone version - no context required)
 /// Returns SOL price if available, otherwise None
+/// 
+/// CRITICAL: This function tries multiple oracle sources in order:
+/// 1. Pyth primary feed (on-chain)
+/// 2. Pyth backup feed (if configured)
+/// 3. Switchboard feed (if configured)
+/// 4. Pyth Hermes API (HTTP)
+/// 5. CoinGecko API (HTTP)
+/// 6. Binance API (HTTP)
+/// 7. Jupiter Price API (HTTP)
 pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
+    log::debug!("🔍 Starting SOL price discovery from multiple oracle sources...");
+    
     // Method 1: Fetch from Pyth SOL/USD price feed (primary)
     let sol_usd_pyth_feed_primary = {
         let feed_str = env::var("SOL_USD_PYTH_FEED")
             .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
         
         match Pubkey::from_str(&feed_str) {
-            Ok(pk) => pk,
+            Ok(pk) => {
+                log::debug!("📡 Using primary Pyth feed: {}", pk);
+                pk
+            },
             Err(_) => {
                 log::error!("Failed to parse primary Pyth SOL/USD feed address from SOL_USD_PYTH_FEED: {}", feed_str);
                 match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
-                    Ok(pk) => pk,
-                    Err(_) => return None,
+                    Ok(pk) => {
+                        log::debug!("📡 Using fallback Pyth feed: {}", pk);
+                        pk
+                    },
+                    Err(_) => {
+                        log::error!("❌ Failed to parse fallback Pyth feed address");
+                        return None;
+                    }
                 }
             }
         }
     };
     
     let current_slot = rpc.get_slot().ok();
+    log::debug!("Current slot: {:?}", current_slot);
     
     // Try primary Pyth feed
     if let Some(slot) = current_slot {
+        log::debug!("🔍 Attempting to get SOL price from primary Pyth feed: {} (slot: {})", sol_usd_pyth_feed_primary, slot);
         match oracle::pyth::validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {
             Ok((true, Some(price))) => {
-                log::debug!("✅ SOL price from primary Pyth feed: ${:.2}", price);
+                log::info!("✅ SOL price from primary Pyth feed: ${:.2} (feed: {})", price, sol_usd_pyth_feed_primary);
                 return Some(price);
             }
-            _ => {}
+            Ok((false, _)) => {
+                log::debug!("⚠️  Primary Pyth feed validation failed (invalid or stale)");
+            }
+            Ok((true, None)) => {
+                log::debug!("⚠️  Primary Pyth feed validation passed but price is None");
+            }
+            Err(e) => {
+                log::debug!("❌ Primary Pyth feed error: {}", e);
+            }
         }
+    } else {
+        log::warn!("⚠️  Cannot get current slot, skipping primary Pyth feed");
     }
     
     // Method 2: Try backup Pyth feed if available
@@ -174,7 +206,14 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
 
     log::error!(
         "❌ CRITICAL: All SOL price oracle methods failed! \
-         SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks."
+         SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks.\n\
+         \n\
+         Troubleshooting:\n\
+         1. Check RPC connection (get_slot() should work)\n\
+         2. Verify Pyth feed addresses in .env (SOL_USD_PYTH_FEED)\n\
+         3. Check network connectivity (HTTP APIs may be blocked)\n\
+         4. Verify Switchboard feed addresses if configured\n\
+         5. Check RPC rate limits (may be blocking requests)"
     );
     
     None
