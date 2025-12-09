@@ -3,6 +3,7 @@
 
 pub mod pyth;
 pub mod switchboard;
+pub mod validation;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
@@ -26,6 +27,9 @@ pub enum OracleSource {
     Pyth,
     Switchboard,
 }
+
+// Re-export validation functions for convenience
+pub use validation::{validate_oracles, validate_oracles_with_twap};
 
 /// Get price from reserve, trying Pyth first, then Switchboard
 /// Returns (price, has_pyth, has_switchboard)

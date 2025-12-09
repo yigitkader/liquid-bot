@@ -18,7 +18,9 @@ use crate::jup::{get_jupiter_quote_with_retry, JupiterQuote};
 use crate::solend::{Obligation, Reserve, solend_program_id};
 use crate::solend::{ObligationLiquidity, ObligationCollateral};
 use crate::utils::{send_jito_bundle, JitoClient};
-use crate::oracle;
+use crate::oracle::{self, validate_oracles_with_twap};
+use crate::liquidation_tx::build_flashloan_liquidation_tx;
+use crate::quotes::{get_liquidation_quote, get_sol_price_usd, get_sol_price_usd_standalone};
 
 // Aligned buffer pool moved to oracle/switchboard.rs
 
@@ -1118,7 +1120,7 @@ async fn validate_jito_endpoint(jito_client: &JitoClient) -> Result<()> {
 }
 
 /// Liquidation context per Structure.md section 9
-struct LiquidationContext {
+pub struct LiquidationContext {
     obligation_pubkey: Pubkey,
     obligation: Obligation,
     borrows: Vec<ObligationLiquidity>,  // Parsed borrows from dataFlat
@@ -1222,477 +1224,14 @@ async fn build_liquidation_context(
     })
 }
 
-// Helper functions moved to oracle module:
-// - pyth_program_id() -> oracle::pyth::pyth_program_id()
-// - switchboard_program_id_v2() -> oracle::switchboard::switchboard_program_id_v2()
-// - switchboard_program_id_v3() -> oracle::switchboard::switchboard_program_id_v3()
+// Oracle validation functions moved to oracle::validation module:
+// - validate_oracles -> oracle::validation::validate_oracles
+// - validate_oracles_with_twap -> oracle::validation::validate_oracles_with_twap
+// - OraclePriceCache -> oracle::validation::OraclePriceCache (private)
 
-/// Minimum valid price threshold (in USD)
-/// Prices below this threshold are considered invalid to prevent division by zero
-/// and floating point precision issues in confidence percentage calculations.
-/// Example: price = 1e-100 → confidence_pct calculation would produce inf or very large values.
-/// 
-/// CRITICAL: Set to 1e-6 to support micro-cap tokens while maintaining safety
-/// Previous 1e-3 was too aggressive and rejected valid micro-cap tokens ($0.0005)
-// CRITICAL FIX: Minimum valid price threshold
-// Increased from 1e-6 to 0.01 to prevent division by zero and floating point precision issues
-// Micro-cap tokens (< $0.01) are too risky for liquidations anyway
-const MIN_VALID_PRICE_USD: f64 = 0.01; // $0.01 minimum (was 1e-6)
-
-/// Get oracle configuration from .env (no hardcoded values)
-/// NOTE: This function is now in oracle::get_oracle_config, but kept here for backward compatibility
-fn get_oracle_config() -> (u64, f64, u64, usize, usize, f64, f64, f64) {
-    oracle::get_oracle_config()
-}
-
-/// Oracle price cache for TWAP calculation
-/// Protects against oracle manipulation when only Pyth is available
-struct OraclePriceCache {
-    prices: VecDeque<(Instant, f64)>, // (timestamp, price)
-    max_age: Duration,
-    min_samples: usize,
-}
-
-impl OraclePriceCache {
-    fn new(max_age_secs: u64, min_samples: usize) -> Self {
-        OraclePriceCache {
-            prices: VecDeque::new(),
-            max_age: Duration::from_secs(max_age_secs),
-            min_samples,
-        }
-    }
-    
-    fn add_price(&mut self, price: f64) {
-        let now = Instant::now();
-        
-        // ✅ FIXED: Time-based cleanup (30 saniyeden eski olanları sil)
-        // retain() is more efficient than while loop for removing multiple items
-        self.prices.retain(|(timestamp, _)| {
-            now.duration_since(*timestamp) <= self.max_age
-        });
-        
-        self.prices.push_back((now, price));
-        
-        // ✅ FIXED: Size-based limit (memory kontrolü)
-        // Increased from 20 to 50 samples for better TWAP accuracy on low-liquidity tokens
-        // Use while loop to ensure we stay under limit even if multiple samples are added quickly
-        let (_, _, _, _, twap_max_samples, _, _, _) = get_oracle_config();
-        while self.prices.len() > twap_max_samples {
-            self.prices.pop_front();
-        }
-    }
-    
-    /// Calculate TWAP (Time-Weighted Average Price)
-    /// Returns None if not enough samples
-    fn calculate_twap(&self) -> Option<f64> {
-        if self.prices.len() < self.min_samples {
-            return None;
-        }
-        
-        let now = Instant::now();
-        let mut weighted_sum = 0.0;
-        let mut total_weight = 0.0;
-        
-        for (timestamp, price) in &self.prices {
-            // Weight = time since sample (older = more weight)
-            let age = now.duration_since(*timestamp).as_secs_f64();
-            let weight = 1.0 / (1.0 + age); // Exponential decay
-            
-            weighted_sum += price * weight;
-            total_weight += weight;
-        }
-        
-        if total_weight > 0.0 {
-            Some(weighted_sum / total_weight)
-        } else {
-            None
-        }
-    }
-    
-    /// Check if current price deviates too much from TWAP
-    /// Returns true if deviation > threshold
-    fn is_price_anomaly(&self, current_price: f64, threshold_pct: f64) -> bool {
-        if let Some(twap) = self.calculate_twap() {
-            let deviation_pct = ((current_price - twap).abs() / twap) * 100.0;
-            deviation_pct > threshold_pct
-        } else {
-            false // Not enough data, assume OK
-        }
-    }
-}
-
-/// Global price cache for TWAP calculation (per reserve)
-/// Uses OnceLock<RwLock<HashMap>> for thread-safe access
-static PRICE_CACHES: std::sync::OnceLock<RwLock<HashMap<Pubkey, OraclePriceCache>>> = 
-    std::sync::OnceLock::new();
-
-/// Get or initialize the global price cache
-fn get_price_caches() -> &'static RwLock<HashMap<Pubkey, OraclePriceCache>> {
-    PRICE_CACHES.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-
-/// Pyth price status values (from price_type byte)
-/// PriceType enum: Unknown = 0, Price = 1, Trading = 2, Halted = 3, Auction = 4
-const PYTH_PRICE_STATUS_UNKNOWN: u8 = 0;
-const PYTH_PRICE_STATUS_PRICE: u8 = 1; // Price status - acceptable for liquidations
-const PYTH_PRICE_STATUS_TRADING: u8 = 2; // Trading status - preferred for liquidations
-const PYTH_PRICE_STATUS_HALTED: u8 = 3;
-
-// get_reserve_price is now in oracle module - use oracle::get_reserve_price
-
-/// Returns (is_valid, borrow_price_usd, deposit_price_usd)
-async fn validate_oracles(
-    rpc: &Arc<RpcClient>,
-    borrow_reserve: &Option<Reserve>,
-    deposit_reserve: &Option<Reserve>,
-) -> Result<(bool, Option<f64>, Option<f64>)> {
-    // ✅ FIXED: Check if reserves exist and have EITHER Pyth OR Switchboard oracle
-    // Use liquiditySwitchboardOracle (primary Switchboard oracle) instead of config().switchboardOraclePubkey
-    let borrow_ok = borrow_reserve
-        .as_ref()
-        .map(|r| {
-            // Check if Pyth oracle exists
-            if r.oracle_pubkey() != Pubkey::default() {
-                return true;
-            }
-            // Check if Switchboard oracle exists (use liquiditySwitchboardOracle)
-            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
-                return true;
-            }
-            false
-        })
-        .unwrap_or(false);
-
-    let deposit_ok = deposit_reserve
-        .as_ref()
-        .map(|r| {
-            // Check if Pyth oracle exists
-            if r.oracle_pubkey() != Pubkey::default() {
-                return true;
-            }
-            // Check if Switchboard oracle exists (use liquiditySwitchboardOracle)
-            if r.liquidity().liquiditySwitchboardOracle != Pubkey::default() {
-                return true;
-            }
-            false
-        })
-        .unwrap_or(false);
-
-    if !borrow_ok || !deposit_ok {
-        log::debug!("Oracle validation failed: missing oracle pubkeys (neither Pyth nor Switchboard)");
-        return Ok((false, None, None));
-    }
-
-    // Get current slot for stale check
-    let current_slot = rpc
-        .get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-
-    // ✅ FIXED: Validate borrow reserve oracle - try Pyth first, fallback to Switchboard
-    let (borrow_price, borrow_has_pyth, borrow_has_switchboard_for_crossval) = if let Some(reserve) = borrow_reserve {
-        match oracle::get_reserve_price(rpc, reserve, current_slot).await {
-            Ok((price, has_pyth, has_switchboard)) => {
-                if price.is_none() {
-                    log::warn!("❌ Borrow reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
-                    return Ok((false, None, None));
-                }
-                (price, has_pyth, has_switchboard)
-            }
-            Err(e) => {
-                log::warn!("❌ Borrow reserve oracle error: {}", e);
-                return Ok((false, None, None));
-            }
-        }
-    } else {
-        (None, false, false)
-    };
-
-    // ✅ FIXED: Validate deposit reserve oracle - try Pyth first, fallback to Switchboard
-    let (deposit_price, deposit_has_pyth, deposit_has_switchboard_for_crossval) = if let Some(reserve) = deposit_reserve {
-        match oracle::get_reserve_price(rpc, reserve, current_slot).await {
-            Ok((price, has_pyth, has_switchboard)) => {
-                if price.is_none() {
-                    log::warn!("❌ Deposit reserve: No valid oracle price found (Pyth: {}, Switchboard: {})", has_pyth, has_switchboard);
-                    return Ok((false, None, None));
-                }
-                (price, has_pyth, has_switchboard)
-            }
-            Err(e) => {
-                log::warn!("❌ Deposit reserve oracle error: {}", e);
-                return Ok((false, None, None));
-            }
-        }
-    } else {
-        (None, false, false)
-    };
-
-    // ✅ FIXED: Validate Switchboard oracles if available per Structure.md section 5.2
-    // "Switchboard varsa, Pyth ile sapma fazla mı?"
-    // 
-    // CRITICAL SECURITY: If Switchboard is NOT available, we rely solely on Pyth.
-    // In this case, we apply stricter validation (stricter confidence threshold).
-    // This mitigates the risk of Pyth oracle manipulation when no cross-validation exists.
-    
-    // Cross-validate: If we have both Pyth and Switchboard, compare them
-    let (_, max_oracle_deviation_pct, _, _, _, _, max_confidence_pct, max_confidence_pct_pyth_only) = get_oracle_config();
-    if borrow_has_pyth && borrow_has_switchboard_for_crossval {
-        if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
-            if let Some(switchboard_price) = oracle::switchboard::validate_switchboard_oracle_if_available(
-                rpc,
-                borrow_reserve,
-                current_slot,
-            )
-            .await?
-            {
-                // Compare Pyth and Switchboard prices
-                let deviation_pct = ((borrow_price - switchboard_price).abs() / borrow_price) * 100.0;
-                if deviation_pct > max_oracle_deviation_pct {
-                    log::warn!(
-                        "Oracle deviation too high for borrow reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
-                        deviation_pct,
-                        max_oracle_deviation_pct,
-                        borrow_price,
-                        switchboard_price
-                    );
-                    return Ok((false, None, None));
-                }
-                log::debug!(
-                    "✅ Oracle deviation OK for borrow reserve: {:.2}% (Pyth: {}, Switchboard: {})",
-                    deviation_pct,
-                    borrow_price,
-                    switchboard_price
-                );
-            }
-        }
-    }
-
-    if deposit_has_pyth && deposit_has_switchboard_for_crossval {
-        if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
-            if let Some(switchboard_price) = oracle::switchboard::validate_switchboard_oracle_if_available(
-                rpc,
-                deposit_reserve,
-                current_slot,
-            )
-            .await?
-            {
-                let deviation_pct = ((deposit_price - switchboard_price).abs() / deposit_price) * 100.0;
-                if deviation_pct > max_oracle_deviation_pct {
-                    log::warn!(
-                        "Oracle deviation too high for deposit reserve: {:.2}% > {:.2}% (Pyth: {}, Switchboard: {})",
-                        deviation_pct,
-                        max_oracle_deviation_pct,
-                        deposit_price,
-                        switchboard_price
-                    );
-                    return Ok((false, None, None));
-                }
-                log::debug!(
-                    "✅ Oracle deviation OK for deposit reserve: {:.2}% (Pyth: {}, Switchboard: {})",
-                    deviation_pct,
-                    deposit_price,
-                    switchboard_price
-                );
-            }
-        }
-    }
-
-    // SECURITY: If Switchboard is NOT available for either reserve AND we're using Pyth, apply stricter Pyth validation
-    // This mitigates the risk of relying solely on Pyth without cross-validation
-    // Note: If we're using Switchboard-only (no Pyth), we don't need this check
-    let borrow_needs_stricter_validation = borrow_has_pyth && !borrow_has_switchboard_for_crossval;
-    let deposit_needs_stricter_validation = deposit_has_pyth && !deposit_has_switchboard_for_crossval;
-    
-    if borrow_needs_stricter_validation || deposit_needs_stricter_validation {
-        log::warn!(
-            "⚠️  SECURITY WARNING: Switchboard oracle not available for cross-validation (borrow: {}, deposit: {}). \
-             Using Pyth-only with stricter confidence threshold ({}% vs {}%). \
-             This increases risk of oracle manipulation.",
-            if borrow_has_switchboard_for_crossval { "✓" } else { "✗" },
-            if deposit_has_switchboard_for_crossval { "✓" } else { "✗" },
-            max_confidence_pct_pyth_only,
-            max_confidence_pct
-        );
-        
-        // Re-validate Pyth confidence with stricter threshold (only if we're using Pyth without Switchboard)
-        if borrow_needs_stricter_validation {
-            if let (Some(borrow_reserve), Some(borrow_price)) = (borrow_reserve, borrow_price) {
-                // Re-check Pyth confidence with stricter threshold
-                let confidence_check = oracle::pyth::validate_pyth_confidence_strict(
-                    rpc,
-                    borrow_reserve.oracle_pubkey(),
-                    borrow_price,
-                    current_slot,
-                ).await?;
-                if !confidence_check {
-                    log::warn!(
-                        "Borrow reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
-                    );
-                    return Ok((false, None, None));
-                }
-            }
-        }
-        
-        if deposit_needs_stricter_validation {
-            if let (Some(deposit_reserve), Some(deposit_price)) = (deposit_reserve, deposit_price) {
-                // Re-check Pyth confidence with stricter threshold
-                let confidence_check = oracle::pyth::validate_pyth_confidence_strict(
-                    rpc,
-                    deposit_reserve.oracle_pubkey(),
-                    deposit_price,
-                    current_slot,
-                ).await?;
-                if !confidence_check {
-                    log::warn!(
-                        "Deposit reserve Pyth confidence check failed (stricter threshold for Pyth-only mode)"
-                    );
-                    return Ok((false, None, None));
-                }
-            }
-        }
-    }
-
-    Ok((true, borrow_price, deposit_price))
-}
-
-/// Enhanced oracle validation with TWAP protection
-/// This function adds TWAP (Time-Weighted Average Price) protection when Switchboard is not available
-/// to detect oracle manipulation attempts
-/// 
-/// Returns (is_valid, borrow_price_usd, deposit_price_usd)
-async fn validate_oracles_with_twap(
-    rpc: &Arc<RpcClient>,
-    borrow_reserve: &Option<Reserve>,
-    deposit_reserve: &Option<Reserve>,
-) -> Result<(bool, Option<f64>, Option<f64>)> {
-    // First, get current prices from standard oracle validation
-    let (pyth_ok, borrow_price, deposit_price) = 
-        validate_oracles(rpc, borrow_reserve, deposit_reserve).await?;
-    
-    if !pyth_ok {
-        return Ok((false, None, None));
-    }
-
-    // Check if TWAP protection is enabled via environment variable
-    let enable_twap = std::env::var("ENABLE_TWAP_PROTECTION")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false); // Default: disabled
-
-    if !enable_twap {
-        log::debug!("TWAP protection disabled (ENABLE_TWAP_PROTECTION=false)");
-        return Ok((true, borrow_price, deposit_price));
-    }
-    
-    // Check if Switchboard is available for either reserve
-    // If Switchboard is available, we don't need TWAP protection (cross-validation is sufficient)
-    let current_slot = rpc
-        .get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-    
-    let mut borrow_has_switchboard = false;
-    let mut deposit_has_switchboard = false;
-    
-    if let Some(reserve) = borrow_reserve {
-        if let Ok(Some(_)) = oracle::switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
-            borrow_has_switchboard = true;
-        }
-    }
-    
-    if let Some(reserve) = deposit_reserve {
-        if let Ok(Some(_)) = oracle::switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
-            deposit_has_switchboard = true;
-        }
-    }
-    
-    // Only apply TWAP protection if Switchboard is NOT available (Pyth-only mode)
-    if !borrow_has_switchboard || !deposit_has_switchboard {
-        let caches = get_price_caches();
-        // Replace unwrap() with proper error handling
-        let mut caches_guard = match caches.write() {
-            Ok(guard) => guard,
-            Err(e) => {
-                log::error!("Failed to acquire write lock on price caches: {}", e);
-                // Fail safe - if we can't check oracle safety, assume unsafe
-                return Ok((false, None, None));
-            }
-        };
-        
-        // Get or create price cache for borrow reserve
-        let (_, _, twap_max_age_secs, twap_min_samples, _, twap_anomaly_threshold_pct, _, _) = get_oracle_config();
-        if let (Some(reserve), Some(price)) = (borrow_reserve.as_ref(), borrow_price) {
-            if !borrow_has_switchboard {
-                let oracle_pubkey = reserve.oracle_pubkey();
-                let borrow_cache = caches_guard
-                    .entry(oracle_pubkey)
-                    .or_insert_with(|| OraclePriceCache::new(twap_max_age_secs, twap_min_samples));
-                
-                // Add current price to cache
-                borrow_cache.add_price(price);
-                
-                // Check for manipulation
-                if borrow_cache.is_price_anomaly(price, twap_anomaly_threshold_pct) {
-                    if let Some(twap) = borrow_cache.calculate_twap() {
-                        log::warn!(
-                            "⚠️  Borrow price anomaly detected! Current: ${:.6}, TWAP: ${:.6}, Deviation: {:.2}%",
-                            price,
-                            twap,
-                            ((price - twap).abs() / twap) * 100.0
-                        );
-                    } else {
-                        log::warn!(
-                            "⚠️  Borrow price anomaly detected! Current: ${:.6} (TWAP not available yet)",
-                            price
-                        );
-                    }
-                    return Ok((false, None, None));
-                }
-            }
-        }
-        
-        // Get or create price cache for deposit reserve
-        if let (Some(reserve), Some(price)) = (deposit_reserve.as_ref(), deposit_price) {
-            if !deposit_has_switchboard {
-                let oracle_pubkey = reserve.oracle_pubkey();
-                let deposit_cache = caches_guard
-                    .entry(oracle_pubkey)
-                    .or_insert_with(|| OraclePriceCache::new(twap_max_age_secs, twap_min_samples));
-                
-                // Add current price to cache
-                deposit_cache.add_price(price);
-                
-                // Check for manipulation
-                if deposit_cache.is_price_anomaly(price, twap_anomaly_threshold_pct) {
-                    if let Some(twap) = deposit_cache.calculate_twap() {
-                        log::warn!(
-                            "⚠️  Deposit price anomaly detected! Current: ${:.6}, TWAP: ${:.6}, Deviation: {:.2}%",
-                            price,
-                            twap,
-                            ((price - twap).abs() / twap) * 100.0
-                        );
-                    } else {
-                        log::warn!(
-                            "⚠️  Deposit price anomaly detected! Current: ${:.6} (TWAP not available yet)",
-                            price
-                        );
-                    }
-                    return Ok((false, None, None));
-                }
-            }
-        }
-    }
-    
-    Ok((true, borrow_price, deposit_price))
-}
-
-// Oracle validation functions moved to oracle module:
-// - validate_switchboard_oracle_if_available -> oracle::switchboard::validate_switchboard_oracle_if_available
-// - validate_switchboard_oracle_by_pubkey -> oracle::switchboard::validate_switchboard_oracle_by_pubkey
-// - validate_pyth_oracle_v3 -> oracle::pyth::validate_pyth_oracle_v3
-// - validate_pyth_oracle -> oracle::pyth::validate_pyth_oracle
-// - validate_pyth_confidence_strict -> oracle::pyth::validate_pyth_confidence_strict
 
 /// Liquidation quote with profit calculation per Structure.md section 7
-struct LiquidationQuote {
+pub struct LiquidationQuote {
     quote: JupiterQuote,
     profit_usdc: f64,
     collateral_value_usd: f64, // Position size in USD for risk limit calculation
@@ -1701,19 +1240,16 @@ struct LiquidationQuote {
     flashloan_fee_raw: u64, // Flashloan fee amount (in raw token units) - CRITICAL: Store to avoid recalculation inconsistency
 }
 
-/// Get SOL price in USD from oracle (standalone version - no context required)
-/// Returns SOL price if available, otherwise None
-/// 
-/// CRITICAL: Tries multiple methods to get SOL price:
-/// 1. From Pyth SOL/USD feed (primary)
-/// 2. From alternative Pyth feed if primary fails
-/// 3. From Jupiter Price API as fallback
-/// 
-/// This function can be called from anywhere without requiring LiquidationContext.
-/// Use this for risk limit calculations, wallet balance logging, etc.
-pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
-    // Method 1: Fetch from Pyth SOL/USD price feed (primary)
-    // Read from .env or use default fallback
+// Quote and profit calculation functions moved to quotes module:
+// - get_liquidation_quote -> quotes::get_liquidation_quote
+// - get_sol_price_usd -> quotes::get_sol_price_usd
+// - get_sol_price_usd_standalone -> quotes::get_sol_price_usd_standalone
+
+// Removed old implementations - see quotes.rs for current code
+
+/// Log wallet balances (SOL and USDC) to console
+/// Used for periodic balance monitoring
+async fn log_wallet_balances(
     let sol_usd_pyth_feed_primary = {
         let feed_str = env::var("SOL_USD_PYTH_FEED")
             .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
@@ -1950,143 +1486,172 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
     None
 }
 
-/// Get SOL price in USD from oracle (with context - checks if SOL is in liquidation)
-/// Returns SOL price if available, otherwise None
-/// 
-/// CRITICAL: Tries multiple methods to get SOL price:
-/// 1. From liquidation context (if SOL is collateral/debt)
-/// 2. From Pyth SOL/USD feed (primary)
-/// 3. From alternative Pyth feed if primary fails
-async fn get_sol_price_usd(rpc: &Arc<RpcClient>, ctx: &LiquidationContext) -> Option<f64> {
-    // SOL native mint: So11111111111111111111111111111111111111112
-    let sol_native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+// Quote and profit calculation functions moved to quotes module - see quotes.rs
+
+/// Log wallet balances (SOL and USDC) to console
+/// Used for periodic balance monitoring
+async fn log_wallet_balances(
+    rpc: &Arc<RpcClient>,
+    wallet_pubkey: &Pubkey,
+) -> Result<()> {
+
+    // Get SOL balance
+    let sol_balance_lamports = rpc
+        .get_balance(wallet_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
+    let sol_balance = sol_balance_lamports as f64 / 1_000_000_000.0;
     
-    // Method 1: Check if collateral or debt is SOL, use its price
-    if let Some(deposit_reserve) = &ctx.deposit_reserve {
-        if deposit_reserve.liquidity().mintPubkey == sol_native_mint {
-            if let Some(price) = ctx.deposit_price_usd {
-                log::debug!("Using SOL price from deposit reserve: ${}", price);
-                return Some(price);
+    // Get SOL price for USD value
+    // Use the specific Pyth feed for SOL/USD price
+    let sol_usd_pyth_feed = match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
+        Ok(pk) => pk,
+        Err(_) => {
+            log::warn!("Failed to parse SOL/USD Pyth feed address, using fallback method");
+            // Fall back to standalone function if feed address is invalid
+            let sol_price_usd = match quotes::get_sol_price_usd_standalone(rpc).await {
+                Some(price) => price,
+                None => {
+                    log::warn!("⚠️  Failed to get SOL price, using fallback $150");
+                    150.0
+                }
+            };
+            let sol_value_usd = sol_balance * sol_price_usd;
+            // Continue with USDC check using fallback price
+            let program_id = crate::solend::solend_program_id()?;
+            let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+                .context("Failed to discover USDC mint")?;
+            use spl_associated_token_account::get_associated_token_address;
+            let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+            let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+                Ok(Some(account)) => account.token_amount.amount.parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+            log::info!(
+                "💰 Wallet Balances: SOL: {:.6} SOL (~${:.2}), USDC: {:.2} USDC, Total: ~${:.2}",
+                sol_balance,
+                sol_value_usd,
+                usdc_balance,
+                sol_value_usd + usdc_balance
+            );
+            return Ok(());
+        }
+    };
+    
+    // Try to get SOL price directly from the specified Pyth feed first
+    let current_slot = rpc.get_slot().unwrap_or(0);
+    let sol_price_usd = match oracle::pyth::validate_pyth_oracle(rpc, sol_usd_pyth_feed, current_slot).await {
+        Ok((true, Some(price))) => {
+            log::debug!("✅ SOL price from Pyth feed {}: ${:.2}", sol_usd_pyth_feed, price);
+            price
+        },
+        _ => {
+            // Fall back to robust standalone function (tries multiple methods)
+            match quotes::get_sol_price_usd_standalone(rpc).await {
+                Some(price) => {
+                    log::debug!("✅ SOL price for balance logging: ${:.2}", price);
+                    price
+                },
+                None => {
+                    log::warn!(
+                        "⚠️  Failed to get SOL price from ALL methods for balance logging, using fallback $150. \
+                         Wallet value calculations may be inaccurate."
+                    );
+                    150.0
+                }
             }
         }
-    }
+    };
     
-    if let Some(borrow_reserve) = &ctx.borrow_reserve {
-        if borrow_reserve.liquidity().mintPubkey == sol_native_mint {
-            if let Some(price) = ctx.borrow_price_usd {
-                log::debug!("Using SOL price from borrow reserve: ${}", price);
-                return Some(price);
-            }
+    let sol_value_usd = sol_balance * sol_price_usd;
+    
+    // Get USDC balance
+    let program_id = crate::solend::solend_program_id()?;
+    let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+        .context("Failed to discover USDC mint")?;
+    
+    use spl_associated_token_account::get_associated_token_address;
+    let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+    
+    let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+        Ok(Some(account)) => {
+            account.token_amount.amount.parse::<u64>().unwrap_or(0)
         }
-    }
+        Ok(None) => 0,
+        Err(_) => 0,
+    };
     
-    // Method 2: Use standalone function (tries Pyth primary, backup, Jupiter API)
-    // This reuses the robust logic from get_sol_price_usd_standalone()
-    if let Some(price) = get_sol_price_usd_standalone(rpc).await {
-        return Some(price);
-    }
+    let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+    let total_value_usd = sol_value_usd + usdc_balance;
     
-    // If standalone function failed, log error
-    log::error!(
-        "❌ CRITICAL: All SOL price oracle methods failed (including context check)! \
-         SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks. \
-         Bot cannot safely operate without accurate SOL price."
+    log::info!(
+        "💰 Wallet Balances: SOL: {:.6} SOL (${:.2}), USDC: {:.2} USDC, Total: ${:.2}",
+        sol_balance,
+        sol_value_usd,
+        usdc_balance,
+        total_value_usd
     );
     
-    None
+    Ok(())
 }
 
-/// Get Jupiter quote for liquidation with profit calculation per Structure.md section 7
-async fn get_liquidation_quote(
-    ctx: &LiquidationContext,
-    config: &Config,
+/// Get total wallet value in USD (SOL + USDC)
+/// Used for risk limit calculations per Structure.md section 6.4
+async fn get_wallet_value_usd(
     rpc: &Arc<RpcClient>,
-) -> Result<LiquidationQuote> {
-    // Use first borrow and first deposit
-    if ctx.borrows.is_empty() || ctx.deposits.is_empty() {
-        return Err(anyhow::anyhow!("No borrows or deposits in obligation"));
-    }
+    wallet_pubkey: &Pubkey,
+) -> Result<f64> {
+    // 1. Get SOL balance and price
+    let sol_balance = rpc
+        .get_balance(wallet_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
 
-    let borrow = &ctx.borrows[0];
-    // Note: deposit is available but we use deposit_reserve directly for mint address
-
-    // CRITICAL FIX: Solend liquidation collateral flow
-    //
-    // Solend LiquidateObligation instruction:
-    // - Input: sourceLiquidity (debt token, e.g., USDC)
-    // - Output: destinationCollateral (collateral cToken, e.g., cSOL)
-    //
-    // PROBLEM: cTokens cannot be traded directly on Jupiter!
-    // SOLUTION: We need to redeem cToken to underlying token first (cSOL -> SOL)
-    //
-    // ✅ CORRECT FLOW IMPLEMENTED in build_flashloan_liquidation_tx():
-    // 1. FlashLoan (borrow USDC)
-    // 2. LiquidateObligation (USDC -> cSOL)
-    // 3. RedeemReserveCollateral (cSOL -> SOL)
-    // 4. Jupiter Swap (SOL -> USDC)
-    // 5. FlashRepay (repay USDC + fee)
-    //
-    // For quote calculation, we use the underlying token mint (e.g. SOL) for Jupiter,
-    // knowing that the transaction will handle the cToken -> Token conversion.
+    let sol_balance_sol = sol_balance as f64 / 1_000_000_000.0;
     
-    // Step 1: Get collateral cToken mint (what Solend gives us)
-    let collateral_ctoken_mint = ctx
-        .deposit_reserve
-        .as_ref()
-        .map(|r| r.collateral().mintPubkey) // cToken mint (e.g., cSOL)
-        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
+    // Get SOL price from oracle
+    let sol_price_usd = match quotes::get_sol_price_usd_standalone(rpc).await {
+        Some(price) => price,
+        None => {
+            log::warn!("⚠️  Failed to get SOL price for wallet value calculation, using fallback $150");
+            150.0
+        }
+    };
     
-    // Step 2: Get underlying collateral token mint (what we need for Jupiter)
-    let collateral_underlying_mint = ctx
-        .deposit_reserve
-        .as_ref()
-        .map(|r| r.liquidity().mintPubkey) // Underlying token mint (e.g., SOL)
-        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
+    let sol_value_usd = sol_balance_sol * sol_price_usd;
     
-    // Step 3: Get debt token mint
-    let debt_mint = ctx
-        .borrow_reserve
-        .as_ref()
-        .map(|r| r.liquidity().mintPubkey) // Debt token mint (e.g., USDC)
-        .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
+    // 2. Get USDC balance
+    let program_id = crate::solend::solend_program_id()?;
+    let usdc_mint = crate::solend::find_usdc_mint_from_reserves(rpc, &program_id)
+        .context("Failed to discover USDC mint")?;
+    
+    use spl_associated_token_account::get_associated_token_address;
+    let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
+    
+    let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+        Ok(Some(account)) => {
+            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+        }
+        Ok(None) => 0,
+        Err(_) => 0,
+    };
+    
+    let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+    
+    // 3. Total value
+    let total_value_usd = sol_value_usd + usdc_balance;
     
     log::debug!(
-        "Jupiter quote request:\n\
-         Collateral cToken: {}\n\
-         Collateral underlying: {} (will be used for Jupiter)\n\
-         Debt token: {}",
-        collateral_ctoken_mint,
-        collateral_underlying_mint,
-        debt_mint
+        "Wallet value: SOL: {:.6} SOL (${:.2}), USDC: {:.2} USDC, Total: ${:.2}",
+        sol_balance_sol,
+        sol_value_usd,
+        usdc_balance,
+        total_value_usd
     );
     
-    // Use underlying mint for Jupiter (cToken cannot be traded on Jupiter)
-    let _collateral_mint = collateral_underlying_mint;
+    Ok(total_value_usd)
+}
 
-    // CRITICAL: Calculate correct collateral amount to seize
-    // 
-    // Liquidation flow:
-    // 1. We repay: debt_to_repay = borrowedAmountWad * close_factor (50%)
-    // 2. Solend gives us: collateral_to_seize = debt_to_repay * (1 + liquidation_bonus)
-    // 3. We need to swap: collateral_to_seize amount of collateral → debt_to_repay amount of debt
-    //
-    // Steps:
-    // a) Calculate debt to repay (with close factor 50%)
-    // b) Calculate collateral to seize (with liquidation bonus)
-    // c) Query Jupiter: collateral_to_seize → debt token
-    
-    // Step 1: Get reserves and token decimals
-    // CRITICAL: We need decimals to calculate raw token amounts correctly
-    let borrow_reserve = ctx
-        .borrow_reserve
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
-    let deposit_reserve = ctx
-        .deposit_reserve
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
-    
-    let debt_decimals = borrow_reserve.liquidity().mintDecimals;
+// Quote and profit calculation functions moved to quotes module - see quotes.rs
     let collateral_decimals = deposit_reserve.liquidity().mintDecimals;
     
     // CRITICAL SECURITY: Validate decimal values to prevent corrupt data issues
@@ -2680,7 +2245,6 @@ async fn get_liquidation_quote(
         collateral_value_usd,
         debt_to_repay_raw, // Debt amount to repay in Solend instruction
         collateral_to_seize_raw, // Collateral cToken amount to seize (for redemption check)
-        flashloan_fee_raw: flashloan_fee_amount_raw, // Store calculated fee to reuse in TX build (calculated once above)
     })
 }
 
@@ -3488,331 +3052,12 @@ async fn build_liquidation_tx2(
     Ok(tx)
 }
 
-/// Build single atomic transaction with flashloan
-/// Flow:
-/// 1. FlashLoan: Borrow debt_amount USDC from Solend (flash)
-/// 2. LiquidateObligation: Repay debt, receive cSOL
-/// 3. RedeemReserveCollateral: cSOL -> SOL
-/// 4. Jupiter Swap: SOL -> USDC
-/// 5. FlashRepayReserveLiquidity: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
-/// All in ONE transaction - atomicity guaranteed!
-/// 
-/// AVANTAJLAR:
-/// ✅ Atomicity: Tüm işlemler tek transaction'da
-/// ✅ No race condition: TX1/TX2 split yok
-/// ✅ No MEV risk: Intermediate state yok
-/// ✅ Sermaye gerektirmez: Flashloan ile başla
-/// ✅ Gas-efficient: Tek transaction
-/// 
-/// DİKKAT:
-/// - Flashloan fee var (~0.3% Solend'de)
-/// - Jupiter swap'i instructions sysvar ile verify etmek gerek
-/// - Compute unit limiti yüksek olmalı (~400k-600k)
-async fn build_flashloan_liquidation_tx(
-    wallet: &Arc<Keypair>,
-    ctx: &LiquidationContext,
-    quote: &LiquidationQuote,
-    rpc: &Arc<RpcClient>,
-    blockhash: solana_sdk::hash::Hash,
-    config: &Config,
-) -> Result<Transaction> {
-    use solana_sdk::{
-        instruction::{AccountMeta, Instruction},
-        sysvar,
-    };
-    use spl_associated_token_account::get_associated_token_address;
-    use spl_token::ID as TOKEN_PROGRAM_ID;
-    use std::str::FromStr;
-    
-    let program_id = crate::solend::solend_program_id()?;
-    let wallet_pubkey = wallet.pubkey();
-    
-    // Get reserves
-    let borrow_reserve = ctx.borrow_reserve.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
-    let deposit_reserve = ctx.deposit_reserve.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
-    
-    let lending_market = ctx.obligation.lendingMarket;
-    let lending_market_authority = crate::solend::derive_lending_market_authority(&lending_market, &program_id)?;
-    
-    // Get reserve addresses
-    let repay_reserve_liquidity_supply = borrow_reserve.liquidity().supplyPubkey;
-    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity().supplyPubkey;
-    let withdraw_reserve_collateral_supply = deposit_reserve.collateral().supplyPubkey;
-    let withdraw_reserve_collateral_mint = deposit_reserve.collateral().mintPubkey;
-    
-    // Validate reserve addresses
-    if repay_reserve_liquidity_supply == Pubkey::default() 
-        || withdraw_reserve_liquidity_supply == Pubkey::default() 
-        || withdraw_reserve_collateral_supply == Pubkey::default()
-        || withdraw_reserve_collateral_mint == Pubkey::default() {
-        return Err(anyhow::anyhow!("Invalid reserve addresses: one or more addresses are default/zero"));
-    }
-    
-    // Get user's token accounts
-    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity().mintPubkey);
-    let destination_collateral = get_associated_token_address(&wallet_pubkey, &withdraw_reserve_collateral_mint);
-    let destination_liquidity = get_associated_token_address(&wallet_pubkey, &deposit_reserve.liquidity().mintPubkey);
-    
-    // Validate ATAs exist
-    if rpc.get_account(&source_liquidity).is_err() {
-        return Err(anyhow::anyhow!(
-            "Source liquidity ATA does not exist: {}. Please create ATA for token {} before liquidation.",
-            source_liquidity,
-            borrow_reserve.liquidity().mintPubkey
-        ));
-    }
-    if rpc.get_account(&destination_collateral).is_err() {
-        return Err(anyhow::anyhow!(
-            "Destination collateral ATA does not exist: {}. Please create ATA for token {} before liquidation.",
-            destination_collateral,
-            withdraw_reserve_collateral_mint
-        ));
-    }
-    if rpc.get_account(&destination_liquidity).is_err() {
-        return Err(anyhow::anyhow!(
-            "Destination liquidity ATA does not exist: {}. Please create ATA for token {} before liquidation.",
-            destination_liquidity,
-            deposit_reserve.liquidity().mintPubkey
-        ));
-    }
-    
-    // ============================================================================
-    // INSTRUCTION 1: FlashLoan (Solend native)
-    // ============================================================================
-    // Borrow debt_amount USDC from Solend reserve (flashloan)
-    let flashloan_amount = quote.debt_to_repay_raw;
-    
-    let mut flashloan_data = vec![crate::solend::get_flashloan_discriminator()]; // FlashLoan discriminator (tag 13)
-    flashloan_data.extend_from_slice(&flashloan_amount.to_le_bytes()); // amount (u64)
-    
-    // FlashLoan accounts per Solend IDL (FlashBorrowReserveLiquidity - tag 13):
-    // CRITICAL: Account order must match Solend SDK exactly
-    // Reference: solend-sdk/src/instruction.rs - LendingInstruction::FlashBorrowReserveLiquidity
-    // 
-    // Correct account order (9 accounts total):
-    // 0. [writable] sourceLiquidity - Reserve's liquidity supply (source of funds)
-    // 1. [writable] destinationLiquidity - User's ATA to receive borrowed funds (DESTINATION)
-    // 2. [writable] reserve - Reserve account to borrow from
-    // 3. [writable] reserveLiquiditySupply - Reserve liquidity supply (same as sourceLiquidity)
-    // 4. [readonly] lendingMarket - Lending market account
-    // 5. [readonly] lendingMarketAuthority - Lending market authority PDA
-    // 6. [signer] transferAuthority - User wallet (signer)
-    // 7. [readonly] instructionsSysvar - Instructions sysvar (for flashloan callback verification)
-    // 8. [readonly] tokenProgram - SPL Token program
-    let flashloan_accounts = vec![
-        AccountMeta::new(repay_reserve_liquidity_supply, false), // 0: sourceLiquidity (reserve's supply)
-        AccountMeta::new(source_liquidity, false),               // 1: destinationLiquidity (user's ATA to receive funds)
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: reserve (reserve to borrow from)
-        AccountMeta::new(repay_reserve_liquidity_supply, false), // 3: reserveLiquiditySupply (same as source)
-        AccountMeta::new_readonly(lending_market, false),       // 4: lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false), // 5: lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),         // 6: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 7: instructionsSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 8: tokenProgram
-    ];
-    
-    let flashloan_ix = Instruction {
-        program_id,
-        accounts: flashloan_accounts,
-        data: flashloan_data,
-    };
-    
-    // ============================================================================
-    // INSTRUCTION 2: LiquidateObligation
-    // ============================================================================
-    // Use borrowed USDC to liquidate obligation, receive cSOL
-    let liquidity_amount = quote.debt_to_repay_raw;
-    
-    let mut liquidation_data = vec![crate::solend::get_liquidate_obligation_discriminator()]; // tag 12
-    liquidation_data.extend_from_slice(&liquidity_amount.to_le_bytes()); // liquidity_amount (u64)
-    
-    let liquidation_accounts = vec![
-        AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity (borrowed USDC)
-        AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral (receive cSOL)
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false), // 2: repayReserve
-        AccountMeta::new(repay_reserve_liquidity_supply, false),     // 3: repayReserveLiquiditySupply
-        AccountMeta::new_readonly(ctx.deposits[0].depositReserve, false), // 4: withdrawReserve
-        AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
-        AccountMeta::new(ctx.obligation_pubkey, false),               // 6: obligation
-        AccountMeta::new_readonly(lending_market, false),             // 7: lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false),   // 8: lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),               // 9: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::clock::id(), false),        // 10: clockSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),           // 11: tokenProgram
-    ];
-    
-    let liquidation_ix = Instruction {
-        program_id,
-        accounts: liquidation_accounts,
-        data: liquidation_data,
-    };
-    
-    // ============================================================================
-    // INSTRUCTION 3: RedeemReserveCollateral
-    // ============================================================================
-    // Redeem cSOL -> SOL
-    let redeem_collateral_amount = quote.collateral_to_seize_raw;
-    
-    let mut redeem_data = vec![crate::solend::get_redeem_reserve_collateral_discriminator()]; // tag 5
-    redeem_data.extend_from_slice(&redeem_collateral_amount.to_le_bytes()); // collateral_amount (u64)
-    
-    let redeem_accounts = vec![
-        AccountMeta::new(destination_collateral, false),              // 0: sourceCollateral (cSOL from liquidation)
-        AccountMeta::new(destination_liquidity, false),               // 1: destinationLiquidity (receive SOL)
-        AccountMeta::new(ctx.deposits[0].depositReserve, false), // 2: reserve
-        AccountMeta::new(withdraw_reserve_collateral_mint, false),    // 3: reserveCollateralMint
-        AccountMeta::new(withdraw_reserve_liquidity_supply, false),   // 4: reserveLiquiditySupply
-        AccountMeta::new_readonly(lending_market, false),             // 5: lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false),   // 6: lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),              // 7: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::clock::id(), false),        // 8: clockSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),           // 9: tokenProgram
-    ];
-    
-    let redeem_ix = Instruction {
-        program_id,
-        accounts: redeem_accounts,
-        data: redeem_data,
-    };
-    
-    // ============================================================================
-    // INSTRUCTION 4: Jupiter Swap (SOL -> USDC)
-    // ============================================================================
-    // CRITICAL: Jupiter returns a vector of instructions (Setup + Swap + Cleanup)
-    // We must include all of them in the transaction to handle ATAs correctly
-    let jupiter_swap_ixs = crate::jup::build_jupiter_swap_instruction(
-        &quote.quote,
-        &wallet_pubkey,
-        &config.jupiter_url,
-    )
-        .await
-    .context("Failed to build Jupiter swap instruction")?;
-    
-    // ============================================================================
-    // INSTRUCTION 5: FlashRepayReserveLiquidity (CRITICAL - Explicit Repayment Required!)
-    // ============================================================================
-    // CRITICAL: FlashLoan requires explicit repayment instruction - NOT automatic!
-    // Solend uses two-instruction pattern: FlashBorrow (tag 13) + FlashRepay (tag 14)
-    // 
-    // CRITICAL FIX: Use flashloan_fee_raw from quote instead of recalculating
-    // This ensures consistency between profit calculation and TX build
-    let flashloan_fee_amount = quote.flashloan_fee_raw;
-        
-    let repay_amount = flashloan_amount + flashloan_fee_amount;
-    
-    // FlashRepayReserveLiquidity instruction data:
-    // [14] (discriminator) + repay_amount (u64) + borrowed_amount (u64)
-    let mut repay_data = vec![crate::solend::get_flashrepay_discriminator()]; // tag 14
-    repay_data.extend_from_slice(&repay_amount.to_le_bytes()); // repay_amount (u64)
-    repay_data.extend_from_slice(&flashloan_amount.to_le_bytes()); // borrowed_amount (u64)
-    
-    // FlashRepayReserveLiquidity accounts per Solend IDL:
-    // CRITICAL: Account order must match Solend SDK exactly
-    // Reference: solend-sdk/src/instruction.rs - LendingInstruction::FlashRepayReserveLiquidity
-    // 
-    // Correct account order (8 accounts total):
-    // 0. [writable] sourceLiquidity - User's ATA (source of repayment funds)
-    // 1. [writable] destinationLiquidity - Reserve's liquidity supply (destination)
-    // 2. [writable] reserveLiquidityFeeReceiver - Reserve's fee receiver (usually supply)
-    // 3. [writable] reserve - Reserve account
-    // 4. [readonly] lendingMarket - Lending market account
-    // 5. [signer] transferAuthority - User wallet (signer)
-    // 6. [readonly] instructionsSysvar - Instructions sysvar
-    // 7. [readonly] tokenProgram - SPL Token program
-    
-    // Use supply as fee receiver (fees go back to pool)
-    let reserve_liquidity_fee_receiver = repay_reserve_liquidity_supply;
-    
-    let repay_accounts = vec![
-        AccountMeta::new(source_liquidity, false),              // 0: sourceLiquidity (user's ATA)
-        AccountMeta::new(repay_reserve_liquidity_supply, false), // 1: destinationLiquidity (reserve supply)
-        AccountMeta::new(reserve_liquidity_fee_receiver, false), // 2: reserveLiquidityFeeReceiver
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 3: reserve
-        AccountMeta::new_readonly(lending_market, false),       // 4: lendingMarket
-        AccountMeta::new_readonly(wallet_pubkey, true),         // 5: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::instructions::id(), false), // 6: instructionsSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // 7: tokenProgram
-    ];
-    
-    let repay_ix = Instruction {
-        program_id,
-        accounts: repay_accounts,
-        data: repay_data,
-    };
-    
-    // ============================================================================
-    // Compute Budget Instructions
-    // ============================================================================
-    let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
-        .map_err(|e| anyhow::anyhow!("Invalid compute budget program ID: {}", e))?;
-    
-    // Higher compute unit limit for flashloan transaction (~500k)
-    let mut compute_limit_data = vec![2u8]; // SetComputeUnitLimit discriminator
-    compute_limit_data.extend_from_slice(&(500_000u32).to_le_bytes());
-    let compute_budget_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_limit_data,
-    };
-    
-    // Priority fee
-    let mut compute_price_data = vec![3u8]; // SetComputeUnitPrice discriminator
-    compute_price_data.extend_from_slice(&(1_000u64).to_le_bytes()); // 0.001 SOL per CU
-    let priority_fee_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_price_data,
-    };
-    
-    // ============================================================================
-    // BUILD TRANSACTION
-    // ============================================================================
-    // All instructions in ONE transaction - atomicity guaranteed!
-    // CRITICAL: FlashLoan requires explicit repayment instruction (FlashRepayReserveLiquidity)
-    
-    // Build instruction list in correct order
-    let mut instructions = vec![
-        compute_budget_ix,        // Compute unit limit
-        priority_fee_ix,          // Priority fee
-        flashloan_ix,             // 1. FlashBorrow: Borrow USDC (flash)
-        liquidation_ix,           // 2. Liquidate: USDC -> cSOL
-        redeem_ix,                // 3. Redeem: cSOL -> SOL
-    ];
-    
-    // Add Jupiter instructions (Setup + Swap + Cleanup)
-    // CRITICAL: Must be inserted after Redeem (to have SOL) and before Repay (to have USDC)
-    instructions.extend(jupiter_swap_ixs);
-    
-    // Add Repay instruction
-    instructions.push(repay_ix); // 5. FlashRepay: Repay borrowed USDC + fee (EXPLICIT - REQUIRED!)
-    
-    let mut tx = Transaction::new_with_payer(
-        &instructions,
-        Some(&wallet_pubkey),
-    );
-    tx.message.recent_blockhash = blockhash;
-    
-    log::info!(
-        "Built atomic flashloan liquidation transaction for obligation {}:\n\
-         - FlashBorrow: {} USDC (flash)\n\
-         - Liquidate: {} debt tokens (USDC -> cSOL)\n\
-         - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
-         - Jupiter Swap: SOL -> USDC ({} instructions)\n\
-         - FlashRepay: {} USDC (borrowed: {} + fee: {}) (EXPLICIT - REQUIRED!)",
-        ctx.obligation_pubkey,
-        flashloan_amount,
-        quote.debt_to_repay_raw,
-        quote.collateral_to_seize_raw,
-        instructions.len() - 5, // Subtract other instructions
-        repay_amount,
-        flashloan_amount,
-        flashloan_fee_amount
-    );
-    
-    Ok(tx)
-}
+// Transaction building functions moved to liquidation_tx module:
+// - build_flashloan_liquidation_tx -> liquidation_tx::build_flashloan_liquidation_tx
+// - build_liquidation_tx1 -> deprecated (kept for reference)
+// - build_liquidation_tx2 -> deprecated (kept for reference)
+
+// Transaction building functions moved to liquidation_tx module
 
 /// Execute liquidation with swap using flashloan (atomic single transaction)
 /// 
