@@ -84,10 +84,28 @@ pub async fn validate_pyth_oracle(
         if is_pythnet_v3 { "v3" } else if is_pyth_v2 { "v2" } else { "env" }
     );
 
-    // 2. Route to correct parser based on program ID OR account size
-    // CRITICAL FIX: If account is large (>2000 bytes), it is almost certainly Pyth v3,
-    // regardless of the exact program ID match (which might be using a proxy or different ID).
-    // Pyth v2 accounts are small (~84 bytes).
+    // 🔴 CRITICAL FIX: Detect version from MAGIC NUMBER, not just owner
+    // Pyth v2 magic: 0xa1b2c3d4 (little-endian: d4 c3 b2 a1)
+    // This is the most reliable way to detect Pyth v2 vs v3
+    if oracle_account.data.len() >= 4 {
+        let magic_bytes = &oracle_account.data[0..4];
+        let magic = u32::from_le_bytes([magic_bytes[0], magic_bytes[1], magic_bytes[2], magic_bytes[3]]);
+        
+        // Pyth v2 magic number
+        const PYTH_V2_MAGIC: u32 = 0xa1b2c3d4;
+        
+        if magic == PYTH_V2_MAGIC {
+            log::debug!("✅ Detected Pyth v2 oracle (magic: 0x{:08x}) for {}", magic, oracle_pubkey);
+            return validate_pyth_oracle_v2(rpc, oracle_pubkey, current_slot).await;
+        } else {
+            log::debug!("✅ Detected Pyth v3 oracle (magic: 0x{:08x}) for {}", magic, oracle_pubkey);
+            return validate_pyth_oracle_v3(rpc, oracle_pubkey, current_slot).await;
+        }
+    }
+    
+    // Fallback: Route to correct parser based on program ID OR account size
+    // If account is large (>2000 bytes), it is almost certainly Pyth v3
+    // Pyth v2 accounts are small (~84 bytes)
     if is_pythnet_v3 || oracle_account.data.len() > 2000 {
         // Use Pythnet v3 parser (pyth-sdk-solana crate)
         log::debug!("✅ Detected Pythnet v3 oracle (via program ID or size > 2000) for {} - using v3 parser", oracle_pubkey);
@@ -106,15 +124,152 @@ pub async fn validate_pyth_oracle(
         return Ok((false, None));
     }
 
-    // Continue with v2 validation...
-    // NOTE: Full v2 validation code is very long (~600 lines)
-    // For now, we'll keep it in pipeline.rs and move it later
-    // This is a placeholder that calls the v2 validation logic
+    // Fallback: Try size-based detection
+    if account_size < 200 {
+        log::debug!("Using Pyth v2 parser (size={}) for {}", account_size, oracle_pubkey);
+        return validate_pyth_oracle_v2(rpc, oracle_pubkey, current_slot).await;
+    }
     
-    // For now, return error to indicate v2 needs to be implemented
-    // TODO: Move full v2 validation from pipeline.rs
-    log::warn!("Pyth v2 validation not yet moved to oracle module - using v3 parser as fallback");
-    validate_pyth_oracle_v3(rpc, oracle_pubkey, current_slot).await
+    Ok((false, None))
+}
+
+/// Validate Pyth v2 oracle (Legacy format - 84 bytes)
+/// 
+/// Pyth v2 layout:
+/// - 0-4: magic (0xa1b2c3d4)
+/// - 4-8: version
+/// - 8-12: type
+/// - 12-16: size
+/// - 16-20: price_type (0=unknown, 1=price)
+/// - 20-24: exponent (i32)
+/// - 24-32: price (i64)
+/// - 32-40: conf (u64)
+/// - 40-48: twap (i64)
+/// - 48-56: twac (u64)
+/// - 56-64: valid_slot (u64)
+/// - 64-72: publish_slot (u64)
+pub async fn validate_pyth_oracle_v2(
+    rpc: &Arc<RpcClient>,
+    oracle_pubkey: Pubkey,
+    current_slot: u64,
+) -> Result<(bool, Option<f64>)> {
+    let oracle_account = rpc
+        .get_account(&oracle_pubkey)
+        .map_err(|e| anyhow::anyhow!("Failed to get oracle account: {}", e))?;
+
+    if oracle_account.data.len() < 84 {
+        return Ok((false, None));
+    }
+    
+    // Pyth v2 layout:
+    // 0-4: magic (0xa1b2c3d4)
+    // 4-8: version
+    // 8-12: type
+    // 12-16: size
+    // 16-20: price_type (0=unknown, 1=price)
+    // 20-24: exponent (i32)
+    // 24-32: price (i64)
+    // 32-40: conf (u64)
+    // 40-48: twap (i64)
+    // 48-56: twac (u64)
+    // 56-64: valid_slot (u64)
+    // 64-72: publish_slot (u64)
+    
+    let price_type = oracle_account.data[16];
+    if price_type != PYTH_PRICE_STATUS_PRICE && price_type != PYTH_PRICE_STATUS_TRADING {
+        log::debug!(
+            "Pyth v2 oracle {}: Invalid price_type {} (expected {} or {})",
+            oracle_pubkey,
+            price_type,
+            PYTH_PRICE_STATUS_PRICE,
+            PYTH_PRICE_STATUS_TRADING
+        );
+        return Ok((false, None));
+    }
+    
+    // Parse exponent (i32 at offset 20-24)
+    let exp_bytes: [u8; 4] = oracle_account.data[20..24]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse exponent bytes"))?;
+    let exponent = i32::from_le_bytes(exp_bytes);
+    
+    // Parse price (i64 at offset 24-32)
+    let price_bytes: [u8; 8] = oracle_account.data[24..32]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse price bytes"))?;
+    let price_raw = i64::from_le_bytes(price_bytes);
+    
+    // Parse confidence (u64 at offset 32-40)
+    let conf_bytes: [u8; 8] = oracle_account.data[32..40]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse confidence bytes"))?;
+    let confidence = u64::from_le_bytes(conf_bytes);
+    
+    // Parse valid_slot (u64 at offset 56-64)
+    let valid_slot_bytes: [u8; 8] = oracle_account.data[56..64]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Failed to parse valid_slot bytes"))?;
+    let valid_slot = u64::from_le_bytes(valid_slot_bytes);
+    
+    // Check staleness
+    let (max_slot_diff, _, _, _, _, _, max_conf_pct, _) = get_oracle_config();
+    if current_slot.saturating_sub(valid_slot) > max_slot_diff {
+        log::debug!(
+            "Pyth v2 oracle {} stale: current={}, valid={}, diff={}",
+            oracle_pubkey,
+            current_slot,
+            valid_slot,
+            current_slot.saturating_sub(valid_slot)
+        );
+        return Ok((false, None));
+    }
+    
+    // Calculate price
+    let price = (price_raw as f64) * 10_f64.powi(exponent);
+    
+    if price <= 0.0 || !price.is_finite() {
+        log::debug!(
+            "Pyth v2 oracle {}: Invalid price {} (raw: {}, exp: {})",
+            oracle_pubkey,
+            price,
+            price_raw,
+            exponent
+        );
+        return Ok((false, None));
+    }
+    
+    // Check confidence
+    let conf_value = (confidence as f64) * 10_f64.powi(exponent);
+    let conf_pct = (conf_value / price.abs()) * 100.0;
+    
+    if conf_pct > max_conf_pct {
+        log::debug!(
+            "Pyth v2 oracle {} confidence too high: {:.2}% > {:.2}%",
+            oracle_pubkey,
+            conf_pct,
+            max_conf_pct
+        );
+        return Ok((false, None));
+    }
+    
+    // Check minimum price threshold
+    if price.abs() < min_valid_price_usd() {
+        log::debug!(
+            "Pyth v2 oracle {} price below minimum threshold: {} < {}",
+            oracle_pubkey,
+            price.abs(),
+            min_valid_price_usd()
+        );
+        return Ok((false, None));
+    }
+    
+    log::debug!(
+        "✅ Pyth v2 oracle validated: {} price=${:.6}, conf={:.2}%",
+        oracle_pubkey,
+        price,
+        conf_pct
+    );
+    Ok((true, Some(price)))
 }
 
 /// Validate Pythnet v3 oracle (current mainnet standard)

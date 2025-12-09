@@ -9,8 +9,27 @@ use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::solend::Reserve;
+
+/// Simple price cache entry (1 second TTL)
+struct CachedPrice {
+    price: f64,
+    timestamp: Instant,
+    has_pyth: bool,
+    has_switchboard: bool,
+}
+
+/// Global price cache (1 second TTL per oracle)
+static PRICE_CACHE: OnceLock<RwLock<HashMap<Pubkey, CachedPrice>>> = OnceLock::new();
+
+fn get_price_cache() -> &'static RwLock<HashMap<Pubkey, CachedPrice>> {
+    PRICE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 // Re-export for convenience (only export what's needed)
 // Note: Individual functions can be accessed via oracle::pyth::* or oracle::switchboard::*
@@ -33,6 +52,7 @@ pub use validation::validate_oracles_with_twap;
 
 /// Get price from reserve, trying Pyth first, then Switchboard
 /// Returns (price, has_pyth, has_switchboard)
+/// 🔴 CRITICAL FIX: Added 1 second cache to reduce RPC calls
 pub async fn get_reserve_price(
     rpc: &Arc<RpcClient>,
     reserve: &Reserve,
@@ -40,6 +60,26 @@ pub async fn get_reserve_price(
 ) -> Result<(Option<f64>, bool, bool)> {
     let pyth_pubkey = reserve.oracle_pubkey();
     let switchboard_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
+    
+    // Check cache first (1 second TTL)
+    let cache_key = if pyth_pubkey != Pubkey::default() {
+        pyth_pubkey
+    } else if switchboard_pubkey != Pubkey::default() {
+        switchboard_pubkey
+    } else {
+        // No oracle, can't cache
+        return Ok((None, false, false));
+    };
+    
+    {
+        let cache = get_price_cache().read().unwrap();
+        if let Some(cached) = cache.get(&cache_key) {
+            if cached.timestamp.elapsed() < Duration::from_secs(1) {
+                log::debug!("✅ Using cached oracle price for {}: ${:.2} (age: {:?})", cache_key, cached.price, cached.timestamp.elapsed());
+                return Ok((Some(cached.price), cached.has_pyth, cached.has_switchboard));
+            }
+        }
+    }
     
     // Try Pyth first if available
     if pyth_pubkey != Pubkey::default() {
@@ -56,6 +96,18 @@ pub async fn get_reserve_price(
                             false
                         };
                         log::debug!("✅ Pyth oracle validation succeeded for reserve {}: price=${:.2}", pyth_pubkey, price);
+                        
+                        // Cache the result
+                        {
+                            let mut cache = get_price_cache().write().unwrap();
+                            cache.insert(pyth_pubkey, CachedPrice {
+                                price,
+                                timestamp: Instant::now(),
+                                has_pyth: true,
+                                has_switchboard,
+                            });
+                        }
+                        
                         return Ok((Some(price), true, has_switchboard));
                     } else {
                         log::debug!("Pyth oracle {} validation returned valid=true but price=None, trying Switchboard", pyth_pubkey);
@@ -75,6 +127,18 @@ pub async fn get_reserve_price(
         match switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
             Ok(Some(switchboard_price)) => {
                 log::debug!("Using Switchboard price (Pyth not available or failed)");
+                
+                // Cache the result
+                {
+                    let mut cache = get_price_cache().write().unwrap();
+                    cache.insert(switchboard_pubkey, CachedPrice {
+                        price: switchboard_price,
+                        timestamp: Instant::now(),
+                        has_pyth: false,
+                        has_switchboard: true,
+                    });
+                }
+                
                 return Ok((Some(switchboard_price), false, true));
             }
             Ok(None) => {

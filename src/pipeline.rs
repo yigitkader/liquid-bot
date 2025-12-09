@@ -243,6 +243,16 @@ async fn process_cycle(
 
     log::debug!("Found {} accounts", accounts.len());
 
+    // 🔴 CRITICAL FIX: Get current slot for stale obligation check
+    let current_slot = rpc.get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+    
+    // Configurable max slot diff for stale obligations (default: 150 slots = ~60 seconds)
+    let max_obligation_slot_diff = std::env::var("MAX_OBLIGATION_SLOT_DIFF")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(150); // Default: 150 slots (~60 seconds at 400ms per slot)
+
     // 2. HF < 1.0 olanları bul
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data
     // ✅ FIXED: Use account type identification utility
@@ -259,6 +269,52 @@ async fn process_cycle(
                 // This looks like an Obligation - try to parse it
                 match Obligation::from_account_data(&acc.data) {
                     Ok(obligation) => {
+                        // 🔴 CRITICAL FIX: Skip obligations with zero borrow or zero deposit
+                        // These are inactive obligations that should not be considered for liquidation
+                        // This prevents false positives from stale/inactive obligations
+                        let borrowed_value = obligation.total_borrowed_value_usd();
+                        let deposited_value = obligation.total_deposited_value_usd();
+                        
+                        // Skip if no borrows (nothing to liquidate)
+                        if borrowed_value <= 0.0 {
+                            log::debug!(
+                                "Skipping obligation {}: zero borrow (borrowed=${:.2})",
+                                pk,
+                                borrowed_value
+                            );
+                            continue;
+                        }
+                        
+                        // Skip if no deposits (no collateral to liquidate)
+                        if deposited_value <= 0.0 {
+                            log::debug!(
+                                "Skipping obligation {}: zero deposit (deposited=${:.2})",
+                                pk,
+                                deposited_value
+                            );
+                            continue;
+                        }
+                        
+                        // 🔴 CRITICAL FIX: Skip stale obligations based on lastUpdate.slot
+                        // Stale obligations may have outdated health factor calculations
+                        if obligation.is_stale(current_slot, max_obligation_slot_diff) {
+                            if let Some(last_slot) = obligation.last_update_slot() {
+                                log::debug!(
+                                    "Skipping stale obligation {}: last_update_slot={}, current_slot={}, diff={}",
+                                    pk,
+                                    last_slot,
+                                    current_slot,
+                                    current_slot.saturating_sub(last_slot)
+                                );
+                            } else {
+                                log::debug!(
+                                    "Skipping obligation {}: cannot determine lastUpdate slot (assuming stale)",
+                                    pk
+                                );
+                            }
+                            continue;
+                        }
+                        
                         // Read health factor threshold from .env (no hardcoded values)
                         let hf_threshold = std::env::var("HF_LIQUIDATION_THRESHOLD")
                             .ok()
@@ -286,8 +342,8 @@ async fn process_cycle(
                                 "Found liquidatable obligation {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}",
                                 pk,
                                 obligation.health_factor(),
-                                obligation.total_deposited_value_usd(),
-                                obligation.total_borrowed_value_usd()
+                                deposited_value,
+                                borrowed_value
                             );
                             candidates.push((pk, obligation));
                         }
@@ -615,15 +671,15 @@ async fn process_cycle(
                         );
                     }
                     BundleStatus::Unknown => {
-                        if let Some(info) = self.bundles.get(&bundle_id) {
-                            expired_to_release.push((bundle_id.clone(), info.value_usd));
-                            log::warn!(
-                                "⏰ Releasing expired bundle {} (${:.2}) after {}s - unknown status",
-                                bundle_id,
-                                info.value_usd,
-                                expiry_timeout_secs
-                            );
-                        }
+                        // 🔴 CRITICAL FIX: Do NOT release Unknown status bundles
+                        // Unknown status means we couldn't determine the status, but the bundle
+                        // might still be pending. Releasing it would cause overcommit.
+                        // Only release bundles with explicit Failed/Dropped status.
+                        log::debug!(
+                            "Bundle {} has unknown status after {}s - keeping to avoid overcommit risk",
+                            bundle_id,
+                            expiry_timeout_secs
+                        );
                     }
                 }
             }
@@ -702,6 +758,27 @@ async fn process_cycle(
                 ctx.deposit_price_usd
             );
             metrics.skipped_oracle_fail += 1;
+            continue;
+        }
+
+        // 🔴 CRITICAL FIX: Skip dust positions (very small positions not worth liquidating)
+        // Configurable via MIN_POSITION_SIZE_USD (default: $10)
+        let min_position_size_usd = std::env::var("MIN_POSITION_SIZE_USD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(10.0); // Default: $10 minimum position size
+        
+        // Use total_deposited_value_usd() which is already in USD (WAD format, divided by 1e18)
+        let position_size_usd = ctx.obligation.total_deposited_value_usd();
+        
+        if position_size_usd < min_position_size_usd {
+            log::debug!(
+                "Skipping {}: Position size ${:.2} < min ${:.2} (dust position)",
+                obl_pubkey,
+                position_size_usd,
+                min_position_size_usd
+            );
+            metrics.skipped_insufficient_profit += 1; // Reuse this metric for dust positions
             continue;
         }
 
@@ -1032,87 +1109,105 @@ async fn build_liquidation_context(
     rpc: &Arc<RpcClient>,
     obligation: &Obligation,
 ) -> Result<LiquidationContext> {
-    // Load reserve accounts for borrow and deposit
+    // 🔴 CRITICAL FIX: Load reserve accounts in parallel for better performance
+    // This reduces latency when loading both borrow and deposit reserves
     let mut borrow_reserve = None;
     let mut deposit_reserve = None;
 
-    // Get first borrow reserve if exists
-    match obligation.borrows() {
-        Ok(borrows) => {
-            if !borrows.is_empty() {
-                let borrow_reserve_pubkey = borrows[0].borrowReserve;
-                match rpc.get_account_data(&borrow_reserve_pubkey) {
-                    Ok(account) => {
-                        match Reserve::from_account_data(&account) {
-                            Ok(reserve) => {
-                                let liquidity = reserve.liquidity();
-                                const WAD: f64 = 1_000_000_000_000_000_000.0;
-                                let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
-                                log::debug!(
-                                    "✅ Loaded borrow reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
-                                    borrow_reserve_pubkey,
-                                    reserve.liquidation_threshold() * 100.0,
-                                    reserve.liquidation_bonus() * 100.0,
-                                    reserve.close_factor() * 100.0,
-                                    market_price
-                                );
-                                borrow_reserve = Some(reserve);
-                            }
-                            Err(e) => {
-                                log::warn!("❌ Failed to parse borrow reserve {}: {}", borrow_reserve_pubkey, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("❌ Failed to load borrow reserve account {}: {}", borrow_reserve_pubkey, e);
-                    }
-                }
+    // Parse borrows and deposits first to get reserve pubkeys
+    let borrow_reserve_pubkey = obligation.borrows()
+        .ok()
+        .and_then(|borrows| borrows.first().map(|b| b.borrowReserve));
+    
+    let deposit_reserve_pubkey = obligation.deposits()
+        .ok()
+        .and_then(|deposits| deposits.first().map(|d| d.depositReserve));
+
+    // Load reserves in parallel using tokio::join!
+    let (borrow_result, deposit_result) = tokio::join!(
+        async {
+            if let Some(pubkey) = borrow_reserve_pubkey {
+                let rpc_clone = Arc::clone(rpc);
+                tokio::task::spawn_blocking(move || {
+                    rpc_clone.get_account_data(&pubkey)
+                        .and_then(|account| {
+                            Reserve::from_account_data(&account)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e)))
+                        })
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("RPC error: {}", e)))
+                }).await
             } else {
-                log::debug!("Obligation has no borrows");
+                Ok(None)
+            }
+        },
+        async {
+            if let Some(pubkey) = deposit_reserve_pubkey {
+                let rpc_clone = Arc::clone(rpc);
+                tokio::task::spawn_blocking(move || {
+                    rpc_clone.get_account_data(&pubkey)
+                        .and_then(|account| {
+                            Reserve::from_account_data(&account)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e)))
+                        })
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("RPC error: {}", e)))
+                }).await
+            } else {
+                Ok(None)
             }
         }
+    );
+
+    // Process borrow reserve result
+    match borrow_result {
+        Ok(Ok(Some(reserve))) => {
+            let liquidity = reserve.liquidity();
+            const WAD: f64 = 1_000_000_000_000_000_000.0;
+            let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
+            log::debug!(
+                "✅ Loaded borrow reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
+                borrow_reserve_pubkey.unwrap(),
+                reserve.liquidation_threshold() * 100.0,
+                reserve.liquidation_bonus() * 100.0,
+                reserve.close_factor() * 100.0,
+                market_price
+            );
+            borrow_reserve = Some(reserve);
+        }
+        Ok(Ok(None)) => {
+            log::debug!("Obligation has no borrows");
+        }
+        Ok(Err(e)) => {
+            log::warn!("❌ Failed to load/parse borrow reserve {}: {}", borrow_reserve_pubkey.unwrap(), e);
+        }
         Err(e) => {
-            log::warn!("❌ Failed to parse obligation borrows: {}", e);
+            log::warn!("❌ Task error loading borrow reserve: {}", e);
         }
     }
 
-    // Get first deposit reserve if exists
-    match obligation.deposits() {
-        Ok(deposits) => {
-            if !deposits.is_empty() {
-                let deposit_reserve_pubkey = deposits[0].depositReserve;
-                match rpc.get_account_data(&deposit_reserve_pubkey) {
-                    Ok(account) => {
-                        match Reserve::from_account_data(&account) {
-                            Ok(reserve) => {
-                                let liquidity = reserve.liquidity();
-                                const WAD: f64 = 1_000_000_000_000_000_000.0;
-                                let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
-                                log::debug!(
-                                    "✅ Loaded deposit reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
-                                    deposit_reserve_pubkey,
-                                    reserve.liquidation_threshold() * 100.0,
-                                    reserve.liquidation_bonus() * 100.0,
-                                    reserve.close_factor() * 100.0,
-                                    market_price
-                                );
-                                deposit_reserve = Some(reserve);
-                            }
-                            Err(e) => {
-                                log::warn!("❌ Failed to parse deposit reserve {}: {}", deposit_reserve_pubkey, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("❌ Failed to load deposit reserve account {}: {}", deposit_reserve_pubkey, e);
-                    }
-                }
-            } else {
-                log::debug!("Obligation has no deposits");
-            }
+    // Process deposit reserve result
+    match deposit_result {
+        Ok(Ok(Some(reserve))) => {
+            let liquidity = reserve.liquidity();
+            const WAD: f64 = 1_000_000_000_000_000_000.0;
+            let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
+            log::debug!(
+                "✅ Loaded deposit reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
+                deposit_reserve_pubkey.unwrap(),
+                reserve.liquidation_threshold() * 100.0,
+                reserve.liquidation_bonus() * 100.0,
+                reserve.close_factor() * 100.0,
+                market_price
+            );
+            deposit_reserve = Some(reserve);
+        }
+        Ok(Ok(None)) => {
+            log::debug!("Obligation has no deposits");
+        }
+        Ok(Err(e)) => {
+            log::warn!("❌ Failed to load/parse deposit reserve {}: {}", deposit_reserve_pubkey.unwrap(), e);
         }
         Err(e) => {
-            log::warn!("❌ Failed to parse obligation deposits: {}", e);
+            log::warn!("❌ Task error loading deposit reserve: {}", e);
         }
     }
 
