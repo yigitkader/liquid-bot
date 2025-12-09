@@ -730,6 +730,19 @@ pub fn get_flashrepay_discriminator() -> u8 {
     14u8
 }
 
+/// RefreshReserve instruction discriminator
+/// Must be called before RefreshObligation for reserves used by the obligation
+pub fn get_refresh_reserve_discriminator() -> u8 {
+    3u8
+}
+
+/// RefreshObligation instruction discriminator
+/// CRITICAL: Must be called before LiquidateObligation to update obligation values
+/// with current oracle prices and accrued interest
+pub fn get_refresh_obligation_discriminator() -> u8 {
+    7u8
+}
+
 // Helper implementation for Reserve
 impl Reserve {
     /// Parse reserve from account data using Borsh

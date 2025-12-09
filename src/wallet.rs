@@ -71,15 +71,19 @@ pub async fn get_wallet_balance(
     
     let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
     
-    let usdc_balance_raw = match rpc.get_token_account(&usdc_ata) {
+    // Get USDC balance with proper decimals handling
+    let (usdc_balance_raw, usdc_decimals) = match rpc.get_token_account(&usdc_ata) {
         Ok(Some(account)) => {
-            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+            let amount = account.token_amount.amount.parse::<u64>().unwrap_or(0);
+            let decimals = account.token_amount.decimals;
+            (amount, decimals)
         }
-        Ok(None) => 0,
-        Err(_) => 0,
+        Ok(None) => (0, 6), // Default to 6 decimals if account doesn't exist
+        Err(_) => (0, 6),
     };
     
-    let usdc_balance = usdc_balance_raw as f64 / 1_000_000.0;
+    let usdc_divisor = 10_u64.pow(usdc_decimals as u32) as f64;
+    let usdc_balance = usdc_balance_raw as f64 / usdc_divisor;
     let total_value_usd = sol_value_usd + usdc_balance;
     
     Ok(WalletBalance {

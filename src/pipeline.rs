@@ -335,29 +335,43 @@ async fn process_cycle(
                             continue;
                         }
                         
-                        // 🔴 CRITICAL FIX: Skip stale obligations based on lastUpdate.slot
-                        // Stale obligations may have outdated health factor calculations
-                        if obligation.is_stale(current_slot, max_obligation_slot_diff) {
+                        // 🔴 CRITICAL FIX: Do NOT skip obligations based on lastUpdate.slot!
+                        // Previously we were skipping 59,769 obligations as "stale" - this was wrong!
+                        // 
+                        // In Solend, lastUpdate.slot indicates when the obligation was last REFRESHED on-chain.
+                        // An obligation that hasn't been refreshed in 3 minutes is NOT invalid!
+                        // The stored values (borrowedValue, allowedBorrowValue) are still valid.
+                        //
+                        // The correct approach:
+                        // 1. Check if obligation LOOKS liquidatable based on stored values
+                        // 2. If yes, refresh the obligation before/during liquidation
+                        // 3. The RefreshObligation instruction will update values with latest interest
+                        //
+                        // We only skip if lastUpdate.stale == 1 (Solend's own stale flag)
+                        // This is different from our slot-based check!
+                        if obligation.lastUpdate.stale == 1 {
                             skipped_stale += 1;
-                            if let Some(last_slot) = obligation.last_update_slot() {
-                                if skipped_stale <= 3 {
-                                    log::debug!(
-                                        "Skipping stale obligation {}: last_update_slot={}, current_slot={}, diff={}",
-                                        pk,
-                                        last_slot,
-                                        current_slot,
-                                        current_slot.saturating_sub(last_slot)
-                                    );
-                                }
-                            } else {
-                                if skipped_stale <= 3 {
-                                    log::debug!(
-                                        "Skipping obligation {}: cannot determine lastUpdate slot (assuming stale)",
-                                        pk
-                                    );
-                                }
+                            if skipped_stale <= 3 {
+                                log::debug!(
+                                    "Skipping obligation {}: marked as stale by Solend (lastUpdate.stale=1)",
+                                    pk
+                                );
                             }
                             continue;
+                        }
+                        
+                        // Log if obligation hasn't been refreshed in a while (for debugging)
+                        // but don't skip it - it might still be liquidatable!
+                        if let Some(last_slot) = obligation.last_update_slot() {
+                            let slot_diff = current_slot.saturating_sub(last_slot);
+                            if slot_diff > max_obligation_slot_diff && skipped_stale == 0 {
+                                log::debug!(
+                                    "Obligation {} hasn't been refreshed in {} slots (~{:.0}s) - will still check HF",
+                                    pk,
+                                    slot_diff,
+                                    slot_diff as f64 * 0.4 // ~400ms per slot
+                                );
+                            }
                         }
                         
                         // Read health factor threshold from .env (no hardcoded values)

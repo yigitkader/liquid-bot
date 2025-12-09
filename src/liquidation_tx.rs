@@ -90,7 +90,71 @@ pub async fn build_flashloan_liquidation_tx(
     }
     
     // ============================================================================
-    // INSTRUCTION 1: FlashLoan (Solend native)
+    // INSTRUCTION 1: RefreshReserve (Borrow Reserve)
+    // ============================================================================
+    // CRITICAL: Must refresh reserves BEFORE RefreshObligation and LiquidateObligation
+    // This updates the reserve's accumulated interest and oracle prices
+    let borrow_pyth_oracle = borrow_reserve.oracle_pubkey();
+    let borrow_switchboard_oracle = borrow_reserve.liquidity().liquiditySwitchboardOracle;
+    
+    let refresh_borrow_reserve_accounts = vec![
+        AccountMeta::new(ctx.borrows[0].borrowReserve, false),    // reserve
+        AccountMeta::new_readonly(borrow_pyth_oracle, false),      // pythOracle
+        AccountMeta::new_readonly(borrow_switchboard_oracle, false), // switchboardOracle
+        AccountMeta::new_readonly(sysvar::clock::id(), false),     // clock
+    ];
+    
+    let refresh_borrow_reserve_ix = Instruction {
+        program_id,
+        accounts: refresh_borrow_reserve_accounts,
+        data: vec![crate::solend::get_refresh_reserve_discriminator()],
+    };
+    
+    // ============================================================================
+    // INSTRUCTION 2: RefreshReserve (Deposit Reserve)
+    // ============================================================================
+    let deposit_pyth_oracle = deposit_reserve.oracle_pubkey();
+    let deposit_switchboard_oracle = deposit_reserve.liquidity().liquiditySwitchboardOracle;
+    
+    let refresh_deposit_reserve_accounts = vec![
+        AccountMeta::new(ctx.deposits[0].depositReserve, false),   // reserve
+        AccountMeta::new_readonly(deposit_pyth_oracle, false),      // pythOracle
+        AccountMeta::new_readonly(deposit_switchboard_oracle, false), // switchboardOracle
+        AccountMeta::new_readonly(sysvar::clock::id(), false),      // clock
+    ];
+    
+    let refresh_deposit_reserve_ix = Instruction {
+        program_id,
+        accounts: refresh_deposit_reserve_accounts,
+        data: vec![crate::solend::get_refresh_reserve_discriminator()],
+    };
+    
+    // ============================================================================
+    // INSTRUCTION 3: RefreshObligation
+    // ============================================================================
+    // CRITICAL: Must be called after RefreshReserve and before LiquidateObligation
+    // This updates the obligation's borrowedValue, allowedBorrowValue with current prices/interest
+    let mut refresh_obligation_accounts = vec![
+        AccountMeta::new(ctx.obligation_pubkey, false),             // obligation
+        AccountMeta::new_readonly(sysvar::clock::id(), false),      // clock
+    ];
+    // Add all deposit reserves used by the obligation
+    for deposit in &ctx.deposits {
+        refresh_obligation_accounts.push(AccountMeta::new_readonly(deposit.depositReserve, false));
+    }
+    // Add all borrow reserves used by the obligation
+    for borrow in &ctx.borrows {
+        refresh_obligation_accounts.push(AccountMeta::new_readonly(borrow.borrowReserve, false));
+    }
+    
+    let refresh_obligation_ix = Instruction {
+        program_id,
+        accounts: refresh_obligation_accounts,
+        data: vec![crate::solend::get_refresh_obligation_discriminator()],
+    };
+    
+    // ============================================================================
+    // INSTRUCTION 4: FlashLoan (Solend native)
     // ============================================================================
     let flashloan_amount = quote.debt_to_repay_raw;
     
@@ -116,7 +180,7 @@ pub async fn build_flashloan_liquidation_tx(
     };
     
     // ============================================================================
-    // INSTRUCTION 2: LiquidateObligation
+    // INSTRUCTION 5: LiquidateObligation
     // ============================================================================
     let liquidity_amount = quote.debt_to_repay_raw;
     
@@ -217,8 +281,10 @@ pub async fn build_flashloan_liquidation_tx(
     let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
         .map_err(|e| anyhow::anyhow!("Invalid compute budget program ID: {}", e))?;
     
+    // Increased compute budget: RefreshReserve x2 + RefreshObligation + FlashLoan + Liquidate + Redeem + Jupiter + Repay
+    // Each instruction needs ~50-100k CU, Jupiter swap can need 200-400k CU
     let mut compute_limit_data = vec![2u8];
-    compute_limit_data.extend_from_slice(&(500_000u32).to_le_bytes());
+    compute_limit_data.extend_from_slice(&(800_000u32).to_le_bytes()); // Increased from 500k to 800k
     let compute_budget_ix = Instruction {
         program_id: compute_budget_program_id,
         accounts: vec![],
@@ -236,9 +302,22 @@ pub async fn build_flashloan_liquidation_tx(
     // ============================================================================
     // BUILD TRANSACTION
     // ============================================================================
+    // Order is CRITICAL:
+    // 1. Compute budget (first)
+    // 2. RefreshReserve (borrow) - update reserve with current oracle prices
+    // 3. RefreshReserve (deposit) - update reserve with current oracle prices  
+    // 4. RefreshObligation - update obligation with current values
+    // 5. FlashBorrow - borrow USDC
+    // 6. LiquidateObligation - repay debt, receive cTokens
+    // 7. RedeemReserveCollateral - convert cTokens to underlying
+    // 8. Jupiter Swap - swap collateral to USDC
+    // 9. FlashRepay - repay borrowed USDC + fee
     let mut instructions = vec![
         compute_budget_ix,
         priority_fee_ix,
+        refresh_borrow_reserve_ix,   // NEW: Refresh borrow reserve first
+        refresh_deposit_reserve_ix,  // NEW: Refresh deposit reserve
+        refresh_obligation_ix,       // NEW: Then refresh obligation
         flashloan_ix,
         liquidation_ix,
         redeem_ix,
@@ -255,16 +334,22 @@ pub async fn build_flashloan_liquidation_tx(
     
     log::info!(
         "Built atomic flashloan liquidation transaction for obligation {}:\n\
+         - RefreshReserve (borrow): {}\n\
+         - RefreshReserve (deposit): {}\n\
+         - RefreshObligation: {}\n\
          - FlashBorrow: {} USDC\n\
          - Liquidate: {} debt tokens\n\
          - Redeem: {} cTokens\n\
          - Jupiter Swap: {} instructions\n\
          - FlashRepay: {} USDC",
         ctx.obligation_pubkey,
+        ctx.borrows[0].borrowReserve,
+        ctx.deposits[0].depositReserve,
+        ctx.obligation_pubkey,
         flashloan_amount,
         quote.debt_to_repay_raw,
         quote.collateral_to_seize_raw,
-        instructions.len() - 5,
+        instructions.len() - 8, // Subtract fixed instructions
         repay_amount
     );
     

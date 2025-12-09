@@ -9,7 +9,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::jup::get_jupiter_quote_with_retry;
-use crate::oracle;
 use crate::pipeline::{Config, LiquidationContext, LiquidationQuote};
 
 const WAD: u128 = 1_000_000_000_000_000_000;
@@ -46,18 +45,19 @@ async fn get_solana_price_coingecko(client: &reqwest::Client) -> Result<f64> {
     Ok(json.solana.usd)
 }
 
-/// Get SOL price in USD from oracle (standalone version - no context required)
+/// Get SOL price in USD from HTTP APIs (standalone version - no context required)
 /// Returns SOL price if available, otherwise None
 /// 
-/// CRITICAL: This function tries multiple oracle sources in order:
-/// 1. Pyth primary feed (on-chain)
-/// 2. Pyth backup feed (if configured)
-/// 3. Switchboard feed (if configured)
-/// 4. Pyth Hermes API (HTTP)
-/// 5. CoinGecko API (HTTP)
-/// 6. Binance API (HTTP)
-/// 7. Jupiter Price API (HTTP)
-pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
+/// CRITICAL: This function tries multiple HTTP sources in order:
+/// 1. CoinGecko API (primary, reliable)
+/// 2. Pyth Hermes API (official Pyth HTTP endpoint)
+/// 3. Binance API (high volume exchange)
+/// 4. Jupiter Price API (Solana native)
+/// 
+/// NOTE: On-chain Pyth feeds are NOT used because they can return stale data.
+/// The feed H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG was returning $42.95
+/// instead of the actual ~$138 price as of Dec 2025.
+pub async fn get_sol_price_usd_standalone(_rpc: &Arc<RpcClient>) -> Option<f64> {
     log::debug!("🔍 Starting SOL price discovery from multiple oracle sources...");
     
     // 🔴 CRITICAL FIX: Default to HTTP price sources (CoinGecko, Binance, Jupiter)
@@ -69,110 +69,40 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
         .map(|v| v.to_lowercase() != "false") // Default true unless explicitly "false"
         .unwrap_or(true); // ✅ DEFAULT: true (use HTTP sources)
         
+    // HTTP client with 5s timeout (CoinGecko can be slow)
+    // 2s was too short and caused frequent failures
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_default();
         
+    // ==========================================================================
+    // SOL PRICE DISCOVERY - HTTP APIs ONLY (no stale on-chain feeds)
+    // ==========================================================================
+    // Priority order:
+    // 1. CoinGecko API (reliable, free)
+    // 2. Pyth Hermes API (official Pyth HTTP endpoint)
+    // 3. Binance API (high volume exchange)
+    // 4. Jupiter API (Solana native)
+    // 
+    // NOTE: On-chain Pyth feeds REMOVED from fallback chain because:
+    // - H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG returns stale $42.95
+    // - Pyth Core "Pull" model requires active price updates
+    // - HTTP APIs are more reliable for SOL/USD price
+    // ==========================================================================
+    
+    // Method 1: CoinGecko API (primary)
     if prefer_http_price {
         log::info!("🌐 Fetching SOL price from CoinGecko API...");
         if let Ok(price) = get_solana_price_coingecko(&client).await {
             log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
             return Some(price);
         }
-        log::warn!("⚠️  CoinGecko failed, trying other sources...");
+        log::debug!("⚠️  CoinGecko failed, trying Pyth Hermes...");
     }
     
-    // Method 1: Fetch from Pyth SOL/USD price feed (primary)
-    let sol_usd_pyth_feed_primary = {
-        let feed_str = env::var("SOL_USD_PYTH_FEED")
-            .unwrap_or_else(|_| "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG".to_string());
-        
-        match Pubkey::from_str(&feed_str) {
-            Ok(pk) => {
-                log::debug!("📡 Using primary Pyth feed: {}", pk);
-                pk
-            },
-            Err(_) => {
-                log::error!("Failed to parse primary Pyth SOL/USD feed address from SOL_USD_PYTH_FEED: {}", feed_str);
-                match Pubkey::from_str("H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG") {
-                    Ok(pk) => {
-                        log::debug!("📡 Using fallback Pyth feed: {}", pk);
-                        pk
-                    },
-                    Err(_) => {
-                        log::error!("❌ Failed to parse fallback Pyth feed address");
-                        return None;
-                    }
-                }
-            }
-        }
-    };
-    
-    let current_slot = rpc.get_slot().ok();
-    log::debug!("Current slot: {:?}", current_slot);
-    
-    // Try primary Pyth feed (fallback if HTTP sources fail)
-    if let Some(slot) = current_slot {
-        log::debug!("🔍 Attempting to get SOL price from primary Pyth feed: {} (slot: {})", sol_usd_pyth_feed_primary, slot);
-        match oracle::pyth::validate_pyth_oracle(rpc, sol_usd_pyth_feed_primary, slot).await {
-            Ok((true, Some(price))) => {
-                log::info!("✅ SOL price from primary Pyth feed: ${:.2} (feed: {})", price, sol_usd_pyth_feed_primary);
-                return Some(price);
-            }
-            Ok((false, _)) => {
-                log::debug!("⚠️  Primary Pyth feed validation failed (invalid or stale)");
-            }
-            Ok((true, None)) => {
-                log::debug!("⚠️  Primary Pyth feed validation passed but price is None");
-            }
-            Err(e) => {
-                log::debug!("❌ Primary Pyth feed error: {}", e);
-            }
-        }
-    } else {
-        log::warn!("⚠️  Cannot get current slot, skipping primary Pyth feed");
-    }
-    
-    // Method 2: Try backup Pyth feed if available
-    if let Ok(backup_feed_str) = env::var("SOL_USD_BACKUP_FEED") {
-        if let Ok(backup_feed) = Pubkey::from_str(&backup_feed_str) {
-            if let Some(slot) = current_slot {
-                match oracle::pyth::validate_pyth_oracle(rpc, backup_feed, slot).await {
-                    Ok((true, Some(price))) => {
-                        log::info!("✅ SOL price from backup Pyth feed: ${:.2}", price);
-                        return Some(price);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    
-    // Method 3: Try Switchboard feed
-    if let Ok(switchboard_feed_str) = env::var("SOL_USD_SWITCHBOARD_FEED") {
-        if let Ok(switchboard_feed) = Pubkey::from_str(&switchboard_feed_str) {
-            if let Some(slot) = current_slot {
-                match oracle::switchboard::validate_switchboard_oracle_by_pubkey(rpc, switchboard_feed, slot).await {
-                    Ok(Some(price)) => {
-                        log::info!("✅ SOL price from Switchboard feed: ${:.2}", price);
-                        return Some(price);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    
-    // Method 4: Try Pyth Hermes Price Service API
+    // Method 2: Pyth Hermes API (official Pyth HTTP endpoint - always fresh)
     const PYTH_HERMES_API: &str = "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-    
-    // Check if client is already initialized (from PREFER_HTTP_PRICE block)
-    // If not, use the local client logic, but we need to reconcile the variable names
-    // To avoid complex variable shadowing, we'll just create a new client for Hermes if needed
-    // or use the one we have if we can reference it properly.
-    // Given the previous block structure, 'client' variable exists from the PREFER_HTTP_PRICE block.
-    
     if let Ok(resp) = client.get(PYTH_HERMES_API).send().await {
         if resp.status().is_success() {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -193,17 +123,9 @@ pub async fn get_sol_price_usd_standalone(rpc: &Arc<RpcClient>) -> Option<f64> {
             }
         }
     }
-
-    // Method 5: Try reliable price APIs
-    // client is already available
+    log::debug!("⚠️  Pyth Hermes failed, trying Binance...");
     
-    // Method 5: CoinGecko API (fallback)
-    if let Ok(price) = get_solana_price_coingecko(&client).await {
-        log::info!("✅ SOL price from CoinGecko API: ${:.2}", price);
-        return Some(price);
-    }
-    
-    // Binance
+    // Method 3: Binance API
     const BINANCE_API: &str = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
     if let Ok(resp) = client.get(BINANCE_API).send().await {
         if resp.status().is_success() {
