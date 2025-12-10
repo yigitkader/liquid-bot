@@ -8,7 +8,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 #[allow(dead_code)]
-use crate::solend::Reserve;  // Only for deprecated functions
 
 // Helper functions for aligned buffer pool (shared with pipeline.rs)
 // These are used for Switchboard Oracle alignment fix
@@ -72,11 +71,11 @@ pub fn switchboard_program_id_v3() -> Result<Pubkey> {
 /// Returns Some(price) if Switchboard oracle exists and is valid, None otherwise
 pub async fn validate_switchboard_oracle_if_available(
     rpc: &Arc<RpcClient>,
-    reserve: &Reserve,
+    reserve: &crate::kamino::Reserve,
     current_slot: u64,
 ) -> Result<Option<f64>> {
-    // Use liquiditySwitchboardOracle (primary Switchboard oracle for liquidity pricing)
-    let switchboard_oracle_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
+    // Use Switchboard oracle from Kamino Reserve
+    let switchboard_oracle_pubkey = reserve.switchboard_oracle();
     if switchboard_oracle_pubkey == Pubkey::default() {
         // No Switchboard oracle configured for this reserve
         return Ok(None);

@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
-use crate::solend::Reserve;  // Only for deprecated functions
 
 /// Simple price cache entry (1 second TTL)
 struct CachedPrice {
@@ -50,7 +49,7 @@ pub enum OracleSource {
 }
 
 // Re-export validation functions for convenience
-pub use validation::validate_oracles_with_twap;
+// Oracle validation functions for Kamino Lend
 
 /// Get price from reserve - HERMES FIRST, then on-chain oracles
 /// Returns (price, has_pyth, has_switchboard)
@@ -61,12 +60,12 @@ pub use validation::validate_oracles_with_twap;
 /// 3. On-chain Switchboard
 pub async fn get_reserve_price(
     rpc: &Arc<RpcClient>,
-    reserve: &Reserve,
+    reserve: &crate::kamino::Reserve,
     current_slot: u64,
 ) -> Result<(Option<f64>, bool, bool)> {
-    let token_mint = reserve.liquidity().mintPubkey;
-    let pyth_pubkey = reserve.oracle_pubkey();
-    let switchboard_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
+    let token_mint = reserve.mint_pubkey();
+    let pyth_pubkey = reserve.pyth_oracle();
+    let switchboard_pubkey = reserve.switchboard_oracle();
     
     // Check cache first (1 second TTL)
     let cache_key = token_mint; // Use mint as cache key for consistency

@@ -62,6 +62,14 @@ impl JitoClient {
         }
     }
 
+    pub fn tip_account(&self) -> Pubkey {
+        self.tip_account
+    }
+
+    pub fn default_tip_amount(&self) -> u64 {
+        self.default_tip_amount
+    }
+
     /// Get tip accounts dynamically from Jito Block Engine API
     /// This is the recommended way to get tip accounts - they can change over time
     /// Returns a list of tip account addresses that are currently active
@@ -226,14 +234,6 @@ impl JitoClient {
         Ok(())
     }
 
-    pub fn tip_account(&self) -> &Pubkey {
-        &self.tip_account
-    }
-
-    pub fn default_tip_amount(&self) -> u64 {
-        self.default_tip_amount
-    }
-
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -353,7 +353,7 @@ pub async fn send_jito_bundle(
     blockhash: Hash,
 ) -> Result<String> {
     let mut bundle = JitoBundle::new(
-        *jito_client.tip_account(),
+        jito_client.tip_account(),
         jito_client.default_tip_amount(),
     );
 

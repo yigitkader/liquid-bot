@@ -387,29 +387,6 @@ impl Obligation {
             .map_err(|e| anyhow::anyhow!("Failed to parse Kamino Obligation: {}", e))
     }
     
-    /// Calculate health factor
-    /// Health Factor = allowed_borrow_value / borrow_factor_adjusted_debt_value
-    pub fn health_factor(&self) -> f64 {
-        let allowed = self.allowed_borrow_value_sf as f64 / SCALE_FACTOR as f64;
-        let debt = self.borrow_factor_adjusted_debt_value_sf as f64 / SCALE_FACTOR as f64;
-        
-        if debt == 0.0 {
-            return f64::MAX; // No debt = infinite health
-        }
-        
-        allowed / debt
-    }
-    
-    /// Get total deposited value in USD
-    pub fn deposited_value_usd(&self) -> f64 {
-        self.deposited_value_sf as f64 / SCALE_FACTOR as f64
-    }
-    
-    /// Get total borrowed value in USD
-    pub fn borrowed_value_usd(&self) -> f64 {
-        self.borrowed_assets_market_value_sf as f64 / SCALE_FACTOR as f64
-    }
-    
     /// Check if obligation has any debt
     pub fn has_any_debt(&self) -> bool {
         self.has_debt != 0 || self.borrow_factor_adjusted_debt_value_sf > 0
@@ -434,9 +411,9 @@ impl Obligation {
             .count()
     }
     
-    /// Check if obligation is stale
-    pub fn is_stale(&self) -> bool {
-        self.last_update.stale != 0
+    /// Get obligation owner (helper method, trait uses this)
+    pub fn get_owner(&self) -> Pubkey {
+        self.owner
     }
 }
 
@@ -446,19 +423,26 @@ impl Obligation {
 
 impl crate::lending_trait::LendingObligation for Obligation {
     fn borrowed_value_usd(&self) -> f64 {
-        self.borrowed_value_usd()
+        self.borrowed_assets_market_value_sf as f64 / SCALE_FACTOR as f64
     }
     
     fn deposited_value_usd(&self) -> f64 {
-        self.deposited_value_usd()
+        self.deposited_value_sf as f64 / SCALE_FACTOR as f64
     }
     
     fn allowed_borrow_value_usd(&self) -> f64 {
-        self.allowed_borrow_value_usd()
+        self.allowed_borrow_value_sf as f64 / SCALE_FACTOR as f64
     }
     
     fn health_factor(&self) -> f64 {
-        self.health_factor()
+        let allowed = self.allowed_borrow_value_sf as f64 / SCALE_FACTOR as f64;
+        let debt = self.borrow_factor_adjusted_debt_value_sf as f64 / SCALE_FACTOR as f64;
+        
+        if debt == 0.0 {
+            return f64::MAX; // No debt = infinite health
+        }
+        
+        allowed / debt
     }
     
     fn owner(&self) -> Pubkey {
@@ -470,15 +454,15 @@ impl crate::lending_trait::LendingObligation for Obligation {
     }
     
     fn has_any_debt(&self) -> bool {
-        self.has_any_debt()
+        self.has_debt != 0 || self.borrow_factor_adjusted_debt_value_sf > 0
     }
     
     fn has_any_deposits(&self) -> bool {
-        self.has_any_deposits()
+        self.deposited_value_sf > 0
     }
     
     fn is_stale(&self) -> bool {
-        self.is_stale()
+        self.last_update.stale != 0
     }
 }
 
@@ -728,83 +712,6 @@ pub fn get_flash_repay_discriminator() -> Vec<u8> {
 // =============================================================================
 // HELPER FUNCTIONS
 // =============================================================================
+// Helper functions are defined in the first impl Reserve block above
 
-impl Reserve {
-    /// Get mint pubkey from reserve
-    pub fn mint_pubkey(&self) -> Pubkey {
-        self.liquidity.mint_pubkey
-    }
-    
-    /// Get mint decimals from reserve
-    pub fn mint_decimals(&self) -> u8 {
-        self.liquidity.mint_decimals as u8
-    }
-    
-    /// Get collateral mint pubkey
-    pub fn collateral_mint_pubkey(&self) -> Pubkey {
-        self.collateral.mint_pubkey
-    }
-    
-    /// Get Pyth oracle pubkey
-    pub fn pyth_oracle(&self) -> Pubkey {
-        self.config.oracle_config.pyth_config.price
-    }
-    
-    /// Get Switchboard oracle pubkey
-    pub fn switchboard_oracle(&self) -> Pubkey {
-        self.config.oracle_config.switchboard_config.price_aggregator
-    }
-    
-    /// Get market price in USD (from market_price_sf)
-    pub fn market_price_usd(&self) -> f64 {
-        (self.liquidity.market_price_sf as f64) / (SCALE_FACTOR as f64)
-    }
-    
-    /// Get LTV percentage
-    pub fn ltv_pct(&self) -> u16 {
-        self.config.loan_to_value_pct
-    }
-    
-    /// Get liquidation threshold percentage
-    pub fn liquidation_threshold_pct(&self) -> u16 {
-        self.config.liquidation_threshold_pct
-    }
-    
-    /// Get liquidation bonus in basis points
-    pub fn liquidation_bonus_bps(&self) -> u16 {
-        self.config.liquidation_bonus_bps
-    }
-    
-    /// Get close factor (0.0 to 1.0)
-    pub fn close_factor(&self) -> f64 {
-        // Kamino uses protocol-level close factor, default to 50%
-        // TODO: Get from LendingMarket config
-        0.5
-    }
-}
-
-impl Obligation {
-    /// Get total deposited value in USD
-    pub fn deposited_value_usd(&self) -> f64 {
-        (self.deposited_value_sf as f64) / (SCALE_FACTOR as f64)
-    }
-    
-    /// Get total borrowed value in USD
-    pub fn borrowed_value_usd(&self) -> f64 {
-        (self.borrowed_assets_market_value_sf as f64) / (SCALE_FACTOR as f64)
-    }
-    
-    /// Get allowed borrow value in USD
-    pub fn allowed_borrow_value_usd(&self) -> f64 {
-        (self.allowed_borrow_value_sf as f64) / (SCALE_FACTOR as f64)
-    }
-    
-    /// Calculate health factor
-    pub fn health_factor(&self) -> f64 {
-        if self.borrowed_assets_market_value_sf == 0 {
-            return f64::INFINITY;
-        }
-        (self.deposited_value_sf as f64) / (self.borrowed_assets_market_value_sf as f64)
-    }
-}
 

@@ -1,10 +1,10 @@
 // Common trait for lending protocol obligations
-// This allows us to write generic code that works with both Solend and Kamino
+// This allows us to write generic code for Kamino Lend
 
 use solana_sdk::pubkey::Pubkey;
 
 /// Trait for lending protocol obligations
-/// Implemented by both Solend and Kamino obligations
+/// Implemented by Kamino Lend obligations
 pub trait LendingObligation {
     /// Get total borrowed value in USD
     fn borrowed_value_usd(&self) -> f64;

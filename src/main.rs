@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-mod solend;  // Legacy Solend protocol (kept only for deprecated functions)
 mod kamino;  // Kamino Lend support
 mod lending_trait;  // Common trait for lending protocols
 mod pipeline;
@@ -110,10 +108,6 @@ async fn main() -> Result<()> {
         .await
         .context("Mainnet connection validation failed - this bot only supports mainnet production")?;
     
-    validate_solend_layouts(&rpc)
-        .await
-        .context("Solend layout validation failed - please rebuild the bot")?;
-
     // Initialize Pyth Hermes feed discovery (pre-warm cache)
     // This dynamically discovers correct feed IDs from Pyth Hermes API
     // No more hardcoded/stale feed addresses
@@ -210,220 +204,6 @@ async fn validate_mainnet_connection(rpc: &Arc<RpcClient>) -> Result<()> {
     }
 }
 
-/// Runtime layout validation per Structure.md section 11.6
-async fn validate_solend_layouts(rpc: &Arc<RpcClient>) -> Result<()> {
-    let program_id = solend::solend_program_id()?;
-
-    // Get a few sample accounts to validate sizes
-    let accounts = rpc
-        .get_program_accounts(&program_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
-
-    if accounts.is_empty() {
-        log::warn!("No Solend accounts found - skipping layout validation");
-        return Ok(());
-    }
-
-    // Check first few accounts for size validation
-    // Expected sizes (from Solend SDK constants, approximate):
-    // OBLIGATION_SIZE ~ 1300 bytes
-    // RESERVE_SIZE ~ 600 bytes
-    // LENDING_MARKET_SIZE ~ 300 bytes
-
-    log::info!("🔍 Validating Solend layouts from {} accounts...", accounts.len());
-
-    let mut obligation_count = 0;
-    let mut reserve_count = 0;
-    let mut lending_market_count = 0;
-    let mut unknown_count = 0;
-
-    for (pubkey, account) in accounts.iter().take(20) {
-        let size = account.data.len();
-        let account_type = if size > 1000 {
-            "Obligation"
-        } else if size > 500 {
-            "Reserve"
-        } else if size > 200 {
-            "LendingMarket"
-        } else {
-            "Unknown"
-        };
-
-        log::debug!(
-            "Account {}: size={} bytes, type={} (estimated)",
-            pubkey,
-            size,
-            account_type
-        );
-
-        // ✅ FIXED: Use account type identification utility
-        match solend::identify_solend_account_type(&account.data) {
-            solend::SolendAccountType::Obligation => {
-                obligation_count += 1;
-                log::debug!("  Attempting to parse as Obligation...");
-                
-                // Log first few bytes for debugging
-                let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
-                let hex_preview = preview_bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                log::debug!("  First 32 bytes (hex): {}", hex_preview);
-                
-                // Try to parse as Obligation to validate
-                match solend::Obligation::from_account_data(&account.data) {
-                    Ok(obligation) => {
-                    log::debug!(
-                        "  ✅ Successfully parsed Obligation: version={}, owner={}, depositsLen={}, borrowsLen={}",
-                        obligation.version,
-                        obligation.owner,
-                        obligation.depositsLen,
-                        obligation.borrowsLen
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "  ❌ Failed to parse Obligation account {}: {}",
-                        pubkey,
-                        e
-                    );
-                    log::error!(
-                        "  Account details: size={} bytes, owner={}, lamports={}",
-                        size,
-                        account.owner,
-                        account.lamports
-                    );
-                    log::error!(
-                        "  First 64 bytes (hex): {}",
-                        account.data.iter()
-                            .take(64)
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                    
-                    // Try to read version byte if possible
-                    if account.data.len() > 0 {
-                        let version_byte = account.data[0];
-                        log::error!("  First byte (version?): {} (0x{:02x})", version_byte, version_byte);
-                    }
-                    
-                    return Err(anyhow::anyhow!(
-                        "Solend account size mismatch. Found account {} with size {} bytes that doesn't match expected Obligation layout.\n\
-                         Error: {}\n\
-                         Layout değişmiş olabilir; lütfen idl JSON'larını güncelle ve botu yeniden build et.\n\
-                         \n\
-                         Debug info:\n\
-                         - Account pubkey: {}\n\
-                         - Account size: {} bytes\n\
-                         - Account owner: {}\n\
-                         - First 32 bytes: {}",
-                        pubkey,
-                        size,
-                        e,
-                        pubkey,
-                        size,
-                        account.owner,
-                        hex_preview
-                    ));
-                    }
-                }
-            }
-            solend::SolendAccountType::Reserve => {
-                reserve_count += 1;
-                log::debug!("  🔍 Attempting to parse as Reserve...");
-                
-                // Log first few bytes for debugging
-                let preview_bytes = account.data.iter().take(32).collect::<Vec<_>>();
-                let hex_preview = preview_bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                log::debug!("  First 32 bytes (hex): {}", hex_preview);
-                
-                // Try to parse as Reserve to validate
-                match solend::Reserve::from_account_data(&account.data) {
-                    Ok(reserve) => {
-                        log::debug!(
-                            "  ✅ Successfully parsed Reserve: version={}, liquidityMint={}, collateralMint={}, lendingMarket={}",
-                            reserve.version,
-                            reserve.liquidityMintPubkey,
-                            reserve.collateralMintPubkey,
-                            reserve.lendingMarket
-                        );
-                        log::debug!(
-                            "  Reserve details: liquidityDecimals={}, availableAmount={}, borrowedAmountWads={}",
-                            reserve.liquidityMintDecimals,
-                            reserve.liquidityAvailableAmount,
-                            reserve.liquidityBorrowedAmountWads
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "  ⚠️  Failed to parse Reserve account {}: {}",
-                            pubkey,
-                            e
-                        );
-                        log::warn!(
-                            "  Account details: size={} bytes, owner={}, lamports={}",
-                            size,
-                            account.owner,
-                            account.lamports
-                        );
-                        log::warn!(
-                            "  First 64 bytes (hex): {}",
-                            account.data.iter()
-                                .take(64)
-                                .map(|b| format!("{:02x}", b))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
-                        
-                        // Try to read version byte if possible
-                        if account.data.len() > 0 {
-                            let version_byte = account.data[0];
-                            log::warn!("  First byte (version?): {} (0x{:02x})", version_byte, version_byte);
-                        }
-                        // Don't fail validation if Reserve parsing fails - just log warning
-                    }
-                }
-            }
-            solend::SolendAccountType::LendingMarket => {
-                lending_market_count += 1;
-                log::debug!("  ⏭️  Skipping LendingMarket account (not needed for validation)");
-                // Skip LendingMarket accounts in validation
-            }
-            solend::SolendAccountType::Unknown => {
-                unknown_count += 1;
-                log::debug!("  ⏭️  Skipping unknown account type");
-                // Skip unknown account types
-            }
-        }
-    }
-
-    log::info!(
-        "📊 Layout validation summary: {} obligations, {} reserves, {} lending markets, {} unknown",
-        obligation_count,
-        reserve_count,
-        lending_market_count,
-        unknown_count
-    );
-
-    if obligation_count == 0 && reserve_count == 0 {
-        log::warn!("⚠️  Could not identify Solend account types - layout validation skipped");
-        log::warn!("   This may indicate that Solend program accounts are not accessible or layout has changed significantly");
-    } else {
-        log::info!(
-            "✅ Solend layout validation passed (found {} obligations, {} reserves)",
-            obligation_count,
-            reserve_count
-        );
-    }
-
-    Ok(())
-}
 
 /// Startup safety checks per Structure.md section 6.3
 /// All values are automatically discovered from chain - no hardcoded addresses
@@ -476,21 +256,10 @@ async fn validate_wallet_balances(
 
     log::info!("✅ SOL balance sufficient: {:.9} SOL (~${:.2} USD)", sol_balance_sol, sol_balance_usd);
 
-    // Automatically discover USDC mint from chain (Solend reserves)
-    // This is chain-based discovery, not hardcoded
-    log::info!("🔍 Discovering USDC mint from Solend reserves...");
-    let program_id = solend::solend_program_id()?;
-    log::info!("   Solend program ID: {}", program_id);
-    
-    // CRITICAL: Verify we're using the correct Solend program
-    if solend::is_valid_solend_program(&program_id) {
-        log::info!("   ✅ Program ID verified as known Solend program");
-    } else {
-        log::warn!("   ⚠️  Program ID not in known Solend programs list - proceed with caution");
-    }
-    
-    let usdc_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)
-        .context("Failed to discover USDC mint from chain")?;
+    // USDC mint (hardcoded - standard mainnet USDC)
+    log::info!("🔍 Using standard USDC mint...");
+    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        .context("Invalid hardcoded USDC mint")?;
     
     log::info!("✅ USDC mint discovered from chain: {}", usdc_mint);
     
@@ -551,8 +320,7 @@ async fn validate_wallet_balances(
 /// Ensure all required ATAs exist at startup
 /// This prevents transaction failures during liquidation
 /// 
-/// CRITICAL: Creates ATAs for all token mints used in Solend reserves
-/// (both debt tokens and collateral tokens)
+/// CRITICAL: Creates ATAs for essential tokens (USDC, WSOL)
 async fn ensure_required_atas_exist(
     rpc: &Arc<RpcClient>,
     wallet_pubkey: &Pubkey,
@@ -577,40 +345,10 @@ async fn ensure_required_atas_exist(
         
     let mut token_mints = std::collections::HashSet::new();
     
-    if skip_scan {
-        log::info!("🚀 Startup optimization: Skipping full ATA check (SKIP_STARTUP_SCAN=true)");
-        log::info!("   Only checking essential ATAs (Quote Token + WSOL)");
-        // We will add essential mints later
-    } else {
-        // Get all Solend reserves to discover token mints
-        let program_id = solend::solend_program_id()?;
-        log::info!("   Scanning all reserves for token mints (this may take a while)...");
-        let accounts = rpc
-            .get_program_accounts(&program_id)
-            .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
-        
-        // Collect all unique token mints from reserves
-        let mut reserve_parse_success = 0;
-        
-        for (_pubkey, account) in accounts {
-            let account_size = account.data.len();
-            if account_size < 400 || account_size > 1500 { continue; }
-            
-            match solend::Reserve::from_account_data(&account.data) {
-                Ok(reserve) => {
-                    reserve_parse_success += 1;
-                    token_mints.insert(reserve.liquidity().mintPubkey);
-                }
-                Err(_) => {}
-            }
-        }
-        log::info!("Found {} unique token mints in {} reserves", token_mints.len(), reserve_parse_success);
-    }
-    
-    // Always add required mints (Quote Token + WSOL)
-    let program_id = solend::solend_program_id()?;
-    let quote_mint = solend::find_usdc_mint_from_reserves(rpc, &program_id)?;
-    token_mints.insert(quote_mint);
+    // Always add required mints (USDC + WSOL)
+    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        .context("Invalid hardcoded USDC mint")?;
+    token_mints.insert(usdc_mint);
     
     let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
     token_mints.insert(wsol_mint);

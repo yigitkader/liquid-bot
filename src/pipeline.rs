@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::jup::JupiterQuote;
-// Kamino Lend support (replaces legacy Solend)
+// Kamino Lend support
 use crate::kamino::{
     Obligation as KaminoObligation,
     Reserve as KaminoReserve,
@@ -26,7 +26,7 @@ use crate::kamino::{
 // Common trait for lending protocols
 use crate::lending_trait::LendingObligation;
 use crate::utils::{send_jito_bundle, JitoClient};
-use crate::oracle::{self, validate_oracles_with_twap};
+use crate::oracle;
 use crate::liquidation_tx::build_flashloan_liquidation_tx;
 use crate::quotes::get_liquidation_quote;
 use crate::wallet::{log_wallet_balances, get_wallet_value_usd};
@@ -255,9 +255,9 @@ async fn process_cycle(
     config: &Config,
     jito_client: &JitoClient,
 ) -> Result<()> {
-    // 1. Solend obligation account'larını çek
-    // NOTE: This RPC call fetches 300K+ accounts and can take 30-90 seconds
-    log::info!("📡 Fetching Solend accounts from RPC (this may take 30-90 seconds for 300K+ accounts)...");
+    // 1. Kamino Lend obligation account'larını çek
+    // NOTE: This RPC call fetches accounts and can take 30-90 seconds
+    log::info!("📡 Fetching Kamino Lend accounts from RPC (this may take 30-90 seconds)...");
     let fetch_start = std::time::Instant::now();
     let rpc_clone = Arc::clone(rpc);
     let program_id_clone = *program_id;
@@ -1219,7 +1219,7 @@ async fn validate_jito_endpoint(jito_client: &JitoClient) -> Result<()> {
 }
 
 /// Liquidation context per Structure.md section 9
-/// Kamino Lend protocol only (Solend removed - legacy/abandoned)
+/// Kamino Lend protocol only
 pub struct LiquidationContext {
     pub obligation_pubkey: Pubkey,
     pub obligation: KaminoObligation,
@@ -1272,7 +1272,7 @@ async fn build_kamino_liquidation_context(
     // Load reserve accounts in parallel for better performance
     let mut borrow_reserve = None;
     let mut deposit_reserve = None;
-    
+
     // Get active borrows and deposits from Kamino obligation
     let active_borrows: Vec<KaminoObligationLiquidity> = obligation.borrows.iter()
         .filter(|b| b.borrowed_amount_sf > 0)
@@ -1294,7 +1294,7 @@ async fn build_kamino_liquidation_context(
     if borrow_reserve_pubkey.is_none() && deposit_reserve_pubkey.is_none() {
         return Err(anyhow::anyhow!("Kamino obligation has no active borrows or deposits"));
     }
-    
+
     // Load reserves in parallel
     log::debug!("  🔄 Loading Kamino reserves in parallel (borrow: {:?}, deposit: {:?})", 
                 borrow_reserve_pubkey, deposit_reserve_pubkey);
@@ -1339,7 +1339,7 @@ async fn build_kamino_liquidation_context(
     
     let reserve_load_duration = reserve_load_start.elapsed();
     log::debug!("  ⏱️  Reserve loading completed in {:?}", reserve_load_duration);
-    
+
     // Process borrow reserve result
     match borrow_result {
         Ok(Ok(Some(reserve))) => {
@@ -1364,7 +1364,7 @@ async fn build_kamino_liquidation_context(
             log::warn!("❌ Task error loading borrow reserve: {}", e);
         }
     }
-    
+
     // Process deposit reserve result
     match deposit_result {
         Ok(Ok(Some(reserve))) => {
@@ -1389,7 +1389,7 @@ async fn build_kamino_liquidation_context(
             log::warn!("❌ Task error loading deposit reserve: {}", e);
         }
     }
-    
+
     // Use active borrows and deposits directly
     let borrows = active_borrows;
     let deposits = active_deposits;
@@ -1404,7 +1404,7 @@ async fn build_kamino_liquidation_context(
         &deposit_reserve,
         current_slot,
     ).await?;
-    
+
     Ok(LiquidationContext {
         obligation_pubkey: Pubkey::default(), // Will be set correctly by caller
         obligation: obligation.clone(),
@@ -1449,175 +1449,7 @@ async fn validate_kamino_oracles(
     Ok((all_ok, borrow_price, deposit_price))
 }
 
-/// Build liquidation context for Solend (REMOVED - legacy protocol)
-#[allow(dead_code)]
-async fn _build_solend_liquidation_context_removed(
-    rpc: &Arc<RpcClient>,
-    obligation: &SolendObligation,
-) -> Result<LiquidationContext> {
-    // 🔴 CRITICAL FIX: Load reserve accounts in parallel for better performance
-    // This reduces latency when loading both borrow and deposit reserves
-    let mut borrow_reserve = None;
-    let mut deposit_reserve = None;
-
-    // Parse borrows and deposits first to get reserve pubkeys
-    log::debug!("🔍 Building liquidation context for obligation: owner={}, depositsLen={}, borrowsLen={}", 
-                obligation.owner, obligation.depositsLen, obligation.borrowsLen);
-    
-    let borrow_reserve_pubkey = obligation.borrows()
-        .ok()
-        .and_then(|borrows| {
-            log::debug!("  📊 Parsed {} borrows from obligation", borrows.len());
-            if let Some(first_borrow) = borrows.first() {
-                log::debug!("  🔍 First borrow reserve: {}", first_borrow.borrowReserve);
-                Some(first_borrow.borrowReserve)
-            } else {
-                log::debug!("  ⚠️  No borrows found in obligation");
-                None
-            }
-        });
-    
-    let deposit_reserve_pubkey = obligation.deposits()
-        .ok()
-        .and_then(|deposits| {
-            log::debug!("  📊 Parsed {} deposits from obligation", deposits.len());
-            if let Some(first_deposit) = deposits.first() {
-                log::debug!("  🔍 First deposit reserve: {}", first_deposit.depositReserve);
-                Some(first_deposit.depositReserve)
-            } else {
-                log::debug!("  ⚠️  No deposits found in obligation");
-                None
-            }
-        });
-    
-    if borrow_reserve_pubkey.is_none() && deposit_reserve_pubkey.is_none() {
-        log::warn!("⚠️  Obligation has neither borrows nor deposits - cannot liquidate");
-        return Err(anyhow::anyhow!("Obligation has no borrows or deposits"));
-    }
-
-    // Load reserves in parallel using tokio::join!
-    log::debug!("  🔄 Loading reserves in parallel (borrow: {:?}, deposit: {:?})", 
-                borrow_reserve_pubkey, deposit_reserve_pubkey);
-    let reserve_load_start = std::time::Instant::now();
-    
-    let (borrow_result, deposit_result) = tokio::join!(
-        async {
-            if let Some(pubkey) = borrow_reserve_pubkey {
-                log::debug!("  📥 Loading borrow reserve: {}", pubkey);
-                let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || -> Result<Option<SolendReserve>, solana_client::client_error::ClientError> {
-                    let account_data = rpc_clone.get_account_data(&pubkey)?;
-                    log::debug!("  📊 Borrow reserve account data retrieved: {} bytes", account_data.len());
-                    let reserve = SolendReserve::from_account_data(&account_data)
-                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
-                    log::debug!("  ✅ Borrow reserve parsed successfully: version={}, mint={}", 
-                                reserve.version, reserve.liquidityMintPubkey);
-                    Ok(Some(reserve))
-                }).await
-                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
-            } else {
-                log::debug!("  ⏭️  No borrow reserve to load");
-                Ok(Ok(None))
-            }
-        },
-        async {
-            if let Some(pubkey) = deposit_reserve_pubkey {
-                log::debug!("  📥 Loading deposit reserve: {}", pubkey);
-                let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || -> Result<Option<SolendReserve>, solana_client::client_error::ClientError> {
-                    let account_data = rpc_clone.get_account_data(&pubkey)?;
-                    log::debug!("  📊 Deposit reserve account data retrieved: {} bytes", account_data.len());
-                    let reserve = SolendReserve::from_account_data(&account_data)
-                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
-                    log::debug!("  ✅ Deposit reserve parsed successfully: version={}, mint={}", 
-                                reserve.version, reserve.liquidityMintPubkey);
-                    Ok(Some(reserve))
-                }).await
-                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
-            } else {
-                log::debug!("  ⏭️  No deposit reserve to load");
-                Ok(Ok(None))
-            }
-        }
-    );
-    
-    let reserve_load_duration = reserve_load_start.elapsed();
-    log::debug!("  ⏱️  Reserve loading completed in {:?}", reserve_load_duration);
-
-    // Process borrow reserve result
-    match borrow_result {
-        Ok(Ok(Some(reserve))) => {
-            let liquidity = reserve.liquidity();
-            const WAD: f64 = 1_000_000_000_000_000_000.0;
-            let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
-            log::debug!(
-                "✅ Loaded borrow reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
-                borrow_reserve_pubkey.unwrap(),
-                reserve.liquidation_threshold() * 100.0,
-                reserve.liquidation_bonus() * 100.0,
-                reserve.close_factor() * 100.0,
-                market_price
-            );
-            borrow_reserve = Some(reserve);
-        }
-        Ok(Ok(None)) => {
-            log::debug!("Obligation has no borrows");
-        }
-        Ok(Err(e)) => {
-            log::warn!("❌ Failed to load/parse borrow reserve {}: {}", borrow_reserve_pubkey.unwrap(), e);
-        }
-        Err(e) => {
-            log::warn!("❌ Task error loading borrow reserve: {}", e);
-        }
-    }
-
-    // Process deposit reserve result
-    match deposit_result {
-        Ok(Ok(Some(reserve))) => {
-            let liquidity = reserve.liquidity();
-            const WAD: f64 = 1_000_000_000_000_000_000.0;
-            let market_price = liquidity.liquidityMarketPrice as f64 / WAD;
-            log::debug!(
-                "✅ Loaded deposit reserve: {} (liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, close_factor={:.2}%, market_price={:.6})",
-                deposit_reserve_pubkey.unwrap(),
-                reserve.liquidation_threshold() * 100.0,
-                reserve.liquidation_bonus() * 100.0,
-                reserve.close_factor() * 100.0,
-                market_price
-            );
-            deposit_reserve = Some(reserve);
-        }
-        Ok(Ok(None)) => {
-            log::debug!("Obligation has no deposits");
-        }
-        Ok(Err(e)) => {
-            log::warn!("❌ Failed to load/parse deposit reserve {}: {}", deposit_reserve_pubkey.unwrap(), e);
-        }
-        Err(e) => {
-            log::warn!("❌ Task error loading deposit reserve: {}", e);
-        }
-    }
-
-    // Parse borrows and deposits from obligation
-    let borrows = obligation.borrows()
-        .map_err(|e| anyhow::anyhow!("Failed to parse borrows: {}", e))?;
-    let deposits = obligation.deposits()
-        .map_err(|e| anyhow::anyhow!("Failed to parse deposits: {}", e))?;
-
-    let (oracle_ok, borrow_price, deposit_price) = validate_oracles_with_twap(rpc, &borrow_reserve, &deposit_reserve).await?;
-
-    Ok(LiquidationContext::Solend {
-        obligation_pubkey: obligation.owner,
-        obligation: obligation.clone(),
-        borrows,
-        deposits,
-        borrow_reserve,
-        deposit_reserve,
-        borrow_price_usd: borrow_price,
-        deposit_price_usd: deposit_price,
-        oracle_ok,
-    })
-}
+// System supports Kamino Lend protocol
 
 /// Liquidation quote with profit calculation
 pub struct LiquidationQuote {
@@ -1629,670 +1461,23 @@ pub struct LiquidationQuote {
     pub flashloan_fee_raw: u64,
 }
 
-/// Build liquidation transaction (DEPRECATED)
-/// 
-/// ⚠️ DEPRECATED: Two-Transaction Approach (Race Condition Risk!)
-/// 
-/// This function is DEPRECATED and should NOT be used.
-/// Use `build_flashloan_liquidation_tx` instead for atomic single-transaction approach.
-/// 
-/// ❌ PROBLEMS WITH TWO-TRANSACTION APPROACH:
-/// - Race condition: TX1 and TX2 can be front-run by MEV bots
-/// - MEV risk: Intermediate SOL state exposed between TX1 and TX2
-/// - Capital requirement: Need USDC upfront for TX1
-/// - Higher fees: Two transaction fees instead of one
-/// 
-/// ✅ USE FLASHLOAN APPROACH INSTEAD:
-/// - Atomic: All operations in single transaction
-/// - No MEV risk: No intermediate state
-/// - No capital needed: Flashloan provides funds
-/// - Gas-efficient: Single transaction fee
-/// 
-/// Build transaction 1: Liquidation + Redemption (NO Jupiter Swap!)
-/// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
-/// Blockhashes are valid for ~150 slots (~60 seconds), so fetch blockhash right before
-/// building the transaction to minimize staleness risk.
-#[deprecated(note = "Use build_flashloan_liquidation_tx instead for atomic single-transaction approach")]
-async fn build_liquidation_tx1(
-    wallet: &Arc<Keypair>,
-    ctx: &LiquidationContext,
-    quote: &LiquidationQuote,
-    rpc: &Arc<RpcClient>,
-    blockhash: solana_sdk::hash::Hash,
-    _config: &Config,
-) -> Result<Transaction> {
-    use solana_sdk::{
-        instruction::{AccountMeta, Instruction},
-        sysvar,
-    };
-    use spl_token::ID as TOKEN_PROGRAM_ID;
-    use crate::solend::{Obligation, Reserve};
-
-    // Only support Solend for deprecated function
-    let LiquidationContext::Solend {
-        obligation,
-        borrows,
-        deposits,
-        borrow_reserve,
-        deposit_reserve,
-        obligation_pubkey,
-        ..
-    } = ctx else {
-        return Err(anyhow::anyhow!("Deprecated build_liquidation_tx1 only supports Solend"));
-    };
-
-    let current_slot_now = rpc
-        .get_slot()
-        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-    
-    if let Some(reserve) = borrow_reserve {
-        let (valid, _) = oracle::pyth::validate_pyth_oracle(
-            rpc,
-            reserve.oracle_pubkey(),
-            current_slot_now,
-        )
-        .await
-        .context("Failed to validate borrow reserve oracle")?;
-        
-        if !valid {
-            return Err(anyhow::anyhow!(
-                "Borrow reserve oracle became stale during TX preparation for obligation {}",
-                obligation_pubkey
-            ));
-        }
-    }
-    
-    if let Some(reserve) = deposit_reserve {
-        let (valid, _) = oracle::pyth::validate_pyth_oracle(
-            rpc,
-            reserve.oracle_pubkey(),
-            current_slot_now,
-        )
-        .await
-        .context("Failed to validate deposit reserve oracle")?;
-        
-        if !valid {
-            return Err(anyhow::anyhow!(
-                "Deposit reserve oracle became stale during TX preparation. \
-                 Time elapsed since initial validation: ~2-3s. Aborting liquidation for obligation {}.",
-                obligation_pubkey
-            ));
-        }
-    }
-    
-    log::debug!(
-        "✅ Oracle re-validation passed for obligation {} (current_slot={})",
-        obligation_pubkey,
-        current_slot_now
-    );
-
-    let program_id = solend_program_id()?;
-    let wallet_pubkey = wallet.pubkey();
-
-    // Get reserves
-    let borrow_reserve = borrow_reserve
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
-    let deposit_reserve = deposit_reserve
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
-
-    // CRITICAL: Solend LiquidateObligation instruction expects debt token amount (liquidity_amount),
-    // NOT collateral amount. This is the amount of debt we're repaying.
-    // We already calculated this in get_liquidation_quote() and stored it in debt_to_repay_raw.
-    let liquidity_amount = quote.debt_to_repay_raw;
-
-    // Derive required addresses
-    let lending_market = obligation.lendingMarket;
-    let lending_market_authority = crate::solend::derive_lending_market_authority(&lending_market, &program_id)?;
-
-    // Get reserve liquidity supply addresses
-    // These are stored in Reserve account (supplyPubkey field)
-    // Solend program stores the correct PDA addresses in Reserve account during initialization
-    let repay_reserve_liquidity_supply = borrow_reserve.liquidity().supplyPubkey;
-    let withdraw_reserve_liquidity_supply = deposit_reserve.liquidity().supplyPubkey;
-    let withdraw_reserve_collateral_supply = deposit_reserve.collateral().supplyPubkey;
-    let withdraw_reserve_collateral_mint = deposit_reserve.collateral().mintPubkey;
-    
-    // Verify these are not default/zero addresses
-    // CRITICAL: Reserve account's supplyPubkey is the authoritative source.
-    // We use the value directly from Reserve account, not derived PDA.
-    // Solend program stores the correct PDA addresses in Reserve account during initialization.
-    if repay_reserve_liquidity_supply == Pubkey::default() 
-        || withdraw_reserve_liquidity_supply == Pubkey::default() 
-        || withdraw_reserve_collateral_supply == Pubkey::default()
-        || withdraw_reserve_collateral_mint == Pubkey::default() {
-        return Err(anyhow::anyhow!("Invalid reserve addresses: one or more addresses are default/zero"));
-    }
-
-    // SECURITY: Verify reserve supply PDA addresses match expected derivation
-    // This helps detect data corruption or manipulation in Reserve accounts.
-    // We derive expected PDA and compare with stored supplyPubkey.
-    // 
-    // CRITICAL: If PDA can be derived and doesn't match, this indicates data corruption
-    // or manipulation. We MUST fail-fast per Structure.md section 13 (fail-fast principle).
-    // 
-    // If PDA cannot be derived (None), this may indicate unknown seed format, but we
-    // still log a warning as this is unusual.
-    let borrow_reserve_pubkey = borrows[0].borrowReserve;
-    let deposit_reserve_pubkey = deposits[0].depositReserve;
-    
-    // Verify repay reserve liquidity supply
-    // CRITICAL SECURITY FIX: Fail-fast if PDA cannot be derived (None)
-    // This prevents proceeding with unverified addresses, which could indicate:
-    // - Unknown PDA format (code needs update)
-    // - Data corruption in Reserve account
-    // - Malicious account manipulation
-    let derived_pda = crate::solend::derive_reserve_liquidity_supply_pda(&borrow_reserve_pubkey, &program_id)
-        .ok_or_else(|| anyhow::anyhow!(
-            "CRITICAL SECURITY FAILURE: Cannot derive PDA for repay reserve liquidity supply. \
-             Reserve: {}. \
-             This may indicate unknown PDA format or data corruption. Transaction ABORTED.",
-            borrow_reserve_pubkey
-        ))?;
-    
-    if derived_pda != repay_reserve_liquidity_supply {
-        log::error!(
-            "🚨 SECURITY ALERT: PDA mismatch detected!\n\
-             Reserve: {}\n\
-             Stored supplyPubkey: {}\n\
-             Derived PDA: {}\n\
-             This may indicate:\n\
-             - Data corruption in Reserve account\n\
-             - Malicious account manipulation\n\
-             - Outdated PDA derivation seeds\n\
-             Transaction ABORTED for security.",
-            borrow_reserve_pubkey,
-            repay_reserve_liquidity_supply,
-            derived_pda
-        );
-        return Err(anyhow::anyhow!("SECURITY FAILURE: PDA mismatch"));
-    }
-    log::debug!("✅ Repay reserve liquidity supply PDA verified: {}", repay_reserve_liquidity_supply);
-    
-    // Verify withdraw reserve liquidity supply
-    // CRITICAL SECURITY FIX: Fail-fast if PDA cannot be derived (None)
-    let derived_pda = crate::solend::derive_reserve_liquidity_supply_pda(&deposit_reserve_pubkey, &program_id)
-        .ok_or_else(|| anyhow::anyhow!(
-            "CRITICAL SECURITY FAILURE: Cannot derive PDA for withdraw reserve liquidity supply. \
-             Reserve: {}. \
-             This may indicate unknown PDA format or data corruption. Transaction ABORTED.",
-            deposit_reserve_pubkey
-        ))?;
-    
-    if derived_pda != withdraw_reserve_liquidity_supply {
-        return Err(anyhow::anyhow!(
-            "SECURITY FAILURE: Withdraw reserve liquidity supply PDA mismatch! \
-             This indicates data corruption or manipulation. \
-             Reserve: {}, Stored: {}, Derived: {}. \
-             Transaction aborted for security.",
-            deposit_reserve_pubkey,
-            withdraw_reserve_liquidity_supply,
-            derived_pda
-        ));
-    }
-    log::debug!("✅ Withdraw reserve liquidity supply PDA verified: {}", withdraw_reserve_liquidity_supply);
-    
-    // Verify withdraw reserve collateral supply
-    // CRITICAL SECURITY FIX: Fail-fast if PDA cannot be derived (None)
-    let derived_pda = crate::solend::derive_reserve_collateral_supply_pda(&deposit_reserve_pubkey, &program_id)
-        .ok_or_else(|| anyhow::anyhow!(
-            "CRITICAL SECURITY FAILURE: Cannot derive PDA for withdraw reserve collateral supply. \
-             Reserve: {}. \
-             This may indicate unknown PDA format or data corruption. Transaction ABORTED.",
-            deposit_reserve_pubkey
-        ))?;
-    
-    if derived_pda != withdraw_reserve_collateral_supply {
-        return Err(anyhow::anyhow!(
-            "SECURITY FAILURE: Withdraw reserve collateral supply PDA mismatch! \
-             This indicates data corruption or manipulation. \
-             Reserve: {}, Stored: {}, Derived: {}. \
-             Transaction aborted for security.",
-            deposit_reserve_pubkey,
-            withdraw_reserve_collateral_supply,
-            derived_pda
-        ));
-    }
-    log::debug!("✅ Withdraw reserve collateral supply PDA verified: {}", withdraw_reserve_collateral_supply);
-
-    // Get user's token accounts (source liquidity and destination collateral)
-    // These would be ATAs for the tokens
-    use spl_associated_token_account::get_associated_token_address;
-    let source_liquidity = get_associated_token_address(&wallet_pubkey, &borrow_reserve.liquidity().mintPubkey);
-    let destination_collateral = get_associated_token_address(&wallet_pubkey, &withdraw_reserve_collateral_mint);
-    
-    // CRITICAL SECURITY: Validate that ATAs exist before building transaction
-    // If ATAs don't exist, the transaction will fail at runtime
-    // In production, these should be created at startup, but we validate here for safety
-    let source_liquidity_exists = rpc.get_account(&source_liquidity).is_ok();
-    if !source_liquidity_exists {
-        return Err(anyhow::anyhow!(
-            "Source liquidity ATA does not exist: {}. \
-             Please create ATA for token {} before liquidation. \
-             NOTE: In production, create all required ATAs at startup to avoid this check.",
-            source_liquidity,
-            borrow_reserve.liquidity().mintPubkey
-        ));
-    }
-    
-    let dest_collateral_exists = rpc.get_account(&destination_collateral).is_ok();
-    if !dest_collateral_exists {
-        return Err(anyhow::anyhow!(
-            "Destination collateral ATA does not exist: {}. \
-             Please create ATA for token {} before liquidation. \
-             NOTE: In production, create all required ATAs at startup to avoid this check.",
-            destination_collateral,
-            withdraw_reserve_collateral_mint
-        ));
-    }
-    
-    log::debug!(
-        "✅ ATA validation passed: source_liquidity={}, destination_collateral={}",
-        source_liquidity,
-        destination_collateral
-    );
-
-    // Build Solend liquidation instruction
-    // Solend uses enum-based instruction encoding via LendingInstruction enum (NOT Anchor)
-    // 
-    // IMPORTANT: Solend is a native Solana program, not Anchor-based.
-    // Reference: solend-sdk crate, instruction.rs - LendingInstruction enum
-    // 
-    // Instruction format:
-    //   [tag: u8] + [args...]
-    //   tag 12 = LiquidateObligation { liquidity_amount: u64 }
-    // 
-    // Full instruction data: [12] + liquidity_amount.to_le_bytes()
-    let mut instruction_data = Vec::new();
-    
-    // Instruction discriminator: LendingInstruction::LiquidateObligation tag = 12
-    // CRITICAL: Solend uses enum-based encoding (tag = 12), NOT Anchor sighash
-    // Solend native program uses only 1 byte for enum tag
-    let discriminator = crate::solend::get_liquidate_obligation_discriminator();
-    log::debug!(
-        "Using instruction discriminator: {} (hex: {:02x}) for liquidateObligation",
-        discriminator,
-        discriminator
-    );
-    instruction_data.push(discriminator); // Add only 1 byte
-    
-    // Args: liquidityAmount (u64)
-    instruction_data.extend_from_slice(&liquidity_amount.to_le_bytes());
-
-    // Build account metas per IDL - order must match Solend IDL exactly
-    // CRITICAL: Account order verified against Solend SDK source code
-    // Reference: solend-sdk/src/instruction.rs - LendingInstruction::LiquidateObligation
-    // 
-    // Correct account order (12 accounts total):
-    // 0. [writable] sourceLiquidity - user's token account for debt token
-    // 1. [writable] destinationCollateral - user's token account for collateral token
-    // 2. [writable] repayReserve - reserve account for debt token (refreshed)
-    // 3. [writable] repayReserveLiquiditySupply - SPL token supply for debt reserve
-    // 4. [readonly] withdrawReserve - reserve account for collateral token (refreshed)
-    // 5. [writable] withdrawReserveCollateralSupply - SPL token supply for collateral reserve
-    // 6. [writable] obligation - obligation account (refreshed)
-    // 7. [readonly] lendingMarket - lending market account
-    // 8. [readonly] lendingMarketAuthority - derived PDA authority
-    // 9. [signer] transferAuthority - user wallet (signer)
-    // 10. [readonly] clockSysvar - clock sysvar account
-    // 11. [readonly] tokenProgram - SPL token program ID
-    let accounts = vec![
-        AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity
-        AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral
-        AccountMeta::new(borrows[0].borrowReserve, false),  // 2: repayReserve (writable, refreshed)
-        AccountMeta::new(repay_reserve_liquidity_supply, false),      // 3: repayReserveLiquiditySupply
-        AccountMeta::new_readonly(deposits[0].depositReserve, false), // 4: withdrawReserve (readonly, refreshed)
-        AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
-        AccountMeta::new(*obligation_pubkey, false),                // 6: obligation (writable, refreshed)
-        AccountMeta::new_readonly(lending_market, false),            // 7: lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false),   // 8: lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),               // 9: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::clock::id(), false),        // 10: clockSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),          // 11: tokenProgram
-    ];
-
-    // CRITICAL FIX: Validate account ordering per Problems.md section 3.B
-    // Account order must match Solend IDL exactly, or transaction will fail
-    const EXPECTED_ACCOUNT_COUNT: usize = 12;
-    if accounts.len() != EXPECTED_ACCOUNT_COUNT {
-        return Err(anyhow::anyhow!(
-            "Invalid account count for LiquidateObligation: expected {}, got {}",
-            EXPECTED_ACCOUNT_COUNT,
-            accounts.len()
-        ));
-    }
-    
-    // Validate specific account requirements
-    // Account 9 (transferAuthority) must be a signer
-    if !accounts[9].is_signer {
-        return Err(anyhow::anyhow!(
-            "Account ordering validation failed: transferAuthority (index 9) must be a signer"
-        ));
-    }
-    
-    // Validate account 0 (sourceLiquidity) is writable
-    if !accounts[0].is_writable {
-        return Err(anyhow::anyhow!(
-            "Account ordering validation failed: sourceLiquidity (index 0) must be writable"
-        ));
-    }
-    
-    // Validate account 1 (destinationCollateral) is writable
-    if !accounts[1].is_writable {
-        return Err(anyhow::anyhow!(
-            "Account ordering validation failed: destinationCollateral (index 1) must be writable"
-        ));
-    }
-    
-    // Validate readonly accounts (indices 4, 7, 8, 10, 11)
-    let readonly_indices = [4, 7, 8, 10, 11];
-    for &idx in &readonly_indices {
-        if accounts[idx].is_writable {
-            return Err(anyhow::anyhow!(
-                "Account ordering validation failed: account at index {} must be readonly",
-                idx
-            ));
-        }
-    }
-    
-    log::debug!(
-        "✅ Account ordering validation passed for LiquidateObligation: {} accounts, transferAuthority is signer",
-        accounts.len()
-    );
-
-    let liquidation_ix = Instruction {
-        program_id,
-        accounts,
-        data: instruction_data,
-    };
-
-    // Add compute budget instruction per Structure.md section 8
-    // Note: solana-sdk 1.18 doesn't have ComputeBudgetInstruction, so we build manually
-    // Compute Budget Program ID
-    let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
-        .map_err(|e| anyhow::anyhow!("Invalid compute budget program ID: {}", e))?;
-
-    // Build compute unit limit instruction manually
-    // Instruction format: [discriminator: 2, units: u32]
-    let mut compute_limit_data = vec![2u8]; // SetComputeUnitLimit discriminator
-    compute_limit_data.extend_from_slice(&(200_000u32).to_le_bytes());
-    let compute_budget_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_limit_data,
-    };
-
-    // Build compute unit price instruction manually
-    // Instruction format: [discriminator: 3, micro_lamports: u64]
-    let mut compute_price_data = vec![3u8]; // SetComputeUnitPrice discriminator
-    compute_price_data.extend_from_slice(&(1_000u64).to_le_bytes()); // 0.001 SOL per CU
-    let priority_fee_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_price_data,
-    };
-
-    // ============================================================================
-    // INSTRUCTION 2: RedeemReserveCollateral (EKLENECEK!)
-    // ============================================================================
-    // LiquidateObligation bize cToken verir, bunu underlying token'a çevirmeliyiz
-    //
-    // Solend IDL: RedeemReserveCollateral instruction
-    // Discriminator: 5 (LendingInstruction enum)
-    // Args: collateral_amount (u64)
-    
-    // Calculate collateral amount to redeem (cToken amount received from liquidation)
-    // CRITICAL: We need to calculate this from the quote or context
-    // For now, we'll calculate it from the debt amount and liquidation bonus
-    // This is an approximation - ideally this should be passed from get_liquidation_quote()
-    
-    // Use collateral_to_seize_raw from quote (calculated in get_liquidation_quote)
-    let redeem_collateral_amount = quote.collateral_to_seize_raw; // cToken amount to redeem
-    
-    // Build RedeemReserveCollateral instruction data
-    let mut redeem_instruction_data = Vec::new();
-    let redeem_discriminator = crate::solend::get_redeem_reserve_collateral_discriminator();
-    log::debug!(
-        "Using instruction discriminator: {} (hex: {:02x}) for RedeemReserveCollateral",
-        redeem_discriminator,
-        redeem_discriminator
-    );
-    redeem_instruction_data.push(redeem_discriminator); // RedeemReserveCollateral discriminator
-    redeem_instruction_data.extend_from_slice(&redeem_collateral_amount.to_le_bytes()); // collateral_amount (u64)
-    
-    // Get necessary accounts for RedeemReserveCollateral
-    // Per Solend IDL:
-    // 0. [writable] sourceCollateral - User's cToken account (destination from LiquidateObligation)
-    // 1. [writable] destinationLiquidity - User's underlying token account
-    // 2. [writable] reserve - Reserve account
-    // 3. [writable] reserveCollateralMint - Reserve cToken mint
-    // 4. [writable] reserveLiquiditySupply - Reserve underlying token supply
-    // 5. [readonly] lendingMarket - Lending market
-    // 6. [readonly] lendingMarketAuthority - Lending market authority PDA
-    // 7. [signer] transferAuthority - User wallet
-    // 8. [readonly] clockSysvar - Clock sysvar
-    // 9. [readonly] tokenProgram - SPL Token program
-    
-    // Source collateral: User's cToken ATA (destination from LiquidateObligation)
-    // This is the same as destination_collateral from LiquidateObligation
-    let source_collateral = destination_collateral;
-    
-    // Destination liquidity: User's underlying token ATA
-    let destination_liquidity = get_associated_token_address(
-        &wallet_pubkey,
-        &deposit_reserve.liquidity().mintPubkey // Underlying token mint (e.g., SOL)
-    );
-    
-    // CRITICAL SECURITY: Validate that destination liquidity ATA exists
-    // If not, transaction will fail at runtime
-    let dest_liquidity_exists = rpc.get_account(&destination_liquidity).is_ok();
-    if !dest_liquidity_exists {
-        return Err(anyhow::anyhow!(
-            "Destination liquidity ATA does not exist: {}. \
-             Please create ATA for underlying token {} before liquidation. \
-             NOTE: In production, create all required ATAs at startup to avoid this check.",
-            destination_liquidity,
-            deposit_reserve.liquidity().mintPubkey
-        ));
-    }
-    
-    log::debug!(
-        "✅ Destination liquidity ATA validation passed: {}",
-        destination_liquidity
-    );
-    
-    // Build RedeemReserveCollateral instruction accounts
-    let redeem_accounts = vec![
-        AccountMeta::new(source_collateral, false),                     // 0: sourceCollateral
-        AccountMeta::new(destination_liquidity, false),                 // 1: destinationLiquidity
-        AccountMeta::new(deposits[0].depositReserve, false), // 2: reserve
-        AccountMeta::new(withdraw_reserve_collateral_mint, false),      // 3: reserveCollateralMint
-        AccountMeta::new(withdraw_reserve_liquidity_supply, false),     // 4: reserveLiquiditySupply
-        AccountMeta::new_readonly(lending_market, false),              // 5: lendingMarket
-        AccountMeta::new_readonly(lending_market_authority, false),     // 6: lendingMarketAuthority
-        AccountMeta::new_readonly(wallet_pubkey, true),                 // 7: transferAuthority (signer)
-        AccountMeta::new_readonly(sysvar::clock::id(), false),          // 8: clockSysvar
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),            // 9: tokenProgram
-    ];
-    
-    let redeem_collateral_ix = Instruction {
-        program_id,
-        accounts: redeem_accounts,
-        data: redeem_instruction_data,
-    };
-    
-    // ============================================================================
-    // TRANSACTION 1: Liquidation + Redemption (NO Jupiter Swap!)
-    // ============================================================================
-    // CRITICAL: Jupiter swap must be in a SEPARATE transaction because:
-    // 1. LiquidateObligation writes cSOL tokens to wallet's ATA
-    // 2. RedeemReserveCollateral reads those cSOL tokens and writes SOL to wallet's ATA
-    // 3. Jupiter swap needs to read SOL from wallet's ATA
-    // 
-    // Solana transactions are atomic - all instructions execute simultaneously.
-    // If we include Jupiter swap in the same transaction, it will try to read SOL
-    // that hasn't been written yet, causing AccountNotFound or InsufficientFunds errors.
-    //
-    // Solution: Split into 2 transactions:
-    // TX1: Liquidation + Redemption (Solend protocol)
-    // TX2: Jupiter Swap (DEX)
-    
-    // Build transaction with fresh blockhash
-    // CRITICAL: blockhash must be fetched immediately before this function is called
-    // to ensure it's fresh and not stale. Blockhashes are valid for ~150 slots (~60 seconds).
-    let mut tx = Transaction::new_with_payer(
-        &[
-            compute_budget_ix,        // Compute unit limit
-            priority_fee_ix,          // Priority fee
-            liquidation_ix,           // LiquidateObligation (USDC -> cSOL)
-            redeem_collateral_ix,     // RedeemReserveCollateral (cSOL -> SOL)
-        ],
-        Some(&wallet_pubkey),
-    );
-    // Set blockhash immediately - it was fetched right before this function call
-    tx.message.recent_blockhash = blockhash;
-
-    log::info!(
-        "Built TX1 (Liquidation + Redemption) for obligation {}:\n\
-         - Liquidate: {} debt tokens (USDC -> cSOL)\n\
-         - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
-         - Source collateral ATA: {}\n\
-         - Destination liquidity ATA: {}",
-        obligation_pubkey,
-        liquidity_amount,
-        redeem_collateral_amount,
-        source_collateral,
-        destination_liquidity
-    );
-
-    Ok(tx)
-}
-
-/// ⚠️ DEPRECATED: Two-Transaction Approach (Race Condition Risk!)
-/// 
-/// This function is DEPRECATED and should NOT be used.
-/// Use `build_flashloan_liquidation_tx` instead for atomic single-transaction approach.
-/// 
-/// ❌ PROBLEMS WITH TWO-TRANSACTION APPROACH:
-/// - Race condition: TX1 and TX2 can be front-run by MEV bots
-/// - MEV risk: Intermediate SOL state exposed between TX1 and TX2
-/// - Capital requirement: Need USDC upfront for TX1
-/// - Higher fees: Two transaction fees instead of one
-/// 
-/// ✅ USE FLASHLOAN APPROACH INSTEAD:
-/// - Atomic: All operations in single transaction
-/// - No MEV risk: No intermediate state
-/// - No capital needed: Flashloan provides funds
-/// - Gas-efficient: Single transaction fee
-/// 
-/// Build transaction 2: Jupiter Swap (SOL -> USDC)
-/// This is called AFTER TX1 confirms and SOL is available in wallet
-/// 
-/// ❌ WARNING: This creates a race condition window where MEV bots can front-run TX2!
-#[deprecated(note = "Use build_flashloan_liquidation_tx instead for atomic single-transaction approach")]
-/// CRITICAL: blockhash must be fresh (fetched immediately before calling this function).
-async fn build_liquidation_tx2(
-    wallet: &Arc<Keypair>,
-    ctx: &LiquidationContext,
-    quote: &LiquidationQuote,
-    blockhash: solana_sdk::hash::Hash,
-    config: &Config,
-) -> Result<Transaction> {
-    // Only support Solend for deprecated function
-    let LiquidationContext::Solend {
-        obligation_pubkey,
-        ..
-    } = ctx else {
-        return Err(anyhow::anyhow!("Deprecated build_liquidation_tx2 only supports Solend"));
-    };
-    use solana_sdk::instruction::Instruction;
-    
-    let wallet_pubkey = wallet.pubkey();
-    
-    // Compute Budget Program ID
-    let compute_budget_program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")
-        .map_err(|e| anyhow::anyhow!("Invalid compute budget program ID: {}", e))?;
-
-    // Build compute unit limit instruction
-    let mut compute_limit_data = vec![2u8]; // SetComputeUnitLimit discriminator
-    compute_limit_data.extend_from_slice(&(200_000u32).to_le_bytes());
-    let compute_budget_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_limit_data,
-    };
-
-    // Build compute unit price instruction
-    let mut compute_price_data = vec![3u8]; // SetComputeUnitPrice discriminator
-    compute_price_data.extend_from_slice(&(1_000u64).to_le_bytes()); // 0.001 SOL per CU
-    let priority_fee_ix = Instruction {
-        program_id: compute_budget_program_id,
-        accounts: vec![],
-        data: compute_price_data,
-    };
-    
-    // ============================================================================
-    // INSTRUCTION: Jupiter Swap (SOL -> USDC)
-    // ============================================================================
-    // After TX1 confirms, we have SOL in wallet's ATA
-    // Now we swap it to USDC to complete the liquidation flow
-    // CRITICAL: Jupiter returns a vector of instructions (Setup + Swap + Cleanup)
-    // We must include all of them in the transaction to handle ATAs correctly
-    let jupiter_swap_ixs = crate::jup::build_jupiter_swap_instruction(
-        &quote.quote,
-        &wallet_pubkey,
-        &config.jupiter_url,
-    )
-    .await
-    .context("Failed to build Jupiter swap instruction")?;
-    
-    // Build instruction list
-    let mut instructions = vec![
-        compute_budget_ix,        // Compute unit limit
-        priority_fee_ix,          // Priority fee
-    ];
-    // Add all Jupiter instructions (setup + swap + cleanup)
-    instructions.extend(jupiter_swap_ixs);
-    
-    // Build transaction with fresh blockhash
-    let mut tx = Transaction::new_with_payer(
-        &instructions,
-        Some(&wallet_pubkey),
-    );
-    tx.message.recent_blockhash = blockhash;
-
-    log::info!(
-        "Built TX2 (Jupiter Swap) for obligation {}:\n\
-         - Swap: SOL -> USDC ({} instructions)",
-        obligation_pubkey,
-        instructions.len() - 2 // Subtract compute budget instructions
-    );
-
-    Ok(tx)
-}
-
-// Transaction building functions moved to liquidation_tx module:
-// - build_flashloan_liquidation_tx -> liquidation_tx::build_flashloan_liquidation_tx
-// - build_liquidation_tx1 -> deprecated (kept for reference)
-// - build_liquidation_tx2 -> deprecated (kept for reference)
-
 // Transaction building functions moved to liquidation_tx module
+// System now only supports Kamino Lend with flashloan approach
 
 /// Execute liquidation with swap using flashloan (atomic single transaction)
 /// 
 /// FLASHLOAN APPROACH - Solves race condition and MEV risks:
-/// - All operations in ONE atomic transaction
+/// - Atomic: All operations in single transaction
 /// - No race conditions: No TX1/TX2 split
 /// - No MEV risk: No intermediate state exposed
 /// - No capital required: Flashloan provides initial funds
 /// - Gas-efficient: Single transaction
 /// 
 /// Flow:
-/// 1. FlashLoan: Borrow debt_amount USDC from Solend (flash)
-/// 2. LiquidateObligation: Repay debt, receive cSOL
-/// 3. RedeemReserveCollateral: cSOL -> SOL
-/// 4. Jupiter Swap: SOL -> USDC
+/// 1. FlashLoan: Borrow debt_amount USDC from Kamino (flash)
+/// 2. LiquidateObligation: Repay debt, receive collateral
+/// 3. RedeemReserveCollateral: Collateral -> underlying token
+/// 4. Jupiter Swap: Underlying token -> USDC
 /// 5. FlashRepayReserveLiquidity: Explicit repayment instruction (REQUIRED!)
 async fn execute_liquidation_with_swap(
     ctx: &LiquidationContext,
@@ -2309,95 +1494,62 @@ async fn execute_liquidation_with_swap(
     log::info!("Building atomic flashloan liquidation transaction");
     
     // ✅ CRITICAL: Get fresh blockhash AFTER Jupiter quote completes
-    // Blockhash expires in ~60 seconds. Jupiter quote can take 8-15 seconds,
-    // so we must get blockhash AFTER quote to ensure maximum freshness.
-    // This prevents "BlockhashNotFound" errors from stale blockhashes.
+    // Blockhashes are valid for ~150 slots (~60 seconds)
+    // Fetching blockhash right before building TX minimizes staleness risk
     let blockhash = rpc
         .get_latest_blockhash()
-        .map_err(|e| anyhow::anyhow!("Failed to get blockhash: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to get latest blockhash: {}", e))?;
     
-    let tx = build_flashloan_liquidation_tx(wallet, ctx, quote, rpc, blockhash, config)
+    // Build atomic flashloan transaction
+    let tx = crate::liquidation_tx::build_flashloan_liquidation_tx(
+        wallet,
+        ctx,
+        quote,
+        rpc,
+        blockhash,
+        config,
+        )
         .await
         .context("Failed to build flashloan liquidation transaction")?;
     
-    // Send transaction via Jito
-    let bundle_id = send_jito_bundle(tx, jito_client, wallet, blockhash)
-        .await
-        .context("Failed to send flashloan liquidation transaction via Jito")?;
+    // ============================================================================
+    // SUBMIT TRANSACTION VIA JITO
+    // ============================================================================
+    log::info!("Submitting liquidation transaction via Jito...");
     
-    log::info!(
-        "✅ Atomic flashloan liquidation transaction sent: bundle_id={}\n\
-         All operations (FlashLoan -> Liquidate -> Redeem -> Swap -> Repay) are atomic!",
-        bundle_id
+    // Sign transaction
+    let mut signed_tx = tx;
+    signed_tx.sign(&[wallet], blockhash);
+    
+    // Create Jito bundle
+    use crate::utils::JitoBundle;
+    let mut bundle = JitoBundle::new(
+        jito_client.tip_account(),
+        jito_client.default_tip_amount(),
     );
+    bundle.add_transaction(signed_tx);
     
-    // ✅ FIXED: Smart polling strategy (Problems.md recommendation)
-    // Bundle typically confirms in 300-400ms. Starting at 100ms is too aggressive.
-    // Strategy: Wait 300ms initially, then exponential backoff (300, 600, 1200, 2000...)
-    let mut confirmed = false;
+    // Submit via Jito
+    jito_client
+        .send_bundle(&bundle)
+        .await
+        .context("Failed to submit liquidation transaction via Jito")?;
     
-    // Initial wait - typical bundle confirmation time
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    
-    let mut delay_ms = 300; 
-    const MAX_ATTEMPTS: u32 = 10;
-    const MAX_DELAY_MS: u64 = 2000; // Max 2s between checks
-    
-    for attempt in 0..MAX_ATTEMPTS {
-        if let Ok(Some(status)) = jito_client.get_bundle_status(&bundle_id).await {
-            if let Some(status_str) = &status.status {
-                match status_str.as_str() {
-                    "landed" | "confirmed" => {
-                        confirmed = true;
-                        log::debug!(
-                            "✅ Bundle {} confirmed (poll #{})",
-                            bundle_id,
-                            attempt + 1
-                        );
-                        break;
-                    }
-                    "failed" | "dropped" => {
-                        log::warn!(
-                            "Bundle {} failed/dropped (poll #{})",
-                            bundle_id,
-                            attempt + 1
-                        );
-                        break;
-                    }
-                    "pending" => {
-                        // Continue polling
-                    }
-                    _ => {
-                        log::debug!("Bundle {} unknown status: {}", bundle_id, status_str);
-                    }
-                }
-            }
-            
-            // If slot is present, bundle likely executed
-            if status.slot.is_some() {
-                confirmed = true;
-                log::debug!(
-                    "✅ Bundle {} confirmed (has slot) (poll #{})",
-                    bundle_id,
-                    attempt + 1
-                );
-                break;
-            }
-        }
-        
-        // Exponential backoff: double delay each time, max 2000ms
-        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-    }
-    
-    if !confirmed {
-        log::debug!(
-            "Bundle {} status still unknown after 4s polling, will be tracked by bundle_tracker",
-            bundle_id
-        );
-    }
+    log::info!("✅ Liquidation transaction submitted successfully!");
     
     Ok(())
 }
+
+
+// Transaction building functions moved to liquidation_tx module:
+// - build_flashloan_liquidation_tx -> liquidation_tx::build_flashloan_liquidation_tx
+
+// Transaction building functions moved to liquidation_tx module:
+// - build_flashloan_liquidation_tx -> liquidation_tx::build_flashloan_liquidation_tx
+// - build_liquidation_tx1 -> deprecated (kept for reference)
+// - build_liquidation_tx2 -> deprecated (kept for reference)
+
+// Transaction building functions moved to liquidation_tx module
+
 
 
