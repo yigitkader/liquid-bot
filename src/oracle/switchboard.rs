@@ -7,7 +7,8 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::solend::Reserve;
+#[allow(dead_code)]
+use crate::solend::Reserve;  // Only for deprecated functions
 
 // Helper functions for aligned buffer pool (shared with pipeline.rs)
 // These are used for Switchboard Oracle alignment fix

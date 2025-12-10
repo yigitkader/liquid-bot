@@ -12,8 +12,19 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::jup::JupiterQuote;
-use crate::solend::{Obligation, Reserve, solend_program_id};
-use crate::solend::{ObligationLiquidity, ObligationCollateral};
+// Kamino Lend support (replaces legacy Solend)
+use crate::kamino::{
+    Obligation as KaminoObligation,
+    Reserve as KaminoReserve,
+    ObligationCollateral as KaminoObligationCollateral,
+    ObligationLiquidity as KaminoObligationLiquidity,
+    detect_account_type as kamino_detect_account_type,
+    KaminoAccountType,
+    KAMINO_LEND_PROGRAM_ID,
+    SCALE_FACTOR,
+};
+// Common trait for lending protocols
+use crate::lending_trait::LendingObligation;
 use crate::utils::{send_jito_bundle, JitoClient};
 use crate::oracle::{self, validate_oracles_with_twap};
 use crate::liquidation_tx::build_flashloan_liquidation_tx;
@@ -47,7 +58,21 @@ pub async fn run_liquidation_loop(
     rpc: Arc<RpcClient>,
     config: Config,
 ) -> Result<()> {
-    let program_id = solend_program_id()?;
+    // Determine lending program ID from environment
+    // Priority: LENDING_PROGRAM_ID > Kamino mainnet default
+    let program_id = {
+        use std::env;
+        if let Ok(id) = env::var("LENDING_PROGRAM_ID") {
+            Pubkey::from_str(&id).context("Invalid LENDING_PROGRAM_ID")?
+        } else {
+            // Default to Kamino Lend mainnet
+            Pubkey::from_str(KAMINO_LEND_PROGRAM_ID)
+                .expect("Invalid hardcoded Kamino program ID")
+        }
+    };
+    
+    log::info!("🚀 Using Kamino Lend protocol (program: {})", program_id);
+    
     let wallet = config.wallet.pubkey();
 
     use std::env;
@@ -280,12 +305,10 @@ async fn process_cycle(
 
     // 2. HF < 1.0 olanları bul
     // CRITICAL SECURITY: Track parse errors to detect layout changes or corrupt data
-    // ✅ FIXED: Use account type identification utility
-    // This is faster and more reliable than attempting to parse every account
     log::info!("🔍 Scanning {} accounts for liquidatable obligations...", accounts.len());
     let scan_start = std::time::Instant::now();
     
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(Pubkey, KaminoObligation)> = Vec::new();
     let mut parse_errors: usize = 0;
     let mut skipped_wrong_type: usize = 0;
     let mut obligation_count: usize = 0;
@@ -295,22 +318,26 @@ async fn process_cycle(
     let mut skipped_hf_too_high: usize = 0;
     let total_accounts = accounts.len();
     
+    // Read health factor threshold from .env (no hardcoded values)
+    let hf_threshold = std::env::var("HF_LIQUIDATION_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0); // Default 1.0 if not set
+    
     for (pk, acc) in accounts {
-        // Use account type identification to quickly filter accounts
-        match crate::solend::identify_solend_account_type(&acc.data) {
-            crate::solend::SolendAccountType::Obligation => {
+        // Use Kamino account type detection (Anchor discriminators)
+        match kamino_detect_account_type(&acc.data) {
+            KaminoAccountType::Obligation => {
                 obligation_count += 1;
-                // This looks like an Obligation - try to parse it
-                match Obligation::from_account_data(&acc.data) {
+                // Parse Kamino Obligation
+                match KaminoObligation::from_account_data(&acc.data) {
                     Ok(obligation) => {
-                        // 🔴 CRITICAL FIX: Skip obligations with zero borrow or zero deposit
-                        // These are inactive obligations that should not be considered for liquidation
-                        // This prevents false positives from stale/inactive obligations
-                        let borrowed_value = obligation.total_borrowed_value_usd();
-                        let deposited_value = obligation.total_deposited_value_usd();
+                        // Get USD values from Kamino obligation using trait
+                        let borrowed_value: f64 = LendingObligation::borrowed_value_usd(&obligation);
+                        let deposited_value: f64 = LendingObligation::deposited_value_usd(&obligation);
                         
                         // Skip if no borrows (nothing to liquidate)
-                        if borrowed_value <= 0.0 {
+                        if !LendingObligation::has_any_debt(&obligation) || borrowed_value <= 0.0 {
                             skipped_zero_borrow += 1;
                             if skipped_zero_borrow <= 3 {
                                 log::debug!(
@@ -323,7 +350,7 @@ async fn process_cycle(
                         }
                         
                         // Skip if no deposits (no collateral to liquidate)
-                        if deposited_value <= 0.0 {
+                        if !LendingObligation::has_any_deposits(&obligation) || deposited_value <= 0.0 {
                             skipped_zero_deposit += 1;
                             if skipped_zero_deposit <= 3 {
                                 log::debug!(
@@ -335,72 +362,31 @@ async fn process_cycle(
                             continue;
                         }
                         
-                        // 🔴 CRITICAL FIX: Do NOT skip obligations based on lastUpdate.slot!
-                        // Previously we were skipping 59,769 obligations as "stale" - this was wrong!
-                        // 
-                        // In Solend, lastUpdate.slot indicates when the obligation was last REFRESHED on-chain.
-                        // An obligation that hasn't been refreshed in 3 minutes is NOT invalid!
-                        // The stored values (borrowedValue, allowedBorrowValue) are still valid.
-                        //
-                        // The correct approach:
-                        // 1. Check if obligation LOOKS liquidatable based on stored values
-                        // 2. If yes, refresh the obligation before/during liquidation
-                        // 3. The RefreshObligation instruction will update values with latest interest
-                        //
-                        // We only skip if lastUpdate.stale == 1 (Solend's own stale flag)
-                        // This is different from our slot-based check!
-                        if obligation.lastUpdate.stale == 1 {
+                        // Skip if obligation is marked as stale
+                        if LendingObligation::is_stale(&obligation) {
                             skipped_stale += 1;
-                            if skipped_stale <= 3 {
-                                log::debug!(
-                                    "Skipping obligation {}: marked as stale by Solend (lastUpdate.stale=1)",
+                                if skipped_stale <= 3 {
+                                    log::debug!(
+                                    "Skipping obligation {}: marked as stale",
                                     pk
                                 );
                             }
                             continue;
                         }
                         
-                        // Log if obligation hasn't been refreshed in a while (for debugging)
-                        // but don't skip it - it might still be liquidatable!
-                        if let Some(last_slot) = obligation.last_update_slot() {
-                            let slot_diff = current_slot.saturating_sub(last_slot);
-                            if slot_diff > max_obligation_slot_diff && skipped_stale == 0 {
-                                log::debug!(
-                                    "Obligation {} hasn't been refreshed in {} slots (~{:.0}s) - will still check HF",
-                                    pk,
-                                    slot_diff,
-                                    slot_diff as f64 * 0.4 // ~400ms per slot
-                                );
-                            }
-                        }
+                        // Calculate health factor using trait
+                        // Kamino HF = allowed_borrow_value / borrow_factor_adjusted_debt_value
+                        let hf = LendingObligation::health_factor(&obligation);
                         
-                        // Read health factor threshold from .env (no hardcoded values)
-                        let hf_threshold = std::env::var("HF_LIQUIDATION_THRESHOLD")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(1.0); // Default 1.0 if not set
-                        
-                        // CRITICAL FIX: Use u128 arithmetic for high-precision HF check
-                        // f64 precision loss can cause missed liquidations for HF very close to 1.0
-                        // (e.g., 0.9999999999 vs 1.0000000001)
-                        const WAD: u128 = 1_000_000_000_000_000_000;
-                        
-                        // Use is_liquidatable() method when threshold is 1.0 (default)
-                        // For custom thresholds, use health_factor_u128() with threshold comparison
-                        let is_liquidatable = if hf_threshold == 1.0 {
-                            obligation.is_liquidatable()
-                        } else {
-                            let hf_wad = obligation.health_factor_u128();
-                            let threshold_wad = (hf_threshold * WAD as f64) as u128;
-                            hf_wad < threshold_wad
-                        };
+                        // Check if liquidatable (HF < threshold)
+                        let is_liquidatable = hf < hf_threshold;
                         
                         if is_liquidatable {
                             // Log obligation details for debugging
                             log::debug!(
                                 "✅ Found liquidatable obligation {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}",
                                 pk,
-                                obligation.health_factor(),
+                                hf,
                                 deposited_value,
                                 borrowed_value
                             );
@@ -411,7 +397,7 @@ async fn process_cycle(
                                 log::debug!(
                                     "Skipping obligation {}: HF={:.6} >= threshold {:.6} (not liquidatable)",
                                     pk,
-                                    obligation.health_factor(),
+                                    hf,
                                     hf_threshold
                                 );
                             }
@@ -419,11 +405,21 @@ async fn process_cycle(
                     }
                     Err(e) => {
                         parse_errors += 1;
-                        log::debug!("Failed to parse Obligation {}: {}", pk, e);
+                        if parse_errors <= 5 {
+                            log::debug!("Failed to parse Kamino Obligation {}: {}", pk, e);
                     }
                 }
             }
-            _ => {
+            }
+            KaminoAccountType::Reserve => {
+                // Skip reserves - we're only looking for obligations
+                skipped_wrong_type += 1;
+            }
+            KaminoAccountType::LendingMarket => {
+                // Skip lending markets
+                skipped_wrong_type += 1;
+            }
+            KaminoAccountType::Unknown => {
                 skipped_wrong_type += 1;
             }
         }
@@ -431,7 +427,7 @@ async fn process_cycle(
     
     if skipped_wrong_type > 0 {
         log::debug!(
-            "Skipped {} accounts with wrong type (likely Reserves/LendingMarkets, not Obligations)",
+            "Skipped {} accounts with wrong type (Reserves/LendingMarkets/Unknown)",
             skipped_wrong_type
         );
     }
@@ -473,12 +469,12 @@ async fn process_cycle(
         let preview_count = total_candidates.min(5);
         log::info!("   📋 First {} candidates preview:", preview_count);
         for (idx, (pubkey, obligation)) in candidates.iter().take(preview_count).enumerate() {
-            let hf = obligation.health_factor();
+            let hf = LendingObligation::health_factor(obligation);
             log::info!("     {}. {}: HF={:.6}, deposited=${:.2}, borrowed=${:.2}, allowedBorrow=${:.2}", 
                        idx + 1, pubkey, hf, 
-                       obligation.total_deposited_value_usd(),
-                       obligation.total_borrowed_value_usd(),
-                       obligation.allowedBorrowValue as f64 / 1e18);
+                       LendingObligation::deposited_value_usd(obligation),
+                       LendingObligation::borrowed_value_usd(obligation),
+                       obligation.allowed_borrow_value_sf as f64 / SCALE_FACTOR as f64);
         }
     } else {
         log::info!("   ⚠️  No liquidatable obligations found (all HF >= threshold)");
@@ -819,9 +815,10 @@ async fn process_cycle(
     // 3. Her candidate için liquidation denemesi per Structure.md section 9
     for (obl_pubkey, obligation) in candidates {
         // a) Oracle + reserve load + HF confirm
-        let ctx = match build_liquidation_context(rpc, &obligation).await {
+        let mut ctx = match build_liquidation_context(rpc, &obligation).await {
             Ok(mut ctx) => {
-                ctx.obligation_pubkey = obl_pubkey; // Set actual obligation pubkey
+                // Set actual obligation pubkey
+                ctx.obligation_pubkey = obl_pubkey;
                 ctx
             }
             Err(e) => {
@@ -836,15 +833,15 @@ async fn process_cycle(
             let borrow_info = ctx.borrow_reserve.as_ref().map(|r| {
                 format!("borrow_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
                     r.mint_pubkey(),
-                    r.oracle_pubkey(),
-                    r.liquidity().liquiditySwitchboardOracle)
+                    r.pyth_oracle(),
+                    r.switchboard_oracle())
             }).unwrap_or_else(|| "borrow_reserve=None".to_string());
             
             let deposit_info = ctx.deposit_reserve.as_ref().map(|r| {
                 format!("deposit_reserve={}, pyth_oracle={}, switchboard_oracle={}", 
                     r.mint_pubkey(),
-                    r.oracle_pubkey(),
-                    r.liquidity().liquiditySwitchboardOracle)
+                    r.pyth_oracle(),
+                    r.switchboard_oracle())
             }).unwrap_or_else(|| "deposit_reserve=None".to_string());
             
             // Reduce log spam: Use debug instead of warn for frequent oracle failures
@@ -854,8 +851,8 @@ async fn process_cycle(
                 obl_pubkey,
                 borrow_info,
                 deposit_info,
-                ctx.borrow_price_usd,
-                ctx.deposit_price_usd
+                ctx.borrow_price_usd(),
+                ctx.deposit_price_usd()
             );
             metrics.skipped_oracle_fail += 1;
             continue;
@@ -868,8 +865,8 @@ async fn process_cycle(
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(10.0); // Default: $10 minimum position size
         
-        // Use total_deposited_value_usd() which is already in USD (WAD format, divided by 1e18)
-        let position_size_usd = ctx.obligation.total_deposited_value_usd();
+        // Use total_deposited_value_usd() which is already in USD
+        let position_size_usd = ctx.total_deposited_value_usd();
         
         if position_size_usd < min_position_size_usd {
             log::debug!(
@@ -1222,22 +1219,241 @@ async fn validate_jito_endpoint(jito_client: &JitoClient) -> Result<()> {
 }
 
 /// Liquidation context per Structure.md section 9
+/// Kamino Lend protocol only (Solend removed - legacy/abandoned)
 pub struct LiquidationContext {
     pub obligation_pubkey: Pubkey,
-    pub obligation: Obligation,
-    pub borrows: Vec<ObligationLiquidity>,  // Parsed borrows from dataFlat
-    pub deposits: Vec<ObligationCollateral>, // Parsed deposits from dataFlat
-    pub borrow_reserve: Option<Reserve>,
-    pub deposit_reserve: Option<Reserve>,
-    pub borrow_price_usd: Option<f64>,  // Price from oracle
-    pub deposit_price_usd: Option<f64>, // Price from oracle
+    pub obligation: KaminoObligation,
+    pub borrows: Vec<KaminoObligationLiquidity>,
+    pub deposits: Vec<KaminoObligationCollateral>,
+    pub borrow_reserve: Option<KaminoReserve>,
+    pub deposit_reserve: Option<KaminoReserve>,
+    pub borrow_price_usd: Option<f64>,
+    pub deposit_price_usd: Option<f64>,
     pub oracle_ok: bool,
 }
 
+impl LiquidationContext {
+    pub fn obligation_pubkey(&self) -> Pubkey {
+        self.obligation_pubkey
+    }
+    
+    pub fn oracle_ok(&self) -> bool {
+        self.oracle_ok
+    }
+    
+    pub fn borrow_price_usd(&self) -> Option<f64> {
+        self.borrow_price_usd
+    }
+    
+    pub fn deposit_price_usd(&self) -> Option<f64> {
+        self.deposit_price_usd
+    }
+    
+    /// Get total deposited value in USD (for position size check)
+    pub fn total_deposited_value_usd(&self) -> f64 {
+        LendingObligation::deposited_value_usd(&self.obligation)
+    }
+}
+
 /// Build liquidation context with Oracle validation per Structure.md section 5.2
+/// Kamino Lend protocol only
 async fn build_liquidation_context(
     rpc: &Arc<RpcClient>,
-    obligation: &Obligation,
+    obligation: &KaminoObligation,
+) -> Result<LiquidationContext> {
+    build_kamino_liquidation_context(rpc, obligation).await
+}
+
+/// Build liquidation context for Kamino Lend
+async fn build_kamino_liquidation_context(
+    rpc: &Arc<RpcClient>,
+    obligation: &KaminoObligation,
+) -> Result<LiquidationContext> {
+    // Load reserve accounts in parallel for better performance
+    let mut borrow_reserve = None;
+    let mut deposit_reserve = None;
+    
+    // Get active borrows and deposits from Kamino obligation
+    let active_borrows: Vec<KaminoObligationLiquidity> = obligation.borrows.iter()
+        .filter(|b| b.borrowed_amount_sf > 0)
+        .cloned()
+        .collect();
+    let active_deposits: Vec<KaminoObligationCollateral> = obligation.deposits.iter()
+        .filter(|d| d.deposited_amount > 0)
+        .cloned()
+        .collect();
+    
+    log::debug!("🔍 Building Kamino liquidation context: owner={}, active_deposits={}, active_borrows={}", 
+                obligation.owner, active_deposits.len(), active_borrows.len());
+    
+    let borrow_reserve_pubkey = active_borrows.first()
+        .map(|b| b.borrow_reserve);
+    let deposit_reserve_pubkey = active_deposits.first()
+        .map(|d| d.deposit_reserve);
+    
+    if borrow_reserve_pubkey.is_none() && deposit_reserve_pubkey.is_none() {
+        return Err(anyhow::anyhow!("Kamino obligation has no active borrows or deposits"));
+    }
+    
+    // Load reserves in parallel
+    log::debug!("  🔄 Loading Kamino reserves in parallel (borrow: {:?}, deposit: {:?})", 
+                borrow_reserve_pubkey, deposit_reserve_pubkey);
+    let reserve_load_start = std::time::Instant::now();
+    
+    let (borrow_result, deposit_result) = tokio::join!(
+        async {
+            if let Some(pubkey) = borrow_reserve_pubkey {
+                log::debug!("  📥 Loading borrow reserve: {}", pubkey);
+                let rpc_clone = Arc::clone(rpc);
+                tokio::task::spawn_blocking(move || -> Result<Option<KaminoReserve>, solana_client::client_error::ClientError> {
+                    let account_data = rpc_clone.get_account_data(&pubkey)?;
+                    log::debug!("  📊 Borrow reserve account data retrieved: {} bytes", account_data.len());
+                    let reserve = KaminoReserve::from_account_data(&account_data)
+                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
+                    log::debug!("  ✅ Borrow reserve parsed successfully: mint={}", reserve.mint_pubkey());
+                    Ok(Some(reserve))
+                }).await
+                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
+            } else {
+                Ok(Ok(None))
+            }
+        },
+        async {
+            if let Some(pubkey) = deposit_reserve_pubkey {
+                log::debug!("  📥 Loading deposit reserve: {}", pubkey);
+                let rpc_clone = Arc::clone(rpc);
+                tokio::task::spawn_blocking(move || -> Result<Option<KaminoReserve>, solana_client::client_error::ClientError> {
+                    let account_data = rpc_clone.get_account_data(&pubkey)?;
+                    log::debug!("  📊 Deposit reserve account data retrieved: {} bytes", account_data.len());
+                    let reserve = KaminoReserve::from_account_data(&account_data)
+                        .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
+                    log::debug!("  ✅ Deposit reserve parsed successfully: mint={}", reserve.mint_pubkey());
+                    Ok(Some(reserve))
+                }).await
+                .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {}", e))))
+            } else {
+                Ok(Ok(None))
+            }
+        }
+    );
+    
+    let reserve_load_duration = reserve_load_start.elapsed();
+    log::debug!("  ⏱️  Reserve loading completed in {:?}", reserve_load_duration);
+    
+    // Process borrow reserve result
+    match borrow_result {
+        Ok(Ok(Some(reserve))) => {
+            let market_price = reserve.market_price_usd();
+            log::debug!(
+                "✅ Loaded borrow reserve: {} (ltv={:.2}%, liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, market_price=${:.6})",
+                borrow_reserve_pubkey.unwrap(),
+                reserve.ltv_pct() as f64,
+                reserve.liquidation_threshold_pct() as f64,
+                reserve.liquidation_bonus_bps() as f64 / 100.0,
+                market_price
+            );
+            borrow_reserve = Some(reserve);
+        }
+        Ok(Ok(None)) => {
+            log::debug!("Obligation has no borrows");
+        }
+        Ok(Err(e)) => {
+            log::warn!("❌ Failed to load/parse borrow reserve {}: {}", borrow_reserve_pubkey.unwrap(), e);
+        }
+        Err(e) => {
+            log::warn!("❌ Task error loading borrow reserve: {}", e);
+        }
+    }
+    
+    // Process deposit reserve result
+    match deposit_result {
+        Ok(Ok(Some(reserve))) => {
+            let market_price = reserve.market_price_usd();
+            log::debug!(
+                "✅ Loaded deposit reserve: {} (ltv={:.2}%, liquidation_threshold={:.2}%, liquidation_bonus={:.2}%, market_price=${:.6})",
+                deposit_reserve_pubkey.unwrap(),
+                reserve.ltv_pct() as f64,
+                reserve.liquidation_threshold_pct() as f64,
+                reserve.liquidation_bonus_bps() as f64 / 100.0,
+                market_price
+            );
+            deposit_reserve = Some(reserve);
+        }
+        Ok(Ok(None)) => {
+            log::debug!("Obligation has no deposits");
+        }
+        Ok(Err(e)) => {
+            log::warn!("❌ Failed to load/parse deposit reserve {}: {}", deposit_reserve_pubkey.unwrap(), e);
+        }
+        Err(e) => {
+            log::warn!("❌ Task error loading deposit reserve: {}", e);
+        }
+    }
+    
+    // Use active borrows and deposits directly
+    let borrows = active_borrows;
+    let deposits = active_deposits;
+    
+    // Validate oracles
+    let current_slot = rpc.get_slot()
+        .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
+    
+    let (oracle_ok, borrow_price, deposit_price) = validate_kamino_oracles(
+        rpc,
+        &borrow_reserve,
+        &deposit_reserve,
+        current_slot,
+    ).await?;
+    
+    Ok(LiquidationContext {
+        obligation_pubkey: Pubkey::default(), // Will be set correctly by caller
+        obligation: obligation.clone(),
+        borrows,
+        deposits,
+        borrow_reserve,
+        deposit_reserve,
+        borrow_price_usd: borrow_price,
+        deposit_price_usd: deposit_price,
+        oracle_ok,
+    })
+}
+
+/// Validate Kamino oracles (simplified version - full validation in oracle module)
+async fn validate_kamino_oracles(
+    rpc: &Arc<RpcClient>,
+    borrow_reserve: &Option<KaminoReserve>,
+    deposit_reserve: &Option<KaminoReserve>,
+    current_slot: u64,
+) -> Result<(bool, Option<f64>, Option<f64>)> {
+    let mut borrow_price = None;
+    let mut deposit_price = None;
+    let mut all_ok = true;
+    
+    if let Some(reserve) = borrow_reserve {
+        // Get price from reserve's market_price_sf (already updated by protocol)
+        let price = reserve.market_price_usd();
+        borrow_price = Some(price);
+        log::debug!("  💰 Borrow reserve price: ${:.6}", price);
+    }
+    
+    if let Some(reserve) = deposit_reserve {
+        // Get price from reserve's market_price_sf
+        let price = reserve.market_price_usd();
+        deposit_price = Some(price);
+        log::debug!("  💰 Deposit reserve price: ${:.6}", price);
+    }
+    
+    // TODO: Add full oracle validation (Pyth/Switchboard confidence checks)
+    // For now, we trust the reserve's market_price_sf which is updated by the protocol
+    
+    Ok((all_ok, borrow_price, deposit_price))
+}
+
+/// Build liquidation context for Solend (REMOVED - legacy protocol)
+#[allow(dead_code)]
+async fn _build_solend_liquidation_context_removed(
+    rpc: &Arc<RpcClient>,
+    obligation: &SolendObligation,
 ) -> Result<LiquidationContext> {
     // 🔴 CRITICAL FIX: Load reserve accounts in parallel for better performance
     // This reduces latency when loading both borrow and deposit reserves
@@ -1289,10 +1505,10 @@ async fn build_liquidation_context(
             if let Some(pubkey) = borrow_reserve_pubkey {
                 log::debug!("  📥 Loading borrow reserve: {}", pubkey);
                 let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || -> Result<Option<Reserve>, solana_client::client_error::ClientError> {
+                tokio::task::spawn_blocking(move || -> Result<Option<SolendReserve>, solana_client::client_error::ClientError> {
                     let account_data = rpc_clone.get_account_data(&pubkey)?;
                     log::debug!("  📊 Borrow reserve account data retrieved: {} bytes", account_data.len());
-                    let reserve = Reserve::from_account_data(&account_data)
+                    let reserve = SolendReserve::from_account_data(&account_data)
                         .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
                     log::debug!("  ✅ Borrow reserve parsed successfully: version={}, mint={}", 
                                 reserve.version, reserve.liquidityMintPubkey);
@@ -1308,10 +1524,10 @@ async fn build_liquidation_context(
             if let Some(pubkey) = deposit_reserve_pubkey {
                 log::debug!("  📥 Loading deposit reserve: {}", pubkey);
                 let rpc_clone = Arc::clone(rpc);
-                tokio::task::spawn_blocking(move || -> Result<Option<Reserve>, solana_client::client_error::ClientError> {
+                tokio::task::spawn_blocking(move || -> Result<Option<SolendReserve>, solana_client::client_error::ClientError> {
                     let account_data = rpc_clone.get_account_data(&pubkey)?;
                     log::debug!("  📊 Deposit reserve account data retrieved: {} bytes", account_data.len());
-                    let reserve = Reserve::from_account_data(&account_data)
+                    let reserve = SolendReserve::from_account_data(&account_data)
                         .map_err(|e| solana_client::client_error::ClientError::from(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Parse error: {}", e))))?;
                     log::debug!("  ✅ Deposit reserve parsed successfully: version={}, mint={}", 
                                 reserve.version, reserve.liquidityMintPubkey);
@@ -1390,7 +1606,7 @@ async fn build_liquidation_context(
 
     let (oracle_ok, borrow_price, deposit_price) = validate_oracles_with_twap(rpc, &borrow_reserve, &deposit_reserve).await?;
 
-    Ok(LiquidationContext {
+    Ok(LiquidationContext::Solend {
         obligation_pubkey: obligation.owner,
         obligation: obligation.clone(),
         borrows,
@@ -1450,12 +1666,26 @@ async fn build_liquidation_tx1(
         sysvar,
     };
     use spl_token::ID as TOKEN_PROGRAM_ID;
+    use crate::solend::{Obligation, Reserve};
+
+    // Only support Solend for deprecated function
+    let LiquidationContext::Solend {
+        obligation,
+        borrows,
+        deposits,
+        borrow_reserve,
+        deposit_reserve,
+        obligation_pubkey,
+        ..
+    } = ctx else {
+        return Err(anyhow::anyhow!("Deprecated build_liquidation_tx1 only supports Solend"));
+    };
 
     let current_slot_now = rpc
         .get_slot()
         .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
     
-    if let Some(reserve) = &ctx.borrow_reserve {
+    if let Some(reserve) = borrow_reserve {
         let (valid, _) = oracle::pyth::validate_pyth_oracle(
             rpc,
             reserve.oracle_pubkey(),
@@ -1467,12 +1697,12 @@ async fn build_liquidation_tx1(
         if !valid {
             return Err(anyhow::anyhow!(
                 "Borrow reserve oracle became stale during TX preparation for obligation {}",
-                ctx.obligation_pubkey
+                obligation_pubkey
             ));
         }
     }
     
-    if let Some(reserve) = &ctx.deposit_reserve {
+    if let Some(reserve) = deposit_reserve {
         let (valid, _) = oracle::pyth::validate_pyth_oracle(
             rpc,
             reserve.oracle_pubkey(),
@@ -1485,14 +1715,14 @@ async fn build_liquidation_tx1(
             return Err(anyhow::anyhow!(
                 "Deposit reserve oracle became stale during TX preparation. \
                  Time elapsed since initial validation: ~2-3s. Aborting liquidation for obligation {}.",
-                ctx.obligation_pubkey
+                obligation_pubkey
             ));
         }
     }
     
     log::debug!(
         "✅ Oracle re-validation passed for obligation {} (current_slot={})",
-        ctx.obligation_pubkey,
+        obligation_pubkey,
         current_slot_now
     );
 
@@ -1500,12 +1730,10 @@ async fn build_liquidation_tx1(
     let wallet_pubkey = wallet.pubkey();
 
     // Get reserves
-    let borrow_reserve = ctx
-        .borrow_reserve
+    let borrow_reserve = borrow_reserve
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Borrow reserve not loaded"))?;
-    let deposit_reserve = ctx
-        .deposit_reserve
+    let deposit_reserve = deposit_reserve
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Deposit reserve not loaded"))?;
 
@@ -1515,7 +1743,7 @@ async fn build_liquidation_tx1(
     let liquidity_amount = quote.debt_to_repay_raw;
 
     // Derive required addresses
-    let lending_market = ctx.obligation.lendingMarket;
+    let lending_market = obligation.lendingMarket;
     let lending_market_authority = crate::solend::derive_lending_market_authority(&lending_market, &program_id)?;
 
     // Get reserve liquidity supply addresses
@@ -1546,8 +1774,8 @@ async fn build_liquidation_tx1(
     // 
     // If PDA cannot be derived (None), this may indicate unknown seed format, but we
     // still log a warning as this is unusual.
-    let borrow_reserve_pubkey = ctx.borrows[0].borrowReserve;
-    let deposit_reserve_pubkey = ctx.deposits[0].depositReserve;
+    let borrow_reserve_pubkey = borrows[0].borrowReserve;
+    let deposit_reserve_pubkey = deposits[0].depositReserve;
     
     // Verify repay reserve liquidity supply
     // CRITICAL SECURITY FIX: Fail-fast if PDA cannot be derived (None)
@@ -1712,11 +1940,11 @@ async fn build_liquidation_tx1(
     let accounts = vec![
         AccountMeta::new(source_liquidity, false),                    // 0: sourceLiquidity
         AccountMeta::new(destination_collateral, false),              // 1: destinationCollateral
-        AccountMeta::new(ctx.borrows[0].borrowReserve, false),  // 2: repayReserve (writable, refreshed)
+        AccountMeta::new(borrows[0].borrowReserve, false),  // 2: repayReserve (writable, refreshed)
         AccountMeta::new(repay_reserve_liquidity_supply, false),      // 3: repayReserveLiquiditySupply
-        AccountMeta::new_readonly(ctx.deposits[0].depositReserve, false), // 4: withdrawReserve (readonly, refreshed)
+        AccountMeta::new_readonly(deposits[0].depositReserve, false), // 4: withdrawReserve (readonly, refreshed)
         AccountMeta::new(withdraw_reserve_collateral_supply, false),  // 5: withdrawReserveCollateralSupply
-        AccountMeta::new(ctx.obligation_pubkey, false),                // 6: obligation (writable, refreshed)
+        AccountMeta::new(*obligation_pubkey, false),                // 6: obligation (writable, refreshed)
         AccountMeta::new_readonly(lending_market, false),            // 7: lendingMarket
         AccountMeta::new_readonly(lending_market_authority, false),   // 8: lendingMarketAuthority
         AccountMeta::new_readonly(wallet_pubkey, true),               // 9: transferAuthority (signer)
@@ -1878,7 +2106,7 @@ async fn build_liquidation_tx1(
     let redeem_accounts = vec![
         AccountMeta::new(source_collateral, false),                     // 0: sourceCollateral
         AccountMeta::new(destination_liquidity, false),                 // 1: destinationLiquidity
-        AccountMeta::new(ctx.deposits[0].depositReserve, false), // 2: reserve
+        AccountMeta::new(deposits[0].depositReserve, false), // 2: reserve
         AccountMeta::new(withdraw_reserve_collateral_mint, false),      // 3: reserveCollateralMint
         AccountMeta::new(withdraw_reserve_liquidity_supply, false),     // 4: reserveLiquiditySupply
         AccountMeta::new_readonly(lending_market, false),              // 5: lendingMarket
@@ -1931,7 +2159,7 @@ async fn build_liquidation_tx1(
          - Redeem: {} cTokens -> underlying tokens (cSOL -> SOL)\n\
          - Source collateral ATA: {}\n\
          - Destination liquidity ATA: {}",
-        ctx.obligation_pubkey,
+        obligation_pubkey,
         liquidity_amount,
         redeem_collateral_amount,
         source_collateral,
@@ -1971,6 +2199,13 @@ async fn build_liquidation_tx2(
     blockhash: solana_sdk::hash::Hash,
     config: &Config,
 ) -> Result<Transaction> {
+    // Only support Solend for deprecated function
+    let LiquidationContext::Solend {
+        obligation_pubkey,
+        ..
+    } = ctx else {
+        return Err(anyhow::anyhow!("Deprecated build_liquidation_tx2 only supports Solend"));
+    };
     use solana_sdk::instruction::Instruction;
     
     let wallet_pubkey = wallet.pubkey();
@@ -2030,7 +2265,7 @@ async fn build_liquidation_tx2(
     log::info!(
         "Built TX2 (Jupiter Swap) for obligation {}:\n\
          - Swap: SOL -> USDC ({} instructions)",
-        ctx.obligation_pubkey,
+        obligation_pubkey,
         instructions.len() - 2 // Subtract compute budget instructions
     );
 

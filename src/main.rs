@@ -1,4 +1,7 @@
-mod solend;
+#[allow(dead_code)]
+mod solend;  // Legacy Solend protocol (kept only for deprecated functions)
+mod kamino;  // Kamino Lend support
+mod lending_trait;  // Common trait for lending protocols
 mod pipeline;
 mod jup;
 mod utils;

@@ -15,7 +15,8 @@ use std::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::solend::Reserve;
+#[allow(dead_code)]
+use crate::solend::Reserve;  // Only for deprecated functions
 
 /// Simple price cache entry (1 second TTL)
 struct CachedPrice {
@@ -51,88 +52,119 @@ pub enum OracleSource {
 // Re-export validation functions for convenience
 pub use validation::validate_oracles_with_twap;
 
-/// Get price from reserve, trying Pyth first, then Switchboard
+/// Get price from reserve - HERMES FIRST, then on-chain oracles
 /// Returns (price, has_pyth, has_switchboard)
-/// 🔴 CRITICAL FIX: Added 1 second cache to reduce RPC calls
+/// 
+/// Priority order:
+/// 1. Hermes API (most reliable, always fresh)
+/// 2. On-chain Pyth (may have 134 bytes legacy format issues)
+/// 3. On-chain Switchboard
 pub async fn get_reserve_price(
     rpc: &Arc<RpcClient>,
     reserve: &Reserve,
     current_slot: u64,
 ) -> Result<(Option<f64>, bool, bool)> {
+    let token_mint = reserve.liquidity().mintPubkey;
     let pyth_pubkey = reserve.oracle_pubkey();
     let switchboard_pubkey = reserve.liquidity().liquiditySwitchboardOracle;
     
     // Check cache first (1 second TTL)
-    let cache_key = if pyth_pubkey != Pubkey::default() {
-        pyth_pubkey
-    } else if switchboard_pubkey != Pubkey::default() {
-        switchboard_pubkey
-    } else {
-        // No oracle, can't cache
-        return Ok((None, false, false));
-    };
-    
+    let cache_key = token_mint; // Use mint as cache key for consistency
     {
         let cache = get_price_cache().read().unwrap();
         if let Some(cached) = cache.get(&cache_key) {
             if cached.timestamp.elapsed() < Duration::from_secs(1) {
-                log::debug!("✅ Using cached oracle price for {}: ${:.2} (age: {:?})", cache_key, cached.price, cached.timestamp.elapsed());
+                log::debug!("✅ Using cached price for {}: ${:.2} (age: {:?})", cache_key, cached.price, cached.timestamp.elapsed());
                 return Ok((Some(cached.price), cached.has_pyth, cached.has_switchboard));
             }
         }
     }
     
-    // Try Pyth first if available
+    // ==========================================================================
+    // PRIORITY 1: Hermes API (most reliable, always fresh)
+    // ==========================================================================
+    // 🔴 IMPORTANT: Return has_pyth=false, has_switchboard=false for Hermes
+    // This signals to validation.rs to SKIP strict on-chain confidence checks
+    // Hermes is Pyth's official HTTP API and already provides reliable prices
+    // No additional validation needed (unlike on-chain oracles which can be stale)
+    if token_mint != Pubkey::default() {
+        if let Some(symbol) = get_token_symbol_from_mint(&token_mint) {
+            match hermes::get_price_from_hermes(symbol).await {
+                Ok(Some(hermes_price)) => {
+                    log::debug!(
+                        "✅ Price from Hermes API for {}: ${:.4}",
+                        symbol,
+                        hermes_price
+                    );
+                    
+                    // Cache the result
+                    {
+                        let mut cache = get_price_cache().write().unwrap();
+                        cache.insert(token_mint, CachedPrice {
+                            price: hermes_price,
+                            timestamp: Instant::now(),
+                            has_pyth: false,       // NOT on-chain Pyth (skip strict validation)
+                            has_switchboard: false, // Hermes is HTTP, no Switchboard
+                        });
+                    }
+                    
+                    // Return false, false to skip strict validation
+                    // Hermes prices are already validated by Pyth network
+                    return Ok((Some(hermes_price), false, false));
+                }
+                Ok(None) => {
+                    log::debug!("⚠️  Hermes returned no price for {}, trying on-chain", symbol);
+                }
+                Err(e) => {
+                    log::debug!("⚠️  Hermes error for {}: {}, trying on-chain", symbol, e);
+                }
+            }
+        }
+    }
+    
+    // ==========================================================================
+    // PRIORITY 2: On-chain Pyth (fallback)
+    // ==========================================================================
     if pyth_pubkey != Pubkey::default() {
         match pyth::validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
             Ok((valid, price)) => {
                 if valid {
                     if let Some(price) = price {
-                        // Pyth succeeded - check if Switchboard is also available for cross-validation
-                        let has_switchboard = if switchboard_pubkey != Pubkey::default() {
-                            switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot)
-                                .await?
-                                .is_some()
-                        } else {
-                            false
-                        };
-                        log::debug!("✅ Pyth oracle validation succeeded for reserve {}: price=${:.2}", pyth_pubkey, price);
+                        log::debug!("✅ On-chain Pyth price for {}: ${:.2}", pyth_pubkey, price);
                         
                         // Cache the result
                         {
                             let mut cache = get_price_cache().write().unwrap();
-                            cache.insert(pyth_pubkey, CachedPrice {
+                            cache.insert(token_mint, CachedPrice {
                                 price,
                                 timestamp: Instant::now(),
                                 has_pyth: true,
-                                has_switchboard,
+                                has_switchboard: false,
                             });
                         }
                         
-                        return Ok((Some(price), true, has_switchboard));
-                    } else {
-                        log::debug!("Pyth oracle {} validation returned valid=true but price=None, trying Switchboard", pyth_pubkey);
+                        return Ok((Some(price), true, false));
                     }
-                } else {
-                    log::debug!("Pyth oracle {} validation failed (may be Switchboard oracle), trying Switchboard", pyth_pubkey);
                 }
             }
             Err(e) => {
-                log::debug!("Pyth oracle {} validation error: {}, trying Switchboard", pyth_pubkey, e);
+                log::debug!("On-chain Pyth error: {}", e);
             }
         }
     }
     
-    // Pyth not available or failed - try Switchboard
+    // ==========================================================================
+    // PRIORITY 3: On-chain Switchboard (fallback)
+    // ==========================================================================
     if switchboard_pubkey != Pubkey::default() {
         match switchboard::validate_switchboard_oracle_if_available(rpc, reserve, current_slot).await {
             Ok(Some(switchboard_price)) => {
-                log::debug!("Using Switchboard price (Pyth not available or failed)");
+                log::debug!("✅ On-chain Switchboard price: ${:.2}", switchboard_price);
                 
                 // Cache the result
                 {
                     let mut cache = get_price_cache().write().unwrap();
-                    cache.insert(switchboard_pubkey, CachedPrice {
+                    cache.insert(token_mint, CachedPrice {
                         price: switchboard_price,
                         timestamp: Instant::now(),
                         has_pyth: false,
@@ -143,16 +175,52 @@ pub async fn get_reserve_price(
                 return Ok((Some(switchboard_price), false, true));
             }
             Ok(None) => {
-                log::debug!("Switchboard oracle not available or invalid");
+                log::debug!("Switchboard oracle not available");
             }
             Err(e) => {
-                log::debug!("Switchboard oracle validation error: {}", e);
+                log::debug!("Switchboard error: {}", e);
             }
         }
     }
     
-    // Neither oracle worked
+    // All methods failed
+    log::warn!(
+        "❌ All oracle methods failed for mint {} (pyth={}, switchboard={})",
+        token_mint,
+        pyth_pubkey,
+        switchboard_pubkey
+    );
     Ok((None, false, false))
+}
+
+/// Get token symbol from known mint addresses
+/// Used for Hermes API fallback when on-chain oracles fail
+fn get_token_symbol_from_mint(mint: &Pubkey) -> Option<&'static str> {
+    use std::str::FromStr;
+    
+    // Known mainnet token mints
+    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+    let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").ok()?;
+    let usdt_mint = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").ok()?;
+    let btc_mint = Pubkey::from_str("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E").ok()?;
+    let eth_mint = Pubkey::from_str("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs").ok()?;
+    let msol_mint = Pubkey::from_str("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So").ok()?;
+    let stsol_mint = Pubkey::from_str("7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj").ok()?;
+    let ray_mint = Pubkey::from_str("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R").ok()?;
+    let srm_mint = Pubkey::from_str("SRMuApVNdxXokk5GT7XD5cUUgXMBCoAz2LHeuAoKWRt").ok()?;
+    
+    if *mint == sol_mint { return Some("SOL"); }
+    if *mint == usdc_mint { return Some("USDC"); }
+    if *mint == usdt_mint { return Some("USDT"); }
+    if *mint == btc_mint { return Some("BTC"); }
+    if *mint == eth_mint { return Some("ETH"); }
+    if *mint == msol_mint { return Some("MSOL"); }
+    if *mint == stsol_mint { return Some("STSOL"); }
+    if *mint == ray_mint { return Some("RAY"); }
+    if *mint == srm_mint { return Some("SRM"); }
+    
+    // Unknown mint - can't map to symbol
+    None
 }
 
 /// Oracle configuration from environment

@@ -1654,3 +1654,46 @@ pub fn find_usdc_mint_from_reserves(
     Err(anyhow::anyhow!("{}", error_msg))
 }
 
+// =============================================================================
+// LENDING TRAIT IMPLEMENTATION
+// =============================================================================
+
+impl crate::lending_trait::LendingObligation for Obligation {
+    fn borrowed_value_usd(&self) -> f64 {
+        self.total_borrowed_value_usd()
+    }
+    
+    fn deposited_value_usd(&self) -> f64 {
+        self.total_deposited_value_usd()
+    }
+    
+    fn allowed_borrow_value_usd(&self) -> f64 {
+        self.allowedBorrowValue as f64 / 1e18
+    }
+    
+    fn health_factor(&self) -> f64 {
+        self.health_factor()
+    }
+    
+    fn owner(&self) -> Pubkey {
+        self.owner
+    }
+    
+    fn lending_market(&self) -> Pubkey {
+        self.lendingMarket
+    }
+    
+    fn has_any_debt(&self) -> bool {
+        self.borrowsLen > 0 && self.borrowedValue > 0
+    }
+    
+    fn has_any_deposits(&self) -> bool {
+        self.depositsLen > 0 && self.depositedValue > 0
+    }
+    
+    fn is_stale(&self) -> bool {
+        // Solend uses lastUpdate.stale flag
+        self.lastUpdate.stale == 1
+    }
+}
+

@@ -9,7 +9,8 @@ use std::sync::{Arc, RwLock};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::solend::Reserve;
+#[allow(dead_code)]
+use crate::solend::Reserve;  // Only for deprecated functions
 use super::{get_oracle_config, get_reserve_price};
 use super::pyth::validate_pyth_confidence_strict;
 use super::switchboard::validate_switchboard_oracle_if_available;

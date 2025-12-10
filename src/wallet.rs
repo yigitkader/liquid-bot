@@ -8,7 +8,7 @@ use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
 
 use crate::quotes::get_sol_price_usd_standalone;
-use crate::solend::{find_usdc_mint_from_reserves, solend_program_id};
+use std::str::FromStr;
 
 /// Wallet balance information
 pub struct WalletBalance {
@@ -65,9 +65,10 @@ pub async fn get_wallet_balance(
     );
     
     // Get USDC balance
-    let program_id = solend_program_id()?;
-    let usdc_mint = find_usdc_mint_from_reserves(rpc, &program_id)
-        .context("Failed to discover USDC mint")?;
+    // USDC mint on Solana mainnet
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let usdc_mint = Pubkey::from_str(USDC_MINT)
+        .context("Invalid hardcoded USDC mint address")?;
     
     let usdc_ata = get_associated_token_address(wallet_pubkey, &usdc_mint);
     
