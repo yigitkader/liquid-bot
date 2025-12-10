@@ -111,6 +111,13 @@ async fn main() -> Result<()> {
         .await
         .context("Solend layout validation failed - please rebuild the bot")?;
 
+    // Initialize Pyth Hermes feed discovery (pre-warm cache)
+    // This dynamically discovers correct feed IDs from Pyth Hermes API
+    // No more hardcoded/stale feed addresses
+    crate::oracle::hermes::initialize_pyth_feeds()
+        .await
+        .context("Pyth Hermes feed discovery failed")?;
+
     // Load wallet - per Structure.md section 6.1: secret/main.json
     // Try multiple path resolutions to handle different working directories
     let keypair_path = resolve_wallet_path("secret/main.json")?;

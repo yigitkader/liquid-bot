@@ -4,6 +4,7 @@
 pub mod pyth;
 pub mod switchboard;
 pub mod validation;
+pub mod hermes; // Pyth Hermes API - dynamic feed discovery
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;

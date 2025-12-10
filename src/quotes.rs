@@ -101,29 +101,21 @@ pub async fn get_sol_price_usd_standalone(_rpc: &Arc<RpcClient>) -> Option<f64> 
         log::debug!("⚠️  CoinGecko failed, trying Pyth Hermes...");
     }
     
-    // Method 2: Pyth Hermes API (official Pyth HTTP endpoint - always fresh)
-    const PYTH_HERMES_API: &str = "https://hermes.pyth.network/api/latest_price_feeds?ids[]=0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-    if let Ok(resp) = client.get(PYTH_HERMES_API).send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(feed) = json.as_array().and_then(|arr| arr.get(0)) {
-                    if let Some(price_obj) = feed.get("price") {
-                        let price_str = price_obj.get("price").and_then(|p| p.as_str());
-                        let expo = price_obj.get("expo").and_then(|e| e.as_i64());
-                        
-                        if let (Some(p_str), Some(e)) = (price_str, expo) {
-                            if let Ok(p_val) = p_str.parse::<i64>() {
-                                let price = (p_val as f64) * 10_f64.powi(e as i32);
-                                log::info!("✅ SOL price from Pyth Hermes API: ${:.2}", price);
-                                return Some(price);
-                            }
-                        }
-                    }
-                }
-            }
+    // Method 2: Pyth Hermes API via simple_pyth_client_rs (dynamic feed discovery)
+    // This uses the hermes module which dynamically discovers feed IDs at runtime
+    // No more hardcoded feed addresses - 100% accurate
+    match crate::oracle::hermes::get_price_from_hermes("SOL").await {
+        Ok(Some(price)) => {
+            log::info!("✅ SOL price from Pyth Hermes SDK: ${:.2}", price);
+            return Some(price);
+        }
+        Ok(None) => {
+            log::debug!("⚠️  Pyth Hermes SDK returned no price, trying Binance...");
+        }
+        Err(e) => {
+            log::debug!("⚠️  Pyth Hermes SDK failed: {}, trying Binance...", e);
         }
     }
-    log::debug!("⚠️  Pyth Hermes failed, trying Binance...");
     
     // Method 3: Binance API
     const BINANCE_API: &str = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
@@ -168,11 +160,10 @@ pub async fn get_sol_price_usd_standalone(_rpc: &Arc<RpcClient>) -> Option<f64> 
          SOL price is REQUIRED for: profit calculations, fee calculations, risk limit checks.\n\
          \n\
          Troubleshooting:\n\
-         1. Check RPC connection (get_slot() should work)\n\
-         2. Verify Pyth feed addresses in .env (SOL_USD_PYTH_FEED)\n\
-         3. Check network connectivity (HTTP APIs may be blocked)\n\
-         4. Verify Switchboard feed addresses if configured\n\
-         5. Check RPC rate limits (may be blocking requests)"
+         1. Check network connectivity (CoinGecko, Pyth Hermes, Binance, Jupiter APIs)\n\
+         2. Check RPC connection (get_slot() should work)\n\
+         3. Check for rate limiting on HTTP APIs\n\
+         4. Verify Hermes API is accessible: https://hermes.pyth.network"
     );
     
     None

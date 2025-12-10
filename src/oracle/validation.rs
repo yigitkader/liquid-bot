@@ -148,42 +148,24 @@ pub async fn validate_oracles(
                   if deposit_reserve.is_some() { "parsed" } else { "None (parsing failed)" });
         log::warn!("   Borrow reserve has oracle: {}, Deposit reserve has oracle: {}", borrow_ok, deposit_ok);
         
-        // Try to get oracle pubkeys from environment variables
-        use std::env;
-        use std::str::FromStr;
-        use super::pyth::validate_pyth_oracle;
+        // 🔴 CRITICAL FIX: Use Hermes API for fallback price instead of stale on-chain feed
+        // The old SOL_USD_PYTH_FEED from .env was returning incorrect prices ($42.95)
+        // Hermes API provides real-time, accurate prices from Pyth Network
+        log::debug!("  🔄 Attempting fallback validation with Pyth Hermes API...");
         
-        if let Ok(pyth_feed_str) = env::var("SOL_USD_PYTH_FEED") {
-            if let Ok(pyth_pubkey) = Pubkey::from_str(&pyth_feed_str) {
-                log::debug!("  🔄 Attempting fallback validation with Pyth feed from env: {}", pyth_pubkey);
-                
-                let current_slot = rpc
-                    .get_slot()
-                    .map_err(|e| anyhow::anyhow!("Failed to get current slot: {}", e))?;
-                
-                match validate_pyth_oracle(rpc, pyth_pubkey, current_slot).await {
-                    Ok((true, Some(price))) => {
-                        log::info!("✅ Fallback oracle validation successful: Pyth price=${:.2}", price);
-                        log::info!("   Using fallback price for both borrow and deposit reserves");
-                        // Return same price for both borrow and deposit (fallback mode)
-                        return Ok((true, Some(price), Some(price)));
-                    }
-                    Ok((true, None)) => {
-                        // Oracle is valid but price is None (shouldn't happen, but handle it)
-                        log::warn!("⚠️  Fallback oracle validation: Oracle is valid but price is None");
-                    }
-                    Ok((false, _)) => {
-                        log::warn!("❌ Fallback oracle validation failed: Pyth oracle invalid");
-                    }
-                    Err(e) => {
-                        log::warn!("❌ Fallback oracle validation error: {}", e);
-                    }
-                }
-            } else {
-                log::warn!("❌ Invalid SOL_USD_PYTH_FEED pubkey format: {}", pyth_feed_str);
+        match super::hermes::get_price_from_hermes("SOL").await {
+            Ok(Some(price)) => {
+                log::info!("✅ Fallback oracle validation successful: Hermes price=${:.2}", price);
+                log::info!("   Using fallback price for both borrow and deposit reserves");
+                // Return same price for both borrow and deposit (fallback mode)
+                return Ok((true, Some(price), Some(price)));
             }
-        } else {
-            log::warn!("❌ SOL_USD_PYTH_FEED not found in environment variables");
+            Ok(None) => {
+                log::warn!("⚠️  Fallback oracle validation: Hermes returned no price");
+            }
+            Err(e) => {
+                log::warn!("❌ Fallback oracle validation error (Hermes): {}", e);
+            }
         }
         
         // If fallback also failed, return error
